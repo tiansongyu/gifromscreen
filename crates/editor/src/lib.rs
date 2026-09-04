@@ -10,12 +10,17 @@ use gif_from_screen_domain::{
 use thiserror::Error;
 
 mod duplicates;
+mod frame_selection;
 mod selection;
 mod yoyo;
 
 pub use duplicates::{
     DuplicateDelayMode, DuplicateFrameRetention, FrameComparison, FrameSimilarityProvider,
     RemoveDuplicateFramesOptions, remove_duplicate_frames,
+};
+pub use frame_selection::{
+    FrameExpressionError, FrameExpressionErrorReason, FrameTimeRangeError, parse_frame_expression,
+    select_frames_by_time_range,
 };
 pub use selection::{TimelineSelection, TimelineSelectionError};
 pub use yoyo::{YoyoOptions, YoyoScope, yoyo_frames};
