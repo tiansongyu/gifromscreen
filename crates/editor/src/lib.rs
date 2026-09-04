@@ -154,6 +154,111 @@ pub fn delete_frames(frame_ids: impl IntoIterator<Item = FrameId>) -> EditComman
     }
 }
 
+/// Builds one atomic command that deletes every frame before the earliest selected frame.
+///
+/// Input order is ignored and duplicate identities are treated as one selection. Transitions
+/// referencing a deleted frame are removed in the same command so that applying it cannot leave
+/// the project in an invalid intermediate state.
+///
+/// # Errors
+///
+/// Returns an error for an empty or unknown selection, or when the earliest selected frame is
+/// already the first frame in the timeline.
+pub fn delete_frames_before(
+    project: &ProjectManifest,
+    frame_ids: impl IntoIterator<Item = FrameId>,
+) -> Result<EditCommand, EditorError> {
+    delete_frames_relative(project, frame_ids, RelativeDelete::Before)
+}
+
+/// Builds one atomic command that deletes every frame after the latest selected frame.
+///
+/// Input order is ignored and duplicate identities are treated as one selection. Transitions
+/// referencing a deleted frame are removed in the same command so that applying it cannot leave
+/// the project in an invalid intermediate state.
+///
+/// # Errors
+///
+/// Returns an error for an empty or unknown selection, or when the latest selected frame is
+/// already the final frame in the timeline.
+pub fn delete_frames_after(
+    project: &ProjectManifest,
+    frame_ids: impl IntoIterator<Item = FrameId>,
+) -> Result<EditCommand, EditorError> {
+    delete_frames_relative(project, frame_ids, RelativeDelete::After)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelativeDelete {
+    Before,
+    After,
+}
+
+fn delete_frames_relative(
+    project: &ProjectManifest,
+    frame_ids: impl IntoIterator<Item = FrameId>,
+    direction: RelativeDelete,
+) -> Result<EditCommand, EditorError> {
+    let selected: BTreeSet<_> = frame_ids.into_iter().collect();
+    ensure_known_selection(project, &selected)?;
+
+    let first_selected = project
+        .timeline
+        .frames
+        .iter()
+        .position(|frame| selected.contains(&frame.id))
+        .ok_or(EditorError::SelectionCardinalityMismatch)?;
+    let last_selected = project
+        .timeline
+        .frames
+        .iter()
+        .rposition(|frame| selected.contains(&frame.id))
+        .ok_or(EditorError::SelectionCardinalityMismatch)?;
+
+    let removed_ids = match direction {
+        RelativeDelete::Before => project.timeline.frames[..first_selected]
+            .iter()
+            .map(|frame| frame.id)
+            .collect::<Vec<_>>(),
+        RelativeDelete::After => project.timeline.frames[last_selected + 1..]
+            .iter()
+            .map(|frame| frame.id)
+            .collect::<Vec<_>>(),
+    };
+    if removed_ids.is_empty() {
+        return Err(match direction {
+            RelativeDelete::Before => EditorError::NoFramesBeforeSelection,
+            RelativeDelete::After => EditorError::NoFramesAfterSelection,
+        });
+    }
+
+    Ok(remove_frames_atomically(project, removed_ids))
+}
+
+fn remove_frames_atomically(project: &ProjectManifest, removed_ids: Vec<FrameId>) -> EditCommand {
+    let removed: BTreeSet<_> = removed_ids.iter().copied().collect();
+    let transitions = project
+        .timeline
+        .transitions
+        .iter()
+        .filter(|transition| {
+            !removed.contains(&transition.from_frame) && !removed.contains(&transition.to_frame)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let remove = EditCommand::RemoveFrames {
+        frame_ids: removed_ids,
+    };
+
+    if transitions.len() == project.timeline.transitions.len() {
+        remove
+    } else {
+        EditCommand::Compound {
+            commands: vec![EditCommand::SetTransitions { transitions }, remove],
+        }
+    }
+}
+
 /// Builds one atomic command that reduces a consecutive selection by a fixed factor.
 ///
 /// The first selected frame is always retained. Subsequent selected frames are retained at
@@ -337,7 +442,7 @@ pub fn move_selected_left(
             order.swap(index - 1, index);
         }
     }
-    Ok(EditCommand::ReorderFrames { order })
+    Ok(reorder_frames_atomically(project, order))
 }
 
 /// Builds a command that moves the selected frames one slot toward the end.
@@ -364,7 +469,37 @@ pub fn move_selected_right(
             order.swap(index, index + 1);
         }
     }
-    Ok(EditCommand::ReorderFrames { order })
+    Ok(reorder_frames_atomically(project, order))
+}
+
+fn reorder_frames_atomically(project: &ProjectManifest, order: Vec<FrameId>) -> EditCommand {
+    let positions = order
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, frame_id)| (frame_id, index))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let transitions = project
+        .timeline
+        .transitions
+        .iter()
+        .filter(|transition| {
+            positions
+                .get(&transition.from_frame)
+                .zip(positions.get(&transition.to_frame))
+                .is_some_and(|(from, to)| from.checked_add(1) == Some(*to))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let reorder = EditCommand::ReorderFrames { order };
+
+    if transitions.len() == project.timeline.transitions.len() {
+        reorder
+    } else {
+        EditCommand::Compound {
+            commands: vec![EditCommand::SetTransitions { transitions }, reorder],
+        }
+    }
 }
 
 /// Overrides the selected frame durations with a single positive duration.
@@ -401,8 +536,9 @@ pub fn adjust_duration(
 ///
 /// # Errors
 ///
-/// Returns an error when the selection is invalid, the percentage is zero, or a duration
-/// overflows.
+/// Successful results are rounded to the nearest microsecond and clamped to at least one
+/// microsecond. Returns an error when the selection is invalid, the percentage is zero, or a
+/// duration exceeds the representable `u64` range.
 pub fn scale_duration(
     project: &ProjectManifest,
     frame_ids: impl IntoIterator<Item = FrameId>,
@@ -416,7 +552,7 @@ pub fn scale_duration(
             .checked_mul(u128::from(percent))
             .ok_or(EditorError::InvalidDuration)?;
         let rounded = scaled.checked_add(50).ok_or(EditorError::InvalidDuration)? / 100;
-        let rounded = u64::try_from(rounded).map_err(|_| EditorError::InvalidDuration)?;
+        let rounded = u64::try_from(rounded.max(1)).map_err(|_| EditorError::InvalidDuration)?;
         DurationUs::new(rounded).ok_or(EditorError::InvalidDuration)
     })
 }
@@ -474,6 +610,12 @@ pub enum EditorError {
     /// A selection referred to a frame outside the project.
     #[error("selected frame {0} does not exist")]
     UnknownSelectedFrame(FrameId),
+    /// There are no frames before the selected range.
+    #[error("there are no frames before the selection")]
+    NoFramesBeforeSelection,
+    /// There are no frames after the selected range.
+    #[error("there are no frames after the selection")]
+    NoFramesAfterSelection,
     /// A similarity provider failed while comparing two adjacent selected frames.
     #[error("failed to compare adjacent frames {first} and {second}")]
     FrameComparisonFailed {
@@ -552,7 +694,7 @@ mod tests {
     use gif_from_screen_domain::{
         AssetDescriptor, AssetId, AssetKind, Canvas, CanvasBackground, CaptureMetadata,
         ClipTransform, ColorSpace, FrameClip, PhysicalSize, ProjectId, ProjectRevision,
-        RasterEncoding, Timeline, UnixTimeMs,
+        RasterEncoding, Timeline, Transition, TransitionId, TransitionKind, UnixTimeMs,
     };
 
     use super::*;
@@ -641,6 +783,37 @@ mod tests {
         project.timeline.total_duration().unwrap().get()
     }
 
+    fn add_adjacent_transitions(project: &mut ProjectManifest) {
+        project.timeline.transitions = project
+            .timeline
+            .frames
+            .windows(2)
+            .enumerate()
+            .map(|(index, pair)| Transition {
+                id: TransitionId::from_u128(u128::try_from(index).unwrap() + 1),
+                from_frame: pair[0].id,
+                to_frame: pair[1].id,
+                duration: DurationUs::new(1).unwrap(),
+                kind: TransitionKind::FadeToNext,
+            })
+            .collect();
+        project.validate().unwrap();
+    }
+
+    fn transition_pairs(project: &ProjectManifest) -> Vec<(u128, u128)> {
+        project
+            .timeline
+            .transitions
+            .iter()
+            .map(|transition| {
+                (
+                    u128::from_be_bytes(*transition.from_frame.as_bytes()),
+                    u128::from_be_bytes(*transition.to_frame.as_bytes()),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn reverse_selected_preserves_unselected_slots() {
         let project = project();
@@ -649,6 +822,81 @@ mod tests {
         let mut session = EditorSession::new(project, 10).unwrap();
         session.execute(&command).unwrap();
         assert_eq!(order(session.project()), [3, 2, 1, 4]);
+    }
+
+    #[test]
+    fn delete_before_uses_earliest_selected_frame_and_is_reversible() {
+        let mut project = project_with_durations(&[10, 20, 30, 40, 50]);
+        add_adjacent_transitions(&mut project);
+        let command = delete_frames_before(
+            &project,
+            [
+                FrameId::from_u128(4),
+                FrameId::from_u128(3),
+                FrameId::from_u128(4),
+            ],
+        )
+        .unwrap();
+        let mut session = EditorSession::new(project, 10).unwrap();
+
+        session.execute(&command).unwrap();
+        assert_eq!(order(session.project()), [3, 4, 5]);
+        assert_eq!(durations(session.project()), [30, 40, 50]);
+        assert_eq!(transition_pairs(session.project()), [(3, 4), (4, 5)]);
+        assert!(session.undo().unwrap());
+        assert_eq!(order(session.project()), [1, 2, 3, 4, 5]);
+        assert_eq!(
+            transition_pairs(session.project()),
+            [(1, 2), (2, 3), (3, 4), (4, 5)]
+        );
+        assert!(session.redo().unwrap());
+        assert_eq!(order(session.project()), [3, 4, 5]);
+        assert_eq!(transition_pairs(session.project()), [(3, 4), (4, 5)]);
+    }
+
+    #[test]
+    fn delete_after_uses_latest_selected_frame_and_is_reversible() {
+        let project = project_with_durations(&[10, 20, 30, 40, 50]);
+        let command = delete_frames_after(
+            &project,
+            [
+                FrameId::from_u128(2),
+                FrameId::from_u128(3),
+                FrameId::from_u128(2),
+            ],
+        )
+        .unwrap();
+        let mut session = EditorSession::new(project, 10).unwrap();
+
+        session.execute(&command).unwrap();
+        assert_eq!(order(session.project()), [1, 2, 3]);
+        assert_eq!(durations(session.project()), [10, 20, 30]);
+        assert!(session.undo().unwrap());
+        assert_eq!(order(session.project()), [1, 2, 3, 4, 5]);
+        assert!(session.redo().unwrap());
+        assert_eq!(order(session.project()), [1, 2, 3]);
+    }
+
+    #[test]
+    fn relative_deletes_reject_invalid_or_exhausted_ranges() {
+        let project = project();
+        assert!(matches!(
+            delete_frames_before(&project, std::iter::empty()),
+            Err(EditorError::EmptySelection)
+        ));
+        assert!(matches!(
+            delete_frames_after(&project, [FrameId::from_u128(99)]),
+            Err(EditorError::UnknownSelectedFrame(frame_id))
+                if frame_id == FrameId::from_u128(99)
+        ));
+        assert!(matches!(
+            delete_frames_before(&project, [FrameId::from_u128(1)]),
+            Err(EditorError::NoFramesBeforeSelection)
+        ));
+        assert!(matches!(
+            delete_frames_after(&project, [FrameId::from_u128(4)]),
+            Err(EditorError::NoFramesAfterSelection)
+        ));
     }
 
     #[test]
@@ -665,6 +913,49 @@ mod tests {
     }
 
     #[test]
+    fn move_disjoint_and_contiguous_selections_preserves_relative_order() {
+        let project = project_with_durations(&[1, 2, 3, 4, 5, 6]);
+        let selection = [
+            FrameId::from_u128(5),
+            FrameId::from_u128(3),
+            FrameId::from_u128(2),
+            FrameId::from_u128(3),
+        ];
+        let left = move_selected_left(&project, selection).unwrap();
+        let right = move_selected_right(&project, selection).unwrap();
+
+        let mut left_session = EditorSession::new(project.clone(), 10).unwrap();
+        left_session.execute(&left).unwrap();
+        assert_eq!(order(left_session.project()), [2, 3, 1, 5, 4, 6]);
+
+        let mut right_session = EditorSession::new(project, 10).unwrap();
+        right_session.execute(&right).unwrap();
+        assert_eq!(order(right_session.project()), [1, 4, 2, 3, 6, 5]);
+    }
+
+    #[test]
+    fn move_removes_only_transitions_invalidated_by_new_order_and_undo_restores_them() {
+        let mut project = project_with_durations(&[10, 20, 30, 40, 50]);
+        add_adjacent_transitions(&mut project);
+        let command =
+            move_selected_left(&project, [FrameId::from_u128(2), FrameId::from_u128(3)]).unwrap();
+        let mut session = EditorSession::new(project, 10).unwrap();
+
+        session.execute(&command).unwrap();
+        assert_eq!(order(session.project()), [2, 3, 1, 4, 5]);
+        assert_eq!(transition_pairs(session.project()), [(2, 3), (4, 5)]);
+        assert!(session.undo().unwrap());
+        assert_eq!(order(session.project()), [1, 2, 3, 4, 5]);
+        assert_eq!(
+            transition_pairs(session.project()),
+            [(1, 2), (2, 3), (3, 4), (4, 5)]
+        );
+        assert!(session.redo().unwrap());
+        assert_eq!(order(session.project()), [2, 3, 1, 4, 5]);
+        assert_eq!(transition_pairs(session.project()), [(2, 3), (4, 5)]);
+    }
+
+    #[test]
     fn duration_edits_reject_non_positive_results() {
         let project = project();
         assert!(matches!(
@@ -674,6 +965,42 @@ mod tests {
         assert!(matches!(
             scale_duration(&project, [FrameId::from_u128(1)], 0),
             Err(EditorError::InvalidScale)
+        ));
+    }
+
+    #[test]
+    fn duration_scaling_clamps_rounding_to_one_and_supports_undo_redo() {
+        let project = project_with_durations(&[1, 149, 150]);
+        let command = scale_duration(&project, frame_ids(&project), 1).unwrap();
+        let mut session = EditorSession::new(project, 10).unwrap();
+
+        session.execute(&command).unwrap();
+        assert_eq!(durations(session.project()), [1, 1, 2]);
+        assert!(
+            session
+                .project()
+                .timeline
+                .frames
+                .iter()
+                .all(|frame| frame.duration.get() > 0)
+        );
+        assert!(session.undo().unwrap());
+        assert_eq!(durations(session.project()), [1, 149, 150]);
+        assert!(session.redo().unwrap());
+        assert_eq!(durations(session.project()), [1, 1, 2]);
+    }
+
+    #[test]
+    fn duration_scaling_accepts_maximum_identity_and_rejects_overflow() {
+        let project = project_with_durations(&[u64::MAX]);
+        let command = scale_duration(&project, frame_ids(&project), 100).unwrap();
+        let mut session = EditorSession::new(project.clone(), 10).unwrap();
+        session.execute(&command).unwrap();
+        assert_eq!(durations(session.project()), [u64::MAX]);
+
+        assert!(matches!(
+            scale_duration(&project, frame_ids(&project), 101),
+            Err(EditorError::InvalidDuration)
         ));
     }
 
