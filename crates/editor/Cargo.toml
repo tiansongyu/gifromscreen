@@ -1,0 +1,15 @@
+[package]
+name = "gif-from-screen-editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Timeline editing use cases and persistent undo/redo semantics for GifFromScreen"
+
+[dependencies]
+gif-from-screen-domain = { path = "../domain" }
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
