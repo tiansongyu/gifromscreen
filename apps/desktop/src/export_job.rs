@@ -247,6 +247,7 @@ mod tests {
         ColorSpace, DurationUs, EditCommand, FrameClip, FrameId, PhysicalSize, ProjectId,
         ProjectManifest, RasterEncoding, UnixTimeMs,
     };
+    use gif_from_screen_gif::CancellationToken as _;
     use gif_from_screen_project::ActiveProject;
     use tempfile::tempdir;
 
@@ -439,5 +440,25 @@ mod tests {
             job.take_result(),
             Some(Err(ExportJobError::WorkerExited))
         ));
+    }
+
+    #[test]
+    fn dropping_a_live_job_requests_cancellation() {
+        let cancellation = CancellationFlag::default();
+        let observer = cancellation.clone();
+        let (_sender, receiver) = mpsc::channel();
+        let job = ExportJob {
+            lifecycle: ExportJobLifecycle {
+                state: ExportJobState::Running,
+            },
+            cancellation: Some(cancellation),
+            receiver: Some(receiver),
+            latest_progress: None,
+            result: None,
+        };
+
+        drop(job);
+
+        assert!(observer.is_cancelled());
     }
 }
