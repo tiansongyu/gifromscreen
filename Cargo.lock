@@ -1029,6 +1029,7 @@ dependencies = [
  "gif-from-screen-editor",
  "gif-from-screen-gif",
  "gif-from-screen-project",
+ "gif-from-screen-render",
  "gif-from-screen-workflow",
  "tempfile",
  "thiserror 2.0.20",

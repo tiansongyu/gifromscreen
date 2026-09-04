@@ -3,6 +3,7 @@
 //! Desktop entry point for the Linux-first `GifFromScreen` application.
 
 mod countdown;
+mod editor_preview;
 mod editor_workspace;
 mod export_job;
 mod retarget;
