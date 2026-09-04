@@ -10,11 +10,13 @@ use gif_from_screen_domain::{
 use thiserror::Error;
 
 mod duplicates;
+mod yoyo;
 
 pub use duplicates::{
     DuplicateDelayMode, DuplicateFrameRetention, FrameComparison, FrameSimilarityProvider,
     RemoveDuplicateFramesOptions, remove_duplicate_frames,
 };
+pub use yoyo::{YoyoOptions, YoyoScope, yoyo_frames};
 
 /// Controls how removing frames affects the duration of the surviving timeline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -513,7 +515,7 @@ pub enum EditorError {
     /// A reduction factor must remove at least every second selected frame.
     #[error("keep_every must be at least two")]
     InvalidKeepEvery,
-    /// Reduce Frames operates on one uninterrupted timeline range.
+    /// The operation requires one uninterrupted timeline range.
     #[error("selected frames must be consecutive")]
     NonConsecutiveSelection,
     /// The selected range was too small for the requested reduction factor.
@@ -525,6 +527,22 @@ pub enum EditorError {
     /// An internal selection transformation produced a different item count.
     #[error("selection transformation changed the number of selected frames")]
     SelectionCardinalityMismatch,
+    /// A Yoyo range needs enough frames to produce a meaningful reverse leg.
+    #[error(
+        "yoyo requires at least {minimum_frames} frame(s) for these endpoint settings, got {actual_frames}"
+    )]
+    YoyoRangeTooShort {
+        /// Minimum source range length for the requested endpoint behavior.
+        minimum_frames: usize,
+        /// Actual source range length.
+        actual_frames: usize,
+    },
+    /// A frame identity generator returned the reserved nil identity.
+    #[error("the frame id generator returned the reserved nil identity")]
+    GeneratedNilFrameId,
+    /// A generated frame identity was already present or returned earlier in this edit.
+    #[error("the generated frame id {0} conflicts with another timeline frame")]
+    GeneratedFrameIdConflict(FrameId),
 }
 
 #[cfg(test)]
