@@ -8,6 +8,14 @@ use crate::{
     CancellationToken, RenderError, RgbaSurface, UnsupportedEffect, surface::checked_byte_len,
 };
 
+/// Largest supported radius for the deterministic region blur.
+///
+/// The cap bounds parameter-driven work at region edges and keeps horizontal
+/// channel sums representable as `u32` in the blur working buffer.
+pub const MAX_BLUR_RADIUS: u16 = 256;
+
+const CANCELLATION_PIXEL_INTERVAL: u32 = 1_024;
+
 /// Boxed provider failure retained as the source of [`RenderError::AssetLoad`].
 pub type AssetProviderError = Box<dyn Error + Send + Sync + 'static>;
 
@@ -35,10 +43,11 @@ where
     }
 }
 
-/// Resource limits applied to each intermediate render surface.
+/// Resource limits applied to each render surface or effect working buffer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RenderLimits {
-    /// Maximum packed RGBA byte length for a source or intermediate surface.
+    /// Maximum byte length for a source, intermediate surface, or individual
+    /// effect working buffer.
     pub max_surface_bytes: usize,
 }
 
@@ -57,7 +66,7 @@ pub struct CpuRenderer {
 }
 
 impl CpuRenderer {
-    /// Creates a renderer with a 512 MiB per-surface limit.
+    /// Creates a renderer with a 512 MiB per-buffer limit.
     pub fn new() -> Self {
         Self::default()
     }
@@ -124,7 +133,7 @@ impl CpuRenderer {
 
         for effect in &clip.effects {
             check_cancelled(cancellation)?;
-            apply_effect(&mut surface, effect, cancellation)?;
+            apply_effect(&mut surface, effect, self.limits, cancellation)?;
         }
         Ok(surface)
     }
@@ -306,6 +315,7 @@ fn swap_pixels(
 fn apply_effect<C: CancellationToken + ?Sized>(
     surface: &mut RgbaSurface,
     effect: &Effect,
+    limits: RenderLimits,
     cancellation: &C,
 ) -> Result<(), RenderError> {
     match effect {
@@ -337,7 +347,17 @@ fn apply_effect<C: CancellationToken + ?Sized>(
             validate_percent("lighten", *amount_percent)?;
             apply_tone(surface, *region, *amount_percent, true, cancellation)
         }
-        Effect::Blur { .. } => Err(RenderError::UnsupportedEffect(UnsupportedEffect::Blur)),
+        Effect::Blur { region, radius } => {
+            validate_region(surface, "blur", *region)?;
+            if *radius == 0 || *radius > MAX_BLUR_RADIUS {
+                return Err(RenderError::InvalidEffectParameter {
+                    effect: "blur",
+                    parameter: "radius",
+                    value: u64::from(*radius),
+                });
+            }
+            apply_blur(surface, *region, *radius, limits, cancellation)
+        }
         Effect::Shadow { .. } => Err(RenderError::UnsupportedEffect(UnsupportedEffect::Shadow)),
         Effect::Cinemagraph { .. } => Err(RenderError::UnsupportedEffect(
             UnsupportedEffect::Cinemagraph,
@@ -350,7 +370,7 @@ fn validate_region(
     effect: &'static str,
     region: PhysicalRect,
 ) -> Result<(), RenderError> {
-    if !region.fits_within(surface.size()) {
+    if region.size.validate().is_err() || !region.fits_within(surface.size()) {
         return Err(RenderError::InvalidEffectRegion {
             effect,
             region,
@@ -359,6 +379,217 @@ fn validate_region(
         });
     }
     Ok(())
+}
+
+fn apply_blur<C: CancellationToken + ?Sized>(
+    surface: &mut RgbaSurface,
+    region: PhysicalRect,
+    radius: u16,
+    limits: RenderLimits,
+    cancellation: &C,
+) -> Result<(), RenderError> {
+    check_cancelled(cancellation)?;
+    let mut horizontal_sums = allocate_blur_working_buffer(region, limits)?;
+    check_cancelled(cancellation)?;
+
+    let radius = u32::from(radius);
+    calculate_horizontal_blur_sums(surface, region, radius, &mut horizontal_sums, cancellation)?;
+    write_vertical_blur(surface, region, radius, &horizontal_sums, cancellation)
+}
+
+fn allocate_blur_working_buffer(
+    region: PhysicalRect,
+    limits: RenderLimits,
+) -> Result<Vec<[u32; 4]>, RenderError> {
+    let region_rgba_bytes = checked_byte_len(region.size)?;
+    let pixel_count = region_rgba_bytes / 4;
+    let working_bytes = pixel_count
+        .checked_mul(std::mem::size_of::<[u32; 4]>())
+        .ok_or(RenderError::EffectWorkingMemorySizeOverflow { effect: "blur" })?;
+    if working_bytes > limits.max_surface_bytes {
+        return Err(RenderError::EffectWorkingMemoryLimitExceeded {
+            effect: "blur",
+            requested: working_bytes,
+            limit: limits.max_surface_bytes,
+        });
+    }
+
+    let mut horizontal_sums = Vec::<[u32; 4]>::new();
+    horizontal_sums
+        .try_reserve_exact(pixel_count)
+        .map_err(|_| RenderError::EffectWorkingMemoryAllocationFailed {
+            effect: "blur",
+            requested: working_bytes,
+        })?;
+    horizontal_sums.resize(pixel_count, [0; 4]);
+    Ok(horizontal_sums)
+}
+
+fn calculate_horizontal_blur_sums<C: CancellationToken + ?Sized>(
+    surface: &RgbaSurface,
+    region: PhysicalRect,
+    radius: u32,
+    horizontal_sums: &mut [[u32; 4]],
+    cancellation: &C,
+) -> Result<(), RenderError> {
+    let width = region.size.width.get();
+    let height = region.size.height.get();
+
+    // Store exact horizontal sums rather than rounded horizontal averages. The
+    // vertical pass therefore performs only one rounding step for the complete
+    // two-dimensional box kernel.
+    for local_y in 0..height {
+        check_cancelled(cancellation)?;
+        let source_y = region.origin.y.get() + local_y;
+        let mut sums = [0_u64; 4];
+        for offset in -(i64::from(radius))..=i64::from(radius) {
+            let local_x = clamp_region_coordinate(offset, width);
+            add_channels(
+                &mut sums,
+                alpha_weighted_pixel(surface, region.origin.x.get() + local_x, source_y),
+            );
+        }
+
+        for local_x in 0..width {
+            if local_x != 0 && local_x % CANCELLATION_PIXEL_INTERVAL == 0 {
+                check_cancelled(cancellation)?;
+            }
+            let index = region_pixel_index(local_x, local_y, width);
+            horizontal_sums[index] = sums.map(|sum| {
+                u32::try_from(sum).expect("the blur radius cap keeps horizontal sums representable")
+            });
+
+            if local_x + 1 < width {
+                let leaving_x =
+                    clamp_region_coordinate(i64::from(local_x) - i64::from(radius), width);
+                let entering_x =
+                    clamp_region_coordinate(i64::from(local_x) + i64::from(radius) + 1, width);
+                subtract_channels(
+                    &mut sums,
+                    alpha_weighted_pixel(surface, region.origin.x.get() + leaving_x, source_y),
+                );
+                add_channels(
+                    &mut sums,
+                    alpha_weighted_pixel(surface, region.origin.x.get() + entering_x, source_y),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_vertical_blur<C: CancellationToken + ?Sized>(
+    surface: &mut RgbaSurface,
+    region: PhysicalRect,
+    radius: u32,
+    horizontal_sums: &[[u32; 4]],
+    cancellation: &C,
+) -> Result<(), RenderError> {
+    let width = region.size.width.get();
+    let height = region.size.height.get();
+    let kernel_width = u64::from(radius) * 2 + 1;
+    let sample_count = kernel_width * kernel_width;
+    for local_x in 0..width {
+        check_cancelled(cancellation)?;
+        let mut sums = [0_u64; 4];
+        for offset in -(i64::from(radius))..=i64::from(radius) {
+            let local_y = clamp_region_coordinate(offset, height);
+            add_channels(
+                &mut sums,
+                horizontal_sums[region_pixel_index(local_x, local_y, width)].map(u64::from),
+            );
+        }
+
+        for local_y in 0..height {
+            if local_y != 0 && local_y % CANCELLATION_PIXEL_INTERVAL == 0 {
+                check_cancelled(cancellation)?;
+            }
+            write_alpha_weighted_average(
+                surface,
+                region.origin.x.get() + local_x,
+                region.origin.y.get() + local_y,
+                sums,
+                sample_count,
+            );
+
+            if local_y + 1 < height {
+                let leaving_y =
+                    clamp_region_coordinate(i64::from(local_y) - i64::from(radius), height);
+                let entering_y =
+                    clamp_region_coordinate(i64::from(local_y) + i64::from(radius) + 1, height);
+                subtract_channels(
+                    &mut sums,
+                    horizontal_sums[region_pixel_index(local_x, leaving_y, width)].map(u64::from),
+                );
+                add_channels(
+                    &mut sums,
+                    horizontal_sums[region_pixel_index(local_x, entering_y, width)].map(u64::from),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn clamp_region_coordinate(position: i64, length: u32) -> u32 {
+    debug_assert!(length > 0);
+    u32::try_from(position.clamp(0, i64::from(length) - 1))
+        .expect("a coordinate clamped to a u32 region remains representable")
+}
+
+fn region_pixel_index(x: u32, y: u32, width: u32) -> usize {
+    usize::try_from(u64::from(y) * u64::from(width) + u64::from(x))
+        .expect("the validated blur working-buffer length makes its index representable")
+}
+
+fn alpha_weighted_pixel(surface: &RgbaSurface, x: u32, y: u32) -> [u64; 4] {
+    let offset = surface.byte_offset(x, y);
+    let pixel = &surface.pixels()[offset..offset + 4];
+    let alpha = u64::from(pixel[3]);
+    [
+        u64::from(pixel[0]) * alpha,
+        u64::from(pixel[1]) * alpha,
+        u64::from(pixel[2]) * alpha,
+        alpha,
+    ]
+}
+
+fn add_channels(sums: &mut [u64; 4], channels: [u64; 4]) {
+    for (sum, channel) in sums.iter_mut().zip(channels) {
+        *sum += channel;
+    }
+}
+
+fn subtract_channels(sums: &mut [u64; 4], channels: [u64; 4]) {
+    for (sum, channel) in sums.iter_mut().zip(channels) {
+        *sum -= channel;
+    }
+}
+
+fn write_alpha_weighted_average(
+    surface: &mut RgbaSurface,
+    x: u32,
+    y: u32,
+    sums: [u64; 4],
+    sample_count: u64,
+) {
+    let alpha_sum = sums[3];
+    let alpha = (alpha_sum + sample_count / 2) / sample_count;
+    let offset = surface.byte_offset(x, y);
+    let destination = &mut surface.pixels_mut()[offset..offset + 4];
+
+    if alpha_sum == 0 {
+        // Straight-alpha pixels with zero alpha have no visible color. Clearing
+        // hidden RGB makes future effects deterministic and prevents color bleed.
+        destination.copy_from_slice(&[0, 0, 0, 0]);
+        return;
+    }
+
+    for channel in 0..3 {
+        destination[channel] = u8::try_from((sums[channel] + alpha_sum / 2) / alpha_sum)
+            .expect("an alpha-weighted average of u8 colors remains an u8");
+    }
+    destination[3] = u8::try_from(alpha).expect("an average of u8 alpha remains an u8");
 }
 
 fn validate_percent(effect: &'static str, amount: u8) -> Result<(), RenderError> {
@@ -535,6 +766,14 @@ mod tests {
         RgbaSurface::new(size, pixels).unwrap()
     }
 
+    fn opaque_red_surface(width: u32, height: u32, red: &[u8]) -> RgbaSurface {
+        let pixels = red
+            .iter()
+            .flat_map(|channel| [*channel, 0, 0, 255])
+            .collect();
+        RgbaSurface::new(PhysicalSize::new(width, height).unwrap(), pixels).unwrap()
+    }
+
     fn clip(transform: ClipTransform, effects: Vec<Effect>) -> FrameClip {
         FrameClip {
             id: FrameId::from_u128(1),
@@ -647,6 +886,90 @@ mod tests {
     }
 
     #[test]
+    fn golden_blur_is_edge_clamped_to_its_region() {
+        let source = opaque_red_surface(
+            5,
+            3,
+            &[200, 0, 0, 0, 201, 202, 0, 90, 0, 203, 204, 0, 0, 0, 205],
+        );
+        let effect = Effect::Blur {
+            region: PhysicalRect::new(1, 0, 3, 3).unwrap(),
+            radius: 1,
+        };
+        let rendered = CpuRenderer::new()
+            .render_clip(
+                &clip(ClipTransform::default(), vec![effect]),
+                &provider(source),
+                &crate::NeverCancel,
+            )
+            .unwrap();
+
+        assert_eq!(
+            red_matrix(&rendered),
+            vec![
+                vec![200, 10, 10, 10, 201],
+                vec![202, 10, 10, 10, 203],
+                vec![204, 10, 10, 10, 205],
+            ]
+        );
+    }
+
+    #[test]
+    fn blur_uses_alpha_weighted_colors_and_canonicalizes_transparency() {
+        let source = RgbaSurface::new(
+            PhysicalSize::new(3, 1).unwrap(),
+            vec![250, 1, 2, 0, 0, 0, 255, 255, 3, 250, 4, 0],
+        )
+        .unwrap();
+        let effect = Effect::Blur {
+            region: PhysicalRect::new(0, 0, 3, 1).unwrap(),
+            radius: 1,
+        };
+        let rendered = CpuRenderer::new()
+            .render_clip(
+                &clip(ClipTransform::default(), vec![effect]),
+                &provider(source),
+                &crate::NeverCancel,
+            )
+            .unwrap();
+        assert_eq!(
+            rendered.pixels(),
+            &[0, 0, 255, 85, 0, 0, 255, 85, 0, 0, 255, 85]
+        );
+
+        let transparent =
+            RgbaSurface::new(PhysicalSize::new(1, 1).unwrap(), vec![255, 100, 50, 0]).unwrap();
+        let effect = Effect::Blur {
+            region: PhysicalRect::new(0, 0, 1, 1).unwrap(),
+            radius: 1,
+        };
+        let rendered = CpuRenderer::new()
+            .render_clip(
+                &clip(ClipTransform::default(), vec![effect]),
+                &provider(transparent),
+                &crate::NeverCancel,
+            )
+            .unwrap();
+        assert_eq!(rendered.pixels(), &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn blur_accepts_the_documented_maximum_radius() {
+        let effect = Effect::Blur {
+            region: PhysicalRect::new(0, 0, 1, 1).unwrap(),
+            radius: MAX_BLUR_RADIUS,
+        };
+        let rendered = CpuRenderer::new()
+            .render_clip(
+                &clip(ClipTransform::default(), vec![effect]),
+                &provider(opaque_red_surface(1, 1, &[73])),
+                &crate::NeverCancel,
+            )
+            .unwrap();
+        assert_eq!(rendered.pixels(), &[73, 0, 0, 255]);
+    }
+
+    #[test]
     fn invalid_geometry_and_effect_parameters_are_rejected() {
         let bad_crop = ClipTransform {
             crop: Some(PhysicalRect::new(3, 0, 2, 1).unwrap()),
@@ -676,13 +999,39 @@ mod tests {
                 ..
             })
         ));
+
+        for invalid_radius in [0, MAX_BLUR_RADIUS + 1] {
+            let bad_blur = Effect::Blur {
+                region: PhysicalRect::new(0, 0, 1, 1).unwrap(),
+                radius: invalid_radius,
+            };
+            assert!(matches!(
+                CpuRenderer::new().render_clip(
+                    &clip(ClipTransform::default(), vec![bad_blur]),
+                    &provider(labelled_surface(1, 1)),
+                    &crate::NeverCancel
+                ),
+                Err(RenderError::InvalidEffectParameter {
+                    effect: "blur",
+                    parameter: "radius",
+                    value,
+                }) if value == u64::from(invalid_radius)
+            ));
+        }
     }
 
     #[test]
     fn unsupported_effect_is_explicit() {
-        let effect = Effect::Blur {
-            region: PhysicalRect::new(0, 0, 1, 1).unwrap(),
-            radius: 2,
+        let effect = Effect::Shadow {
+            offset_x: 1,
+            offset_y: 1,
+            blur_radius: 2,
+            color: Rgba {
+                red: 0,
+                green: 0,
+                blue: 0,
+                alpha: 128,
+            },
         };
         assert!(matches!(
             CpuRenderer::new().render_clip(
@@ -690,21 +1039,21 @@ mod tests {
                 &provider(labelled_surface(1, 1)),
                 &crate::NeverCancel
             ),
-            Err(RenderError::UnsupportedEffect(UnsupportedEffect::Blur))
+            Err(RenderError::UnsupportedEffect(UnsupportedEffect::Shadow))
         ));
     }
 
-    struct CancelAfterChecks(AtomicUsize);
+    struct CancelAfterChecks(AtomicUsize, usize);
 
     impl CancellationToken for CancelAfterChecks {
         fn is_cancelled(&self) -> bool {
-            self.0.fetch_add(1, Ordering::Relaxed) >= 2
+            self.0.fetch_add(1, Ordering::Relaxed) >= self.1
         }
     }
 
     #[test]
     fn cancellation_is_observed_inside_row_processing() {
-        let cancellation = CancelAfterChecks(AtomicUsize::new(0));
+        let cancellation = CancelAfterChecks(AtomicUsize::new(0), 2);
         let transform = ClipTransform {
             output_size: Some(PhysicalSize::new(8, 8).unwrap()),
             ..ClipTransform::default()
@@ -716,6 +1065,48 @@ mod tests {
                 &cancellation
             ),
             Err(RenderError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn cancellation_is_observed_during_blur_row_processing() {
+        // Five checks occur before the first horizontal row finishes. Delaying
+        // cancellation until check six proves the blur loops observe the token.
+        let cancellation = CancelAfterChecks(AtomicUsize::new(0), 6);
+        let effect = Effect::Blur {
+            region: PhysicalRect::new(0, 0, 8, 8).unwrap(),
+            radius: 2,
+        };
+        assert!(matches!(
+            CpuRenderer::new().render_clip(
+                &clip(ClipTransform::default(), vec![effect]),
+                &provider(labelled_surface(8, 8)),
+                &cancellation
+            ),
+            Err(RenderError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn blur_working_memory_is_limited_before_allocation() {
+        let renderer = CpuRenderer::with_limits(RenderLimits {
+            max_surface_bytes: 32,
+        });
+        let effect = Effect::Blur {
+            region: PhysicalRect::new(0, 0, 2, 2).unwrap(),
+            radius: 1,
+        };
+        assert!(matches!(
+            renderer.render_clip(
+                &clip(ClipTransform::default(), vec![effect]),
+                &provider(labelled_surface(2, 2)),
+                &crate::NeverCancel
+            ),
+            Err(RenderError::EffectWorkingMemoryLimitExceeded {
+                effect: "blur",
+                requested: 64,
+                limit: 32,
+            })
         ));
     }
 
@@ -765,5 +1156,30 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn blur_rejects_empty_and_out_of_bounds_regions() {
+        let empty_region = PhysicalRect {
+            origin: PhysicalPoint::default(),
+            size: PhysicalSize {
+                width: PhysicalPx::ZERO,
+                height: PhysicalPx::new(1),
+            },
+        };
+        for region in [
+            empty_region,
+            PhysicalRect::new(1, 0, 1, 1).expect("the rectangle itself is valid"),
+        ] {
+            let effect = Effect::Blur { region, radius: 1 };
+            assert!(matches!(
+                CpuRenderer::new().render_clip(
+                    &clip(ClipTransform::default(), vec![effect]),
+                    &provider(labelled_surface(1, 1)),
+                    &crate::NeverCancel
+                ),
+                Err(RenderError::InvalidEffectRegion { effect: "blur", .. })
+            ));
+        }
     }
 }

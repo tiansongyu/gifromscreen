@@ -41,8 +41,6 @@ pub enum SurfaceError {
 /// Effects intentionally deferred beyond the first CPU-renderer milestone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnsupportedEffect {
-    /// Region blur.
-    Blur,
     /// Drop shadow.
     Shadow,
     /// Masked cinemagraph composition.
@@ -52,7 +50,6 @@ pub enum UnsupportedEffect {
 impl std::fmt::Display for UnsupportedEffect {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::Blur => "blur",
             Self::Shadow => "shadow",
             Self::Cinemagraph => "cinemagraph",
         })
@@ -115,6 +112,32 @@ pub enum RenderError {
         requested: usize,
         /// Configured maximum packed RGBA byte length.
         limit: usize,
+    },
+    /// An effect's temporary working buffer cannot be represented on this target.
+    #[error("{effect} working-memory size overflows for the selected region")]
+    EffectWorkingMemorySizeOverflow {
+        /// Stable effect name.
+        effect: &'static str,
+    },
+    /// An effect's temporary working buffer exceeded the configured byte budget.
+    #[error(
+        "{effect} requires {requested} bytes of working memory, exceeding the {limit}-byte render limit"
+    )]
+    EffectWorkingMemoryLimitExceeded {
+        /// Stable effect name.
+        effect: &'static str,
+        /// Required temporary-buffer byte length.
+        requested: usize,
+        /// Configured byte limit.
+        limit: usize,
+    },
+    /// The allocator could not reserve an effect's temporary working buffer.
+    #[error("could not allocate {requested} bytes of working memory for {effect}")]
+    EffectWorkingMemoryAllocationFailed {
+        /// Stable effect name.
+        effect: &'static str,
+        /// Number of bytes requested from the allocator.
+        requested: usize,
     },
     /// This milestone does not yet implement the requested effect.
     #[error("unsupported effect: {0}")]
