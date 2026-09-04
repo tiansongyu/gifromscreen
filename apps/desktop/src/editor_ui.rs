@@ -241,6 +241,9 @@ pub(crate) enum EditorUiOperation {
     Cut,
     Copy,
     Paste,
+    SelectClipboardEntry,
+    RemoveClipboardEntry,
+    ClearClipboardHistory,
     DeleteSelection,
     DeleteBeforeSelection,
     DeleteAfterSelection,
@@ -316,6 +319,7 @@ pub(crate) fn show_editor_ui(
     advance_playback(ui.ctx(), workspace, state, now, &mut results);
 
     show_editor_summary(ui, workspace);
+    show_clipboard_history(ui, workspace, &mut results);
     show_project_storage_toolbar(ui, workspace, &mut results);
     show_editor_statistics(ui, workspace, &mut results);
     ui.separator();
@@ -342,7 +346,11 @@ fn show_editor_summary(ui: &mut egui::Ui, workspace: &EditorWorkspace) {
             workspace.manifest().timeline.frames.len()
         ));
         ui.label(format!("{} selected", workspace.selection().len()));
-        ui.label(format!("Clipboard: {} frame(s)", workspace.clipboard_len()));
+        ui.label(format!(
+            "Clipboard: {} frame(s) in {} snapshot(s)",
+            workspace.clipboard_len(),
+            workspace.clipboard_history_len()
+        ));
         if workspace.is_dirty() {
             ui.strong("Journaled · checkpoint pending");
         }
@@ -353,6 +361,99 @@ fn show_editor_summary(ui: &mut egui::Ui, workspace: &EditorWorkspace) {
             );
         }
     });
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClipboardHistoryUiAction {
+    Select(gif_from_screen_editor::FrameClipboardEntryId),
+    Remove(gif_from_screen_editor::FrameClipboardEntryId),
+    Clear,
+}
+
+fn show_clipboard_history(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    results: &mut Vec<EditorUiResult>,
+) {
+    let entry_count = workspace.clipboard_history_len();
+    egui::CollapsingHeader::new(format!("Clipboard history ({entry_count})"))
+        .id_salt("editor-clipboard-history")
+        .show(ui, |ui| {
+            if entry_count == 0 {
+                ui.weak("Copy or cut frames to create a session-local snapshot.");
+                return;
+            }
+
+            let selected = workspace.selected_clipboard_id();
+            let entries = workspace
+                .clipboard_history_entries()
+                .rev()
+                .map(|entry| (entry.id(), entry.frame_count(), entry.total_duration_us()))
+                .collect::<Vec<_>>();
+            let mut action = None;
+            for (id, frames, duration_us) in entries {
+                ui.horizontal(|ui| {
+                    let duration = duration_us
+                        .map_or_else(|| "duration overflow".to_owned(), format_duration_us);
+                    if ui
+                        .selectable_label(
+                            selected == Some(id),
+                            format!("#{} · {frames} frame(s) · {duration}", id.get()),
+                        )
+                        .on_hover_text("Use this snapshot for Paste")
+                        .clicked()
+                    {
+                        action = Some(ClipboardHistoryUiAction::Select(id));
+                    }
+                    if ui.small_button("Remove").clicked() {
+                        action = Some(ClipboardHistoryUiAction::Remove(id));
+                    }
+                });
+            }
+            if ui.button("Clear clipboard history").clicked() {
+                action = Some(ClipboardHistoryUiAction::Clear);
+            }
+
+            match action {
+                Some(ClipboardHistoryUiAction::Select(id)) => {
+                    if workspace.select_clipboard_entry(id) {
+                        let frames = workspace.clipboard_len();
+                        results.push(Ok(EditorUiAction::Clipboard {
+                            operation: EditorUiOperation::SelectClipboardEntry,
+                            frames,
+                        }));
+                    } else {
+                        push_failure(
+                            results,
+                            EditorUiOperation::SelectClipboardEntry,
+                            "Clipboard history changed before the entry could be selected.",
+                        );
+                    }
+                }
+                Some(ClipboardHistoryUiAction::Remove(id)) => {
+                    match workspace.remove_clipboard_entry(id) {
+                        Some(frames) => results.push(Ok(EditorUiAction::Clipboard {
+                            operation: EditorUiOperation::RemoveClipboardEntry,
+                            frames,
+                        })),
+                        None => push_failure(
+                            results,
+                            EditorUiOperation::RemoveClipboardEntry,
+                            "Clipboard history changed before the entry could be removed.",
+                        ),
+                    }
+                }
+                Some(ClipboardHistoryUiAction::Clear) => {
+                    workspace.clear_clipboard_history();
+                    push_notice(
+                        results,
+                        EditorUiOperation::ClearClipboardHistory,
+                        "Clipboard history cleared.",
+                    );
+                }
+                None => {}
+            }
+        });
 }
 
 fn show_project_storage_toolbar(

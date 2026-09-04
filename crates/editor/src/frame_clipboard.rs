@@ -179,6 +179,40 @@ impl FrameClipboardHistory {
         &mut self,
         clipboard: FrameClipboard,
     ) -> Result<FrameClipboardEntryId, FrameClipboardHistoryError> {
+        self.prepare_push(&clipboard)?;
+        Ok(self.insert_prepared(clipboard))
+    }
+
+    /// Runs a fallible operation and pushes the snapshot only when it succeeds.
+    ///
+    /// History validation and allocation happen before `operation` is invoked. The outer result
+    /// reports a history preparation failure, while the inner result preserves the operation's
+    /// own error type. An operation failure leaves entries and selection unchanged; an operation
+    /// success is followed only by non-fallible ring-buffer mutation. This supports atomic Cut
+    /// semantics when the durable project commit is supplied as `operation`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameClipboardHistoryError`] before invoking `operation` when the snapshot cannot
+    /// be retained. The nested result returns the unchanged error produced by `operation`.
+    pub fn push_after<T, E>(
+        &mut self,
+        clipboard: FrameClipboard,
+        operation: impl FnOnce() -> Result<T, E>,
+    ) -> Result<Result<(FrameClipboardEntryId, T), E>, FrameClipboardHistoryError> {
+        self.prepare_push(&clipboard)?;
+        let value = match operation() {
+            Ok(value) => value,
+            Err(error) => return Ok(Err(error)),
+        };
+        let id = self.insert_prepared(clipboard);
+        Ok(Ok((id, value)))
+    }
+
+    fn prepare_push(
+        &mut self,
+        clipboard: &FrameClipboard,
+    ) -> Result<(), FrameClipboardHistoryError> {
         if clipboard.is_empty() {
             return Err(FrameClipboardHistoryError::EmptyClipboard);
         }
@@ -193,6 +227,12 @@ impl FrameClipboardHistory {
             })?;
         }
 
+        Ok(())
+    }
+
+    fn insert_prepared(&mut self, clipboard: FrameClipboard) -> FrameClipboardEntryId {
+        debug_assert!(!clipboard.is_empty());
+        debug_assert_ne!(self.next_id, 0);
         let id = FrameClipboardEntryId(self.next_id);
         let next_id = self.next_id.checked_add(1).unwrap_or(0);
         if self.entries.len() == self.capacity {
@@ -202,7 +242,7 @@ impl FrameClipboardHistory {
             .push_back(FrameClipboardHistoryEntry { id, clipboard });
         self.selected = Some(id);
         self.next_id = next_id;
-        Ok(id)
+        id
     }
 
     /// Selects an existing entry without changing its position.
@@ -805,5 +845,29 @@ mod tests {
         let mut history = FrameClipboardHistory::default();
         history.push(clipboard).unwrap();
         assert_eq!(history.selected().unwrap().total_duration_us(), None);
+    }
+
+    #[test]
+    fn clipboard_history_push_after_is_atomic_around_the_supplied_operation() {
+        let project = project(2);
+        let first = copy_selected_frames(&project, [FrameId::from_u128(1)]).unwrap();
+        let second = copy_selected_frames(&project, [FrameId::from_u128(2)]).unwrap();
+        let mut history = FrameClipboardHistory::new(2).unwrap();
+        history.push(first).unwrap();
+        let before = history.clone();
+
+        let failed = history
+            .push_after(second.clone(), || Err::<(), _>("commit failed"))
+            .unwrap();
+        assert_eq!(failed, Err("commit failed"));
+        assert_eq!(history, before);
+
+        let succeeded = history
+            .push_after(second, || Ok::<_, &str>(42_u8))
+            .unwrap()
+            .unwrap();
+        assert_eq!(succeeded.1, 42);
+        assert_eq!(history.selected_id(), Some(succeeded.0));
+        assert_eq!(history.len(), 2);
     }
 }

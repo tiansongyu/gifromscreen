@@ -14,7 +14,8 @@ use gif_from_screen_domain::{
 };
 use gif_from_screen_editor::{
     ClipTransformEdit, DuplicateDelayMode, DuplicateFrameRetention, EditorError, EditorStatistics,
-    EditorStatisticsError, FrameClipboard, FrameComparison, FrameEffectEdit,
+    EditorStatisticsError, FrameClipboardEntryId, FrameClipboardHistory,
+    FrameClipboardHistoryEntry, FrameClipboardHistoryError, FrameComparison, FrameEffectEdit,
     FrameSimilarityProvider, FrameTimeRangeError, FrameTransitionSettings, ReduceDelayMode,
     ReduceOptions, RemoveDuplicateFramesOptions, TimelineSelection, TimelineSelectionError,
     YoyoOptions, YoyoScope, adjust_duration, copy_selected_frames, cut_selected_frames,
@@ -25,7 +26,8 @@ use gif_from_screen_editor::{
     set_transition_after, yoyo_frames,
 };
 use gif_from_screen_project::{
-    ActiveProject, AssetIssue, JournalRecoveryReport, LockPolicy, OpenedProject, ProjectError,
+    ActiveProject, AssetIssue, CommitReceipt, JournalRecoveryReport, LockPolicy, OpenedProject,
+    ProjectError,
 };
 use gif_from_screen_render::RgbaSurface;
 use thiserror::Error;
@@ -52,7 +54,7 @@ pub(crate) struct EditorWorkspace {
     dirty: bool,
     journal_recovery: Option<JournalRecoveryReport>,
     asset_issues: Vec<AssetIssue>,
-    clipboard: Option<FrameClipboard>,
+    clipboard: FrameClipboardHistory,
 }
 
 impl EditorWorkspace {
@@ -118,7 +120,7 @@ impl EditorWorkspace {
             dirty: false,
             journal_recovery: None,
             asset_issues: Vec::new(),
-            clipboard: None,
+            clipboard: FrameClipboardHistory::default(),
         })
     }
 
@@ -190,9 +192,43 @@ impl EditorWorkspace {
         self.history_limit
     }
 
-    /// Returns the frame count in the single bounded application clipboard.
+    /// Returns the frame count in the selected bounded clipboard-history entry.
     pub(crate) fn clipboard_len(&self) -> usize {
-        self.clipboard.as_ref().map_or(0, FrameClipboard::len)
+        self.clipboard
+            .selected_clipboard()
+            .map_or(0, gif_from_screen_editor::FrameClipboard::len)
+    }
+
+    /// Returns the number of retained clipboard snapshots.
+    pub(crate) fn clipboard_history_len(&self) -> usize {
+        self.clipboard.len()
+    }
+
+    /// Iterates clipboard snapshots from oldest to newest.
+    pub(crate) fn clipboard_history_entries(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = &FrameClipboardHistoryEntry> {
+        self.clipboard.entries()
+    }
+
+    /// Returns the stable identity of the snapshot used by Paste.
+    pub(crate) const fn selected_clipboard_id(&self) -> Option<FrameClipboardEntryId> {
+        self.clipboard.selected_id()
+    }
+
+    /// Selects an existing clipboard snapshot for subsequent Paste.
+    pub(crate) fn select_clipboard_entry(&mut self, id: FrameClipboardEntryId) -> bool {
+        self.clipboard.select(id)
+    }
+
+    /// Removes one clipboard snapshot and returns its frame count.
+    pub(crate) fn remove_clipboard_entry(&mut self, id: FrameClipboardEntryId) -> Option<usize> {
+        self.clipboard.remove(id).map(|clipboard| clipboard.len())
+    }
+
+    /// Clears all session-local clipboard snapshots.
+    pub(crate) fn clear_clipboard_history(&mut self) {
+        self.clipboard.clear();
     }
 
     /// Projects current timeline, selection, delay, canvas, and asset statistics.
@@ -345,11 +381,15 @@ impl EditorWorkspace {
     /// Returns an error when the command violates a project invariant or cannot be journaled.
     pub(crate) fn execute(&mut self, command: EditCommand) -> Result<(), EditorWorkspaceError> {
         let receipt = self.project.commit(command)?;
+        self.accept_commit(receipt);
+        Ok(())
+    }
+
+    fn accept_commit(&mut self, receipt: CommitReceipt) {
         push_bounded(&mut self.undo, receipt.inverse, self.history_limit);
         self.redo.clear();
         self.selection.reconcile(&self.project.manifest().timeline);
         self.dirty = true;
-        Ok(())
     }
 
     /// Deletes the current selection and any transitions that reference it.
@@ -364,7 +404,7 @@ impl EditorWorkspace {
         let selected = self.selected_frame_ids()?;
         let clipboard = copy_selected_frames(self.project.manifest(), selected)?;
         let count = clipboard.len();
-        self.clipboard = Some(clipboard);
+        self.clipboard.push(clipboard)?;
         Ok(count)
     }
 
@@ -373,8 +413,13 @@ impl EditorWorkspace {
         let selected = self.selected_frame_ids()?;
         let cut = cut_selected_frames(self.project.manifest(), selected)?;
         let count = cut.clipboard.len();
-        self.execute(cut.command)?;
-        self.clipboard = Some(cut.clipboard);
+        let committed = {
+            let history = &mut self.clipboard;
+            let project = &mut self.project;
+            history.push_after(cut.clipboard, || project.commit(cut.command))?
+        };
+        let (_, receipt) = committed.map_err(EditorWorkspaceError::Project)?;
+        self.accept_commit(receipt);
         Ok(count)
     }
 
@@ -382,7 +427,7 @@ impl EditorWorkspace {
     pub(crate) fn paste_after_current(&mut self) -> Result<usize, EditorWorkspaceError> {
         let clipboard = self
             .clipboard
-            .as_ref()
+            .selected_clipboard()
             .ok_or(EditorWorkspaceError::EmptyClipboard)?;
         let count = clipboard.len();
         let command = paste_frame_clipboard(
@@ -894,6 +939,9 @@ pub(crate) enum EditorWorkspaceError {
     /// An editor command could not be built for the current selection.
     #[error(transparent)]
     Editor(#[from] EditorError),
+    /// Session-local clipboard history could not retain a Copy/Cut snapshot.
+    #[error(transparent)]
+    ClipboardHistory(#[from] FrameClipboardHistoryError),
     /// A selection or navigation request was invalid.
     #[error(transparent)]
     Selection(#[from] TimelineSelectionError),
@@ -1804,6 +1852,7 @@ mod tests {
 
         assert_eq!(workspace.copy_selection().unwrap(), 2);
         assert_eq!(workspace.clipboard_len(), 2);
+        assert_eq!(workspace.clipboard_history_len(), 1);
         assert_eq!(workspace.manifest().revision, revision);
         assert!(!workspace.can_undo());
 
@@ -1829,20 +1878,23 @@ mod tests {
         assert_eq!(reopened.manifest().timeline.frames.len(), 6);
         assert_eq!(reopened.manifest().timeline.frames[1].id, pasted_ids[0]);
         assert_eq!(reopened.clipboard_len(), 0);
+        assert_eq!(reopened.clipboard_history_len(), 0);
     }
 
     #[test]
-    fn cut_and_failed_copy_replace_clipboard_only_after_success() {
+    fn cut_and_failed_copy_append_clipboard_only_after_success() {
         let directory = tempfile::tempdir().unwrap();
         let mut workspace = create_workspace(&directory, &[10, 20, 30, 40], 8);
         workspace.select_only(frame_id(1)).unwrap();
         workspace.copy_selection().unwrap();
         assert_eq!(workspace.clipboard_len(), 1);
+        assert_eq!(workspace.clipboard_history_len(), 1);
 
         workspace.select_only(frame_id(2)).unwrap();
         workspace.toggle_selection(frame_id(3)).unwrap();
         assert_eq!(workspace.cut_selection().unwrap(), 2);
         assert_eq!(workspace.clipboard_len(), 2);
+        assert_eq!(workspace.clipboard_history_len(), 2);
         assert_eq!(order(&workspace), [1, 4]);
         assert!(workspace.undo().unwrap());
         assert_eq!(order(&workspace), [1, 2, 3, 4]);
@@ -1855,9 +1907,11 @@ mod tests {
             ))
         ));
         assert_eq!(workspace.clipboard_len(), 2);
+        assert_eq!(workspace.clipboard_history_len(), 2);
         workspace.clear_selection();
         assert!(workspace.copy_selection().is_err());
         assert_eq!(workspace.clipboard_len(), 2);
+        assert_eq!(workspace.clipboard_history_len(), 2);
     }
 
     #[test]
@@ -1869,8 +1923,100 @@ mod tests {
             workspace.paste_after_current(),
             Err(EditorWorkspaceError::EmptyClipboard)
         ));
+        assert_eq!(workspace.clipboard_history_len(), 0);
         assert!(!workspace.is_dirty());
         assert!(!workspace.can_undo());
+    }
+
+    #[test]
+    fn clipboard_history_select_remove_clear_and_capacity_control_paste_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let durations = (1..=10).map(|value| value * 10).collect::<Vec<_>>();
+        let mut workspace = create_workspace(&directory, &durations, 16);
+        for number in 1..=10 {
+            workspace.select_only(frame_id(number)).unwrap();
+            workspace.copy_selection().unwrap();
+        }
+
+        assert_eq!(workspace.clipboard_history_len(), 8);
+        let retained = workspace
+            .clipboard_history_entries()
+            .map(|entry| (entry.id(), entry.clipboard().frames()[0].id))
+            .collect::<Vec<_>>();
+        assert_eq!(retained.first().unwrap().0.get(), 3);
+        assert_eq!(retained.first().unwrap().1, frame_id(3));
+        assert_eq!(retained.last().unwrap().1, frame_id(10));
+
+        let oldest = retained.first().unwrap().0;
+        assert!(workspace.select_clipboard_entry(oldest));
+        assert_eq!(workspace.clipboard_len(), 1);
+        workspace.select_only(frame_id(10)).unwrap();
+        workspace.paste_after_current().unwrap();
+        assert_eq!(
+            workspace
+                .manifest()
+                .timeline
+                .frames
+                .last()
+                .unwrap()
+                .duration
+                .get(),
+            30
+        );
+
+        assert_eq!(workspace.remove_clipboard_entry(oldest), Some(1));
+        assert_eq!(workspace.clipboard_history_len(), 7);
+        assert_eq!(workspace.clipboard_len(), 1);
+        assert_eq!(
+            workspace
+                .clipboard_history_entries()
+                .find(|entry| Some(entry.id()) == workspace.selected_clipboard_id())
+                .unwrap()
+                .clipboard()
+                .frames()[0]
+                .id,
+            frame_id(10)
+        );
+
+        workspace.clear_clipboard_history();
+        assert_eq!(workspace.clipboard_history_len(), 0);
+        assert!(matches!(
+            workspace.paste_after_current(),
+            Err(EditorWorkspaceError::EmptyClipboard)
+        ));
+    }
+
+    #[test]
+    fn failed_cut_commit_preserves_manifest_and_clipboard_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = create_workspace(&directory, &[10, 20, 30], 8);
+        workspace.select_only(frame_id(1)).unwrap();
+        workspace.copy_selection().unwrap();
+        let manifest_before = workspace.manifest().clone();
+        let clipboard_before = workspace
+            .clipboard_history_entries()
+            .map(FrameClipboardHistoryEntry::id)
+            .collect::<Vec<_>>();
+
+        workspace.select_only(frame_id(2)).unwrap();
+        let journal = workspace.project_root().join("journal.ndjson");
+        std::fs::remove_file(&journal).unwrap();
+        std::fs::create_dir(&journal).unwrap();
+        assert!(matches!(
+            workspace.cut_selection(),
+            Err(EditorWorkspaceError::Project(
+                ProjectError::JournalCommitFailed { .. }
+            ))
+        ));
+        assert_eq!(workspace.manifest(), &manifest_before);
+        assert_eq!(
+            workspace
+                .clipboard_history_entries()
+                .map(FrameClipboardHistoryEntry::id)
+                .collect::<Vec<_>>(),
+            clipboard_before
+        );
+        assert_eq!(workspace.clipboard_len(), 1);
     }
 
     #[test]
