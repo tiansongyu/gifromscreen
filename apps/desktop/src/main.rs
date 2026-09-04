@@ -16,8 +16,8 @@ use gif_from_screen_capture::{
 use gif_from_screen_capture_linux::X11CaptureBackend;
 use gif_from_screen_gif::{CancellationFlag, EncodeOptions};
 use gif_from_screen_workflow::{
-    CollectOptions, CollectionLimit, RecordToGifOptions, RecordToGifReport, WorkflowProgress,
-    record_to_gif,
+    CollectOptions, CollectionLimit, RecordToGifOptions, RecordToGifReport, RecordingControl,
+    RecordingController, WorkflowProgress, record_to_gif_controlled,
 };
 
 const APP_NAME: &str = "GifFromScreen";
@@ -69,6 +69,8 @@ enum JobMessage {
 struct RecordingJob {
     receiver: Receiver<JobMessage>,
     cancellation: CancellationFlag,
+    controller: RecordingController,
+    paused: bool,
 }
 
 struct RegionPicker {
@@ -117,6 +119,7 @@ impl Default for GifFromScreenApp {
 impl Drop for GifFromScreenApp {
     fn drop(&mut self) {
         if let Some(job) = &self.job {
+            let _ = job.controller.discard();
             job.cancellation.cancel();
         }
     }
@@ -217,13 +220,26 @@ impl GifFromScreenApp {
             {
                 self.notice = Some(error);
             }
-            if ui
-                .add_enabled(self.job.is_some(), egui::Button::new("Cancel"))
-                .clicked()
-                && let Some(job) = &self.job
-            {
-                job.cancellation.cancel();
-                self.notice = Some("Cancelling recording…".into());
+            if let Some(job) = &mut self.job {
+                let pause_label = if job.paused { "Resume" } else { "Pause" };
+                if ui.button(pause_label).clicked() {
+                    let accepted = if job.paused {
+                        job.controller.resume()
+                    } else {
+                        job.controller.pause()
+                    };
+                    if accepted {
+                        job.paused = !job.paused;
+                    }
+                }
+                if ui.button("Stop and save").clicked() {
+                    let _ = job.controller.stop();
+                    self.notice = Some("Stopping and encoding…".into());
+                }
+                if ui.button("Discard").clicked() {
+                    let _ = job.controller.discard();
+                    self.notice = Some("Discarding recording…".into());
+                }
             }
         });
 
@@ -273,7 +289,7 @@ impl GifFromScreenApp {
                 ui.label("Output GIF");
                 ui.text_edit_singleline(&mut self.settings.output);
                 ui.end_row();
-                ui.label("Duration (ms)");
+                ui.label("Maximum duration (ms)");
                 ui.add(egui::DragValue::new(&mut self.settings.duration_ms).range(1..=60_000));
                 ui.end_row();
                 ui.label("Frames per second");
@@ -456,6 +472,7 @@ impl GifFromScreenApp {
         let source_kind = selected.kind();
         let cancellation = CancellationFlag::default();
         let worker_cancellation = cancellation.clone();
+        let (controller, mut control) = RecordingController::channel();
         let (sender, receiver) = mpsc::channel();
 
         std::thread::Builder::new()
@@ -469,6 +486,7 @@ impl GifFromScreenApp {
                     &settings,
                     source_id,
                     source_kind,
+                    &mut control,
                     &worker_cancellation,
                     &mut progress,
                 )
@@ -482,6 +500,8 @@ impl GifFromScreenApp {
         self.job = Some(RecordingJob {
             receiver,
             cancellation,
+            controller,
+            paused: false,
         });
         Ok(())
     }
@@ -712,6 +732,7 @@ fn run_x11_recording(
     settings: &RecordingSettings,
     source_id: CaptureSourceId,
     source_kind: CaptureSourceKind,
+    control: &mut RecordingControl,
     cancellation: &CancellationFlag,
     progress: &mut dyn gif_from_screen_workflow::WorkflowProgressSink,
 ) -> Result<RecordToGifReport, Box<dyn std::error::Error + Send + Sync>> {
@@ -743,11 +764,12 @@ fn run_x11_recording(
         },
         encoding: EncodeOptions::default(),
     };
-    record_to_gif(
+    record_to_gif_controlled(
         &backend,
         request,
         settings.output.trim(),
         &options,
+        control,
         cancellation,
         progress,
     )
