@@ -8,6 +8,7 @@ description = "Bounded media import and full-canvas GIF decoding for GifFromScre
 
 [dependencies]
 gif.workspace = true
+image.workspace = true
 thiserror.workspace = true
 
 [lints]
