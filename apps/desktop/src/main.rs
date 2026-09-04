@@ -4,6 +4,7 @@
 
 mod countdown;
 mod editor_workspace;
+mod export_job;
 mod retarget;
 
 use std::{
