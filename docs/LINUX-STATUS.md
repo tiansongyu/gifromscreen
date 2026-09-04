@@ -28,6 +28,9 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Negotiate a real Wayland ScreenCast Portal session through the PipeWire FD handoff.
 - [x] Stream X11 recording frames into the recoverable project journal while capture is active.
 - [x] Consume mapped Wayland PipeWire frames through a bounded native capture session.
+- [x] Cut, copy, and paste bounded frame selections with immutable-asset reuse.
+- [x] Show overflow-safe timing, selection, canvas, and asset statistics.
+- [x] Route dropped project, GIF, PNG, JPEG, BMP, and WebP paths into background jobs.
 
 ## Delivery gates
 
@@ -60,7 +63,8 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [ ] Fade and slide transitions.
 - [x] Palette, dithering, transparency, and delta-frame controls.
 - [x] PNG/JPEG/BMP/WebP/GIF import.
-- [ ] Clipboard history, reusable presets, and project statistics.
+- [x] Single-slot frame clipboard and project statistics.
+- [ ] Multi-entry clipboard history and reusable presets.
 
 ### M3 — complete content sources
 
