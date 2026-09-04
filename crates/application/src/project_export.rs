@@ -9,8 +9,8 @@ use gif_from_screen_domain::{
 };
 use gif_from_screen_gif::{
     BuiltinGifEncoder, CancellationToken as GifCancellationToken, EncodeOptions, EncodeProgress,
-    EncodeReport, FrameError, GifEncodeError, GifEncoder, IteratorFrameSource, ProgressSink,
-    RgbaFrame,
+    EncodeReport, FixedPaletteQuantizer, FrameError, GifEncodeError, GifEncoder,
+    IteratorFrameSource, ProgressSink, QuantizationError, RgbaFrame, Transparency,
 };
 use gif_from_screen_project::{ActiveProject, AssetStore, ProjectError};
 use gif_from_screen_render::{
@@ -58,6 +58,89 @@ pub enum ProjectFrameSelection {
     Ordered(Vec<FrameId>),
 }
 
+/// Immutable caller-supplied GIF palette in tightly packed RGB byte order.
+///
+/// The optional transparent index designates one existing RGB entry. Duplicate RGB entries are
+/// accepted so a transparent entry can intentionally share its visible color with an opaque one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CustomGifPalette {
+    packed_rgb: Vec<u8>,
+    transparent_index: Option<u8>,
+}
+
+impl CustomGifPalette {
+    /// Validates and constructs a palette containing between 2 and 256 complete RGB entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CustomGifPaletteError`] when the byte length is not divisible by three, the entry
+    /// count is outside GIF's supported range, or `transparent_index` does not name an entry.
+    pub fn new(
+        packed_rgb: Vec<u8>,
+        transparent_index: Option<u8>,
+    ) -> Result<Self, CustomGifPaletteError> {
+        if !packed_rgb.len().is_multiple_of(3) {
+            return Err(CustomGifPaletteError::IncompleteRgbEntry {
+                byte_len: packed_rgb.len(),
+            });
+        }
+        let color_count = packed_rgb.len() / 3;
+        if !(2..=256).contains(&color_count) {
+            return Err(CustomGifPaletteError::ColorCountOutOfRange { color_count });
+        }
+        if let Some(index) = transparent_index
+            && usize::from(index) >= color_count
+        {
+            return Err(CustomGifPaletteError::TransparentIndexOutOfRange { index, color_count });
+        }
+        Ok(Self {
+            packed_rgb,
+            transparent_index,
+        })
+    }
+
+    /// Returns tightly packed RGB entries in stable palette-index order.
+    pub fn packed_rgb(&self) -> &[u8] {
+        &self.packed_rgb
+    }
+
+    /// Returns the designated transparent palette index, when configured.
+    pub const fn transparent_index(&self) -> Option<u8> {
+        self.transparent_index
+    }
+
+    /// Returns the number of RGB entries, including the optional transparent entry.
+    pub fn color_count(&self) -> usize {
+        self.packed_rgb.len() / 3
+    }
+}
+
+/// Invalid construction input for [`CustomGifPalette`].
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CustomGifPaletteError {
+    /// The packed bytes end inside an RGB triplet.
+    #[error("custom GIF palette byte length {byte_len} is not divisible by three")]
+    IncompleteRgbEntry {
+        /// Rejected packed byte length.
+        byte_len: usize,
+    },
+    /// GIF palettes require between two and 256 entries.
+    #[error("custom GIF palette must contain 2..=256 colors, got {color_count}")]
+    ColorCountOutOfRange {
+        /// Rejected number of complete RGB entries.
+        color_count: usize,
+    },
+    /// The transparent index does not name an existing RGB entry.
+    #[error("custom GIF transparent index {index} is outside the {color_count}-color palette")]
+    TransparentIndexOutOfRange {
+        /// Rejected palette index.
+        index: u8,
+        /// Number of entries in the palette.
+        color_count: usize,
+    },
+}
+
 /// Configuration for a project-to-GIF export.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectGifExportOptions {
@@ -65,6 +148,9 @@ pub struct ProjectGifExportOptions {
     pub frames: ProjectFrameSelection,
     /// Palette, timing, loop, transparency, delta, and dithering configuration.
     pub encoding: EncodeOptions,
+    /// Optional immutable palette overriding `encoding.quantizer` while retaining palette mode,
+    /// transparency, dithering, timing, delta, and loop settings.
+    pub custom_palette: Option<CustomGifPalette>,
     /// Whether a successfully encoded GIF may atomically replace an existing file.
     pub overwrite_existing: bool,
     /// Maximum combined bytes retained for source assets and rendered frames.
@@ -76,6 +162,7 @@ impl Default for ProjectGifExportOptions {
         Self {
             frames: ProjectFrameSelection::All,
             encoding: EncodeOptions::default(),
+            custom_palette: None,
             overwrite_existing: false,
             render_buffer_limit_bytes: 512 * 1024 * 1024,
         }
@@ -387,6 +474,41 @@ pub enum ProjectGifExportError {
         /// Deterministic renderer failure.
         #[source]
         source: RenderError,
+    },
+
+    /// A custom palette was paired with an invalid encoder color limit.
+    #[error("custom palette requires max_colors in 2..=256, got {max_colors}")]
+    InvalidCustomPaletteColorLimit {
+        /// Rejected encoder limit.
+        max_colors: u16,
+    },
+
+    /// A fixed custom palette cannot be truncated to the requested encoder limit.
+    #[error("custom palette contains {palette_colors} colors, above max_colors={max_colors}")]
+    CustomPaletteExceedsColorLimit {
+        /// Number of caller-supplied palette entries.
+        palette_colors: usize,
+        /// Encoder color limit.
+        max_colors: u16,
+    },
+
+    /// Rendered transparency requires a designated entry in the custom palette.
+    #[error(
+        "rendered frame {frame_index} contains alpha below {alpha_threshold}, but the custom palette has no transparent index"
+    )]
+    CustomPaletteMissingTransparency {
+        /// Zero-based rendered output-frame position containing transparency.
+        frame_index: usize,
+        /// Strict alpha threshold used by the encoder.
+        alpha_threshold: u8,
+    },
+
+    /// The GIF quantizer unexpectedly rejected a previously validated application palette.
+    #[error("validated custom palette could not initialize the GIF quantizer: {source}")]
+    CustomPaletteQuantizerRejected {
+        /// Lower-level fixed-palette validation failure.
+        #[source]
+        source: QuantizationError,
     },
 
     /// Built-in GIF encoding failed.
@@ -868,6 +990,8 @@ fn encode_and_commit(
     execution: &mut ExportExecution<'_>,
 ) -> Result<(EncodeReport, u64), ProjectGifExportError> {
     ensure_not_cancelled(execution.cancellation)?;
+    let encoder = encoder_for_options(options, &gif_frames, execution.cancellation)?;
+    ensure_not_cancelled(execution.cancellation)?;
     let mut temporary = create_temporary(parent, output)?;
     execution.report_phase(ProjectExportPhase::Encoding);
     let mut frame_source = IteratorFrameSource::new(gif_frames.into_iter());
@@ -877,7 +1001,7 @@ fn encode_and_commit(
             sink: execution.progress,
             state: &mut execution.state,
         };
-        BuiltinGifEncoder::default()
+        encoder
             .encode(
                 &mut frame_source,
                 temporary.as_file_mut(),
@@ -919,6 +1043,68 @@ fn encode_and_commit(
     persist_temporary(temporary, output, options.overwrite_existing)?;
     sync_directory_after_commit(parent, output)?;
     Ok((encoding, bytes_written))
+}
+
+fn encoder_for_options(
+    options: &ProjectGifExportOptions,
+    frames: &[RgbaFrame],
+    cancellation: &dyn GifCancellationToken,
+) -> Result<BuiltinGifEncoder, ProjectGifExportError> {
+    let Some(palette) = &options.custom_palette else {
+        return Ok(BuiltinGifEncoder::default());
+    };
+    let max_colors = options.encoding.max_colors;
+    if !(2..=256).contains(&max_colors) {
+        return Err(ProjectGifExportError::InvalidCustomPaletteColorLimit { max_colors });
+    }
+    if palette.color_count() > usize::from(max_colors) {
+        return Err(ProjectGifExportError::CustomPaletteExceedsColorLimit {
+            palette_colors: palette.color_count(),
+            max_colors,
+        });
+    }
+    if palette.transparent_index().is_none()
+        && let Transparency::AlphaThreshold(alpha_threshold) = options.encoding.transparency
+        && let Some(frame_index) =
+            first_frame_requiring_transparency(frames, alpha_threshold, cancellation)?
+    {
+        return Err(ProjectGifExportError::CustomPaletteMissingTransparency {
+            frame_index,
+            alpha_threshold,
+        });
+    }
+    let quantizer =
+        FixedPaletteQuantizer::new(palette.packed_rgb().to_vec(), palette.transparent_index())
+            .map_err(|source| ProjectGifExportError::CustomPaletteQuantizerRejected { source })?;
+    Ok(BuiltinGifEncoder::new(Box::new(quantizer)))
+}
+
+fn first_frame_requiring_transparency(
+    frames: &[RgbaFrame],
+    alpha_threshold: u8,
+    cancellation: &dyn GifCancellationToken,
+) -> Result<Option<usize>, ProjectGifExportError> {
+    ensure_not_cancelled(cancellation)?;
+    if alpha_threshold == 0 {
+        return Ok(None);
+    }
+    for (frame_index, frame) in frames.iter().enumerate() {
+        ensure_not_cancelled(cancellation)?;
+        let row_bytes = usize::from(frame.width()) * 4;
+        for row in frame.pixels().chunks_exact(row_bytes) {
+            ensure_not_cancelled(cancellation)?;
+            if row
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[3] < alpha_threshold)
+            {
+                return Ok(Some(frame_index));
+            }
+        }
+    }
+    ensure_not_cancelled(cancellation)?;
+    Ok(None)
 }
 
 fn select_clips(
@@ -1203,7 +1389,10 @@ fn sync_directory_after_commit(
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
+    use std::{
+        fs::File,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use gif_from_screen_domain::{
         AssetDescriptor, Canvas, CanvasBackground, CaptureMetadata, ClipTransform, ColorSpace,
@@ -1211,7 +1400,7 @@ mod tests {
         ProjectManifest, Rgba, SlideDirection, Transition, TransitionId, TransitionKind,
         UnixTimeMs,
     };
-    use gif_from_screen_gif::CancellationFlag;
+    use gif_from_screen_gif::{CancellationFlag, DitherMode, PaletteMode};
     use gif_from_screen_project::LockPolicy;
     use tempfile::tempdir;
 
@@ -1345,6 +1534,238 @@ mod tests {
             steps,
             kind,
         });
+    }
+
+    #[test]
+    fn custom_palette_constructor_validates_packed_entries_and_transparent_index() {
+        for byte_len in [1, 4, 7] {
+            assert_eq!(
+                CustomGifPalette::new(vec![0; byte_len], None),
+                Err(CustomGifPaletteError::IncompleteRgbEntry { byte_len })
+            );
+        }
+        for color_count in [0, 1, 257] {
+            assert_eq!(
+                CustomGifPalette::new(vec![0; color_count * 3], None),
+                Err(CustomGifPaletteError::ColorCountOutOfRange { color_count })
+            );
+        }
+        assert_eq!(
+            CustomGifPalette::new(vec![0; 2 * 3], Some(2)),
+            Err(CustomGifPaletteError::TransparentIndexOutOfRange {
+                index: 2,
+                color_count: 2,
+            })
+        );
+
+        let minimum = CustomGifPalette::new(vec![0, 0, 0, 255, 255, 255], Some(1)).unwrap();
+        assert_eq!(minimum.color_count(), 2);
+        assert_eq!(minimum.transparent_index(), Some(1));
+        assert_eq!(minimum.packed_rgb(), [0, 0, 0, 255, 255, 255]);
+        assert_eq!(minimum.clone(), minimum);
+        let maximum = CustomGifPalette::new(vec![0; 256 * 3], Some(255)).unwrap();
+        assert_eq!(maximum.color_count(), 256);
+    }
+
+    #[test]
+    fn custom_palette_roundtrips_local_global_and_every_dither_mode() {
+        let directory = tempdir().unwrap();
+        let first = [
+            0, 0, 0, 0, 32, 32, 32, 255, 224, 224, 224, 255, 255, 0, 0, 255,
+        ];
+        let second = [
+            255, 0, 0, 255, 0, 0, 0, 0, 96, 96, 96, 255, 255, 255, 255, 255,
+        ];
+        let (snapshot, _) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(2, 2).unwrap(),
+            &[
+                TestClip::rgba(1, &first, 10_000),
+                TestClip::rgba(2, &second, 20_000),
+            ],
+        );
+        let packed_rgb = vec![
+            0, 0, 0, // transparent black
+            0, 0, 0, // opaque black
+            255, 255, 255, // white
+            255, 0, 0, // red
+        ];
+        let palette = CustomGifPalette::new(packed_rgb.clone(), Some(0)).unwrap();
+        let dithers = [
+            DitherMode::None,
+            DitherMode::Bayer4x4,
+            DitherMode::FloydSteinberg,
+            DitherMode::Atkinson,
+            DitherMode::Burkes,
+            DitherMode::SierraLite,
+            DitherMode::TwoRowSierra,
+            DitherMode::Sierra,
+            DitherMode::JarvisJudiceNinke,
+            DitherMode::Stucki,
+            DitherMode::StevensonArce,
+        ];
+
+        for palette_mode in [PaletteMode::LocalPerFrame, PaletteMode::Global] {
+            for dither in dithers {
+                let output = directory
+                    .path()
+                    .join(format!("custom-{palette_mode:?}-{dither:?}.gif"));
+                let options = ProjectGifExportOptions {
+                    encoding: EncodeOptions {
+                        max_colors: 4,
+                        merge_duplicate_frames: false,
+                        transparency: Transparency::AlphaThreshold(128),
+                        palette_mode,
+                        dither,
+                        ..EncodeOptions::default()
+                    },
+                    custom_palette: Some(palette.clone()),
+                    ..ProjectGifExportOptions::default()
+                };
+                let report = export(&snapshot, &output, &options).unwrap();
+                assert_eq!(report.encoding.input_frames, 2);
+
+                let mut decoder = gif::DecodeOptions::new()
+                    .read_info(File::open(&output).unwrap())
+                    .unwrap();
+                if palette_mode == PaletteMode::Global {
+                    assert_eq!(decoder.global_palette(), Some(packed_rgb.as_slice()));
+                }
+                let mut decoded_frames = 0;
+                while let Some(frame) = decoder.read_next_frame().unwrap() {
+                    assert_eq!(
+                        frame.palette.is_some(),
+                        palette_mode == PaletteMode::LocalPerFrame
+                    );
+                    if let Some(local) = frame.palette.as_deref() {
+                        assert_eq!(local, packed_rgb);
+                    }
+                    assert_eq!(frame.transparent, Some(0));
+                    decoded_frames += 1;
+                }
+                assert_eq!(decoded_frames, 2);
+
+                let rgba = decode_rgba(&output);
+                assert_eq!(rgba[0].1[3], 0);
+                assert_eq!(rgba[1].1[7], 0);
+            }
+        }
+    }
+
+    #[test]
+    fn custom_palette_conflicts_are_typed_before_temporary_file_creation() {
+        let directory = tempdir().unwrap();
+        let transparent_pixel = [10, 20, 30, 0];
+        let (snapshot, _) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(1, 1).unwrap(),
+            &[TestClip::rgba(1, &transparent_pixel, 10_000)],
+        );
+        let output = directory.path().join("preserved.gif");
+        fs::write(&output, b"previous GIF").unwrap();
+        let three_colors =
+            CustomGifPalette::new(vec![0, 0, 0, 128, 128, 128, 255, 255, 255], Some(0)).unwrap();
+        let conflict = ProjectGifExportOptions {
+            encoding: EncodeOptions {
+                max_colors: 2,
+                ..EncodeOptions::default()
+            },
+            custom_palette: Some(three_colors),
+            overwrite_existing: true,
+            ..ProjectGifExportOptions::default()
+        };
+        assert!(matches!(
+            export(&snapshot, &output, &conflict),
+            Err(ProjectGifExportError::CustomPaletteExceedsColorLimit {
+                palette_colors: 3,
+                max_colors: 2,
+            })
+        ));
+        assert_eq!(fs::read(&output).unwrap(), b"previous GIF");
+        assert_eq!(partial_files(directory.path()), 0);
+
+        let no_transparency = CustomGifPalette::new(vec![0, 0, 0, 255, 255, 255], None).unwrap();
+        let missing_output = directory.path().join("missing-transparency.gif");
+        let missing = ProjectGifExportOptions {
+            custom_palette: Some(no_transparency.clone()),
+            ..ProjectGifExportOptions::default()
+        };
+        assert!(matches!(
+            export(&snapshot, &missing_output, &missing),
+            Err(ProjectGifExportError::CustomPaletteMissingTransparency {
+                frame_index: 0,
+                alpha_threshold: 1,
+            })
+        ));
+        assert!(!missing_output.exists());
+        assert_eq!(partial_files(directory.path()), 0);
+
+        let invalid_limit_output = directory.path().join("invalid-limit.gif");
+        let invalid_limit = ProjectGifExportOptions {
+            encoding: EncodeOptions {
+                max_colors: 300,
+                transparency: Transparency::Opaque,
+                ..EncodeOptions::default()
+            },
+            custom_palette: Some(no_transparency.clone()),
+            ..ProjectGifExportOptions::default()
+        };
+        assert!(matches!(
+            export(&snapshot, &invalid_limit_output, &invalid_limit),
+            Err(ProjectGifExportError::InvalidCustomPaletteColorLimit { max_colors: 300 })
+        ));
+        assert!(!invalid_limit_output.exists());
+        assert_eq!(partial_files(directory.path()), 0);
+
+        let opaque_output = directory.path().join("opaque-custom.gif");
+        let opaque = ProjectGifExportOptions {
+            encoding: EncodeOptions {
+                max_colors: 2,
+                transparency: Transparency::Opaque,
+                ..EncodeOptions::default()
+            },
+            custom_palette: Some(no_transparency),
+            ..ProjectGifExportOptions::default()
+        };
+        export(&snapshot, &opaque_output, &opaque).unwrap();
+        assert!(opaque_output.is_file());
+    }
+
+    #[test]
+    fn custom_palette_transparency_preflight_checks_cancellation_by_row() {
+        struct CancelAfterChecks {
+            checks: AtomicUsize,
+            cancel_at: usize,
+        }
+
+        impl GifCancellationToken for CancelAfterChecks {
+            fn is_cancelled(&self) -> bool {
+                self.checks.fetch_add(1, Ordering::Relaxed) >= self.cancel_at
+            }
+        }
+
+        let frame = RgbaFrame::new(2, 3, [10, 20, 30, 255].repeat(6), 10_000).unwrap();
+        let options = ProjectGifExportOptions {
+            encoding: EncodeOptions {
+                max_colors: 2,
+                transparency: Transparency::AlphaThreshold(255),
+                ..EncodeOptions::default()
+            },
+            custom_palette: Some(
+                CustomGifPalette::new(vec![0, 0, 0, 255, 255, 255], None).unwrap(),
+            ),
+            ..ProjectGifExportOptions::default()
+        };
+        let cancellation = CancelAfterChecks {
+            checks: AtomicUsize::new(0),
+            cancel_at: 3,
+        };
+
+        assert!(matches!(
+            encoder_for_options(&options, &[frame], &cancellation),
+            Err(ProjectGifExportError::Cancelled)
+        ));
+        assert_eq!(cancellation.checks.load(Ordering::Relaxed), 4);
     }
 
     #[test]

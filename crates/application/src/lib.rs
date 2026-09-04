@@ -20,9 +20,10 @@ pub use import_project::{
 };
 
 pub use project_export::{
-    NoopProjectExportProgress, ProjectExportPhase, ProjectExportProgress,
-    ProjectExportProgressSink, ProjectExportSnapshot, ProjectFrameSelection, ProjectGifExportError,
-    ProjectGifExportOptions, ProjectGifExportReport, export_project_snapshot_to_gif,
+    CustomGifPalette, CustomGifPaletteError, NoopProjectExportProgress, ProjectExportPhase,
+    ProjectExportProgress, ProjectExportProgressSink, ProjectExportSnapshot, ProjectFrameSelection,
+    ProjectGifExportError, ProjectGifExportOptions, ProjectGifExportReport,
+    export_project_snapshot_to_gif,
 };
 pub use recording_project::{
     IncrementalRecordingProject, IncrementalRecordingProjectError,
