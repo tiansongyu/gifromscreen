@@ -147,6 +147,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "serde",
+ "serde_repr",
  "tokio",
  "zbus",
 ]
@@ -1065,6 +1066,7 @@ dependencies = [
  "ashpd",
  "gif-from-screen-capture",
  "pipewire",
+ "tokio",
  "x11rb 0.14.0",
 ]
 

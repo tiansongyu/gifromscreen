@@ -13,8 +13,15 @@ use gif_from_screen_capture::{
 };
 use std::env;
 
+#[cfg(all(target_os = "linux", feature = "wayland-portal"))]
+mod wayland;
 mod x11;
 
+#[cfg(all(target_os = "linux", feature = "wayland-portal"))]
+pub use wayland::{
+    PortalStreamInfo, WaylandPortal, WaylandPortalCapabilities, WaylandPortalSession,
+    WaylandPortalSessionState,
+};
 pub use x11::X11CaptureBackend;
 
 /// Display protocol selected for the Linux desktop session.
@@ -226,6 +233,8 @@ impl LinuxEnvironmentReport {
 /// Native adapter dependencies compiled into the current binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeBuildSupport {
+    /// `ashpd` `ScreenCast` portal support was compiled for Linux.
+    pub wayland_portal: bool,
     /// `ashpd` and `pipewire-rs` were compiled for Linux.
     pub wayland_portal_pipewire: bool,
     /// `x11rb` was compiled for Linux.
@@ -236,6 +245,7 @@ impl NativeBuildSupport {
     /// Reports feature-gated native dependency availability.
     pub const fn current() -> Self {
         Self {
+            wayland_portal: cfg!(all(target_os = "linux", feature = "wayland-portal")),
             wayland_portal_pipewire: cfg!(all(target_os = "linux", feature = "native-wayland")),
             x11rb: cfg!(all(target_os = "linux", feature = "native-x11")),
         }
@@ -243,7 +253,7 @@ impl NativeBuildSupport {
 
     const fn supports(self, display_server: LinuxDisplayServer) -> bool {
         match display_server {
-            LinuxDisplayServer::Wayland => self.wayland_portal_pipewire,
+            LinuxDisplayServer::Wayland => self.wayland_portal,
             LinuxDisplayServer::X11 => self.x11rb,
         }
     }
@@ -262,9 +272,10 @@ pub struct LinuxBackendReport {
 
 /// Detected but not-yet-initialized Linux screen capture adapter.
 ///
-/// This first vertical slice intentionally stops before opening D-Bus,
-/// `PipeWire`, or X11 connections. It therefore never returns fake sources or a
-/// fake successful session; callers get [`CaptureErrorKind::BackendUninitialized`].
+/// Explicit initialization opens a complete X11 backend or live Wayland
+/// `ScreenCast` portal probe. Until the selected native path is complete this
+/// wrapper never returns fake sources or a fake successful session; callers get
+/// [`CaptureErrorKind::BackendUninitialized`].
 #[derive(Debug, Clone)]
 pub struct LinuxCaptureBackend {
     environment: LinuxEnvironment,
@@ -328,9 +339,10 @@ impl LinuxCaptureBackend {
 
     /// Opens the detected native backend.
     ///
-    /// The current vertical slice initializes X11 through [`X11CaptureBackend`].
-    /// Wayland detection remains available, but its Portal/PipeWire session is
-    /// intentionally deferred to the next adapter iteration.
+    /// X11 returns a complete [`CaptureBackend`]. A Wayland build performs a
+    /// live `ScreenCast` portal probe, then reports the remaining `PipeWire` frame
+    /// consumer boundary explicitly rather than falling back to X11 or
+    /// returning a fake capture session.
     ///
     /// # Errors
     ///
@@ -350,12 +362,45 @@ impl LinuxCaptureBackend {
                 X11CaptureBackend::connect(Some(display))
                     .map(|backend| Box::new(backend) as Box<dyn CaptureBackend>)
             }
-            Some(LinuxDisplayServer::Wayland) => Err(CaptureError::backend_uninitialized(
-                "cannot initialize Wayland capture yet: the XDG ScreenCast Portal/PipeWire \
-                 driver is not implemented in this vertical slice",
-            )),
+            Some(LinuxDisplayServer::Wayland) => {
+                #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
+                {
+                    let portal = self.initialize_wayland_portal()?;
+                    let capabilities = portal.capabilities();
+                    Err(CaptureError::backend_uninitialized(format!(
+                        "Wayland ScreenCast portal v{} is reachable (monitor={}, window={}), but \
+                         the negotiated PipeWire video consumer is not yet connected to the \
+                         portable CaptureSession frame channel",
+                        capabilities.version, capabilities.monitor, capabilities.window
+                    )))
+                }
+                #[cfg(not(all(target_os = "linux", feature = "wayland-portal")))]
+                {
+                    Err(self.readiness_error("initialize Wayland ScreenCast portal capture"))
+                }
+            }
             None => Err(self.readiness_error("initialize a Linux capture backend")),
         }
+    }
+
+    /// Opens and probes the real XDG `ScreenCast` portal for a Wayland session.
+    ///
+    /// This is the independently usable first half of Wayland capture. Call
+    /// [`WaylandPortal::start_session`] to complete the portal lifecycle and
+    /// obtain the selected `PipeWire` node/remote handoff.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaptureError`] when Wayland was not selected or the live
+    /// session bus/portal probe fails.
+    #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
+    pub fn initialize_wayland_portal(&self) -> Result<WaylandPortal, CaptureError> {
+        if self.report.environment.display_server() != Some(LinuxDisplayServer::Wayland) {
+            return Err(CaptureError::invalid_request(
+                "cannot initialize a Wayland portal outside a detected Wayland session",
+            ));
+        }
+        WaylandPortal::connect()
     }
 
     fn readiness_error(&self, operation: &str) -> CaptureError {
@@ -481,16 +526,19 @@ fn x11_capabilities() -> CaptureCapabilities {
 /// Runs no native I/O; it only makes feature builds type-check/link their
 /// selected dependency crates. The return value is suitable for diagnostics.
 pub fn native_dependency_compile_probe() -> NativeBuildSupport {
-    #[cfg(all(target_os = "linux", feature = "native-wayland"))]
+    #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
     native_wayland_probe::assert_dependencies_linked();
     #[cfg(all(target_os = "linux", feature = "native-x11"))]
     native_x11_probe::assert_dependency_linked();
     NativeBuildSupport::current()
 }
 
-#[cfg(all(target_os = "linux", feature = "native-wayland"))]
+#[cfg(all(target_os = "linux", feature = "wayland-portal"))]
 mod native_wayland_probe {
     use ashpd as _;
+    use tokio as _;
+
+    #[cfg(feature = "native-wayland")]
     use pipewire as _;
 
     pub(super) const fn assert_dependencies_linked() {}
@@ -598,6 +646,10 @@ mod tests {
     #[test]
     fn compile_probe_matches_cfg_flags() {
         let support = native_dependency_compile_probe();
+        assert_eq!(
+            support.wayland_portal,
+            cfg!(all(target_os = "linux", feature = "wayland-portal"))
+        );
         assert_eq!(
             support.wayland_portal_pipewire,
             cfg!(all(target_os = "linux", feature = "native-wayland"))
