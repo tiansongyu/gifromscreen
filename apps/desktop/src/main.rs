@@ -11,6 +11,7 @@ mod open_project_job;
 mod retarget;
 
 use std::{
+    collections::BTreeSet,
     fs, io,
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
@@ -18,16 +19,25 @@ use std::{
 };
 
 use countdown::{CountdownStart, CountdownTick, MAX_COUNTDOWN_SECONDS, RecordingCountdown};
+use editor_preview::EditorPreviewCache;
+use editor_ui::{EditorUiState, show_editor_ui};
 use editor_workspace::EditorWorkspace;
 use eframe::egui;
-use gif_from_screen_application::{RecordingProjectOptions, persist_collected_recording};
+use export_job::{ExportJob, ExportJobError, ExportJobEvent, ExportJobState};
+use gif_from_screen_application::{
+    ProjectExportSnapshot, ProjectFrameSelection, ProjectGifExportOptions, ProjectGifExportReport,
+    RecordingProjectOptions, persist_collected_recording,
+};
 use gif_from_screen_capture::{
     CaptureBackend, CaptureCadence, CaptureRequest, CaptureSource, CaptureSourceId,
     CaptureSourceKind, CaptureTarget, CapturedFrame, CursorCaptureMode, PhysicalRect, PixelFormat,
 };
 use gif_from_screen_capture_linux::X11CaptureBackend;
 use gif_from_screen_domain::{FrameId, ProjectId, UnixTimeMs};
-use gif_from_screen_gif::{CancellationFlag, CancellationToken as _};
+use gif_from_screen_gif::{
+    CancellationFlag, CancellationToken as _, DeltaMode, DitherMode, EncodeOptions, LoopBehavior,
+    PaletteMode, QuantizerStrategy, Transparency,
+};
 use gif_from_screen_project::ActiveProject;
 use gif_from_screen_workflow::{
     CollectOptions, CollectedRecording, CollectionLimit, FrameRetention, RecordingControl,
@@ -42,6 +52,7 @@ const RECORDER_BORDER_POINTS: f32 = 4.0;
 const RECORDER_TOOLBAR_POINTS: f32 = 76.0;
 const MAX_RECORDING_DURATION_MS: u64 = 3_600_000;
 const EDITOR_HISTORY_LIMIT: usize = 100;
+const EDITOR_PREVIEW_MAX_SIZE: [u32; 2] = [960, 540];
 
 fn recorder_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("gif-from-screen-recorder-frame")
@@ -109,6 +120,76 @@ struct CompletedProjectSummary {
     frames: usize,
     duration_us: u64,
     project_path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ExportFrameScope {
+    #[default]
+    All,
+    Selected,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ExportPaletteChoice {
+    #[default]
+    Local,
+    Global,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ExportQuantizerChoice {
+    #[default]
+    MedianCut,
+    Octree,
+    Grayscale,
+    MostUsed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ExportDitherChoice {
+    #[default]
+    None,
+    Bayer,
+    FloydSteinberg,
+    Sierra,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ExportLoopChoice {
+    #[default]
+    Infinite,
+    Finite,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EditorExportSettings {
+    frame_scope: ExportFrameScope,
+    max_colors: u16,
+    palette: ExportPaletteChoice,
+    quantizer: ExportQuantizerChoice,
+    dither: ExportDitherChoice,
+    delta: bool,
+    alpha_threshold: u8,
+    loop_choice: ExportLoopChoice,
+    finite_loop_count: u16,
+    overwrite: bool,
+}
+
+impl Default for EditorExportSettings {
+    fn default() -> Self {
+        Self {
+            frame_scope: ExportFrameScope::All,
+            max_colors: 256,
+            palette: ExportPaletteChoice::Local,
+            quantizer: ExportQuantizerChoice::MedianCut,
+            dither: ExportDitherChoice::None,
+            delta: false,
+            alpha_threshold: 1,
+            loop_choice: ExportLoopChoice::Infinite,
+            finite_loop_count: 1,
+            overwrite: false,
+        }
+    }
 }
 
 struct RecordingJob {
@@ -287,6 +368,10 @@ struct GifFromScreenApp {
     job: Option<RecordingJob>,
     progress: Option<WorkflowProgress>,
     editor_workspace: Option<EditorWorkspace>,
+    editor_ui_state: EditorUiState,
+    editor_preview_cache: EditorPreviewCache,
+    editor_export_settings: EditorExportSettings,
+    export_job: ExportJob,
 }
 
 impl Default for GifFromScreenApp {
@@ -313,6 +398,10 @@ impl Default for GifFromScreenApp {
             job: None,
             progress: None,
             editor_workspace: None,
+            editor_ui_state: EditorUiState::default(),
+            editor_preview_cache: EditorPreviewCache::new(),
+            editor_export_settings: EditorExportSettings::default(),
+            export_job: ExportJob::default(),
         }
     }
 }
@@ -329,6 +418,7 @@ impl Drop for GifFromScreenApp {
 impl eframe::App for GifFromScreenApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_job_messages();
+        self.receive_export_messages();
         self.advance_recording_countdown(context);
         if self.restore_main_window {
             if let Some(snapshot) = self.main_window_snapshot.take() {
@@ -348,6 +438,7 @@ impl eframe::App for GifFromScreenApp {
         if self.job.is_some()
             || self.recorder_overlay.is_some()
             || self.recording_countdown.is_active()
+            || export_job_is_active(self.export_job.state())
         {
             context.request_repaint_after(Duration::from_millis(33));
         }
@@ -466,38 +557,48 @@ impl GifFromScreenApp {
     }
 
     fn show_editor(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Editor project");
-        ui.label("The durable project is ready. Full timeline editing UI is the next slice.");
-        ui.add_space(12.0);
-        let Some(workspace) = &self.editor_workspace else {
+        show_editor_scroll_area(ui, |ui| self.show_editor_contents(ui));
+    }
+
+    fn show_editor_contents(&mut self, ui: &mut egui::Ui) {
+        let Some(workspace) = &mut self.editor_workspace else {
             ui.label("No active editor project.");
             return;
         };
-        let manifest = workspace.manifest();
-        let duration_us = manifest
-            .timeline
-            .total_duration()
-            .map_or(0, gif_from_screen_domain::TimeUs::get);
-        egui::Grid::new("editor_project_summary")
-            .num_columns(2)
-            .spacing([16.0, 8.0])
-            .show(ui, |ui| {
-                ui.label("Project");
-                ui.monospace(workspace.project_root().display().to_string());
-                ui.end_row();
-                ui.label("Frames");
-                ui.label(manifest.timeline.frames.len().to_string());
-                ui.end_row();
-                ui.label("Duration");
-                ui.label(format!(
-                    "{:.3} s",
-                    Duration::from_micros(duration_us).as_secs_f64()
-                ));
-                ui.end_row();
-                ui.label("Final GIF target");
-                ui.monospace(self.settings.output.trim());
-                ui.end_row();
-            });
+        let results = show_editor_ui(ui, workspace, &mut self.editor_ui_state);
+        for failure in results.into_iter().filter_map(Result::err) {
+            self.notice = Some(format!(
+                "Editor {:?} failed: {}",
+                failure.operation, failure.message
+            ));
+        }
+
+        ui.separator();
+        show_editor_preview_panel(ui, workspace, &mut self.editor_preview_cache);
+        ui.separator();
+        let selected_count = workspace.selection().len();
+        let asset_issue_count = workspace.asset_issues().len();
+        let export_action = show_export_panel(
+            ui,
+            &mut self.settings.output,
+            &mut self.editor_export_settings,
+            &self.export_job,
+            selected_count,
+            asset_issue_count,
+        );
+        match export_action {
+            EditorExportAction::None => {}
+            EditorExportAction::Start => {
+                if let Err(error) = self.start_editor_export() {
+                    self.notice = Some(error);
+                }
+            }
+            EditorExportAction::Cancel => {
+                if self.export_job.cancel() {
+                    self.notice = Some("Cancelling GIF export…".to_owned());
+                }
+            }
+        }
         if let Some(notice) = &self.notice {
             ui.add_space(12.0);
             ui.label(notice);
@@ -1105,12 +1206,17 @@ impl GifFromScreenApp {
                                 &mut self.editor_workspace,
                                 *project,
                             ) {
-                                Ok(summary) => format!(
-                                    "Project ready: {} frames, {:.3}s at {}",
-                                    summary.frames,
-                                    Duration::from_micros(summary.duration_us).as_secs_f64(),
-                                    summary.project_path.display()
-                                ),
+                                Ok(summary) => {
+                                    self.editor_ui_state = EditorUiState::default();
+                                    self.editor_preview_cache = EditorPreviewCache::new();
+                                    self.editor_export_settings = EditorExportSettings::default();
+                                    format!(
+                                        "Project ready: {} frames, {:.3}s at {}",
+                                        summary.frames,
+                                        Duration::from_micros(summary.duration_us).as_secs_f64(),
+                                        summary.project_path.display()
+                                    )
+                                }
                                 Err(error) => format!("Could not open recorded project: {error}"),
                             },
                         );
@@ -1133,11 +1239,346 @@ impl GifFromScreenApp {
         }
     }
 
+    fn start_editor_export(&mut self) -> Result<(), String> {
+        let workspace = self
+            .editor_workspace
+            .as_ref()
+            .ok_or_else(|| "No active editor project is available for export.".to_owned())?;
+        if !workspace.asset_issues().is_empty() {
+            return Err(format!(
+                "Cannot export while the project has {} unresolved asset issue(s).",
+                workspace.asset_issues().len()
+            ));
+        }
+        let timeline_order: Vec<_> = workspace
+            .manifest()
+            .timeline
+            .frames
+            .iter()
+            .map(|frame| frame.id)
+            .collect();
+        let frame_selection = resolve_export_selection(
+            self.editor_export_settings.frame_scope,
+            &timeline_order,
+            workspace.selection().selected(),
+        )?;
+        let options = build_project_export_options(&self.editor_export_settings, frame_selection)?;
+        let output = validate_export_output(self.settings.output.trim())?;
+        let snapshot = ProjectExportSnapshot::from_active(workspace.active_project());
+        self.export_job
+            .start(snapshot, output, options)
+            .map_err(|error| error.to_string())?;
+        self.notice = Some("GIF export started…".to_owned());
+        Ok(())
+    }
+
+    fn receive_export_messages(&mut self) {
+        let finished = self
+            .export_job
+            .drain()
+            .into_iter()
+            .any(|event| event == ExportJobEvent::Finished);
+        if !finished {
+            return;
+        }
+        let notice = self.export_job.take_result().map_or_else(
+            || "GIF export worker finished without a result.".to_owned(),
+            export_result_notice,
+        );
+        self.export_job = ExportJob::default();
+        self.notice = Some(notice);
+    }
+
     fn finish_recording_job(&mut self) {
         self.job = None;
         self.recording_countdown.cancel();
         self.recorder_overlay = None;
         self.restore_main_window = true;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum EditorExportAction {
+    #[default]
+    None,
+    Start,
+    Cancel,
+}
+
+fn show_editor_scroll_area<R>(
+    ui: &mut egui::Ui,
+    contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::containers::scroll_area::ScrollAreaOutput<R> {
+    egui::ScrollArea::vertical()
+        .id_salt("editor_page_vertical_scroll")
+        .auto_shrink([false, false])
+        .show(ui, contents)
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "preview dimensions are capped below 1024 pixels before the egui f32 boundary"
+)]
+fn show_editor_preview_panel(
+    ui: &mut egui::Ui,
+    workspace: &EditorWorkspace,
+    cache: &mut EditorPreviewCache,
+) {
+    ui.heading("Current frame preview");
+    if !workspace.asset_issues().is_empty() {
+        ui.colored_label(
+            ui.visuals().error_fg_color,
+            format!(
+                "Preview and export are blocked by {} unresolved asset issue(s).",
+                workspace.asset_issues().len()
+            ),
+        );
+        for issue in workspace.asset_issues() {
+            ui.monospace(format!("{issue:?}"));
+        }
+        return;
+    }
+    let Some(frame_id) = workspace.selection().current() else {
+        ui.label("Select a frame to preview it.");
+        return;
+    };
+    match cache.preview(
+        workspace.active_project(),
+        frame_id,
+        ui.ctx(),
+        EDITOR_PREVIEW_MAX_SIZE,
+    ) {
+        Ok(preview) => {
+            let natural = egui::vec2(
+                preview.preview_size[0] as f32,
+                preview.preview_size[1] as f32,
+            );
+            let available_width = ui.available_width().max(1.0);
+            let scale = (available_width / natural.x).min(1.0);
+            ui.image((preview.texture.id(), natural * scale));
+            ui.weak(format!(
+                "Rendered {}×{} · preview {}×{}",
+                preview.rendered_size[0],
+                preview.rendered_size[1],
+                preview.preview_size[0],
+                preview.preview_size[1]
+            ));
+        }
+        Err(error) => {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Could not render preview: {error}"),
+            );
+        }
+    }
+}
+
+fn show_export_panel(
+    ui: &mut egui::Ui,
+    output: &mut String,
+    settings: &mut EditorExportSettings,
+    job: &ExportJob,
+    selected_count: usize,
+    asset_issue_count: usize,
+) -> EditorExportAction {
+    ui.heading("Export GIF");
+    let active = export_job_is_active(job.state());
+    ui.add_enabled_ui(!active, |ui| {
+        show_export_configuration(ui, output, settings, selected_count);
+    });
+    if asset_issue_count > 0 {
+        ui.colored_label(
+            ui.visuals().error_fg_color,
+            format!("Resolve {asset_issue_count} asset issue(s) before exporting."),
+        );
+    }
+
+    match job.state() {
+        ExportJobState::Idle => {
+            if ui
+                .add_enabled(asset_issue_count == 0, egui::Button::new("Export GIF"))
+                .clicked()
+            {
+                EditorExportAction::Start
+            } else {
+                EditorExportAction::None
+            }
+        }
+        ExportJobState::Running | ExportJobState::Cancelling => {
+            if let Some(progress) = job.latest_progress() {
+                ui.label(format!(
+                    "{:?}: rendered {}/{}, encoded {}/{}",
+                    progress.phase,
+                    progress.frames_rendered,
+                    progress.total_frames,
+                    progress.frames_encoded,
+                    progress.total_frames
+                ));
+            } else {
+                ui.label("Starting export worker…");
+            }
+            if ui
+                .add_enabled(
+                    job.state() == ExportJobState::Running,
+                    egui::Button::new(if job.state() == ExportJobState::Cancelling {
+                        "Cancelling…"
+                    } else {
+                        "Cancel export"
+                    }),
+                )
+                .clicked()
+            {
+                EditorExportAction::Cancel
+            } else {
+                EditorExportAction::None
+            }
+        }
+        ExportJobState::Finished => {
+            ui.label("Finishing export result…");
+            EditorExportAction::None
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the compact two-column export form is kept together so every GIF option is auditable"
+)]
+fn show_export_configuration(
+    ui: &mut egui::Ui,
+    output: &mut String,
+    settings: &mut EditorExportSettings,
+    selected_count: usize,
+) {
+    egui::Grid::new("editor_export_configuration")
+        .num_columns(2)
+        .spacing([16.0, 6.0])
+        .show(ui, |ui| {
+            ui.label("Output");
+            ui.text_edit_singleline(output);
+            ui.end_row();
+
+            ui.label("Frames");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut settings.frame_scope, ExportFrameScope::All, "All");
+                ui.selectable_value(
+                    &mut settings.frame_scope,
+                    ExportFrameScope::Selected,
+                    format!("Selected ({selected_count})"),
+                );
+            });
+            ui.end_row();
+
+            ui.label("Maximum colors");
+            ui.add(egui::DragValue::new(&mut settings.max_colors).range(2..=256));
+            ui.end_row();
+
+            ui.label("Palette");
+            egui::ComboBox::from_id_salt("editor_export_palette")
+                .selected_text(match settings.palette {
+                    ExportPaletteChoice::Local => "Local per frame",
+                    ExportPaletteChoice::Global => "Global",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut settings.palette,
+                        ExportPaletteChoice::Local,
+                        "Local per frame",
+                    );
+                    ui.selectable_value(
+                        &mut settings.palette,
+                        ExportPaletteChoice::Global,
+                        "Global",
+                    );
+                });
+            ui.end_row();
+
+            ui.label("Quantizer");
+            egui::ComboBox::from_id_salt("editor_export_quantizer")
+                .selected_text(export_quantizer_label(settings.quantizer))
+                .show_ui(ui, |ui| {
+                    for choice in [
+                        ExportQuantizerChoice::MedianCut,
+                        ExportQuantizerChoice::Octree,
+                        ExportQuantizerChoice::Grayscale,
+                        ExportQuantizerChoice::MostUsed,
+                    ] {
+                        ui.selectable_value(
+                            &mut settings.quantizer,
+                            choice,
+                            export_quantizer_label(choice),
+                        );
+                    }
+                });
+            ui.end_row();
+
+            ui.label("Dither");
+            egui::ComboBox::from_id_salt("editor_export_dither")
+                .selected_text(export_dither_label(settings.dither))
+                .show_ui(ui, |ui| {
+                    for choice in [
+                        ExportDitherChoice::None,
+                        ExportDitherChoice::Bayer,
+                        ExportDitherChoice::FloydSteinberg,
+                        ExportDitherChoice::Sierra,
+                    ] {
+                        ui.selectable_value(
+                            &mut settings.dither,
+                            choice,
+                            export_dither_label(choice),
+                        );
+                    }
+                });
+            ui.end_row();
+
+            ui.label("Alpha threshold");
+            ui.add(egui::DragValue::new(&mut settings.alpha_threshold).range(0..=255));
+            ui.end_row();
+
+            ui.label("Loop");
+            ui.horizontal(|ui| {
+                ui.selectable_value(
+                    &mut settings.loop_choice,
+                    ExportLoopChoice::Infinite,
+                    "Infinite",
+                );
+                ui.selectable_value(
+                    &mut settings.loop_choice,
+                    ExportLoopChoice::Finite,
+                    "Finite",
+                );
+                if settings.loop_choice == ExportLoopChoice::Finite {
+                    ui.add(
+                        egui::DragValue::new(&mut settings.finite_loop_count).range(1..=u16::MAX),
+                    );
+                }
+            });
+            ui.end_row();
+
+            ui.label("Optimization");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut settings.delta, "Changed rectangles");
+                ui.checkbox(&mut settings.overwrite, "Overwrite output");
+            });
+            ui.end_row();
+        });
+}
+
+const fn export_quantizer_label(choice: ExportQuantizerChoice) -> &'static str {
+    match choice {
+        ExportQuantizerChoice::MedianCut => "Median cut",
+        ExportQuantizerChoice::Octree => "Octree",
+        ExportQuantizerChoice::Grayscale => "Grayscale",
+        ExportQuantizerChoice::MostUsed => "Most used",
+    }
+}
+
+const fn export_dither_label(choice: ExportDitherChoice) -> &'static str {
+    match choice {
+        ExportDitherChoice::None => "None",
+        ExportDitherChoice::Bayer => "Bayer 4×4",
+        ExportDitherChoice::FloydSteinberg => "Floyd–Steinberg",
+        ExportDitherChoice::Sierra => "Sierra",
     }
 }
 
@@ -1732,14 +2173,128 @@ fn project_path_for_output(output: &Path) -> Result<PathBuf, String> {
     Ok(output.with_extension("gfsproj"))
 }
 
+fn resolve_export_selection(
+    scope: ExportFrameScope,
+    timeline_order: &[FrameId],
+    selected: &BTreeSet<FrameId>,
+) -> Result<ProjectFrameSelection, String> {
+    if timeline_order.is_empty() {
+        return Err("The project has no frames to export.".to_owned());
+    }
+    match scope {
+        ExportFrameScope::All => Ok(ProjectFrameSelection::All),
+        ExportFrameScope::Selected => {
+            let ordered: Vec<_> = timeline_order
+                .iter()
+                .copied()
+                .filter(|frame_id| selected.contains(frame_id))
+                .collect();
+            if ordered.is_empty() {
+                return Err(
+                    "Select at least one frame before exporting Selected frames.".to_owned(),
+                );
+            }
+            Ok(ProjectFrameSelection::Ordered(ordered))
+        }
+    }
+}
+
+fn build_project_export_options(
+    settings: &EditorExportSettings,
+    frames: ProjectFrameSelection,
+) -> Result<ProjectGifExportOptions, String> {
+    if !(2..=256).contains(&settings.max_colors) {
+        return Err("Maximum colors must be between 2 and 256.".to_owned());
+    }
+    if settings.loop_choice == ExportLoopChoice::Finite && settings.finite_loop_count == 0 {
+        return Err("Finite loop count must be at least one.".to_owned());
+    }
+    let palette_mode = match settings.palette {
+        ExportPaletteChoice::Local => PaletteMode::LocalPerFrame,
+        ExportPaletteChoice::Global => PaletteMode::Global,
+    };
+    let quantizer = match settings.quantizer {
+        ExportQuantizerChoice::MedianCut => QuantizerStrategy::MedianCut,
+        ExportQuantizerChoice::Octree => QuantizerStrategy::Octree,
+        ExportQuantizerChoice::Grayscale => QuantizerStrategy::Grayscale,
+        ExportQuantizerChoice::MostUsed => QuantizerStrategy::MostUsed,
+    };
+    let dither = match settings.dither {
+        ExportDitherChoice::None => DitherMode::None,
+        ExportDitherChoice::Bayer => DitherMode::Bayer4x4,
+        ExportDitherChoice::FloydSteinberg => DitherMode::FloydSteinberg,
+        ExportDitherChoice::Sierra => DitherMode::Sierra,
+    };
+    let loop_behavior = match settings.loop_choice {
+        ExportLoopChoice::Infinite => LoopBehavior::Infinite,
+        ExportLoopChoice::Finite => LoopBehavior::Finite(settings.finite_loop_count),
+    };
+    Ok(ProjectGifExportOptions {
+        frames,
+        encoding: EncodeOptions {
+            max_colors: settings.max_colors,
+            loop_behavior,
+            transparency: Transparency::AlphaThreshold(settings.alpha_threshold),
+            palette_mode,
+            quantizer,
+            delta_mode: if settings.delta {
+                DeltaMode::ChangedRectangles
+            } else {
+                DeltaMode::FullFrames
+            },
+            dither,
+            ..EncodeOptions::default()
+        },
+        overwrite_existing: settings.overwrite,
+        ..ProjectGifExportOptions::default()
+    })
+}
+
+fn validate_export_output(output: &str) -> Result<PathBuf, String> {
+    let output = PathBuf::from(output.trim());
+    if output.file_name().is_none() {
+        return Err("Export output must identify a GIF file.".to_owned());
+    }
+    if output
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_none_or(|extension| !extension.eq_ignore_ascii_case("gif"))
+    {
+        return Err("Export output filename must end in .gif.".to_owned());
+    }
+    Ok(output)
+}
+
+const fn export_job_is_active(state: ExportJobState) -> bool {
+    matches!(state, ExportJobState::Running | ExportJobState::Cancelling)
+}
+
+fn export_result_notice(result: Result<ProjectGifExportReport, ExportJobError>) -> String {
+    match result {
+        Ok(report) => format!(
+            "Exported {} selected frames as {} GIF images ({} bytes) to {}",
+            report.selected_frames,
+            report.encoding.encoded_frames,
+            report.bytes_written,
+            report.output_path.display()
+        ),
+        Err(error) => format!("GIF export failed: {error}"),
+    }
+}
+
 fn activate_editor(
     view: &mut AppView,
     editor_workspace: &mut Option<EditorWorkspace>,
     project: ActiveProject,
 ) -> Result<CompletedProjectSummary, String> {
-    let workspace = EditorWorkspace::from_active(project, EDITOR_HISTORY_LIMIT)
+    let mut workspace = EditorWorkspace::from_active(project, EDITOR_HISTORY_LIMIT)
         .map_err(|error| error.to_string())?;
     let frames = workspace.manifest().timeline.frames.len();
+    if frames > 0 {
+        workspace
+            .select_first()
+            .map_err(|error| error.to_string())?;
+    }
     let duration_us = workspace
         .manifest()
         .timeline
@@ -1976,24 +2531,39 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, time::Duration};
+    use std::{
+        collections::BTreeSet,
+        fs,
+        path::{Path, PathBuf},
+        time::Duration,
+    };
 
     use eframe::egui;
+    use gif_from_screen_application::{ProjectFrameSelection, ProjectGifExportReport};
     use gif_from_screen_domain::{
-        Canvas, CanvasBackground, ColorSpace, PhysicalSize as DomainSize, ProjectId,
-        ProjectManifest, UnixTimeMs,
+        AssetDescriptor, AssetKind, Canvas, CanvasBackground, CaptureMetadata, ClipTransform,
+        ColorSpace, DurationUs, EditCommand, FrameClip, FrameId, PhysicalSize as DomainSize,
+        ProjectId, ProjectManifest, ProjectRevision, RasterEncoding, UnixTimeMs,
+    };
+    use gif_from_screen_gif::{
+        DeltaMode, DitherMode, EncodeReport, LoopBehavior, PaletteMode, QuantizerStrategy,
+        Transparency,
     };
     use gif_from_screen_project::ActiveProject;
     use tempfile::tempdir;
 
     use super::{
-        AppView, MAX_COUNTDOWN_SECONDS, MAX_RECORDING_DURATION_MS, RecorderOverlayAction,
-        RecorderStage, RecordingSettings, activate_editor, apply_overlay_region, collection_limit,
-        collection_options, fit_dimensions, frame_retention, map_preview_selection,
-        project_path_for_output, remove_completed_project, resize_nearest_rgba,
-        should_sync_retarget, validate_settings,
+        AppView, EDITOR_PREVIEW_MAX_SIZE, EditorExportSettings, ExportDitherChoice,
+        ExportFrameScope, ExportLoopChoice, ExportPaletteChoice, ExportQuantizerChoice,
+        MAX_COUNTDOWN_SECONDS, MAX_RECORDING_DURATION_MS, RecorderOverlayAction, RecorderStage,
+        RecordingSettings, activate_editor, apply_overlay_region, build_project_export_options,
+        collection_limit, collection_options, export_job_is_active, export_result_notice,
+        fit_dimensions, frame_retention, map_preview_selection, project_path_for_output,
+        remove_completed_project, resize_nearest_rgba, resolve_export_selection,
+        should_sync_retarget, show_editor_scroll_area, validate_export_output, validate_settings,
     };
     use crate::editor_workspace::EditorWorkspace;
+    use crate::export_job::{ExportJobError, ExportJobState};
     use gif_from_screen_workflow::{CollectionLimit, FrameRetention};
 
     #[test]
@@ -2083,6 +2653,171 @@ mod tests {
         assert_eq!(options.tail_frame_duration, Duration::from_millis(50));
     }
 
+    #[test]
+    fn selected_export_frames_follow_timeline_order_not_identity_order() {
+        let timeline_order = [
+            FrameId::from_u128(30),
+            FrameId::from_u128(10),
+            FrameId::from_u128(20),
+        ];
+        let selected = BTreeSet::from([FrameId::from_u128(20), FrameId::from_u128(30)]);
+
+        let resolved =
+            resolve_export_selection(ExportFrameScope::Selected, &timeline_order, &selected)
+                .unwrap();
+
+        assert_eq!(
+            resolved,
+            ProjectFrameSelection::Ordered(vec![FrameId::from_u128(30), FrameId::from_u128(20)])
+        );
+        assert!(matches!(
+            resolve_export_selection(ExportFrameScope::All, &timeline_order, &selected),
+            Ok(ProjectFrameSelection::All)
+        ));
+        assert!(
+            resolve_export_selection(
+                ExportFrameScope::Selected,
+                &timeline_order,
+                &BTreeSet::new()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn editor_export_settings_map_to_application_and_encoder_options() {
+        let settings = EditorExportSettings {
+            frame_scope: ExportFrameScope::Selected,
+            max_colors: 128,
+            palette: ExportPaletteChoice::Global,
+            quantizer: ExportQuantizerChoice::Octree,
+            dither: ExportDitherChoice::Sierra,
+            delta: true,
+            alpha_threshold: 42,
+            loop_choice: ExportLoopChoice::Finite,
+            finite_loop_count: 7,
+            overwrite: true,
+        };
+        let frames = ProjectFrameSelection::Ordered(vec![FrameId::from_u128(1)]);
+
+        let options = build_project_export_options(&settings, frames.clone()).unwrap();
+
+        assert_eq!(options.frames, frames);
+        assert_eq!(options.encoding.max_colors, 128);
+        assert_eq!(options.encoding.palette_mode, PaletteMode::Global);
+        assert_eq!(options.encoding.quantizer, QuantizerStrategy::Octree);
+        assert_eq!(options.encoding.dither, DitherMode::Sierra);
+        assert_eq!(options.encoding.delta_mode, DeltaMode::ChangedRectangles);
+        assert_eq!(
+            options.encoding.transparency,
+            Transparency::AlphaThreshold(42)
+        );
+        assert_eq!(options.encoding.loop_behavior, LoopBehavior::Finite(7));
+        assert!(options.overwrite_existing);
+
+        for (choice, expected) in [
+            (
+                ExportQuantizerChoice::MedianCut,
+                QuantizerStrategy::MedianCut,
+            ),
+            (
+                ExportQuantizerChoice::Grayscale,
+                QuantizerStrategy::Grayscale,
+            ),
+            (ExportQuantizerChoice::MostUsed, QuantizerStrategy::MostUsed),
+        ] {
+            let mapped = build_project_export_options(
+                &EditorExportSettings {
+                    quantizer: choice,
+                    ..EditorExportSettings::default()
+                },
+                ProjectFrameSelection::All,
+            )
+            .unwrap();
+            assert_eq!(mapped.encoding.quantizer, expected);
+        }
+        for (choice, expected) in [
+            (ExportDitherChoice::None, DitherMode::None),
+            (ExportDitherChoice::Bayer, DitherMode::Bayer4x4),
+            (
+                ExportDitherChoice::FloydSteinberg,
+                DitherMode::FloydSteinberg,
+            ),
+        ] {
+            let mapped = build_project_export_options(
+                &EditorExportSettings {
+                    dither: choice,
+                    ..EditorExportSettings::default()
+                },
+                ProjectFrameSelection::All,
+            )
+            .unwrap();
+            assert_eq!(mapped.encoding.dither, expected);
+        }
+    }
+
+    #[test]
+    fn export_state_and_result_handling_are_explicit() {
+        assert!(!export_job_is_active(ExportJobState::Idle));
+        assert!(export_job_is_active(ExportJobState::Running));
+        assert!(export_job_is_active(ExportJobState::Cancelling));
+        assert!(!export_job_is_active(ExportJobState::Finished));
+        let failure = export_result_notice(Err(ExportJobError::WorkerExited));
+        assert!(failure.contains("worker exited"));
+
+        let output = PathBuf::from("finished.gif");
+        let success = export_result_notice(Ok(ProjectGifExportReport {
+            project_id: ProjectId::from_u128(1),
+            revision: ProjectRevision::new(2),
+            selected_frames: 3,
+            encoding: EncodeReport {
+                input_frames: 3,
+                encoded_frames: 2,
+                ..EncodeReport::default()
+            },
+            output_path: output.clone(),
+            bytes_written: 99,
+        }));
+        assert!(success.contains("3 selected frames"));
+        assert!(success.contains("2 GIF images"));
+        assert!(success.contains("99 bytes"));
+        assert!(success.contains(output.to_string_lossy().as_ref()));
+        assert_eq!(validate_export_output(" finished.gif ").unwrap(), output);
+        assert!(validate_export_output("finished.mp4").is_err());
+    }
+
+    #[test]
+    fn editor_page_scroll_keeps_controls_below_the_preview_reachable() {
+        let context = egui::Context::default();
+        let mut metrics = None;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(820.0, 560.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        let preview_height = f32::from(u16::try_from(EDITOR_PREVIEW_MAX_SIZE[1]).unwrap());
+
+        let _ = context.run(input, |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                let output = show_editor_scroll_area(ui, |ui| {
+                    ui.allocate_space(egui::vec2(1.0, preview_height + 500.0));
+                    "export-controls-rendered"
+                });
+                metrics = Some((
+                    output.content_size.y,
+                    output.inner_rect.height(),
+                    output.inner,
+                ));
+            });
+        });
+
+        let (content_height, viewport_height, marker) = metrics.unwrap();
+        assert_eq!(marker, "export-controls-rendered");
+        assert!(content_height > viewport_height);
+    }
+
     fn empty_project(root: &Path) -> ActiveProject {
         ActiveProject::create(
             root,
@@ -2101,21 +2836,59 @@ mod tests {
         .unwrap()
     }
 
+    fn single_frame_project(root: &Path) -> ActiveProject {
+        let mut project = empty_project(root);
+        let pixels = [12, 34, 56, 255];
+        let asset_id = project.assets().put(&pixels).unwrap();
+        project
+            .commit(EditCommand::Compound {
+                commands: vec![
+                    EditCommand::RegisterAsset {
+                        asset: AssetDescriptor {
+                            id: asset_id,
+                            byte_len: 4,
+                            kind: AssetKind::Frame {
+                                size: DomainSize::new(1, 1).unwrap(),
+                                encoding: RasterEncoding::Rgba8,
+                            },
+                        },
+                    },
+                    EditCommand::InsertFrames {
+                        index: 0,
+                        frames: vec![FrameClip {
+                            id: FrameId::from_u128(7),
+                            asset_id,
+                            duration: DurationUs::new(10_000).unwrap(),
+                            transform: ClipTransform::default(),
+                            capture_metadata: CaptureMetadata::default(),
+                            effects: Vec::new(),
+                        }],
+                    },
+                ],
+            })
+            .unwrap();
+        project.checkpoint_and_compact().unwrap();
+        project
+    }
+
     #[test]
     fn stopped_recording_project_switches_to_editor_and_keeps_the_lock() {
         let directory = tempdir().unwrap();
         let root = directory.path().join("recording.gfsproj");
-        let project = empty_project(&root);
+        let project = single_frame_project(&root);
         let mut view = AppView::ScreenRecorder;
         let mut workspace: Option<EditorWorkspace> = None;
 
         let summary = activate_editor(&mut view, &mut workspace, project).unwrap();
 
         assert_eq!(view, AppView::Editor);
-        assert_eq!(summary.frames, 0);
-        assert_eq!(summary.duration_us, 0);
+        assert_eq!(summary.frames, 1);
+        assert_eq!(summary.duration_us, 10_000);
         assert_eq!(summary.project_path, root);
-        assert!(workspace.is_some());
+        assert_eq!(
+            workspace.as_ref().unwrap().selection().current(),
+            Some(FrameId::from_u128(7))
+        );
         assert!(root.join("project.lock").exists());
     }
 
