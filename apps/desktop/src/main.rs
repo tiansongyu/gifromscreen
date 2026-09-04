@@ -45,6 +45,7 @@ use gif_from_screen_workflow::{
     RecordingController, TargetUpdateRequest, TargetUpdateStatus, WorkflowProgress,
     collect_controlled,
 };
+use import_gif_job::{ImportGifJob, ImportGifJobEvent, ImportGifJobState};
 use open_project_job::{OpenProjectJob, OpenProjectJobEvent, OpenProjectJobState};
 use retarget::{RegionRetargetPlan, RetargetCompletion};
 use uuid::Uuid;
@@ -55,6 +56,8 @@ const RECORDER_TOOLBAR_POINTS: f32 = 76.0;
 const MAX_RECORDING_DURATION_MS: u64 = 3_600_000;
 const EDITOR_HISTORY_LIMIT: usize = 100;
 const EDITOR_PREVIEW_MAX_SIZE: [u32; 2] = [960, 540];
+const LANDING_COLUMN_COUNT: usize = 2;
+const LANDING_CARD_MIN_WIDTH: f32 = 280.0;
 
 fn recorder_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("gif-from-screen-recorder-frame")
@@ -65,6 +68,7 @@ enum AppView {
     #[default]
     Landing,
     OpenProject,
+    ImportGif,
     ScreenRecorder,
     Editor,
 }
@@ -372,6 +376,8 @@ struct GifFromScreenApp {
     progress: Option<WorkflowProgress>,
     open_project_path: String,
     open_project_job: OpenProjectJob,
+    import_gif_path: String,
+    import_gif_job: ImportGifJob,
     editor_workspace: Option<EditorWorkspace>,
     editor_ui_state: EditorUiState,
     editor_preview_cache: EditorPreviewCache,
@@ -404,6 +410,8 @@ impl Default for GifFromScreenApp {
             progress: None,
             open_project_path: String::new(),
             open_project_job: OpenProjectJob::default(),
+            import_gif_path: String::new(),
+            import_gif_job: ImportGifJob::default(),
             editor_workspace: None,
             editor_ui_state: EditorUiState::default(),
             editor_preview_cache: EditorPreviewCache::new(),
@@ -427,6 +435,7 @@ impl eframe::App for GifFromScreenApp {
         self.receive_job_messages();
         self.receive_export_messages();
         self.receive_open_project_messages();
+        self.receive_import_gif_messages();
         self.advance_recording_countdown(context);
         if self.restore_main_window {
             if let Some(snapshot) = self.main_window_snapshot.take() {
@@ -448,13 +457,18 @@ impl eframe::App for GifFromScreenApp {
             || self.recording_countdown.is_active()
             || export_job_is_active(self.export_job.state())
             || self.open_project_job.state() == OpenProjectJobState::Running
+            || self.import_gif_job.state() == ImportGifJobState::Running
         {
             context.request_repaint_after(Duration::from_millis(33));
         }
 
         egui::TopBottomPanel::top("app_header").show(context, |ui| {
             ui.horizontal(|ui| {
-                let back_enabled = can_navigate_back(self.view, self.open_project_job.state());
+                let back_enabled = can_navigate_back(
+                    self.view,
+                    self.open_project_job.state(),
+                    self.import_gif_job.state(),
+                );
                 if self.view != AppView::Landing
                     && ui
                         .add_enabled(back_enabled, egui::Button::new("Back"))
@@ -471,6 +485,7 @@ impl eframe::App for GifFromScreenApp {
         egui::CentralPanel::default().show(context, |ui| match self.view {
             AppView::Landing => self.show_landing(ui),
             AppView::OpenProject => self.show_open_project(ui),
+            AppView::ImportGif => self.show_import_gif(ui),
             AppView::ScreenRecorder => self.show_screen_recorder(ui),
             AppView::Editor => self.show_editor(ui),
         });
@@ -489,7 +504,7 @@ impl GifFromScreenApp {
             ui.label("Capture, edit frame by frame, and export locally.");
             ui.add_space(28.0);
 
-            ui.columns(2, |columns| {
+            ui.columns(LANDING_COLUMN_COUNT, |columns| {
                 if landing_action(
                     &mut columns[0],
                     "Screen recorder",
@@ -501,7 +516,7 @@ impl GifFromScreenApp {
                 if landing_action(
                     &mut columns[1],
                     "Open project",
-                    "Open an existing .gfsproj directory. GIF and media import are planned next.",
+                    "Open an existing editable .gfsproj directory.",
                     true,
                 ) {
                     self.view = AppView::OpenProject;
@@ -510,15 +525,31 @@ impl GifFromScreenApp {
             });
 
             ui.add_space(12.0);
-            ui.columns(2, |columns| {
-                let _ = landing_action(
+            ui.columns(LANDING_COLUMN_COUNT, |columns| {
+                if landing_action(
                     &mut columns[0],
+                    "Import GIF",
+                    "Decode a GIF safely into a new editable project.",
+                    true,
+                ) {
+                    self.view = AppView::ImportGif;
+                    self.notice = Some(
+                        "GIF import uses strict 10,000-frame, 16K-canvas, and 512 MiB limits. Import cannot currently be cancelled once started."
+                            .to_owned(),
+                    );
+                }
+                let _ = landing_action(
+                    &mut columns[1],
                     "Webcam recorder",
                     "Create an animated GIF from a camera.",
                     false,
                 );
+            });
+
+            ui.add_space(12.0);
+            ui.columns(LANDING_COLUMN_COUNT, |columns| {
                 let _ = landing_action(
-                    &mut columns[1],
+                    &mut columns[0],
                     "Drawing board",
                     "Record drawing strokes as an animation.",
                     false,
@@ -536,7 +567,6 @@ impl GifFromScreenApp {
         let running = self.open_project_job.state() == OpenProjectJobState::Running;
         ui.heading("Open editable project");
         ui.label("Choose an existing .gfsproj directory containing manifest.json.");
-        ui.weak("Importing GIF, image sequences, and video is planned next.");
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             ui.label("Project directory");
@@ -558,7 +588,11 @@ impl GifFromScreenApp {
             }
             if ui
                 .add_enabled(
-                    can_navigate_back(self.view, self.open_project_job.state()),
+                    can_navigate_back(
+                        self.view,
+                        self.open_project_job.state(),
+                        self.import_gif_job.state(),
+                    ),
                     egui::Button::new("Back"),
                 )
                 .clicked()
@@ -585,6 +619,73 @@ impl GifFromScreenApp {
             .start(PathBuf::from(path), LockPolicy::FailIfPresent)
             .map_err(|error| error.to_string())?;
         self.notice = Some("Opening project in the background…".to_owned());
+        Ok(())
+    }
+
+    fn show_import_gif(&mut self, ui: &mut egui::Ui) {
+        let running = self.import_gif_job.state() == ImportGifJobState::Running;
+        ui.heading("Import GIF as editable project");
+        ui.label(
+            "Choose a regular .gif file. The project will be created beside it as <stem>.gfsproj.",
+        );
+        ui.weak(
+            "Safety limits: 10,000 frames, 16K canvas dimensions, and 512 MiB decoded RGBA. This operation cannot currently be cancelled once started.",
+        );
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.label("GIF file");
+            ui.add_enabled(
+                !running,
+                egui::TextEdit::singleline(&mut self.import_gif_path)
+                    .desired_width(420.0)
+                    .hint_text("/path/to/animation.gif"),
+            );
+        });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!running, egui::Button::new("Import"))
+                .clicked()
+                && let Err(error) = self.start_import_gif()
+            {
+                self.notice = Some(format!("Could not start GIF import: {error}"));
+            }
+            if ui
+                .add_enabled(
+                    can_navigate_back(
+                        self.view,
+                        self.open_project_job.state(),
+                        self.import_gif_job.state(),
+                    ),
+                    egui::Button::new("Back"),
+                )
+                .clicked()
+            {
+                self.view = AppView::Landing;
+            }
+            if running {
+                ui.spinner();
+                ui.label("Decoding and creating project… this operation is not cancellable.");
+            }
+        });
+        if let Some(notice) = &self.notice {
+            ui.add_space(12.0);
+            ui.label(notice);
+        }
+    }
+
+    fn start_import_gif(&mut self) -> Result<(), String> {
+        let path = self.import_gif_path.trim();
+        if path.is_empty() {
+            return Err("Select a .gif file first.".to_owned());
+        }
+        self.import_gif_job
+            .start(PathBuf::from(path))
+            .map_err(|error| error.to_string())?;
+        self.notice = Some(
+            "Importing GIF in the background. The bounded decode/persist operation cannot be cancelled."
+                .to_owned(),
+        );
         Ok(())
     }
 
@@ -1379,6 +1480,46 @@ impl GifFromScreenApp {
             Some(Err(error)) => format!("Could not open project: {error}"),
             None => "Project-open worker finished without a result.".to_owned(),
         });
+    }
+
+    fn receive_import_gif_messages(&mut self) {
+        let finished = self
+            .import_gif_job
+            .drain()
+            .into_iter()
+            .any(|event| event == ImportGifJobEvent::Finished);
+        if !finished {
+            return;
+        }
+        let result = self.import_gif_job.take_result();
+        self.import_gif_job = ImportGifJob::default();
+        self.notice = Some(match result {
+            Some(Ok(project)) => match self.activate_imported_gif(project) {
+                Ok(notice) => notice,
+                Err(error) => format!("Could not prepare imported GIF project: {error}"),
+            },
+            Some(Err(error)) => format!(
+                "Could not import GIF: {error}. You can correct the path or file and retry."
+            ),
+            None => "GIF import worker finished without a result. You can retry safely.".to_owned(),
+        });
+    }
+
+    fn activate_imported_gif(&mut self, project: ActiveProject) -> Result<String, String> {
+        let source = Path::new(self.import_gif_path.trim());
+        let output = edited_gif_path_for_import(source)?;
+        let summary = activate_editor(&mut self.view, &mut self.editor_workspace, project)?;
+        self.editor_ui_state = EditorUiState::default();
+        self.editor_preview_cache = EditorPreviewCache::new();
+        self.editor_export_settings = EditorExportSettings::default();
+        self.export_job = ExportJob::default();
+        self.settings.output = output.to_string_lossy().into_owned();
+        Ok(format!(
+            "Imported {} frame(s) into {}. Default GIF output is {} and will not overwrite the source.",
+            summary.frames,
+            summary.project_path.display(),
+            output.display()
+        ))
     }
 
     fn activate_opened_project(&mut self, opened: OpenedProject) -> Result<String, String> {
@@ -2378,8 +2519,14 @@ const fn export_job_is_active(state: ExportJobState) -> bool {
     matches!(state, ExportJobState::Running | ExportJobState::Cancelling)
 }
 
-const fn can_navigate_back(view: AppView, open_state: OpenProjectJobState) -> bool {
-    !(matches!(view, AppView::OpenProject) && matches!(open_state, OpenProjectJobState::Running))
+const fn can_navigate_back(
+    view: AppView,
+    open_state: OpenProjectJobState,
+    import_state: ImportGifJobState,
+) -> bool {
+    !((matches!(view, AppView::OpenProject) && matches!(open_state, OpenProjectJobState::Running))
+        || (matches!(view, AppView::ImportGif)
+            && matches!(import_state, ImportGifJobState::Running)))
 }
 
 fn export_result_notice(result: Result<ProjectGifExportReport, ExportJobError>) -> String {
@@ -2397,6 +2544,16 @@ fn export_result_notice(result: Result<ProjectGifExportReport, ExportJobError>) 
 
 fn default_gif_path_for_project(project_root: &Path) -> PathBuf {
     project_root.with_extension("gif")
+}
+
+fn edited_gif_path_for_import(source: &Path) -> Result<PathBuf, String> {
+    let stem = source
+        .file_stem()
+        .filter(|stem| !stem.is_empty())
+        .ok_or_else(|| "Imported GIF path has no filename stem.".to_owned())?;
+    let mut filename = stem.to_os_string();
+    filename.push("-edited.gif");
+    Ok(source.with_file_name(filename))
 }
 
 fn opened_project_notice(
@@ -2658,7 +2815,7 @@ fn landing_action(ui: &mut egui::Ui, title: &str, description: &str, enabled: bo
     let mut clicked = false;
     ui.group(|ui| {
         ui.set_min_height(112.0);
-        ui.set_min_width(280.0);
+        ui.set_min_width(LANDING_CARD_MIN_WIDTH);
         clicked = ui.add_enabled(enabled, egui::Button::new(title)).clicked();
         ui.label(description);
         if !enabled {
@@ -2666,6 +2823,11 @@ fn landing_action(ui: &mut egui::Ui, title: &str, description: &str, enabled: bo
         }
     });
     clicked
+}
+
+#[cfg(test)]
+fn landing_cards_fit(available_width: f32, column_spacing: f32) -> bool {
+    available_width >= LANDING_CARD_MIN_WIDTH * 2.0 + column_spacing
 }
 
 fn main() -> eframe::Result {
@@ -2702,8 +2864,8 @@ mod tests {
         ProjectId, ProjectManifest, ProjectRevision, RasterEncoding, UnixTimeMs,
     };
     use gif_from_screen_gif::{
-        DeltaMode, DitherMode, EncodeReport, LoopBehavior, PaletteMode, QuantizerStrategy,
-        Transparency,
+        BuiltinGifEncoder, DeltaMode, DitherMode, EncodeOptions, EncodeReport, LoopBehavior,
+        PaletteMode, QuantizerStrategy, RgbaFrame, Transparency,
     };
     use gif_from_screen_project::ActiveProject;
     use tempfile::tempdir;
@@ -2714,13 +2876,15 @@ mod tests {
         GifFromScreenApp, MAX_COUNTDOWN_SECONDS, MAX_RECORDING_DURATION_MS, RecorderOverlayAction,
         RecorderStage, RecordingSettings, activate_editor, apply_overlay_region,
         build_project_export_options, can_navigate_back, collection_limit, collection_options,
-        default_gif_path_for_project, export_job_is_active, export_result_notice, fit_dimensions,
-        frame_retention, map_preview_selection, project_path_for_output, remove_completed_project,
+        default_gif_path_for_project, edited_gif_path_for_import, export_job_is_active,
+        export_result_notice, fit_dimensions, frame_retention, landing_cards_fit,
+        map_preview_selection, project_path_for_output, remove_completed_project,
         resize_nearest_rgba, resolve_export_selection, should_sync_retarget,
         show_editor_scroll_area, validate_export_output, validate_settings,
     };
     use crate::editor_workspace::EditorWorkspace;
     use crate::export_job::{ExportJobError, ExportJobState};
+    use crate::import_gif_job::ImportGifJobState;
     use crate::open_project_job::OpenProjectJobState;
     use gif_from_screen_workflow::{CollectionLimit, FrameRetention};
 
@@ -3038,6 +3202,23 @@ mod tests {
         }
     }
 
+    fn write_import_gif(path: &Path) {
+        let frame = RgbaFrame::new(2, 1, vec![255, 0, 0, 255, 0, 0, 0, 0], 10_000).unwrap();
+        let mut file = fs::File::create(path).unwrap();
+        BuiltinGifEncoder::default()
+            .encode_frames(vec![frame], &mut file, &EncodeOptions::default())
+            .unwrap();
+    }
+
+    fn drain_import_job(app: &mut GifFromScreenApp) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.import_gif_job.state() == ImportGifJobState::Running {
+            app.receive_import_gif_messages();
+            assert!(Instant::now() < deadline, "GIF import job timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn project_root_derives_default_gif_path() {
         assert_eq!(
@@ -3051,18 +3232,130 @@ mod tests {
     }
 
     #[test]
+    fn imported_gif_derives_non_overwriting_output_and_landing_cards_fit_default_width() {
+        let source = Path::new("/tmp/animation.gif");
+        assert_eq!(
+            edited_gif_path_for_import(source).unwrap(),
+            PathBuf::from("/tmp/animation-edited.gif")
+        );
+        assert_ne!(edited_gif_path_for_import(source).unwrap(), source);
+        assert!(landing_cards_fit(820.0 - 32.0, 8.0));
+        assert!(!landing_cards_fit(550.0, 8.0));
+    }
+
+    #[test]
     fn running_open_job_locks_both_back_navigation_controls() {
         assert!(!can_navigate_back(
             AppView::OpenProject,
-            OpenProjectJobState::Running
+            OpenProjectJobState::Running,
+            ImportGifJobState::Idle,
         ));
         for state in [OpenProjectJobState::Idle, OpenProjectJobState::Finished] {
-            assert!(can_navigate_back(AppView::OpenProject, state));
+            assert!(can_navigate_back(
+                AppView::OpenProject,
+                state,
+                ImportGifJobState::Idle,
+            ));
         }
         assert!(can_navigate_back(
             AppView::Editor,
-            OpenProjectJobState::Running
+            OpenProjectJobState::Running,
+            ImportGifJobState::Running,
         ));
+    }
+
+    #[test]
+    fn running_import_job_locks_top_and_page_back_navigation() {
+        assert!(!can_navigate_back(
+            AppView::ImportGif,
+            OpenProjectJobState::Idle,
+            ImportGifJobState::Running,
+        ));
+        for state in [ImportGifJobState::Idle, ImportGifJobState::Finished] {
+            assert!(can_navigate_back(
+                AppView::ImportGif,
+                OpenProjectJobState::Idle,
+                state,
+            ));
+        }
+        assert!(can_navigate_back(
+            AppView::OpenProject,
+            OpenProjectJobState::Idle,
+            ImportGifJobState::Running,
+        ));
+    }
+
+    #[test]
+    fn successful_gif_import_enters_editor_with_readable_preview_and_safe_output() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("transparent.gif");
+        write_import_gif(&source);
+        let mut app = GifFromScreenApp::default();
+        app.view = AppView::ImportGif;
+        app.import_gif_path = source.to_string_lossy().into_owned();
+        app.editor_ui_state.frame_number_input = "99".to_owned();
+        app.editor_export_settings.overwrite = true;
+
+        app.start_import_gif().unwrap();
+        assert_eq!(app.import_gif_job.state(), ImportGifJobState::Running);
+        drain_import_job(&mut app);
+
+        assert_eq!(app.import_gif_job.state(), ImportGifJobState::Idle);
+        assert_eq!(app.view, AppView::Editor);
+        assert_eq!(
+            Path::new(&app.settings.output),
+            directory.path().join("transparent-edited.gif")
+        );
+        assert_ne!(Path::new(&app.settings.output), source);
+        assert!(source.is_file());
+        assert_eq!(app.editor_ui_state.frame_number_input, "1");
+        assert_eq!(app.editor_export_settings, EditorExportSettings::default());
+        assert_eq!(app.export_job.state(), ExportJobState::Idle);
+        let (workspace_slot, preview_cache) =
+            (&app.editor_workspace, &mut app.editor_preview_cache);
+        let workspace = workspace_slot.as_ref().unwrap();
+        assert_eq!(
+            workspace.project_root(),
+            directory.path().join("transparent.gfsproj")
+        );
+        let frame_id = workspace.selection().current().unwrap();
+        let context = egui::Context::default();
+        let preview = preview_cache
+            .preview(workspace.active_project(), frame_id, &context, [64, 64])
+            .unwrap();
+        assert_eq!(preview.rendered_size, [2, 1]);
+        assert!(workspace.project_root().join("project.lock").is_file());
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("will not overwrite")
+        );
+    }
+
+    #[test]
+    fn malformed_gif_import_resets_job_and_can_retry() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("retry.gif");
+        fs::write(&source, b"broken").unwrap();
+        let mut app = GifFromScreenApp::default();
+        app.view = AppView::ImportGif;
+        app.import_gif_path = source.to_string_lossy().into_owned();
+
+        app.start_import_gif().unwrap();
+        drain_import_job(&mut app);
+
+        assert_eq!(app.import_gif_job.state(), ImportGifJobState::Idle);
+        assert_eq!(app.view, AppView::ImportGif);
+        assert!(app.editor_workspace.is_none());
+        assert!(app.notice.as_deref().unwrap().contains("You can correct"));
+        assert!(!source.with_extension("gfsproj").exists());
+
+        write_import_gif(&source);
+        app.start_import_gif().unwrap();
+        drain_import_job(&mut app);
+        assert_eq!(app.view, AppView::Editor);
+        assert!(app.editor_workspace.is_some());
     }
 
     #[test]
