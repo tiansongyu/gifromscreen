@@ -59,6 +59,28 @@ pub enum RenderError {
     /// The caller requested cancellation.
     #[error("render cancelled")]
     Cancelled,
+    /// Both transition endpoints must use the same canvas.
+    #[error(
+        "transition endpoint dimensions differ: {from_width}x{from_height} versus {to_width}x{to_height}"
+    )]
+    TransitionDimensionMismatch {
+        /// Width of the outgoing surface.
+        from_width: u32,
+        /// Height of the outgoing surface.
+        from_height: u32,
+        /// Width of the incoming surface.
+        to_width: u32,
+        /// Height of the incoming surface.
+        to_height: u32,
+    },
+    /// A transition step lies outside its non-empty inclusive range.
+    #[error("transition step {step} is outside 0..={steps}; steps must be greater than zero")]
+    InvalidTransitionProgress {
+        /// Requested current step.
+        step: u32,
+        /// Requested number of steps.
+        steps: u32,
+    },
     /// The source asset provider could not return normalized RGBA8 pixels.
     #[error("could not load RGBA8 frame asset {asset_id}: {source}")]
     AssetLoad {

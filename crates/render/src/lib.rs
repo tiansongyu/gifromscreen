@@ -19,6 +19,7 @@ mod control;
 mod error;
 mod renderer;
 mod surface;
+mod transition;
 
 pub use control::{CancellationToken, NeverCancel};
 pub use error::{RenderError, SurfaceError, UnsupportedEffect};
@@ -26,3 +27,4 @@ pub use renderer::{
     AssetProviderError, CpuRenderer, FrameAssetProvider, MAX_BLUR_RADIUS, RenderLimits,
 };
 pub use surface::RgbaSurface;
+pub use transition::{TransitionProgress, render_transition};
