@@ -15,12 +15,14 @@ mod import_static_image_job;
 mod import_static_sequence_job;
 mod open_project_job;
 mod retarget;
+mod static_sequence_ui;
 mod wayland_prepare_job;
 
 use std::{
     collections::BTreeSet,
     ffi::{OsStr, OsString},
     fs, io,
+    num::NonZeroU64,
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -49,6 +51,9 @@ use gif_from_screen_gif::{
     CancellationFlag, CancellationToken as _, DeltaMode, DitherMode, EncodeOptions, LoopBehavior,
     PaletteMode, QuantizerStrategy, Transparency,
 };
+use gif_from_screen_media::{
+    DecodeLimits, LoopBehavior as ImportedLoopBehavior, StaticImageSequenceDurationPolicy,
+};
 use gif_from_screen_project::{ActiveProject, LockPolicy, OpenedProject, ProjectError};
 use gif_from_screen_workflow::{
     CollectOptions, CollectionLimit, FrameRetention, RecordingControl, RecordingController,
@@ -60,10 +65,18 @@ use import_gif_job::{ImportGifJob, ImportGifJobEvent, ImportGifJobState};
 use import_static_image_job::{
     ImportStaticImageJob, ImportStaticImageJobEvent, ImportStaticImageJobState,
 };
+use import_static_sequence_job::{
+    ImportStaticSequenceJob, ImportStaticSequenceJobEvent, ImportStaticSequenceJobState,
+    ImportStaticSequenceRequest,
+};
 use open_project_job::{
     OpenProjectJob, OpenProjectJobError, OpenProjectJobEvent, OpenProjectJobState,
 };
 use retarget::{RegionRetargetPlan, RetargetCompletion};
+use static_sequence_ui::{
+    StaticSequenceLoopChoice, StaticSequenceTimingChoice, StaticSequenceUiAction,
+    StaticSequenceUiState, show_static_sequence_ui,
+};
 use uuid::Uuid;
 use wayland_prepare_job::{
     FrozenSourcePreview, WaylandPrepareJob, WaylandPrepareJobEvent, WaylandPrepareJobState,
@@ -78,6 +91,9 @@ const EDITOR_HISTORY_LIMIT: usize = 100;
 const EDITOR_PREVIEW_MAX_SIZE: [u32; 2] = [960, 540];
 const LANDING_COLUMN_COUNT: usize = 2;
 const LANDING_CARD_MIN_WIDTH: f32 = 280.0;
+const MAX_STATIC_SEQUENCE_FRAMES: usize = 10_000;
+const MAX_STATIC_SEQUENCE_EDGE: u16 = 16_384;
+const MAX_STATIC_SEQUENCE_RGBA_BYTES: u64 = 512 * 1024 * 1024;
 
 fn recorder_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("gif-from-screen-recorder-frame")
@@ -90,6 +106,7 @@ enum AppView {
     OpenProject,
     ImportGif,
     ImportImage,
+    ImportImageSequence,
     ScreenRecorder,
     Editor,
 }
@@ -108,6 +125,7 @@ enum FileDropRoute {
     OpenProject(PathBuf),
     ImportGif(PathBuf),
     ImportImage(PathBuf),
+    ImportImageSequence(Vec<PathBuf>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -126,6 +144,7 @@ enum FileDropActivity {
     ProjectOpen,
     GifImport,
     ImageImport,
+    ImageSequenceImport,
     Export,
 }
 
@@ -544,6 +563,8 @@ struct GifFromScreenApp {
     import_gif_job: ImportGifJob,
     import_image_path: String,
     import_image_job: ImportStaticImageJob,
+    import_sequence_ui: StaticSequenceUiState,
+    import_sequence_job: ImportStaticSequenceJob,
     editor_workspace: Option<EditorWorkspace>,
     editor_ui_state: EditorUiState,
     editor_preview_cache: EditorPreviewCache,
@@ -579,6 +600,8 @@ impl Default for GifFromScreenApp {
             import_gif_job: ImportGifJob::default(),
             import_image_path: String::new(),
             import_image_job: ImportStaticImageJob::default(),
+            import_sequence_ui: StaticSequenceUiState::default(),
+            import_sequence_job: ImportStaticSequenceJob::default(),
             editor_workspace: None,
             editor_ui_state: EditorUiState::default(),
             editor_preview_cache: EditorPreviewCache::new(),
@@ -606,6 +629,7 @@ impl eframe::App for GifFromScreenApp {
         self.receive_open_project_messages();
         self.receive_import_gif_messages();
         self.receive_import_image_messages();
+        self.receive_import_sequence_messages();
         let dropped_paths = context.input(|input| {
             input
                 .raw
@@ -647,6 +671,7 @@ impl eframe::App for GifFromScreenApp {
             || self.open_project_job.state() == OpenProjectJobState::Running
             || self.import_gif_job.state() == ImportGifJobState::Running
             || self.import_image_job.state() == ImportStaticImageJobState::Running
+            || self.import_sequence_job.state() == ImportStaticSequenceJobState::Running
             || self.source_catalog_job.state() == CaptureSourceJobState::Loading
             || self.wayland_prepare_job.is_active()
         {
@@ -660,6 +685,7 @@ impl eframe::App for GifFromScreenApp {
                     self.open_project_job.state(),
                     self.import_gif_job.state(),
                     self.import_image_job.state(),
+                    self.import_sequence_job.state(),
                 );
                 if self.view != AppView::Landing
                     && ui
@@ -684,6 +710,7 @@ impl eframe::App for GifFromScreenApp {
             AppView::OpenProject => self.show_open_project(ui),
             AppView::ImportGif => self.show_import_gif(ui),
             AppView::ImportImage => self.show_import_image(ui),
+            AppView::ImportImageSequence => self.show_import_sequence(ui),
             AppView::ScreenRecorder => self.show_screen_recorder(ui),
             AppView::Editor => self.show_editor(ui),
         });
@@ -730,6 +757,8 @@ impl GifFromScreenApp {
             FileDropActivity::GifImport
         } else if self.import_image_job.state() != ImportStaticImageJobState::Idle {
             FileDropActivity::ImageImport
+        } else if self.import_sequence_job.state() != ImportStaticSequenceJobState::Idle {
+            FileDropActivity::ImageSequenceImport
         } else if self.export_job.state() != ExportJobState::Idle {
             FileDropActivity::Export
         } else {
@@ -754,6 +783,16 @@ impl GifFromScreenApp {
                 self.view = AppView::ImportImage;
                 self.import_image_path = path.to_string_lossy().into_owned();
                 self.start_import_image()
+            }
+            FileDropRoute::ImportImageSequence(inputs) => {
+                let target = default_sequence_project_path(&inputs)?;
+                self.import_sequence_ui.replace_inputs(inputs, &target);
+                self.view = AppView::ImportImageSequence;
+                self.notice = Some(
+                    "Image sequence loaded in dropped-file order. Review timing, loop, and target, then start the bounded import."
+                        .to_owned(),
+                );
+                Ok(())
             }
         }
     }
@@ -845,16 +884,22 @@ impl GifFromScreenApp {
 
             ui.add_space(12.0);
             ui.columns(LANDING_COLUMN_COUNT, |columns| {
-                let _ = landing_action(
+                if landing_action(
                     &mut columns[0],
-                    "Webcam recorder",
-                    "Create an animated GIF from a camera.",
-                    false,
-                );
+                    "Import image sequence",
+                    "Build an animation from ordered PNG, JPEG, BMP, or WebP files.",
+                    true,
+                ) {
+                    self.view = AppView::ImportImageSequence;
+                    self.notice = Some(
+                        "Add at least two same-sized images or drop them together. Their order can be adjusted before import."
+                            .to_owned(),
+                    );
+                }
                 let _ = landing_action(
                     &mut columns[1],
-                    "Drawing board",
-                    "Record drawing strokes as an animation.",
+                    "More recorders",
+                    "Webcam and drawing-board capture.",
                     false,
                 );
             });
@@ -919,6 +964,7 @@ impl GifFromScreenApp {
                         self.open_project_job.state(),
                         self.import_gif_job.state(),
                         self.import_image_job.state(),
+                        self.import_sequence_job.state(),
                     ),
                     egui::Button::new("Back"),
                 )
@@ -991,6 +1037,7 @@ impl GifFromScreenApp {
                         self.open_project_job.state(),
                         self.import_gif_job.state(),
                         self.import_image_job.state(),
+                        self.import_sequence_job.state(),
                     ),
                     egui::Button::new("Back"),
                 )
@@ -1059,6 +1106,7 @@ impl GifFromScreenApp {
                         self.open_project_job.state(),
                         self.import_gif_job.state(),
                         self.import_image_job.state(),
+                        self.import_sequence_job.state(),
                     ),
                     egui::Button::new("Back"),
                 )
@@ -1089,6 +1137,36 @@ impl GifFromScreenApp {
             "Importing static image in the background. The bounded decode/persist operation cannot be cancelled."
                 .to_owned(),
         );
+        Ok(())
+    }
+
+    fn show_import_sequence(&mut self, ui: &mut egui::Ui) {
+        let running = self.import_sequence_job.state() == ImportStaticSequenceJobState::Running;
+        match show_static_sequence_ui(ui, &mut self.import_sequence_ui, running) {
+            StaticSequenceUiAction::None => {}
+            StaticSequenceUiAction::Start => {
+                if let Err(error) = self.start_import_sequence() {
+                    self.notice = Some(format!("Could not start image-sequence import: {error}"));
+                }
+            }
+            StaticSequenceUiAction::Back => self.view = AppView::Landing,
+            StaticSequenceUiAction::Notice(message) => self.notice = Some(message),
+        }
+        if let Some(notice) = &self.notice {
+            ui.add_space(12.0);
+            ui.label(notice);
+        }
+    }
+
+    fn start_import_sequence(&mut self) -> Result<(), String> {
+        let request = build_static_sequence_request(&self.import_sequence_ui)?;
+        let frame_count = request.inputs.len();
+        self.import_sequence_job
+            .start(request)
+            .map_err(|error| error.to_string())?;
+        self.notice = Some(format!(
+            "Importing {frame_count} ordered images in the background. This bounded operation cannot be cancelled."
+        ));
         Ok(())
     }
 
@@ -2404,6 +2482,54 @@ impl GifFromScreenApp {
         };
         Ok(format!(
             "Imported image into {} as one 100 ms frame. Default GIF output is {}.{existing}",
+            summary.project_path.display(),
+            output.display()
+        ))
+    }
+
+    fn receive_import_sequence_messages(&mut self) {
+        let finished = self
+            .import_sequence_job
+            .drain()
+            .into_iter()
+            .any(|event| event == ImportStaticSequenceJobEvent::Finished);
+        if !finished {
+            return;
+        }
+        let result = self.import_sequence_job.take_result();
+        self.import_sequence_job = ImportStaticSequenceJob::default();
+        self.notice = Some(match result {
+            Some(Ok(project)) => match self.activate_imported_sequence(project) {
+                Ok(notice) => notice,
+                Err(error) => format!("Could not prepare imported image sequence: {error}"),
+            },
+            Some(Err(error)) => format!(
+                "Could not import image sequence: {error}. Adjust the ordered inputs or settings and retry."
+            ),
+            None => {
+                "Image-sequence worker finished without a result. You can retry safely.".to_owned()
+            }
+        });
+    }
+
+    fn activate_imported_sequence(&mut self, project: ActiveProject) -> Result<String, String> {
+        let output = project.layout().root.with_extension("gif");
+        let output_exists = output.exists();
+        let summary = activate_editor(&mut self.view, &mut self.editor_workspace, project)?;
+        self.editor_ui_state = EditorUiState::default();
+        self.editor_preview_cache = EditorPreviewCache::new();
+        self.editor_export_settings = EditorExportSettings::default();
+        self.export_job = ExportJob::default();
+        self.import_sequence_ui = StaticSequenceUiState::default();
+        self.settings.output = output.to_string_lossy().into_owned();
+        let existing = if output_exists {
+            " The default GIF already exists; enable Overwrite before exporting."
+        } else {
+            ""
+        };
+        Ok(format!(
+            "Imported {} ordered images into {}. Default GIF output is {}.{existing}",
+            summary.frames,
             summary.project_path.display(),
             output.display()
         ))
@@ -3857,12 +3983,15 @@ const fn can_navigate_back(
     open_state: OpenProjectJobState,
     import_state: ImportGifJobState,
     image_state: ImportStaticImageJobState,
+    sequence_state: ImportStaticSequenceJobState,
 ) -> bool {
     !((matches!(view, AppView::OpenProject) && matches!(open_state, OpenProjectJobState::Running))
         || (matches!(view, AppView::ImportGif)
             && matches!(import_state, ImportGifJobState::Running))
         || (matches!(view, AppView::ImportImage)
-            && matches!(image_state, ImportStaticImageJobState::Running)))
+            && matches!(image_state, ImportStaticImageJobState::Running))
+        || (matches!(view, AppView::ImportImageSequence)
+            && matches!(sequence_state, ImportStaticSequenceJobState::Running)))
 }
 
 fn export_result_notice(result: Result<ProjectGifExportReport, ExportJobError>) -> String {
@@ -3890,6 +4019,140 @@ fn edited_gif_path_for_import(source: &Path) -> Result<PathBuf, String> {
     let mut filename = stem.to_os_string();
     filename.push("-edited.gif");
     Ok(source.with_file_name(filename))
+}
+
+fn default_sequence_project_path(inputs: &[PathBuf]) -> Result<PathBuf, String> {
+    let first = inputs.first().ok_or_else(|| {
+        "An image sequence needs at least one path to derive a target.".to_owned()
+    })?;
+    let stem = first
+        .file_stem()
+        .filter(|stem| !stem.is_empty())
+        .ok_or_else(|| format!("Cannot derive a sequence target from {}.", first.display()))?;
+    let parent = first
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let stem = stem.to_string_lossy();
+    for suffix in 1..=MAX_STATIC_SEQUENCE_FRAMES {
+        let filename = if suffix == 1 {
+            format!("{stem}-sequence.gfsproj")
+        } else {
+            format!("{stem}-sequence-{suffix}.gfsproj")
+        };
+        let candidate = parent.join(filename);
+        match candidate.try_exists() {
+            Ok(false) => return Ok(candidate),
+            Ok(true) => {}
+            Err(error) => {
+                return Err(format!(
+                    "Could not inspect default sequence target {}: {error}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "No available default sequence target remains beside {}.",
+        first.display()
+    ))
+}
+
+fn build_static_sequence_request(
+    state: &StaticSequenceUiState,
+) -> Result<ImportStaticSequenceRequest, String> {
+    if state.inputs.len() < 2 {
+        return Err("Add at least two images to the sequence.".to_owned());
+    }
+    if state.inputs.len() > MAX_STATIC_SEQUENCE_FRAMES {
+        return Err(format!(
+            "A sequence may contain at most {MAX_STATIC_SEQUENCE_FRAMES} images."
+        ));
+    }
+    let target = state.target.trim();
+    if target.is_empty() {
+        return Err("Choose a .gfsproj target directory.".to_owned());
+    }
+    let duration_policy = static_sequence_duration_policy(state.timing, state.uniform_duration_ms)?;
+    let loop_behavior = static_sequence_loop_behavior(state.loop_choice, state.finite_repeats)?;
+    let mut inputs = Vec::new();
+    let mut frame_ids = Vec::new();
+    let mut display_names = Vec::new();
+    inputs
+        .try_reserve_exact(state.inputs.len())
+        .map_err(|_| "Could not reserve sequence input paths.".to_owned())?;
+    frame_ids
+        .try_reserve_exact(state.inputs.len())
+        .map_err(|_| "Could not reserve sequence frame identities.".to_owned())?;
+    display_names
+        .try_reserve_exact(state.inputs.len())
+        .map_err(|_| "Could not reserve sequence source labels.".to_owned())?;
+    for path in &state.inputs {
+        let display_name = path
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| format!("Image path {} has no filename.", path.display()))?;
+        inputs.push(path.clone());
+        frame_ids.push(FrameId::from_u128(Uuid::new_v4().as_u128()));
+        display_names.push(display_name.to_string_lossy().into_owned());
+    }
+    let created_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("System clock is before the Unix epoch: {error}"))?
+        .as_millis();
+    let created_millis = i64::try_from(created_millis)
+        .map_err(|_| "Current time does not fit the project timestamp.".to_owned())?;
+    Ok(ImportStaticSequenceRequest {
+        inputs,
+        target: PathBuf::from(target),
+        duration_policy,
+        loop_behavior,
+        limits: DecodeLimits {
+            max_width: MAX_STATIC_SEQUENCE_EDGE,
+            max_height: MAX_STATIC_SEQUENCE_EDGE,
+            max_frames: MAX_STATIC_SEQUENCE_FRAMES,
+            max_total_rgba_bytes: MAX_STATIC_SEQUENCE_RGBA_BYTES,
+        },
+        project_id: ProjectId::from_u128(Uuid::new_v4().as_u128()),
+        frame_ids,
+        app_version: env!("CARGO_PKG_VERSION").to_owned(),
+        created_at: UnixTimeMs::new(created_millis),
+        display_names,
+    })
+}
+
+fn static_sequence_duration_policy(
+    timing: StaticSequenceTimingChoice,
+    uniform_duration_ms: u64,
+) -> Result<StaticImageSequenceDurationPolicy, String> {
+    match timing {
+        StaticSequenceTimingChoice::PreserveDefault => {
+            Ok(StaticImageSequenceDurationPolicy::PreserveDecoded)
+        }
+        StaticSequenceTimingChoice::Uniform => {
+            let duration_us = uniform_duration_ms
+                .checked_mul(1_000)
+                .and_then(NonZeroU64::new)
+                .ok_or_else(|| "Uniform frame duration must be positive and fit u64.".to_owned())?;
+            Ok(StaticImageSequenceDurationPolicy::Uniform(duration_us))
+        }
+    }
+}
+
+fn static_sequence_loop_behavior(
+    choice: StaticSequenceLoopChoice,
+    finite_repeats: u16,
+) -> Result<ImportedLoopBehavior, String> {
+    match choice {
+        StaticSequenceLoopChoice::Once => Ok(ImportedLoopBehavior::Once),
+        StaticSequenceLoopChoice::Infinite => Ok(ImportedLoopBehavior::Infinite),
+        StaticSequenceLoopChoice::Finite if finite_repeats > 0 => {
+            Ok(ImportedLoopBehavior::Finite(finite_repeats))
+        }
+        StaticSequenceLoopChoice::Finite => {
+            Err("Finite sequence repeats must be at least one.".to_owned())
+        }
+    }
 }
 
 fn opened_project_notice(
@@ -4276,16 +4539,17 @@ const fn file_drop_block_reason(activity: FileDropActivity) -> Option<&'static s
         FileDropActivity::ProjectOpen => Some("a project-open job is active"),
         FileDropActivity::GifImport => Some("a GIF import is active"),
         FileDropActivity::ImageImport => Some("an image import is active"),
+        FileDropActivity::ImageSequenceImport => Some("an image-sequence import is active"),
         FileDropActivity::Export => Some("a GIF export is active"),
     }
 }
 
 fn prepare_file_drop_route(dropped_paths: &[Option<PathBuf>]) -> Result<FileDropRoute, String> {
-    if dropped_paths.len() != 1 {
-        return Err(format!(
-            "Drop exactly one local file or project directory at a time; received {} items.",
-            dropped_paths.len()
-        ));
+    if dropped_paths.is_empty() {
+        return Err("No dropped files were provided.".to_owned());
+    }
+    if dropped_paths.len() > 1 {
+        return prepare_static_sequence_drop(dropped_paths);
     }
     let path = dropped_paths[0].as_ref().ok_or_else(|| {
         "Dropped data has no local filesystem path; save it to disk before importing.".to_owned()
@@ -4313,6 +4577,45 @@ fn prepare_file_drop_route(dropped_paths: &[Option<PathBuf>]) -> Result<FileDrop
         is_regular_file: metadata.is_file(),
         has_project_manifest,
     }))
+}
+
+fn prepare_static_sequence_drop(
+    dropped_paths: &[Option<PathBuf>],
+) -> Result<FileDropRoute, String> {
+    if dropped_paths.len() > MAX_STATIC_SEQUENCE_FRAMES {
+        return Err(format!(
+            "Image-sequence drop has {} files, above the {MAX_STATIC_SEQUENCE_FRAMES}-frame limit.",
+            dropped_paths.len()
+        ));
+    }
+    let mut inputs = Vec::new();
+    inputs
+        .try_reserve_exact(dropped_paths.len())
+        .map_err(|_| "Could not reserve the dropped image-sequence path list.".to_owned())?;
+    for (index, dropped_path) in dropped_paths.iter().enumerate() {
+        let path = dropped_path.as_ref().ok_or_else(|| {
+            format!(
+                "Dropped item {} has no local filesystem path; save every image to disk first.",
+                index + 1
+            )
+        })?;
+        let metadata = fs::metadata(path).map_err(|error| {
+            format!(
+                "Could not inspect dropped image {} at {}: {error}",
+                index + 1,
+                path.display()
+            )
+        })?;
+        if !metadata.is_file() || !has_static_image_extension(path) {
+            return Err(format!(
+                "Dropped item {} ({}) is not a regular PNG, JPEG, BMP, or WebP file; multi-file drops are image sequences only.",
+                index + 1,
+                path.display()
+            ));
+        }
+        inputs.push(path.clone());
+    }
+    Ok(FileDropRoute::ImportImageSequence(inputs))
 }
 
 fn route_file_drop(candidate: Option<FileDropCandidate>) -> Result<FileDropRoute, String> {
@@ -4465,6 +4768,7 @@ mod tests {
         collections::BTreeSet,
         ffi::OsString,
         fs,
+        num::NonZeroU64,
         path::{Path, PathBuf},
         time::{Duration, Instant},
     };
@@ -4484,6 +4788,9 @@ mod tests {
         BuiltinGifEncoder, DeltaMode, DitherMode, EncodeOptions, EncodeReport, LoopBehavior,
         PaletteMode, QuantizerStrategy, RgbaFrame, Transparency,
     };
+    use gif_from_screen_media::{
+        LoopBehavior as ImportedLoopBehavior, StaticImageSequenceDurationPolicy,
+    };
     use gif_from_screen_project::{ActiveProject, LockPolicy};
     use gif_from_screen_workflow::RecordingFrameSink;
     use tempfile::tempdir;
@@ -4495,24 +4802,28 @@ mod tests {
         IncrementalProjectFrameSink, MAX_COUNTDOWN_SECONDS, MAX_RECORDING_DURATION_MS,
         RecorderOverlayAction, RecorderStage, RecordingSettings, RecordingWorkerRequest,
         StartupIntent, activate_editor, apply_overlay_region, build_project_export_options,
-        can_navigate_back, collection_limit, collection_options,
+        build_static_sequence_request, can_navigate_back, collection_limit, collection_options,
         create_incremental_recording_project, default_gif_path_for_project,
-        edited_gif_path_for_import, editor_result_notice, export_job_is_active,
-        export_result_notice, file_drop_block_reason, fit_dimensions, frame_retention,
-        has_static_image_extension, initial_wayland_region, landing_cards_fit,
+        default_sequence_project_path, edited_gif_path_for_import, editor_result_notice,
+        export_job_is_active, export_result_notice, file_drop_block_reason, fit_dimensions,
+        frame_retention, has_static_image_extension, initial_wayland_region, landing_cards_fit,
         map_preview_selection, open_project_controls_enabled, open_project_lock_policy,
         parse_startup_intent, prepare_file_drop_route, project_path_for_output,
         recording_project_canvas, remove_completed_project, remove_recording_project_path,
         resize_nearest_rgba, resolve_export_selection, route_file_drop, should_sync_retarget,
-        show_editor_scroll_area, translate_source_region, validate_export_output,
-        validate_settings,
+        show_editor_scroll_area, static_sequence_duration_policy, static_sequence_loop_behavior,
+        translate_source_region, validate_export_output, validate_settings,
     };
     use crate::editor_ui::{EditorUiAction, EditorUiFailure, EditorUiOperation};
     use crate::editor_workspace::EditorWorkspace;
     use crate::export_job::{ExportJobError, ExportJobState};
     use crate::import_gif_job::ImportGifJobState;
     use crate::import_static_image_job::ImportStaticImageJobState;
+    use crate::import_static_sequence_job::ImportStaticSequenceJobState;
     use crate::open_project_job::OpenProjectJobState;
+    use crate::static_sequence_ui::{
+        StaticSequenceLoopChoice, StaticSequenceTimingChoice, StaticSequenceUiState,
+    };
     use gif_from_screen_workflow::{CollectionLimit, FrameRetention};
 
     #[test]
@@ -4675,13 +4986,30 @@ mod tests {
                 .unwrap_err()
                 .contains("no local filesystem path")
         );
+        let directory = tempdir().unwrap();
+        let first = directory.path().join("first.png");
+        let second = directory.path().join("second.JPG");
+        let gif = directory.path().join("mixed.gif");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        fs::write(&gif, b"gif").unwrap();
+        assert_eq!(
+            prepare_file_drop_route(&[Some(second.clone()), Some(first.clone())]).unwrap(),
+            FileDropRoute::ImportImageSequence(vec![second.clone(), first.clone()])
+        );
+        assert_eq!(
+            prepare_file_drop_route(&[Some(first.clone())]).unwrap(),
+            FileDropRoute::ImportImage(first.clone())
+        );
         assert!(
-            prepare_file_drop_route(&[
-                Some(PathBuf::from("/tmp/one.gif")),
-                Some(PathBuf::from("/tmp/two.gif")),
-            ])
-            .unwrap_err()
-            .contains("received 2 items")
+            prepare_file_drop_route(&[Some(first), Some(gif)])
+                .unwrap_err()
+                .contains("image sequences only")
+        );
+        assert!(
+            prepare_file_drop_route(&[Some(second), None])
+                .unwrap_err()
+                .contains("no local filesystem path")
         );
         assert_eq!(file_drop_block_reason(FileDropActivity::default()), None);
         for (activity, expected) in [
@@ -4689,10 +5017,59 @@ mod tests {
             (FileDropActivity::ProjectOpen, "project-open"),
             (FileDropActivity::GifImport, "GIF import"),
             (FileDropActivity::ImageImport, "image import"),
+            (
+                FileDropActivity::ImageSequenceImport,
+                "image-sequence import",
+            ),
             (FileDropActivity::Export, "GIF export"),
         ] {
             assert!(file_drop_block_reason(activity).unwrap().contains(expected));
         }
+    }
+
+    #[test]
+    fn sequence_form_maps_order_timing_loop_limits_and_metadata_into_job_request() {
+        let state = StaticSequenceUiState {
+            inputs: vec![PathBuf::from("second.png"), PathBuf::from("first.webp")],
+            target: "ordered.gfsproj".to_owned(),
+            timing: StaticSequenceTimingChoice::Uniform,
+            uniform_duration_ms: 125,
+            loop_choice: StaticSequenceLoopChoice::Finite,
+            finite_repeats: 7,
+            ..StaticSequenceUiState::default()
+        };
+
+        let request = build_static_sequence_request(&state).unwrap();
+        assert_eq!(request.inputs, state.inputs);
+        assert_eq!(request.target, PathBuf::from("ordered.gfsproj"));
+        assert_eq!(
+            request.duration_policy,
+            StaticImageSequenceDurationPolicy::Uniform(NonZeroU64::new(125_000).unwrap())
+        );
+        assert_eq!(request.loop_behavior, ImportedLoopBehavior::Finite(7));
+        assert_eq!(request.limits.max_frames, 10_000);
+        assert_eq!(request.limits.max_width, 16_384);
+        assert_eq!(request.limits.max_height, 16_384);
+        assert_eq!(request.limits.max_total_rgba_bytes, 512 * 1024 * 1024);
+        assert_eq!(request.display_names, ["second.png", "first.webp"]);
+        assert_eq!(request.frame_ids.len(), 2);
+        assert_ne!(request.frame_ids[0], request.frame_ids[1]);
+        assert!(!request.project_id.is_nil());
+        assert_eq!(
+            static_sequence_duration_policy(StaticSequenceTimingChoice::PreserveDefault, 0)
+                .unwrap(),
+            StaticImageSequenceDurationPolicy::PreserveDecoded
+        );
+        assert!(static_sequence_duration_policy(StaticSequenceTimingChoice::Uniform, 0).is_err());
+        assert_eq!(
+            static_sequence_loop_behavior(StaticSequenceLoopChoice::Once, 0).unwrap(),
+            ImportedLoopBehavior::Once
+        );
+        assert_eq!(
+            static_sequence_loop_behavior(StaticSequenceLoopChoice::Infinite, 0).unwrap(),
+            ImportedLoopBehavior::Infinite
+        );
+        assert!(static_sequence_loop_behavior(StaticSequenceLoopChoice::Finite, 0).is_err());
     }
 
     #[test]
@@ -5080,6 +5457,15 @@ mod tests {
         }
     }
 
+    fn drain_import_sequence_job(app: &mut GifFromScreenApp) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.import_sequence_job.state() == ImportStaticSequenceJobState::Running {
+            app.receive_import_sequence_messages();
+            assert!(Instant::now() < deadline, "image-sequence import timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn project_root_derives_default_gif_path() {
         assert_eq!(
@@ -5105,6 +5491,24 @@ mod tests {
     }
 
     #[test]
+    fn sequence_default_target_uses_first_source_and_skips_existing_names() {
+        let directory = tempdir().unwrap();
+        let first = directory.path().join("frame.png");
+        fs::create_dir(directory.path().join("frame-sequence.gfsproj")).unwrap();
+        fs::write(
+            directory.path().join("frame-sequence-2.gfsproj"),
+            b"occupied",
+        )
+        .unwrap();
+
+        assert_eq!(
+            default_sequence_project_path(&[first, directory.path().join("other.png")]).unwrap(),
+            directory.path().join("frame-sequence-3.gfsproj")
+        );
+        assert!(default_sequence_project_path(&[]).is_err());
+    }
+
+    #[test]
     fn running_open_job_locks_both_back_navigation_controls() {
         assert_eq!(open_project_lock_policy(false), LockPolicy::FailIfPresent);
         assert_eq!(open_project_lock_policy(true), LockPolicy::TakeOver);
@@ -5116,6 +5520,7 @@ mod tests {
             OpenProjectJobState::Running,
             ImportGifJobState::Idle,
             ImportStaticImageJobState::Idle,
+            ImportStaticSequenceJobState::Idle,
         ));
         for state in [OpenProjectJobState::Idle, OpenProjectJobState::Finished] {
             assert!(can_navigate_back(
@@ -5123,6 +5528,7 @@ mod tests {
                 state,
                 ImportGifJobState::Idle,
                 ImportStaticImageJobState::Idle,
+                ImportStaticSequenceJobState::Idle,
             ));
         }
         assert!(can_navigate_back(
@@ -5130,6 +5536,7 @@ mod tests {
             OpenProjectJobState::Running,
             ImportGifJobState::Running,
             ImportStaticImageJobState::Running,
+            ImportStaticSequenceJobState::Running,
         ));
     }
 
@@ -5140,6 +5547,7 @@ mod tests {
             OpenProjectJobState::Idle,
             ImportGifJobState::Running,
             ImportStaticImageJobState::Idle,
+            ImportStaticSequenceJobState::Idle,
         ));
         for state in [ImportGifJobState::Idle, ImportGifJobState::Finished] {
             assert!(can_navigate_back(
@@ -5147,6 +5555,7 @@ mod tests {
                 OpenProjectJobState::Idle,
                 state,
                 ImportStaticImageJobState::Idle,
+                ImportStaticSequenceJobState::Idle,
             ));
         }
         assert!(can_navigate_back(
@@ -5154,6 +5563,7 @@ mod tests {
             OpenProjectJobState::Idle,
             ImportGifJobState::Running,
             ImportStaticImageJobState::Running,
+            ImportStaticSequenceJobState::Running,
         ));
     }
 
@@ -5164,6 +5574,7 @@ mod tests {
             OpenProjectJobState::Idle,
             ImportGifJobState::Idle,
             ImportStaticImageJobState::Running,
+            ImportStaticSequenceJobState::Idle,
         ));
         for state in [
             ImportStaticImageJobState::Idle,
@@ -5173,6 +5584,30 @@ mod tests {
                 AppView::ImportImage,
                 OpenProjectJobState::Idle,
                 ImportGifJobState::Idle,
+                state,
+                ImportStaticSequenceJobState::Idle,
+            ));
+        }
+    }
+
+    #[test]
+    fn running_image_sequence_import_locks_top_and_page_back_navigation() {
+        assert!(!can_navigate_back(
+            AppView::ImportImageSequence,
+            OpenProjectJobState::Idle,
+            ImportGifJobState::Idle,
+            ImportStaticImageJobState::Idle,
+            ImportStaticSequenceJobState::Running,
+        ));
+        for state in [
+            ImportStaticSequenceJobState::Idle,
+            ImportStaticSequenceJobState::Finished,
+        ] {
+            assert!(can_navigate_back(
+                AppView::ImportImageSequence,
+                OpenProjectJobState::Idle,
+                ImportGifJobState::Idle,
+                ImportStaticImageJobState::Idle,
                 state,
             ));
         }
@@ -5261,6 +5696,116 @@ mod tests {
         drain_import_image_job(&mut app);
         assert_eq!(app.view, AppView::Editor);
         assert!(app.editor_workspace.is_some());
+    }
+
+    #[test]
+    fn successful_sequence_import_enters_editor_in_user_order_and_resets_job() {
+        let directory = tempdir().unwrap();
+        let first = directory.path().join("first.png");
+        let second = directory.path().join("second.png");
+        let target = directory.path().join("ordered.gfsproj");
+        write_import_png(&first);
+        write_import_png(&second);
+        let mut app = GifFromScreenApp::default();
+        app.view = AppView::ImportImageSequence;
+        app.import_sequence_ui
+            .replace_inputs(vec![second.clone(), first.clone()], &target);
+        app.import_sequence_ui.uniform_duration_ms = 80;
+        app.import_sequence_ui.loop_choice = StaticSequenceLoopChoice::Once;
+
+        app.start_import_sequence().unwrap();
+        assert_eq!(
+            app.import_sequence_job.state(),
+            ImportStaticSequenceJobState::Running
+        );
+        assert_eq!(
+            app.file_drop_activity(),
+            FileDropActivity::ImageSequenceImport
+        );
+        app.handle_dropped_paths(&[Some(first)]);
+        assert_eq!(app.view, AppView::ImportImageSequence);
+        assert_eq!(
+            app.import_image_job.state(),
+            ImportStaticImageJobState::Idle
+        );
+        drain_import_sequence_job(&mut app);
+
+        assert_eq!(
+            app.import_sequence_job.state(),
+            ImportStaticSequenceJobState::Idle
+        );
+        assert_eq!(app.view, AppView::Editor);
+        assert!(app.import_sequence_ui.inputs.is_empty());
+        assert_eq!(
+            Path::new(&app.settings.output),
+            target.with_extension("gif")
+        );
+        let workspace = app.editor_workspace.as_ref().unwrap();
+        assert_eq!(workspace.project_root(), target);
+        assert_eq!(workspace.manifest().timeline.frames.len(), 2);
+        assert_eq!(
+            workspace
+                .manifest()
+                .timeline
+                .frames
+                .iter()
+                .map(|frame| frame.duration.get())
+                .collect::<Vec<_>>(),
+            [80_000, 80_000]
+        );
+        assert!(matches!(
+            workspace.manifest().source_provenance.as_slice(),
+            [
+                SourceProvenance::Imported { display_name: second_name, .. },
+                SourceProvenance::Imported { display_name: first_name, .. }
+            ] if second_name == "second.png" && first_name == "first.png"
+        ));
+        assert_eq!(
+            workspace.selection().current(),
+            Some(workspace.manifest().timeline.frames[0].id)
+        );
+        assert!(app.notice.as_deref().unwrap().contains("2 ordered images"));
+    }
+
+    #[test]
+    fn failed_sequence_import_keeps_form_and_can_retry() {
+        let directory = tempdir().unwrap();
+        let first = directory.path().join("first.png");
+        let second = directory.path().join("broken.png");
+        let target = directory.path().join("retry.gfsproj");
+        write_import_png(&first);
+        fs::write(&second, b"broken").unwrap();
+        let inputs = vec![first, second.clone()];
+        let mut app = GifFromScreenApp::default();
+        app.view = AppView::ImportImageSequence;
+        app.import_sequence_ui
+            .replace_inputs(inputs.clone(), &target);
+
+        app.start_import_sequence().unwrap();
+        drain_import_sequence_job(&mut app);
+
+        assert_eq!(app.view, AppView::ImportImageSequence);
+        assert_eq!(app.import_sequence_ui.inputs, inputs);
+        assert_eq!(
+            app.import_sequence_job.state(),
+            ImportStaticSequenceJobState::Idle
+        );
+        assert!(!target.exists());
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("Adjust the ordered inputs")
+        );
+
+        write_import_png(&second);
+        app.start_import_sequence().unwrap();
+        drain_import_sequence_job(&mut app);
+        assert_eq!(app.view, AppView::Editor);
+        assert_eq!(
+            app.import_sequence_job.state(),
+            ImportStaticSequenceJobState::Idle
+        );
     }
 
     #[test]
@@ -5421,6 +5966,35 @@ mod tests {
     }
 
     #[test]
+    fn multi_image_drop_opens_sequence_form_in_original_order() {
+        let directory = tempdir().unwrap();
+        let first = directory.path().join("first.png");
+        let second = directory.path().join("second.webp");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let mut app = GifFromScreenApp::default();
+
+        app.handle_dropped_paths(&[Some(second.clone()), Some(first.clone())]);
+
+        assert_eq!(app.view, AppView::ImportImageSequence);
+        assert_eq!(app.import_sequence_ui.inputs, [second.clone(), first]);
+        assert_eq!(
+            Path::new(&app.import_sequence_ui.target),
+            directory.path().join("second-sequence.gfsproj")
+        );
+        assert_eq!(
+            app.import_sequence_job.state(),
+            ImportStaticSequenceJobState::Idle
+        );
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("dropped-file order")
+        );
+    }
+
+    #[test]
     fn rejected_drops_keep_the_active_workspace_and_routes_unchanged() {
         let directory = tempdir().unwrap();
         let root = directory.path().join("current.gfsproj");
@@ -5446,6 +6020,7 @@ mod tests {
             assert!(app.open_project_path.is_empty());
             assert!(app.import_gif_path.is_empty());
             assert!(app.import_image_path.is_empty());
+            assert!(app.import_sequence_ui.inputs.is_empty());
         }
 
         let _ = app.recording_countdown.start(Instant::now(), 1);
