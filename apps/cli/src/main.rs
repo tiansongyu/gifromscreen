@@ -5,8 +5,8 @@
 use std::{env, fs, io, path::Path, time::Duration};
 
 use gif_from_screen_capture::{
-    CaptureBackend, CaptureCadence, CaptureRequest, CaptureTarget, CursorCaptureMode, FramePoll,
-    PhysicalRect as CaptureRect, PixelFormat,
+    CaptureBackend, CaptureCadence, CaptureRequest, CaptureTarget, CursorCaptureMode,
+    PhysicalRect as CaptureRect,
 };
 use gif_from_screen_capture_linux::X11CaptureBackend;
 use gif_from_screen_domain::{
@@ -15,10 +15,16 @@ use gif_from_screen_domain::{
     PhysicalRect as DomainRect, PhysicalSize, ProjectId, ProjectManifest, RasterEncoding, Rgba,
     UnixTimeMs,
 };
-use gif_from_screen_gif::{BuiltinGifEncoder, EncodeOptions, RgbaFrame};
+use gif_from_screen_gif::{
+    BuiltinGifEncoder, EncodeOptions, NeverCancel as GifNeverCancel, RgbaFrame,
+};
 use gif_from_screen_project::{ActiveProject, LockPolicy};
 use gif_from_screen_render::{
-    AssetProviderError, CpuRenderer, FrameAssetProvider, NeverCancel, RgbaSurface,
+    AssetProviderError, CpuRenderer, FrameAssetProvider, NeverCancel as RenderNeverCancel,
+    RgbaSurface,
+};
+use gif_from_screen_workflow::{
+    CollectOptions, CollectionLimit, NoopWorkflowProgress, RecordToGifOptions, record_to_gif,
 };
 
 fn main() {
@@ -177,7 +183,7 @@ fn export_project(project_root: &Path, output: &Path) -> Result<(), Box<dyn std:
         .frames
         .iter()
         .map(|clip| {
-            let surface = renderer.render_clip(clip, &provider, &NeverCancel)?;
+            let surface = renderer.render_clip(clip, &provider, &RenderNeverCancel)?;
             RgbaFrame::new(
                 u16::try_from(surface.width())?,
                 u16::try_from(surface.height())?,
@@ -296,6 +302,9 @@ fn record_x11(
     if !(1..=60).contains(&fps) {
         return Err("FPS must be between 1 and 60".into());
     }
+    if output.exists() {
+        return Err(format!("refusing to overwrite {}", output.display()).into());
+    }
     let backend = X11CaptureBackend::connect(None)?;
     let source = backend
         .list_sources()?
@@ -311,80 +320,30 @@ fn record_x11(
     );
     let mut request = CaptureRequest::new(target, CaptureCadence::fixed_fps(fps)?);
     request.cursor = CursorCaptureMode::Hidden;
-    let mut session = backend.start_session(request)?;
-    let deadline = std::time::Instant::now()
-        .checked_add(Duration::from_millis(duration_ms))
-        .ok_or("capture deadline overflow")?;
-    let mut captured = Vec::new();
-    while std::time::Instant::now() < deadline {
-        match session.poll_frame(Duration::from_millis(250))? {
-            FramePoll::Frame(frame) => captured.push(frame),
-            FramePoll::Pending => {}
-            FramePoll::EndOfStream => break,
-        }
-    }
-    session.stop()?;
-    if captured.is_empty() {
-        return Err("capture finished without any frames".into());
-    }
-
-    let fallback_duration = 1_000_000_u64 / u64::from(fps);
-    let mut frames = Vec::with_capacity(captured.len());
-    for (index, frame) in captured.iter().enumerate() {
-        let frame_delay_us = captured
-            .get(index + 1)
-            .map(|next| {
-                next.captured_at()
-                    .as_micros()
-                    .saturating_sub(frame.captured_at().as_micros())
-            })
-            .filter(|duration| *duration > 0)
-            .unwrap_or(fallback_duration);
-        frames.push(captured_frame_to_gif(frame, frame_delay_us)?);
-    }
-    let report = write_gif_frames(output, frames)?;
+    let options = RecordToGifOptions {
+        collection: CollectOptions {
+            limit: CollectionLimit::Duration(Duration::from_millis(duration_ms)),
+            tail_frame_duration: Duration::from_micros(1_000_000 / u64::from(fps)),
+            ..CollectOptions::default()
+        },
+        encoding: EncodeOptions::default(),
+    };
+    let mut progress = NoopWorkflowProgress;
+    let report = record_to_gif(
+        &backend,
+        request,
+        output,
+        &options,
+        &GifNeverCancel,
+        &mut progress,
+    )?;
     println!(
         "captured {} X11 frames and wrote {} GIF frames to {}",
-        captured.len(),
-        report.encoded_frames,
+        report.collection.frames,
+        report.encoding.encoded_frames,
         output.display()
     );
     Ok(())
-}
-
-fn captured_frame_to_gif(
-    frame: &gif_from_screen_capture::CapturedFrame,
-    duration_us: u64,
-) -> Result<RgbaFrame, Box<dyn std::error::Error>> {
-    let width = usize::try_from(frame.size().width())?;
-    let height = usize::try_from(frame.size().height())?;
-    let tight_stride = width.checked_mul(4).ok_or("RGBA row size overflow")?;
-    let tight_len = tight_stride
-        .checked_mul(height)
-        .ok_or("RGBA frame size overflow")?;
-    let mut pixels = Vec::with_capacity(tight_len);
-    for row in frame.pixels().chunks(frame.stride()).take(height) {
-        let row = row.get(..tight_stride).ok_or("captured row is truncated")?;
-        match frame.format() {
-            PixelFormat::Rgba8 => pixels.extend_from_slice(row),
-            PixelFormat::Bgra8 => {
-                for pixel in row.as_chunks::<4>().0 {
-                    pixels.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
-                }
-            }
-            _ => return Err("unsupported captured pixel format".into()),
-        }
-    }
-    if pixels.len() != tight_len {
-        return Err("captured frame has too few rows".into());
-    }
-    RgbaFrame::new(
-        u16::try_from(width)?,
-        u16::try_from(height)?,
-        pixels,
-        duration_us,
-    )
-    .map_err(Into::into)
 }
 
 fn parse_optional<T: std::str::FromStr>(

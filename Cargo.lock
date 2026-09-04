@@ -1037,6 +1037,7 @@ dependencies = [
  "gif-from-screen-gif",
  "gif-from-screen-project",
  "gif-from-screen-render",
+ "gif-from-screen-workflow",
 ]
 
 [[package]]
