@@ -11,6 +11,7 @@ use thiserror::Error;
 
 mod clip_transform;
 mod duplicates;
+mod frame_effect;
 mod frame_selection;
 mod selection;
 mod virtual_filmstrip;
@@ -21,6 +22,7 @@ pub use duplicates::{
     DuplicateDelayMode, DuplicateFrameRetention, FrameComparison, FrameSimilarityProvider,
     RemoveDuplicateFramesOptions, remove_duplicate_frames,
 };
+pub use frame_effect::{FrameEffectEdit, MAX_FRAME_EFFECT_BLUR_RADIUS, edit_frame_effects};
 pub use frame_selection::{
     FrameExpressionError, FrameExpressionErrorReason, FrameTimeRangeError, parse_frame_expression,
     select_frames_by_time_range,
@@ -659,6 +661,59 @@ pub enum EditorError {
     /// A requested pre-rotation output size is empty or invalid.
     #[error("clip output size {0:?} is invalid")]
     InvalidOutputSize(gif_from_screen_domain::PhysicalSize),
+    /// A frame effect region is empty, overflowing, or outside the project canvas.
+    #[error("{effect} region {region:?} does not fit project canvas {canvas:?}")]
+    InvalidFrameEffectRegion {
+        /// Stable effect family name.
+        effect: &'static str,
+        /// Rejected canvas-coordinate region.
+        region: gif_from_screen_domain::PhysicalRect,
+        /// Current project canvas dimensions.
+        canvas: gif_from_screen_domain::PhysicalSize,
+    },
+    /// A numeric frame-effect parameter is outside its supported range.
+    #[error("invalid {effect} {parameter}={value}; maximum is {maximum}")]
+    InvalidFrameEffectParameter {
+        /// Stable effect family name.
+        effect: &'static str,
+        /// Stable parameter name.
+        parameter: &'static str,
+        /// Rejected value.
+        value: u64,
+        /// Largest supported value.
+        maximum: u64,
+    },
+    /// Border edge widths are empty or overlap beyond the project canvas.
+    #[error("border widths {widths:?} are invalid for project canvas {canvas:?}")]
+    InvalidBorderWidths {
+        /// Rejected edge widths.
+        widths: gif_from_screen_domain::EdgeWidths,
+        /// Current project canvas dimensions.
+        canvas: gif_from_screen_domain::PhysicalSize,
+    },
+    /// A visible effect was given a fully transparent color.
+    #[error("{effect} color {color:?} is fully transparent")]
+    InvisibleFrameEffectColor {
+        /// Stable effect family name.
+        effect: &'static str,
+        /// Rejected color.
+        color: gif_from_screen_domain::Rgba,
+    },
+    /// One selected frame has no effect at the requested replacement index.
+    #[error(
+        "frame {frame_id} has {effect_count} effects, so effect index {index} cannot be replaced"
+    )]
+    EffectIndexOutOfBounds {
+        /// Selected frame with a shorter effect list.
+        frame_id: FrameId,
+        /// Requested zero-based effect index.
+        index: usize,
+        /// Number of effects currently on that frame.
+        effect_count: usize,
+    },
+    /// The effect is persisted by the domain but not supported by the current renderer/editor.
+    #[error("frame effect {0} is not supported by the editor")]
+    UnsupportedFrameEffect(&'static str),
     /// There are no frames before the selected range.
     #[error("there are no frames before the selection")]
     NoFramesBeforeSelection,

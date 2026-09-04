@@ -6,15 +6,15 @@
 use std::{collections::BTreeSet, path::Path};
 
 use gif_from_screen_domain::{
-    DurationUs, EditCommand, FrameId, PhysicalRect, PhysicalSize, ProjectManifest, TimeUs,
+    DurationUs, EditCommand, Effect, FrameId, PhysicalRect, PhysicalSize, ProjectManifest, TimeUs,
 };
 use gif_from_screen_editor::{
     ClipTransformEdit, DuplicateDelayMode, DuplicateFrameRetention, EditorError, FrameComparison,
-    FrameSimilarityProvider, FrameTimeRangeError, ReduceDelayMode, ReduceOptions,
+    FrameEffectEdit, FrameSimilarityProvider, FrameTimeRangeError, ReduceDelayMode, ReduceOptions,
     RemoveDuplicateFramesOptions, TimelineSelection, TimelineSelectionError, YoyoOptions,
     YoyoScope, adjust_duration, delete_frames, delete_frames_after, delete_frames_before,
-    edit_clip_transforms, move_selected_left, move_selected_right, override_duration,
-    reduce_frames, remove_duplicate_frames, reverse_selected, scale_duration,
+    edit_clip_transforms, edit_frame_effects, move_selected_left, move_selected_right,
+    override_duration, reduce_frames, remove_duplicate_frames, reverse_selected, scale_duration,
     select_frames_by_time_range, yoyo_frames,
 };
 use gif_from_screen_project::{
@@ -472,6 +472,28 @@ impl EditorWorkspace {
         self.execute(command)
     }
 
+    /// Appends one validated effect to every selected frame.
+    pub(crate) fn add_selection_effect(
+        &mut self,
+        effect: Effect,
+    ) -> Result<(), EditorWorkspaceError> {
+        self.execute_selection_effect(&FrameEffectEdit::Add(effect))
+    }
+
+    /// Replaces one zero-based effect position on every selected frame.
+    pub(crate) fn replace_selection_effect(
+        &mut self,
+        index: usize,
+        effect: Effect,
+    ) -> Result<(), EditorWorkspaceError> {
+        self.execute_selection_effect(&FrameEffectEdit::Replace { index, effect })
+    }
+
+    /// Clears all effects from every selected frame.
+    pub(crate) fn clear_selection_effects(&mut self) -> Result<(), EditorWorkspaceError> {
+        self.execute_selection_effect(&FrameEffectEdit::Clear)
+    }
+
     /// Sets one source-coordinate crop on every selected frame.
     pub(crate) fn set_selection_crop(
         &mut self,
@@ -596,6 +618,15 @@ impl EditorWorkspace {
             });
         }
         Ok(frame_ids)
+    }
+
+    fn execute_selection_effect(
+        &mut self,
+        edit: &FrameEffectEdit,
+    ) -> Result<(), EditorWorkspaceError> {
+        let selected = self.selected_frame_ids()?;
+        let command = edit_frame_effects(self.project.manifest(), selected, edit)?;
+        self.execute(command)
     }
 }
 
@@ -1472,5 +1503,76 @@ mod tests {
         ));
         assert!(!workspace.is_dirty());
         assert!(!workspace.can_undo());
+    }
+
+    #[test]
+    fn frame_effects_update_final_render_and_persist_with_single_step_undo() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = create_rendered_duplicate_workspace(&directory);
+        let frame_id = frame_id(1);
+        workspace.select_only(frame_id).unwrap();
+        let before = render_frame_surface(
+            workspace.active_project(),
+            frame_id,
+            DUPLICATE_RENDER_SURFACE_LIMIT_BYTES,
+        )
+        .unwrap();
+
+        workspace
+            .add_selection_effect(Effect::Darken {
+                region: PhysicalRect::new(0, 0, 2, 1).unwrap(),
+                amount_percent: 100,
+            })
+            .unwrap();
+        let darkened = render_frame_surface(
+            workspace.active_project(),
+            frame_id,
+            DUPLICATE_RENDER_SURFACE_LIMIT_BYTES,
+        )
+        .unwrap();
+        assert_eq!(&darkened.pixels()[..4], &[0, 0, 0, 255]);
+        assert!(workspace.undo().unwrap());
+        let restored = render_frame_surface(
+            workspace.active_project(),
+            frame_id,
+            DUPLICATE_RENDER_SURFACE_LIMIT_BYTES,
+        )
+        .unwrap();
+        assert_eq!(restored, before);
+        assert!(workspace.redo().unwrap());
+
+        workspace
+            .replace_selection_effect(
+                0,
+                Effect::Lighten {
+                    region: PhysicalRect::new(0, 0, 2, 1).unwrap(),
+                    amount_percent: 100,
+                },
+            )
+            .unwrap();
+        let lightened = render_frame_surface(
+            workspace.active_project(),
+            frame_id,
+            DUPLICATE_RENDER_SURFACE_LIMIT_BYTES,
+        )
+        .unwrap();
+        assert_eq!(&lightened.pixels()[..4], &[255, 255, 255, 255]);
+
+        workspace.clear_selection_effects().unwrap();
+        assert!(workspace.manifest().timeline.frames[0].effects.is_empty());
+        assert!(workspace.undo().unwrap());
+        assert_eq!(workspace.manifest().timeline.frames[0].effects.len(), 1);
+        drop(workspace);
+
+        let reopened =
+            EditorWorkspace::open(directory.path(), LockPolicy::FailIfPresent, 16).unwrap();
+        assert_eq!(reopened.manifest().timeline.frames[0].effects.len(), 1);
+        let reopened_render = render_frame_surface(
+            reopened.active_project(),
+            frame_id,
+            DUPLICATE_RENDER_SURFACE_LIMIT_BYTES,
+        )
+        .unwrap();
+        assert_eq!(&reopened_render.pixels()[..4], &[255, 255, 255, 255]);
     }
 }

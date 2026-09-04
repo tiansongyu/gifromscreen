@@ -11,10 +11,12 @@ use std::{
 };
 
 use eframe::egui;
-use gif_from_screen_domain::{DurationUs, FrameId, PhysicalRect, PhysicalSize, TimeUs};
+use gif_from_screen_domain::{
+    DurationUs, EdgeWidths, Effect, FrameId, PhysicalRect, PhysicalSize, Rgba, TimeUs,
+};
 use gif_from_screen_editor::{
-    DuplicateDelayMode, DuplicateFrameRetention, ReduceDelayMode, VirtualFilmstripError,
-    VirtualFilmstripLayout, YoyoScope, parse_frame_expression,
+    DuplicateDelayMode, DuplicateFrameRetention, MAX_FRAME_EFFECT_BLUR_RADIUS, ReduceDelayMode,
+    VirtualFilmstripError, VirtualFilmstripLayout, YoyoScope, parse_frame_expression,
 };
 
 use crate::editor_workspace::{EditorWorkspace, EditorWorkspaceError};
@@ -23,6 +25,17 @@ const FILMSTRIP_ITEM_WIDTH: f64 = 112.0;
 const FILMSTRIP_ITEM_GAP: f64 = 8.0;
 const FILMSTRIP_ITEM_HEIGHT: f32 = 78.0;
 const FILMSTRIP_OVERSCAN: usize = 3;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum EffectChoice {
+    #[default]
+    Blur,
+    Pixelate,
+    Darken,
+    Lighten,
+    Border,
+    Shadow,
+}
 
 /// Ephemeral editor controls and playback state retained between egui frames.
 #[derive(Debug)]
@@ -53,6 +66,28 @@ pub(crate) struct EditorUiState {
     pub(crate) duplicate_retention: DuplicateFrameRetention,
     /// How duplicate-run delay is assigned to its survivor.
     pub(crate) duplicate_delay_mode: DuplicateDelayMode,
+    /// Effect family currently configured by the effect controls.
+    pub(crate) effect_choice: EffectChoice,
+    /// One-based effect position used by Replace.
+    pub(crate) effect_index_input: String,
+    pub(crate) effect_region_x_input: String,
+    pub(crate) effect_region_y_input: String,
+    pub(crate) effect_region_width_input: String,
+    pub(crate) effect_region_height_input: String,
+    pub(crate) effect_blur_radius_input: String,
+    pub(crate) effect_pixel_block_input: String,
+    pub(crate) effect_tone_percent_input: String,
+    pub(crate) effect_border_top_input: String,
+    pub(crate) effect_border_right_input: String,
+    pub(crate) effect_border_bottom_input: String,
+    pub(crate) effect_border_left_input: String,
+    pub(crate) effect_shadow_offset_x_input: String,
+    pub(crate) effect_shadow_offset_y_input: String,
+    pub(crate) effect_shadow_blur_input: String,
+    pub(crate) effect_color_red_input: String,
+    pub(crate) effect_color_green_input: String,
+    pub(crate) effect_color_blue_input: String,
+    pub(crate) effect_color_alpha_input: String,
     /// Comma/range expression used to replace the current frame selection.
     pub(crate) frame_expression: String,
     /// Source-coordinate crop X input in physical pixels.
@@ -89,6 +124,26 @@ impl Default for EditorUiState {
             duplicate_threshold_input: "100".into(),
             duplicate_retention: DuplicateFrameRetention::First,
             duplicate_delay_mode: DuplicateDelayMode::Sum,
+            effect_choice: EffectChoice::Blur,
+            effect_index_input: "1".into(),
+            effect_region_x_input: "0".into(),
+            effect_region_y_input: "0".into(),
+            effect_region_width_input: "1".into(),
+            effect_region_height_input: "1".into(),
+            effect_blur_radius_input: "2".into(),
+            effect_pixel_block_input: "8".into(),
+            effect_tone_percent_input: "25".into(),
+            effect_border_top_input: "1".into(),
+            effect_border_right_input: "1".into(),
+            effect_border_bottom_input: "1".into(),
+            effect_border_left_input: "1".into(),
+            effect_shadow_offset_x_input: "4".into(),
+            effect_shadow_offset_y_input: "4".into(),
+            effect_shadow_blur_input: "4".into(),
+            effect_color_red_input: "0".into(),
+            effect_color_green_input: "0".into(),
+            effect_color_blue_input: "0".into(),
+            effect_color_alpha_input: "255".into(),
             frame_expression: "1".into(),
             crop_x_input: "0".into(),
             crop_y_input: "0".into(),
@@ -165,6 +220,9 @@ pub(crate) enum EditorUiOperation {
     ReduceFrames,
     Yoyo,
     RemoveDuplicates,
+    AddEffect,
+    ReplaceEffect,
+    ClearEffects,
     ApplyCrop,
     ClearCrop,
     Resize,
@@ -216,6 +274,7 @@ pub(crate) fn show_editor_ui(
     show_edit_toolbar(ui, workspace, state, now, &mut results);
     show_advanced_timing_toolbar(ui, workspace, state, now, &mut results);
     show_transform_toolbar(ui, workspace, state, now, &mut results);
+    show_effect_toolbar(ui, workspace, state, now, &mut results);
     ui.separator();
     show_virtual_filmstrip(ui, workspace, state, now, &mut results);
 
@@ -1010,6 +1069,266 @@ fn parse_output_size(state: &EditorUiState) -> Result<PhysicalSize, String> {
     PhysicalSize::new(width, height).map_err(|error| format!("invalid resize: {error}"))
 }
 
+fn show_effect_toolbar(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    now: Instant,
+    results: &mut Vec<EditorUiResult>,
+) {
+    ui.group(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Frame effects");
+            egui::ComboBox::from_id_salt("frame_effect_choice")
+                .selected_text(effect_choice_label(state.effect_choice))
+                .show_ui(ui, |ui| {
+                    for choice in [
+                        EffectChoice::Blur,
+                        EffectChoice::Pixelate,
+                        EffectChoice::Darken,
+                        EffectChoice::Lighten,
+                        EffectChoice::Border,
+                        EffectChoice::Shadow,
+                    ] {
+                        ui.selectable_value(
+                            &mut state.effect_choice,
+                            choice,
+                            effect_choice_label(choice),
+                        );
+                    }
+                });
+            ui.label("Replace #");
+            compact_input(ui, &mut state.effect_index_input);
+        });
+        show_effect_inputs(ui, state);
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Add effect").clicked() {
+                match build_effect(state) {
+                    Ok(effect) => {
+                        let result = workspace.add_selection_effect(effect);
+                        record_project_result(
+                            workspace,
+                            state,
+                            now,
+                            results,
+                            EditorUiOperation::AddEffect,
+                            result,
+                        );
+                    }
+                    Err(message) => push_failure(results, EditorUiOperation::AddEffect, message),
+                }
+            }
+            if ui.button("Replace effect").clicked() {
+                match parse_effect_index(state)
+                    .and_then(|index| build_effect(state).map(|effect| (index, effect)))
+                {
+                    Ok((index, effect)) => {
+                        let result = workspace.replace_selection_effect(index, effect);
+                        record_project_result(
+                            workspace,
+                            state,
+                            now,
+                            results,
+                            EditorUiOperation::ReplaceEffect,
+                            result,
+                        );
+                    }
+                    Err(message) => {
+                        push_failure(results, EditorUiOperation::ReplaceEffect, message);
+                    }
+                }
+            }
+            if ui.button("Clear selected effects").clicked() {
+                let result = workspace.clear_selection_effects();
+                record_project_result(
+                    workspace,
+                    state,
+                    now,
+                    results,
+                    EditorUiOperation::ClearEffects,
+                    result,
+                );
+            }
+        });
+    });
+}
+
+fn show_effect_inputs(ui: &mut egui::Ui, state: &mut EditorUiState) {
+    match state.effect_choice {
+        EffectChoice::Blur
+        | EffectChoice::Pixelate
+        | EffectChoice::Darken
+        | EffectChoice::Lighten => {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Canvas region X/Y/W/H");
+                compact_input(ui, &mut state.effect_region_x_input);
+                compact_input(ui, &mut state.effect_region_y_input);
+                compact_input(ui, &mut state.effect_region_width_input);
+                compact_input(ui, &mut state.effect_region_height_input);
+                match state.effect_choice {
+                    EffectChoice::Blur => {
+                        ui.label("Radius");
+                        compact_input(ui, &mut state.effect_blur_radius_input);
+                    }
+                    EffectChoice::Pixelate => {
+                        ui.label("Block");
+                        compact_input(ui, &mut state.effect_pixel_block_input);
+                    }
+                    EffectChoice::Darken | EffectChoice::Lighten => {
+                        ui.label("Percent");
+                        compact_input(ui, &mut state.effect_tone_percent_input);
+                    }
+                    EffectChoice::Border | EffectChoice::Shadow => {}
+                }
+            });
+        }
+        EffectChoice::Border => {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Edges T/R/B/L");
+                compact_input(ui, &mut state.effect_border_top_input);
+                compact_input(ui, &mut state.effect_border_right_input);
+                compact_input(ui, &mut state.effect_border_bottom_input);
+                compact_input(ui, &mut state.effect_border_left_input);
+                show_effect_color_inputs(ui, state);
+            });
+        }
+        EffectChoice::Shadow => {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Offset X/Y");
+                compact_input(ui, &mut state.effect_shadow_offset_x_input);
+                compact_input(ui, &mut state.effect_shadow_offset_y_input);
+                ui.label("Blur");
+                compact_input(ui, &mut state.effect_shadow_blur_input);
+                show_effect_color_inputs(ui, state);
+            });
+        }
+    }
+}
+
+fn show_effect_color_inputs(ui: &mut egui::Ui, state: &mut EditorUiState) {
+    ui.label("RGBA");
+    compact_input(ui, &mut state.effect_color_red_input);
+    compact_input(ui, &mut state.effect_color_green_input);
+    compact_input(ui, &mut state.effect_color_blue_input);
+    compact_input(ui, &mut state.effect_color_alpha_input);
+}
+
+const fn effect_choice_label(choice: EffectChoice) -> &'static str {
+    match choice {
+        EffectChoice::Blur => "Blur",
+        EffectChoice::Pixelate => "Pixelate",
+        EffectChoice::Darken => "Darken",
+        EffectChoice::Lighten => "Lighten",
+        EffectChoice::Border => "Border",
+        EffectChoice::Shadow => "Shadow",
+    }
+}
+
+fn build_effect(state: &EditorUiState) -> Result<Effect, String> {
+    match state.effect_choice {
+        EffectChoice::Blur => {
+            let radius = parse_input::<u16>(&state.effect_blur_radius_input, "blur radius")?;
+            if !(1..=MAX_FRAME_EFFECT_BLUR_RADIUS).contains(&radius) {
+                return Err(format!(
+                    "blur radius must be between 1 and {MAX_FRAME_EFFECT_BLUR_RADIUS}"
+                ));
+            }
+            Ok(Effect::Blur {
+                region: parse_effect_region(state)?,
+                radius,
+            })
+        }
+        EffectChoice::Pixelate => {
+            let block_size =
+                parse_input::<u16>(&state.effect_pixel_block_input, "pixel block size")?;
+            if block_size == 0 {
+                return Err("pixel block size must be positive".to_owned());
+            }
+            Ok(Effect::Pixelate {
+                region: parse_effect_region(state)?,
+                block_size,
+            })
+        }
+        EffectChoice::Darken | EffectChoice::Lighten => {
+            let amount_percent =
+                parse_input::<u8>(&state.effect_tone_percent_input, "tone percentage")?;
+            if amount_percent > 100 {
+                return Err("tone percentage must be between 0 and 100".to_owned());
+            }
+            let region = parse_effect_region(state)?;
+            if state.effect_choice == EffectChoice::Darken {
+                Ok(Effect::Darken {
+                    region,
+                    amount_percent,
+                })
+            } else {
+                Ok(Effect::Lighten {
+                    region,
+                    amount_percent,
+                })
+            }
+        }
+        EffectChoice::Border => {
+            let widths = EdgeWidths {
+                top: parse_input::<u16>(&state.effect_border_top_input, "border top")?,
+                right: parse_input::<u16>(&state.effect_border_right_input, "border right")?,
+                bottom: parse_input::<u16>(&state.effect_border_bottom_input, "border bottom")?,
+                left: parse_input::<u16>(&state.effect_border_left_input, "border left")?,
+            };
+            if widths == EdgeWidths::default() {
+                return Err("at least one border edge must be positive".to_owned());
+            }
+            Ok(Effect::Border {
+                widths,
+                color: parse_effect_color(state)?,
+            })
+        }
+        EffectChoice::Shadow => {
+            let blur_radius =
+                parse_input::<u16>(&state.effect_shadow_blur_input, "shadow blur radius")?;
+            if blur_radius > MAX_FRAME_EFFECT_BLUR_RADIUS {
+                return Err(format!(
+                    "shadow blur radius must be at most {MAX_FRAME_EFFECT_BLUR_RADIUS}"
+                ));
+            }
+            Ok(Effect::Shadow {
+                offset_x: parse_input::<i32>(&state.effect_shadow_offset_x_input, "shadow X")?,
+                offset_y: parse_input::<i32>(&state.effect_shadow_offset_y_input, "shadow Y")?,
+                blur_radius,
+                color: parse_effect_color(state)?,
+            })
+        }
+    }
+}
+
+fn parse_effect_region(state: &EditorUiState) -> Result<PhysicalRect, String> {
+    let x = parse_input::<u32>(&state.effect_region_x_input, "effect region X")?;
+    let y = parse_input::<u32>(&state.effect_region_y_input, "effect region Y")?;
+    let width = parse_input::<u32>(&state.effect_region_width_input, "effect region width")?;
+    let height = parse_input::<u32>(&state.effect_region_height_input, "effect region height")?;
+    PhysicalRect::new(x, y, width, height)
+        .map_err(|error| format!("invalid effect region: {error}"))
+}
+
+fn parse_effect_color(state: &EditorUiState) -> Result<Rgba, String> {
+    let color = Rgba {
+        red: parse_input::<u8>(&state.effect_color_red_input, "effect red")?,
+        green: parse_input::<u8>(&state.effect_color_green_input, "effect green")?,
+        blue: parse_input::<u8>(&state.effect_color_blue_input, "effect blue")?,
+        alpha: parse_input::<u8>(&state.effect_color_alpha_input, "effect alpha")?,
+    };
+    if color.alpha == 0 {
+        return Err("effect color alpha must be positive".to_owned());
+    }
+    Ok(color)
+}
+
+fn parse_effect_index(state: &EditorUiState) -> Result<usize, String> {
+    parse_input::<usize>(&state.effect_index_input, "effect number")?
+        .checked_sub(1)
+        .ok_or_else(|| "effect number is 1-based and must be positive".to_owned())
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "virtual range calculation and its only widget loop are intentionally co-located"
@@ -1461,15 +1780,16 @@ fn schedule_playback_repaint(context: &egui::Context, state: &EditorUiState, now
 mod tests {
     use std::time::{Duration, Instant};
 
-    use gif_from_screen_domain::{DurationUs, FrameId, PhysicalRect, PhysicalSize, TimeUs};
+    use gif_from_screen_domain::{DurationUs, Effect, FrameId, PhysicalRect, PhysicalSize, TimeUs};
     use gif_from_screen_editor::{
         DuplicateDelayMode, DuplicateFrameRetention, ReduceDelayMode, YoyoScope,
     };
 
     use super::{
-        EditorUiOperation, EditorUiState, FILMSTRIP_ITEM_WIDTH, OrientationControl, PlaybackClock,
-        duplicate_delay_label, duplicate_retention_label, frame_click_operation,
-        orientation_operation, parse_crop, parse_duration_us, parse_keep_every, parse_output_size,
+        EditorUiOperation, EditorUiState, EffectChoice, FILMSTRIP_ITEM_WIDTH, OrientationControl,
+        PlaybackClock, build_effect, duplicate_delay_label, duplicate_retention_label,
+        effect_choice_label, frame_click_operation, orientation_operation, parse_crop,
+        parse_duration_us, parse_effect_index, parse_keep_every, parse_output_size,
         parse_similarity_threshold, parse_time_ms, parse_time_range, reduce_delay_label,
         to_ui_points, visible_widget_range, yoyo_scope_label,
     };
@@ -1490,6 +1810,13 @@ mod tests {
         assert_eq!(state.duplicate_threshold_input, "100");
         assert_eq!(state.duplicate_retention, DuplicateFrameRetention::First);
         assert_eq!(state.duplicate_delay_mode, DuplicateDelayMode::Sum);
+        assert_eq!(state.effect_choice, EffectChoice::Blur);
+        assert_eq!(state.effect_index_input, "1");
+        assert_eq!(state.effect_region_x_input, "0");
+        assert_eq!(state.effect_region_y_input, "0");
+        assert_eq!(state.effect_region_width_input, "1");
+        assert_eq!(state.effect_region_height_input, "1");
+        assert_eq!(state.effect_color_alpha_input, "255");
         assert_eq!(state.frame_expression, "1");
         assert_eq!(state.crop_x_input, "0");
         assert_eq!(state.crop_y_input, "0");
@@ -1585,6 +1912,71 @@ mod tests {
         ] {
             assert!(!duplicate_delay_label(mode).is_empty());
         }
+    }
+
+    #[test]
+    fn every_effect_family_builds_from_typed_default_inputs() {
+        let mut state = EditorUiState::default();
+        for choice in [
+            EffectChoice::Blur,
+            EffectChoice::Pixelate,
+            EffectChoice::Darken,
+            EffectChoice::Lighten,
+            EffectChoice::Border,
+            EffectChoice::Shadow,
+        ] {
+            state.effect_choice = choice;
+            let effect = build_effect(&state).unwrap();
+            assert!(!effect_choice_label(choice).is_empty());
+            assert!(matches!(
+                (choice, effect),
+                (EffectChoice::Blur, Effect::Blur { .. })
+                    | (EffectChoice::Pixelate, Effect::Pixelate { .. })
+                    | (EffectChoice::Darken, Effect::Darken { .. })
+                    | (EffectChoice::Lighten, Effect::Lighten { .. })
+                    | (EffectChoice::Border, Effect::Border { .. })
+                    | (EffectChoice::Shadow, Effect::Shadow { .. })
+            ));
+        }
+        assert_eq!(parse_effect_index(&state).unwrap(), 0);
+    }
+
+    #[test]
+    fn effect_inputs_reject_invalid_ranges_parameters_colors_and_indices() {
+        let mut state = EditorUiState {
+            effect_choice: EffectChoice::Blur,
+            effect_blur_radius_input: "0".to_owned(),
+            ..EditorUiState::default()
+        };
+        assert!(build_effect(&state).is_err());
+        state.effect_blur_radius_input = "257".to_owned();
+        assert!(build_effect(&state).is_err());
+        state.effect_blur_radius_input = "2".to_owned();
+        state.effect_region_width_input = "0".to_owned();
+        assert!(build_effect(&state).is_err());
+
+        state = EditorUiState {
+            effect_choice: EffectChoice::Pixelate,
+            effect_pixel_block_input: "0".to_owned(),
+            ..EditorUiState::default()
+        };
+        assert!(build_effect(&state).is_err());
+        state.effect_choice = EffectChoice::Darken;
+        state.effect_tone_percent_input = "101".to_owned();
+        assert!(build_effect(&state).is_err());
+        state.effect_choice = EffectChoice::Border;
+        state.effect_border_top_input = "0".to_owned();
+        state.effect_border_right_input = "0".to_owned();
+        state.effect_border_bottom_input = "0".to_owned();
+        state.effect_border_left_input = "0".to_owned();
+        assert!(build_effect(&state).is_err());
+        state.effect_border_top_input = "1".to_owned();
+        state.effect_color_alpha_input = "0".to_owned();
+        assert!(build_effect(&state).is_err());
+        state.effect_color_alpha_input = "256".to_owned();
+        assert!(build_effect(&state).is_err());
+        state.effect_index_input = "0".to_owned();
+        assert!(parse_effect_index(&state).is_err());
     }
 
     #[test]
