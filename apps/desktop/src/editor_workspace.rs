@@ -9,15 +9,17 @@ use gif_from_screen_domain::{
     DurationUs, EditCommand, FrameId, PhysicalRect, PhysicalSize, ProjectManifest, TimeUs,
 };
 use gif_from_screen_editor::{
-    ClipTransformEdit, EditorError, FrameTimeRangeError, TimelineSelection, TimelineSelectionError,
-    adjust_duration, delete_frames, delete_frames_after, delete_frames_before,
-    edit_clip_transforms, move_selected_left, move_selected_right, override_duration,
-    reverse_selected, scale_duration, select_frames_by_time_range,
+    ClipTransformEdit, EditorError, FrameTimeRangeError, ReduceDelayMode, ReduceOptions,
+    TimelineSelection, TimelineSelectionError, YoyoOptions, YoyoScope, adjust_duration,
+    delete_frames, delete_frames_after, delete_frames_before, edit_clip_transforms,
+    move_selected_left, move_selected_right, override_duration, reduce_frames, reverse_selected,
+    scale_duration, select_frames_by_time_range, yoyo_frames,
 };
 use gif_from_screen_project::{
     ActiveProject, AssetIssue, JournalRecoveryReport, LockPolicy, OpenedProject, ProjectError,
 };
 use thiserror::Error;
+use uuid::Uuid;
 
 /// Durable editor state owned by the desktop application.
 ///
@@ -381,6 +383,48 @@ impl EditorWorkspace {
     ) -> Result<(), EditorWorkspaceError> {
         let selected = self.selected_frame_ids()?;
         let command = scale_duration(self.project.manifest(), selected, percent)?;
+        self.execute(command)
+    }
+
+    /// Reduces a consecutive selection using a fixed interval and explicit delay policy.
+    pub(crate) fn reduce_selection(
+        &mut self,
+        keep_every: usize,
+        delay_mode: ReduceDelayMode,
+    ) -> Result<(), EditorWorkspaceError> {
+        let selected = self.selected_frame_ids()?;
+        let command = reduce_frames(
+            self.project.manifest(),
+            selected,
+            ReduceOptions {
+                keep_every,
+                delay_mode,
+            },
+        )?;
+        self.execute(command)
+    }
+
+    /// Appends a reversed clone leg for the selected range or complete timeline.
+    pub(crate) fn yoyo(
+        &mut self,
+        scope: YoyoScope,
+        repeat_endpoints: bool,
+    ) -> Result<(), EditorWorkspaceError> {
+        let selected = self
+            .selection
+            .selected()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let command = yoyo_frames(
+            self.project.manifest(),
+            selected,
+            YoyoOptions {
+                repeat_endpoints,
+                scope,
+            },
+            || FrameId::from_u128(Uuid::new_v4().as_u128()),
+        )?;
         self.execute(command)
     }
 
@@ -1093,5 +1137,84 @@ mod tests {
         assert_eq!(workspace.selection(), &selection_before);
         assert_eq!(workspace.manifest().revision, revision_before);
         assert!(!workspace.can_undo());
+    }
+
+    #[test]
+    fn all_reduce_delay_modes_are_single_undoable_persistent_edits() {
+        let cases = [
+            (ReduceDelayMode::DontAdjust, vec![10, 30, 50]),
+            (ReduceDelayMode::Previous, vec![30, 70, 50]),
+            (ReduceDelayMode::Evenly, vec![30, 50, 70]),
+        ];
+        for (mode, expected_durations) in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let mut workspace = create_workspace(&directory, &[10, 20, 30, 40, 50], 8);
+            workspace.select_all();
+
+            workspace.reduce_selection(2, mode).unwrap();
+            assert_eq!(order(&workspace), [1, 3, 5]);
+            assert_eq!(durations(&workspace), expected_durations);
+            assert!(workspace.undo().unwrap());
+            assert_eq!(order(&workspace), [1, 2, 3, 4, 5]);
+            assert!(!workspace.undo().unwrap());
+            assert!(workspace.redo().unwrap());
+            assert_eq!(order(&workspace), [1, 3, 5]);
+            drop(workspace);
+
+            let reopened =
+                EditorWorkspace::open(directory.path(), LockPolicy::FailIfPresent, 8).unwrap();
+            assert_eq!(order(&reopened), [1, 3, 5]);
+            assert_eq!(durations(&reopened), expected_durations);
+        }
+    }
+
+    #[test]
+    fn yoyo_selection_and_entire_timeline_are_journaled_and_reversible() {
+        let selection_directory = tempfile::tempdir().unwrap();
+        let mut workspace = create_workspace(&selection_directory, &[10, 20, 30, 40], 8);
+        workspace.select_only(frame_id(2)).unwrap();
+        workspace.toggle_selection(frame_id(3)).unwrap();
+
+        workspace.yoyo(YoyoScope::Selection, true).unwrap();
+        assert_eq!(workspace.manifest().timeline.frames.len(), 6);
+        let frames = &workspace.manifest().timeline.frames;
+        assert_eq!(frames[3].asset_id, frames[2].asset_id);
+        assert_eq!(frames[3].duration, frames[2].duration);
+        assert_eq!(frames[4].asset_id, frames[1].asset_id);
+        assert_eq!(frames[4].duration, frames[1].duration);
+        assert_ne!(frames[3].id, frames[2].id);
+        assert_ne!(frames[4].id, frames[1].id);
+        assert!(workspace.undo().unwrap());
+        assert_eq!(workspace.manifest().timeline.frames.len(), 4);
+        assert!(workspace.redo().unwrap());
+        assert_eq!(workspace.manifest().timeline.frames.len(), 6);
+        drop(workspace);
+        let reopened =
+            EditorWorkspace::open(selection_directory.path(), LockPolicy::FailIfPresent, 8)
+                .unwrap();
+        assert_eq!(reopened.manifest().timeline.frames.len(), 6);
+
+        let entire_directory = tempfile::tempdir().unwrap();
+        let mut entire = create_workspace(&entire_directory, &[10, 20, 30, 40], 8);
+        assert!(entire.selection().is_empty());
+        entire.yoyo(YoyoScope::EntireTimeline, false).unwrap();
+        assert_eq!(entire.manifest().timeline.frames.len(), 6);
+        assert_eq!(entire.manifest().timeline.frames[4].duration.get(), 30);
+        assert_eq!(entire.manifest().timeline.frames[5].duration.get(), 20);
+    }
+
+    #[test]
+    fn duration_adjust_and_scale_remain_journal_backed_with_undo() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = create_workspace(&directory, &[100], 8);
+        workspace.select_only(frame_id(1)).unwrap();
+
+        workspace.adjust_selection_duration(20).unwrap();
+        workspace.scale_selection_duration(50).unwrap();
+        assert_eq!(durations(&workspace), [60]);
+        assert!(workspace.undo().unwrap());
+        assert_eq!(durations(&workspace), [120]);
+        assert!(workspace.undo().unwrap());
+        assert_eq!(durations(&workspace), [100]);
     }
 }

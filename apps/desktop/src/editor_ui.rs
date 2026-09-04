@@ -13,7 +13,8 @@ use std::{
 use eframe::egui;
 use gif_from_screen_domain::{DurationUs, FrameId, PhysicalRect, PhysicalSize, TimeUs};
 use gif_from_screen_editor::{
-    VirtualFilmstripError, VirtualFilmstripLayout, parse_frame_expression,
+    ReduceDelayMode, VirtualFilmstripError, VirtualFilmstripLayout, YoyoScope,
+    parse_frame_expression,
 };
 
 use crate::editor_workspace::{EditorWorkspace, EditorWorkspaceError};
@@ -38,6 +39,14 @@ pub(crate) struct EditorUiState {
     pub(crate) duration_us_input: String,
     /// Positive percentage input used to scale selected frame delays.
     pub(crate) percentage_input: String,
+    /// Retain-every-N interval for frame reduction.
+    pub(crate) reduce_keep_every_input: String,
+    /// Delay redistribution policy for frame reduction.
+    pub(crate) reduce_delay_mode: ReduceDelayMode,
+    /// Source range used by the Yoyo operation.
+    pub(crate) yoyo_scope: YoyoScope,
+    /// Whether Yoyo clones both source endpoints onto its reverse leg.
+    pub(crate) yoyo_repeat_endpoints: bool,
     /// Comma/range expression used to replace the current frame selection.
     pub(crate) frame_expression: String,
     /// Source-coordinate crop X input in physical pixels.
@@ -67,6 +76,10 @@ impl Default for EditorUiState {
             time_range_end_ms_input: "1000".into(),
             duration_us_input: "100000".into(),
             percentage_input: "100".into(),
+            reduce_keep_every_input: "2".into(),
+            reduce_delay_mode: ReduceDelayMode::DontAdjust,
+            yoyo_scope: YoyoScope::Selection,
+            yoyo_repeat_endpoints: false,
             frame_expression: "1".into(),
             crop_x_input: "0".into(),
             crop_y_input: "0".into(),
@@ -140,6 +153,8 @@ pub(crate) enum EditorUiOperation {
     OverrideDuration,
     AdjustDuration,
     ScaleDuration,
+    ReduceFrames,
+    Yoyo,
     ApplyCrop,
     ClearCrop,
     Resize,
@@ -189,6 +204,7 @@ pub(crate) fn show_editor_ui(
     show_selection_toolbar(ui, workspace, state, now, &mut results);
     show_time_range_toolbar(ui, workspace, state, now, &mut results);
     show_edit_toolbar(ui, workspace, state, now, &mut results);
+    show_advanced_timing_toolbar(ui, workspace, state, now, &mut results);
     show_transform_toolbar(ui, workspace, state, now, &mut results);
     ui.separator();
     show_virtual_filmstrip(ui, workspace, state, now, &mut results);
@@ -626,6 +642,104 @@ fn show_edit_toolbar(
             }
         }
     });
+}
+
+fn show_advanced_timing_toolbar(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    now: Instant,
+    results: &mut Vec<EditorUiResult>,
+) {
+    ui.group(|ui| {
+        ui.strong("Advanced timing");
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Reduce: keep every");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.reduce_keep_every_input).desired_width(54.0),
+            );
+            egui::ComboBox::from_id_salt("reduce_delay_mode")
+                .selected_text(reduce_delay_label(state.reduce_delay_mode))
+                .show_ui(ui, |ui| {
+                    for mode in [
+                        ReduceDelayMode::DontAdjust,
+                        ReduceDelayMode::Previous,
+                        ReduceDelayMode::Evenly,
+                    ] {
+                        ui.selectable_value(
+                            &mut state.reduce_delay_mode,
+                            mode,
+                            reduce_delay_label(mode),
+                        );
+                    }
+                });
+            if ui.button("Reduce frames").clicked() {
+                match parse_keep_every(&state.reduce_keep_every_input) {
+                    Ok(keep_every) => {
+                        let result =
+                            workspace.reduce_selection(keep_every, state.reduce_delay_mode);
+                        record_project_result(
+                            workspace,
+                            state,
+                            now,
+                            results,
+                            EditorUiOperation::ReduceFrames,
+                            result,
+                        );
+                    }
+                    Err(message) => {
+                        push_failure(results, EditorUiOperation::ReduceFrames, message);
+                    }
+                }
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Yoyo source");
+            egui::ComboBox::from_id_salt("yoyo_scope")
+                .selected_text(yoyo_scope_label(state.yoyo_scope))
+                .show_ui(ui, |ui| {
+                    for scope in [YoyoScope::Selection, YoyoScope::EntireTimeline] {
+                        ui.selectable_value(&mut state.yoyo_scope, scope, yoyo_scope_label(scope));
+                    }
+                });
+            ui.checkbox(&mut state.yoyo_repeat_endpoints, "Repeat endpoints");
+            if ui.button("Create Yoyo").clicked() {
+                let result = workspace.yoyo(state.yoyo_scope, state.yoyo_repeat_endpoints);
+                record_project_result(
+                    workspace,
+                    state,
+                    now,
+                    results,
+                    EditorUiOperation::Yoyo,
+                    result,
+                );
+            }
+        });
+    });
+}
+
+const fn reduce_delay_label(mode: ReduceDelayMode) -> &'static str {
+    match mode {
+        ReduceDelayMode::DontAdjust => "Shorten timing",
+        ReduceDelayMode::Previous => "Add delay to previous",
+        ReduceDelayMode::Evenly => "Distribute delay evenly",
+    }
+}
+
+const fn yoyo_scope_label(scope: YoyoScope) -> &'static str {
+    match scope {
+        YoyoScope::Selection => "Selection",
+        YoyoScope::EntireTimeline => "Entire timeline",
+    }
+}
+
+fn parse_keep_every(input: &str) -> Result<usize, String> {
+    let keep_every = parse_input::<usize>(input, "reduce interval")?;
+    if keep_every < 2 {
+        return Err("reduce interval must be at least 2".to_owned());
+    }
+    Ok(keep_every)
 }
 
 fn show_transform_toolbar(
@@ -1246,11 +1360,13 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use gif_from_screen_domain::{DurationUs, FrameId, PhysicalRect, PhysicalSize, TimeUs};
+    use gif_from_screen_editor::{ReduceDelayMode, YoyoScope};
 
     use super::{
         EditorUiOperation, EditorUiState, FILMSTRIP_ITEM_WIDTH, OrientationControl, PlaybackClock,
         frame_click_operation, orientation_operation, parse_crop, parse_duration_us,
-        parse_output_size, parse_time_ms, parse_time_range, to_ui_points, visible_widget_range,
+        parse_keep_every, parse_output_size, parse_time_ms, parse_time_range, reduce_delay_label,
+        to_ui_points, visible_widget_range, yoyo_scope_label,
     };
 
     #[test]
@@ -1262,6 +1378,10 @@ mod tests {
         assert_eq!(state.time_range_end_ms_input, "1000");
         assert_eq!(state.duration_us_input, "100000");
         assert_eq!(state.percentage_input, "100");
+        assert_eq!(state.reduce_keep_every_input, "2");
+        assert_eq!(state.reduce_delay_mode, ReduceDelayMode::DontAdjust);
+        assert_eq!(state.yoyo_scope, YoyoScope::Selection);
+        assert!(!state.yoyo_repeat_endpoints);
         assert_eq!(state.frame_expression, "1");
         assert_eq!(state.crop_x_input, "0");
         assert_eq!(state.crop_y_input, "0");
@@ -1317,6 +1437,29 @@ mod tests {
         assert!(parse_time_range(&state).is_err());
         state.time_range_end_ms_input.clear();
         assert!(parse_time_range(&state).is_err());
+    }
+
+    #[test]
+    fn advanced_timing_inputs_and_choice_labels_are_type_safe() {
+        assert_eq!(parse_keep_every(" 2 ").unwrap(), 2);
+        assert_eq!(
+            parse_keep_every(&usize::MAX.to_string()).unwrap(),
+            usize::MAX
+        );
+        assert!(parse_keep_every("0").is_err());
+        assert!(parse_keep_every("1").is_err());
+        assert!(parse_keep_every("2.5").is_err());
+
+        for mode in [
+            ReduceDelayMode::DontAdjust,
+            ReduceDelayMode::Previous,
+            ReduceDelayMode::Evenly,
+        ] {
+            assert!(!reduce_delay_label(mode).is_empty());
+        }
+        for scope in [YoyoScope::Selection, YoyoScope::EntireTimeline] {
+            assert!(!yoyo_scope_label(scope).is_empty());
+        }
     }
 
     #[test]
