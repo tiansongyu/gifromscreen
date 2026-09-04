@@ -92,6 +92,32 @@ enum StartupIntent {
     Invalid(String),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FileDropRoute {
+    OpenProject(PathBuf),
+    ImportGif(PathBuf),
+    ImportImage(PathBuf),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileDropCandidate {
+    path: PathBuf,
+    is_directory: bool,
+    is_regular_file: bool,
+    has_project_manifest: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum FileDropActivity {
+    #[default]
+    Idle,
+    Recording,
+    ProjectOpen,
+    GifImport,
+    ImageImport,
+    Export,
+}
+
 #[derive(Clone, Debug)]
 struct RecordingSettings {
     output: String,
@@ -545,6 +571,17 @@ impl eframe::App for GifFromScreenApp {
         self.receive_open_project_messages();
         self.receive_import_gif_messages();
         self.receive_import_image_messages();
+        let dropped_paths = context.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect::<Vec<_>>()
+        });
+        if !dropped_paths.is_empty() {
+            self.handle_dropped_paths(&dropped_paths);
+        }
         self.advance_recording_countdown(context);
         if self.restore_main_window {
             if let Some(snapshot) = self.main_window_snapshot.take() {
@@ -609,6 +646,66 @@ impl eframe::App for GifFromScreenApp {
 }
 
 impl GifFromScreenApp {
+    fn handle_dropped_paths(&mut self, dropped_paths: &[Option<PathBuf>]) {
+        if let Some(reason) = file_drop_block_reason(self.file_drop_activity()) {
+            self.notice = Some(format!(
+                "Cannot accept dropped files while {reason}. Finish the active operation and try again."
+            ));
+            return;
+        }
+        let route = match prepare_file_drop_route(dropped_paths) {
+            Ok(route) => route,
+            Err(error) => {
+                self.notice = Some(error);
+                return;
+            }
+        };
+        if let Err(error) = self.start_file_drop_route(route) {
+            self.notice = Some(format!("Could not start dropped-file operation: {error}"));
+        }
+    }
+
+    fn file_drop_activity(&self) -> FileDropActivity {
+        if self.job.is_some()
+            || self.recorder_overlay.is_some()
+            || self.recording_countdown.is_active()
+            || self.region_picker.is_some()
+        {
+            FileDropActivity::Recording
+        } else if self.open_project_job.state() != OpenProjectJobState::Idle {
+            FileDropActivity::ProjectOpen
+        } else if self.import_gif_job.state() != ImportGifJobState::Idle {
+            FileDropActivity::GifImport
+        } else if self.import_image_job.state() != ImportStaticImageJobState::Idle {
+            FileDropActivity::ImageImport
+        } else if self.export_job.state() != ExportJobState::Idle {
+            FileDropActivity::Export
+        } else {
+            FileDropActivity::Idle
+        }
+    }
+
+    fn start_file_drop_route(&mut self, route: FileDropRoute) -> Result<(), String> {
+        match route {
+            FileDropRoute::OpenProject(path) => {
+                self.view = AppView::OpenProject;
+                self.open_project_path = path.to_string_lossy().into_owned();
+                self.open_project_take_over_lock = false;
+                self.start_open_project()
+            }
+            FileDropRoute::ImportGif(path) => {
+                self.view = AppView::ImportGif;
+                self.import_gif_path = path.to_string_lossy().into_owned();
+                self.start_import_gif()
+            }
+            FileDropRoute::ImportImage(path) => {
+                self.view = AppView::ImportImage;
+                self.import_image_path = path.to_string_lossy().into_owned();
+                self.start_import_image()
+            }
+        }
+    }
+
     fn apply_startup_intent(&mut self, intent: StartupIntent) {
         match intent {
             StartupIntent::None => {}
@@ -3304,6 +3401,102 @@ fn landing_cards_fit(available_width: f32, column_spacing: f32) -> bool {
     available_width >= LANDING_CARD_MIN_WIDTH * 2.0 + column_spacing
 }
 
+const fn file_drop_block_reason(activity: FileDropActivity) -> Option<&'static str> {
+    match activity {
+        FileDropActivity::Idle => None,
+        FileDropActivity::Recording => Some("the recorder or region picker is active"),
+        FileDropActivity::ProjectOpen => Some("a project-open job is active"),
+        FileDropActivity::GifImport => Some("a GIF import is active"),
+        FileDropActivity::ImageImport => Some("an image import is active"),
+        FileDropActivity::Export => Some("a GIF export is active"),
+    }
+}
+
+fn prepare_file_drop_route(dropped_paths: &[Option<PathBuf>]) -> Result<FileDropRoute, String> {
+    if dropped_paths.len() != 1 {
+        return Err(format!(
+            "Drop exactly one local file or project directory at a time; received {} items.",
+            dropped_paths.len()
+        ));
+    }
+    let path = dropped_paths[0].as_ref().ok_or_else(|| {
+        "Dropped data has no local filesystem path; save it to disk before importing.".to_owned()
+    })?;
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("Could not inspect dropped path {}: {error}", path.display()))?;
+    let has_project_manifest = if metadata.is_dir() {
+        let manifest = path.join("manifest.json");
+        match fs::metadata(&manifest) {
+            Ok(manifest_metadata) => manifest_metadata.is_file(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(format!(
+                    "Could not inspect dropped project manifest {}: {error}",
+                    manifest.display()
+                ));
+            }
+        }
+    } else {
+        false
+    };
+    route_file_drop(Some(FileDropCandidate {
+        path: path.clone(),
+        is_directory: metadata.is_dir(),
+        is_regular_file: metadata.is_file(),
+        has_project_manifest,
+    }))
+}
+
+fn route_file_drop(candidate: Option<FileDropCandidate>) -> Result<FileDropRoute, String> {
+    let candidate = candidate.ok_or_else(|| {
+        "Dropped data has no local filesystem path; save it to disk before importing.".to_owned()
+    })?;
+    let path = candidate.path;
+    if candidate.has_project_manifest {
+        return Ok(FileDropRoute::OpenProject(path));
+    }
+    let project_extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gfsproj"));
+    if candidate.is_directory {
+        return if project_extension {
+            Ok(FileDropRoute::OpenProject(path))
+        } else {
+            Err(format!(
+                "Dropped directory {} is not a project: it has no manifest.json.",
+                path.display()
+            ))
+        };
+    }
+    if !candidate.is_regular_file {
+        return Err(format!(
+            "Dropped path {} is neither a regular file nor a project directory.",
+            path.display()
+        ));
+    }
+    if project_extension {
+        return Err(format!(
+            "Dropped project path {} must be a directory containing manifest.json.",
+            path.display()
+        ));
+    }
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gif"))
+    {
+        Ok(FileDropRoute::ImportGif(path))
+    } else if has_static_image_extension(&path) {
+        Ok(FileDropRoute::ImportImage(path))
+    } else {
+        Err(format!(
+            "Unsupported dropped file {}. Drop a .gfsproj directory, GIF, PNG, JPEG, BMP, or WebP file.",
+            path.display()
+        ))
+    }
+}
+
 fn parse_startup_intent(arguments: impl IntoIterator<Item = OsString>) -> StartupIntent {
     let mut arguments = arguments.into_iter();
     let Some(first) = arguments.next() else {
@@ -3430,18 +3623,20 @@ mod tests {
     use super::{
         AppView, EDITOR_PREVIEW_MAX_SIZE, EditorExportSettings, ExportDitherChoice,
         ExportFrameScope, ExportLoopChoice, ExportPaletteChoice, ExportQuantizerChoice,
-        GifFromScreenApp, IncrementalProjectFrameSink, MAX_COUNTDOWN_SECONDS,
-        MAX_RECORDING_DURATION_MS, RecorderOverlayAction, RecorderStage, RecordingSettings,
-        RecordingWorkerRequest, StartupIntent, activate_editor, apply_overlay_region,
-        build_project_export_options, can_navigate_back, collection_limit, collection_options,
+        FileDropActivity, FileDropCandidate, FileDropRoute, GifFromScreenApp,
+        IncrementalProjectFrameSink, MAX_COUNTDOWN_SECONDS, MAX_RECORDING_DURATION_MS,
+        RecorderOverlayAction, RecorderStage, RecordingSettings, RecordingWorkerRequest,
+        StartupIntent, activate_editor, apply_overlay_region, build_project_export_options,
+        can_navigate_back, collection_limit, collection_options,
         create_incremental_recording_project, default_gif_path_for_project,
         edited_gif_path_for_import, editor_result_notice, export_job_is_active,
-        export_result_notice, fit_dimensions, frame_retention, has_static_image_extension,
-        landing_cards_fit, map_preview_selection, open_project_controls_enabled,
-        open_project_lock_policy, parse_startup_intent, project_path_for_output,
-        recording_project_canvas, remove_completed_project, remove_recording_project_path,
-        resize_nearest_rgba, resolve_export_selection, should_sync_retarget,
-        show_editor_scroll_area, validate_export_output, validate_settings,
+        export_result_notice, file_drop_block_reason, fit_dimensions, frame_retention,
+        has_static_image_extension, landing_cards_fit, map_preview_selection,
+        open_project_controls_enabled, open_project_lock_policy, parse_startup_intent,
+        prepare_file_drop_route, project_path_for_output, recording_project_canvas,
+        remove_completed_project, remove_recording_project_path, resize_nearest_rgba,
+        resolve_export_selection, route_file_drop, should_sync_retarget, show_editor_scroll_area,
+        validate_export_output, validate_settings,
     };
     use crate::editor_ui::{EditorUiAction, EditorUiFailure, EditorUiOperation};
     use crate::editor_workspace::EditorWorkspace;
@@ -3531,6 +3726,104 @@ mod tests {
         ));
         assert!(has_static_image_extension(Path::new("photo.JPEG")));
         assert!(!has_static_image_extension(Path::new("animation.gif")));
+    }
+
+    #[test]
+    fn pure_file_drop_routing_prioritizes_project_manifests_and_supported_types() {
+        let project_named_like_gif = PathBuf::from("/tmp/project.gif");
+        assert_eq!(
+            route_file_drop(Some(FileDropCandidate {
+                path: project_named_like_gif.clone(),
+                is_directory: true,
+                is_regular_file: false,
+                has_project_manifest: true,
+            }))
+            .unwrap(),
+            FileDropRoute::OpenProject(project_named_like_gif)
+        );
+        let extension_project = PathBuf::from("/tmp/project.GFSPROJ");
+        assert_eq!(
+            route_file_drop(Some(FileDropCandidate {
+                path: extension_project.clone(),
+                is_directory: true,
+                is_regular_file: false,
+                has_project_manifest: false,
+            }))
+            .unwrap(),
+            FileDropRoute::OpenProject(extension_project)
+        );
+        let gif = PathBuf::from("/tmp/animation.GIF");
+        assert_eq!(
+            route_file_drop(Some(FileDropCandidate {
+                path: gif.clone(),
+                is_directory: false,
+                is_regular_file: true,
+                has_project_manifest: false,
+            }))
+            .unwrap(),
+            FileDropRoute::ImportGif(gif)
+        );
+        for extension in ["png", "JPG", "jpeg", "BMP", "webp"] {
+            let image = PathBuf::from(format!("/tmp/image.{extension}"));
+            assert_eq!(
+                route_file_drop(Some(FileDropCandidate {
+                    path: image.clone(),
+                    is_directory: false,
+                    is_regular_file: true,
+                    has_project_manifest: false,
+                }))
+                .unwrap(),
+                FileDropRoute::ImportImage(image)
+            );
+        }
+        assert!(route_file_drop(None).unwrap_err().contains("no local"));
+        assert!(
+            route_file_drop(Some(FileDropCandidate {
+                path: PathBuf::from("/tmp/movie.mp4"),
+                is_directory: false,
+                is_regular_file: true,
+                has_project_manifest: false,
+            }))
+            .unwrap_err()
+            .contains("Unsupported")
+        );
+        assert!(
+            route_file_drop(Some(FileDropCandidate {
+                path: PathBuf::from("/tmp/not-a-directory.gfsproj"),
+                is_directory: false,
+                is_regular_file: true,
+                has_project_manifest: false,
+            }))
+            .unwrap_err()
+            .contains("must be a directory")
+        );
+    }
+
+    #[test]
+    fn file_drop_cardinality_and_activity_rejections_are_explicit() {
+        assert!(
+            prepare_file_drop_route(&[None])
+                .unwrap_err()
+                .contains("no local filesystem path")
+        );
+        assert!(
+            prepare_file_drop_route(&[
+                Some(PathBuf::from("/tmp/one.gif")),
+                Some(PathBuf::from("/tmp/two.gif")),
+            ])
+            .unwrap_err()
+            .contains("received 2 items")
+        );
+        assert_eq!(file_drop_block_reason(FileDropActivity::default()), None);
+        for (activity, expected) in [
+            (FileDropActivity::Recording, "recorder"),
+            (FileDropActivity::ProjectOpen, "project-open"),
+            (FileDropActivity::GifImport, "GIF import"),
+            (FileDropActivity::ImageImport, "image import"),
+            (FileDropActivity::Export, "GIF export"),
+        ] {
+            assert!(file_drop_block_reason(activity).unwrap().contains(expected));
+        }
     }
 
     #[test]
@@ -4203,6 +4496,95 @@ mod tests {
         let notice = app.notice.as_deref().unwrap();
         assert!(notice.contains("Opened 1 frame"));
         assert!(notice.contains("enable Overwrite"));
+    }
+
+    #[test]
+    fn dropped_manifest_project_auto_starts_open_and_enters_editor() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("manifest-priority.data");
+        drop(single_frame_project(&root));
+        let mut app = GifFromScreenApp::default();
+        app.open_project_take_over_lock = true;
+
+        app.handle_dropped_paths(&[Some(root.clone())]);
+
+        assert_eq!(app.view, AppView::OpenProject);
+        assert_eq!(Path::new(&app.open_project_path), root);
+        assert!(!app.open_project_take_over_lock);
+        assert_eq!(app.open_project_job.state(), OpenProjectJobState::Running);
+        drain_open_job(&mut app);
+        assert_eq!(app.view, AppView::Editor);
+        assert_eq!(
+            app.editor_workspace.as_ref().unwrap().selection().current(),
+            Some(FrameId::from_u128(7))
+        );
+    }
+
+    #[test]
+    fn dropped_gif_and_static_image_auto_start_their_existing_import_jobs() {
+        let directory = tempdir().unwrap();
+        let gif = directory.path().join("dropped.gif");
+        let image = directory.path().join("still.png");
+        write_import_gif(&gif);
+        write_import_png(&image);
+        let mut app = GifFromScreenApp::default();
+
+        app.handle_dropped_paths(&[Some(gif.clone())]);
+        assert_eq!(app.view, AppView::ImportGif);
+        assert_eq!(Path::new(&app.import_gif_path), gif);
+        assert_eq!(app.import_gif_job.state(), ImportGifJobState::Running);
+        drain_import_job(&mut app);
+        assert_eq!(app.view, AppView::Editor);
+
+        app.handle_dropped_paths(&[Some(image.clone())]);
+        assert_eq!(app.view, AppView::ImportImage);
+        assert_eq!(Path::new(&app.import_image_path), image);
+        assert_eq!(
+            app.import_image_job.state(),
+            ImportStaticImageJobState::Running
+        );
+        drain_import_image_job(&mut app);
+        assert_eq!(app.view, AppView::Editor);
+        assert_eq!(
+            app.editor_workspace.as_ref().unwrap().project_root(),
+            directory.path().join("still.gfsproj")
+        );
+    }
+
+    #[test]
+    fn rejected_drops_keep_the_active_workspace_and_routes_unchanged() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("current.gfsproj");
+        let unsupported = directory.path().join("movie.mp4");
+        let valid_gif = directory.path().join("blocked.gif");
+        fs::write(&unsupported, b"unsupported").unwrap();
+        write_import_gif(&valid_gif);
+        let project = single_frame_project(&root);
+        let mut app = GifFromScreenApp::default();
+        activate_editor(&mut app.view, &mut app.editor_workspace, project).unwrap();
+
+        for dropped in [
+            vec![None],
+            vec![
+                Some(PathBuf::from("/tmp/one.gif")),
+                Some(PathBuf::from("/tmp/two.gif")),
+            ],
+            vec![Some(unsupported)],
+        ] {
+            app.handle_dropped_paths(&dropped);
+            assert_eq!(app.view, AppView::Editor);
+            assert_eq!(app.editor_workspace.as_ref().unwrap().project_root(), root);
+            assert!(app.open_project_path.is_empty());
+            assert!(app.import_gif_path.is_empty());
+            assert!(app.import_image_path.is_empty());
+        }
+
+        let _ = app.recording_countdown.start(Instant::now(), 1);
+        app.handle_dropped_paths(&[Some(valid_gif)]);
+        assert_eq!(app.view, AppView::Editor);
+        assert_eq!(app.editor_workspace.as_ref().unwrap().project_root(), root);
+        assert_eq!(app.import_gif_job.state(), ImportGifJobState::Idle);
+        assert!(app.notice.as_deref().unwrap().contains("recorder"));
     }
 
     #[test]
