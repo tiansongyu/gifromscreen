@@ -39,7 +39,7 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Import ordered static-image sequences with timing, loop, reordering, and multi-file drop controls.
 - [x] Retain, select, remove, and clear a bounded multi-entry frame clipboard history.
 - [x] Preview and export timed raster, shape, and pressure-drawing overlays through one compositor.
-- [x] Add bounded Wu quantization and deterministic Dotted, Blue Noise, and Interleaved Noise dithering.
+- [x] Expose bounded Wu/custom palettes and deterministic Dotted, Blue Noise, and Interleaved Noise dithering in desktop export controls.
 
 ## Delivery gates
 
