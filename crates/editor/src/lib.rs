@@ -2,12 +2,19 @@
 
 //! Pure timeline editing services built on serializable domain commands.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, error::Error};
 
 use gif_from_screen_domain::{
     DomainError, DurationUs, EditCommand, FrameDurationChange, FrameId, ProjectManifest,
 };
 use thiserror::Error;
+
+mod duplicates;
+
+pub use duplicates::{
+    DuplicateDelayMode, DuplicateFrameRetention, FrameComparison, FrameSimilarityProvider,
+    RemoveDuplicateFramesOptions, remove_duplicate_frames,
+};
 
 /// Controls how removing frames affects the duration of the surviving timeline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -465,6 +472,35 @@ pub enum EditorError {
     /// A selection referred to a frame outside the project.
     #[error("selected frame {0} does not exist")]
     UnknownSelectedFrame(FrameId),
+    /// A similarity provider failed while comparing two adjacent selected frames.
+    #[error("failed to compare adjacent frames {first} and {second}")]
+    FrameComparisonFailed {
+        /// The earlier frame in timeline order.
+        first: FrameId,
+        /// The later frame in timeline order.
+        second: FrameId,
+        /// The provider-specific failure.
+        #[source]
+        source: Box<dyn Error + Send + Sync>,
+    },
+    /// A similarity provider returned a percentage outside the inclusive 0..=100 range.
+    #[error(
+        "similarity provider returned invalid percentage {percent} for frames {first} and {second}"
+    )]
+    InvalidSimilarityPercent {
+        /// The earlier frame in timeline order.
+        first: FrameId,
+        /// The later frame in timeline order.
+        second: FrameId,
+        /// The invalid percentage.
+        percent: u8,
+    },
+    /// The requested inclusive similarity threshold exceeded 100 percent.
+    #[error("duplicate-frame similarity threshold must be between 0 and 100, got {0}")]
+    InvalidSimilarityThreshold(u8),
+    /// No adjacent frames in the selection met the requested similarity threshold.
+    #[error("the selected frames contain no removable duplicate group")]
+    NoDuplicateFrames,
     /// Undo history must retain at least one command.
     #[error("history limit must be greater than zero")]
     ZeroHistoryLimit,
