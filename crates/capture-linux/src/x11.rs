@@ -148,7 +148,8 @@ mod native {
         }
 
         /// Captures one owned RGBA8 frame from a monitor/root or source-local
-        /// rectangular target.
+        /// rectangular target without a cursor. Use [`CaptureBackend::start_session`]
+        /// with a [`CaptureRequest`] to select cursor behavior.
         ///
         /// # Errors
         ///
