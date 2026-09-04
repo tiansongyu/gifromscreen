@@ -548,6 +548,24 @@ mod tests {
     }
 
     #[test]
+    fn failed_result_send_drops_active_project_and_releases_lock() {
+        let directory = tempdir().unwrap();
+        let input = directory.path().join("unsent.gif");
+        write_test_gif(&input);
+        let project_path = input.with_extension(PROJECT_EXTENSION);
+        let project = import_gif(&input, &project_path).unwrap();
+        assert!(project.layout().lock.is_file());
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+
+        send_worker_result(&sender, Ok(project));
+
+        assert!(!project_path.join("project.lock").exists());
+        let reopened = ActiveProject::open(&project_path, LockPolicy::FailIfPresent).unwrap();
+        assert_eq!(reopened.project.manifest().timeline.frames.len(), 2);
+    }
+
+    #[test]
     fn disconnected_worker_becomes_a_typed_terminal_error() {
         let (sender, receiver) = mpsc::channel();
         drop(sender);
