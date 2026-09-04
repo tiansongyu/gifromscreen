@@ -1,0 +1,25 @@
+[package]
+name = "gif-from-screen-capture-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Linux Wayland/X11 capture adapter for GifFromScreen"
+
+[features]
+default = []
+# Native dependencies are deliberately opt-in so the portable workspace and
+# headless CI do not require PipeWire development packages or an X server.
+native-wayland = ["dep:ashpd", "dep:pipewire"]
+native-x11 = ["dep:x11rb"]
+
+[dependencies]
+gif-from-screen-capture = { path = "../capture" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13", optional = true }
+pipewire = { version = "0.10", optional = true }
+x11rb = { version = "0.14", optional = true, features = ["randr"] }
+
+[lints]
+workspace = true
