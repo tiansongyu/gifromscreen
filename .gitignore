@@ -1,0 +1,13 @@
+/target/
+**/*.rs.bk
+*.log
+*.partial
+*.gfsproj
+.DS_Store
+.idea/
+.vscode/
+
+# Local recording sessions and generated fixtures.
+/.gfs-sessions/
+/artifacts/
+
