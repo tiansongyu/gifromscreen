@@ -229,6 +229,7 @@ pub(crate) enum EditorUiOperation {
     SaveCheckpoint,
     SaveAndCompact,
     RepairJournal,
+    Statistics,
     ApplyCrop,
     ClearCrop,
     Resize,
@@ -284,6 +285,7 @@ pub(crate) fn show_editor_ui(
 
     show_editor_summary(ui, workspace);
     show_project_storage_toolbar(ui, workspace, &mut results);
+    show_editor_statistics(ui, workspace, &mut results);
     ui.separator();
     show_navigation_toolbar(ui, workspace, state, now, &mut results);
     show_selection_toolbar(ui, workspace, state, now, &mut results);
@@ -357,6 +359,108 @@ fn show_project_storage_toolbar(
             }
         }
     });
+}
+
+fn show_editor_statistics(
+    ui: &mut egui::Ui,
+    workspace: &EditorWorkspace,
+    results: &mut Vec<EditorUiResult>,
+) {
+    egui::CollapsingHeader::new("Statistics")
+        .default_open(false)
+        .show(ui, |ui| match workspace.statistics() {
+            Ok(statistics) => {
+                egui::Grid::new("editor_statistics_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 4.0])
+                    .show(ui, |ui| {
+                        statistic_row(ui, "Frames", statistics.frame_count.to_string());
+                        statistic_row(
+                            ui,
+                            "Selected frames",
+                            statistics.selected_frame_count.to_string(),
+                        );
+                        statistic_row(
+                            ui,
+                            "Canvas",
+                            format!(
+                                "{} × {}",
+                                statistics.canvas.width.get(),
+                                statistics.canvas.height.get()
+                            ),
+                        );
+                        statistic_row(
+                            ui,
+                            "Total duration",
+                            format_duration_us(statistics.total_duration_us),
+                        );
+                        statistic_row(
+                            ui,
+                            "Selected duration",
+                            format_duration_us(statistics.selection_duration_us),
+                        );
+                        statistic_row(
+                            ui,
+                            "Minimum delay",
+                            format_optional_duration(statistics.minimum_delay_us),
+                        );
+                        statistic_row(
+                            ui,
+                            "Maximum delay",
+                            format_optional_duration(statistics.maximum_delay_us),
+                        );
+                        statistic_row(
+                            ui,
+                            "Average delay",
+                            format_optional_duration(statistics.average_delay_us),
+                        );
+                        statistic_row(
+                            ui,
+                            "Unique assets",
+                            statistics.unique_asset_count.to_string(),
+                        );
+                        statistic_row(
+                            ui,
+                            "Asset descriptor bytes",
+                            statistics.asset_descriptor_bytes.to_string(),
+                        );
+                        let current = statistics.current_frame.map_or_else(
+                            || "None".to_owned(),
+                            |current| {
+                                format!(
+                                    "#{} · start {} · delay {}",
+                                    current.frame_number,
+                                    format_duration_us(current.start_us),
+                                    format_duration_us(current.duration_us)
+                                )
+                            },
+                        );
+                        statistic_row(ui, "Current frame", current);
+                    });
+            }
+            Err(error) => {
+                ui.colored_label(ui.visuals().error_fg_color, error.to_string());
+                push_failure(results, EditorUiOperation::Statistics, error);
+            }
+        });
+}
+
+fn statistic_row(ui: &mut egui::Ui, label: &str, value: String) {
+    ui.label(label);
+    ui.monospace(value);
+    ui.end_row();
+}
+
+fn format_duration_us(duration_us: u64) -> String {
+    format!(
+        "{}.{:06} s",
+        duration_us / 1_000_000,
+        duration_us % 1_000_000
+    )
+}
+
+fn format_optional_duration(duration_us: Option<u64>) -> String {
+    duration_us.map_or_else(|| "None".to_owned(), format_duration_us)
 }
 
 fn repair_journal_notice(preserved: Option<&std::path::Path>) -> String {
@@ -1894,10 +1998,11 @@ mod tests {
     use super::{
         EditorUiAction, EditorUiOperation, EditorUiState, EffectChoice, FILMSTRIP_ITEM_WIDTH,
         OrientationControl, PlaybackClock, build_effect, duplicate_delay_label,
-        duplicate_retention_label, effect_choice_label, frame_click_operation,
-        orientation_operation, parse_crop, parse_duration_us, parse_effect_index, parse_keep_every,
-        parse_output_size, parse_similarity_threshold, parse_time_ms, parse_time_range,
-        push_notice, reduce_delay_label, repair_journal_notice, to_ui_points, visible_widget_range,
+        duplicate_retention_label, effect_choice_label, format_duration_us,
+        format_optional_duration, frame_click_operation, orientation_operation, parse_crop,
+        parse_duration_us, parse_effect_index, parse_keep_every, parse_output_size,
+        parse_similarity_threshold, parse_time_ms, parse_time_range, push_notice,
+        reduce_delay_label, repair_journal_notice, to_ui_points, visible_widget_range,
         yoyo_scope_label,
     };
 
@@ -2105,6 +2210,17 @@ mod tests {
             })]
         );
         assert!(repair_journal_notice(None).contains("already clean"));
+    }
+
+    #[test]
+    fn statistics_duration_formatting_is_integer_exact() {
+        assert_eq!(format_duration_us(0), "0.000000 s");
+        assert_eq!(format_duration_us(1_234_567), "1.234567 s");
+        assert_eq!(format_optional_duration(None), "None");
+        assert_eq!(
+            format_optional_duration(Some(u64::MAX)),
+            format_duration_us(u64::MAX)
+        );
     }
 
     #[test]

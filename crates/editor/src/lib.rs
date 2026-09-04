@@ -15,6 +15,7 @@ mod frame_clipboard;
 mod frame_effect;
 mod frame_selection;
 mod selection;
+mod statistics;
 mod virtual_filmstrip;
 mod yoyo;
 
@@ -33,6 +34,9 @@ pub use frame_selection::{
     select_frames_by_time_range,
 };
 pub use selection::{TimelineSelection, TimelineSelectionError};
+pub use statistics::{
+    CurrentFrameStatistics, EditorStatistics, EditorStatisticsError, project_statistics,
+};
 pub use virtual_filmstrip::{
     MAX_VIRTUAL_FILMSTRIP_FRAMES, VirtualFilmstripError, VirtualFilmstripLayout,
 };

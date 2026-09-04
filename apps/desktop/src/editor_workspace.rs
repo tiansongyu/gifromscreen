@@ -12,14 +12,15 @@ use gif_from_screen_domain::{
     DurationUs, EditCommand, Effect, FrameId, PhysicalRect, PhysicalSize, ProjectManifest, TimeUs,
 };
 use gif_from_screen_editor::{
-    ClipTransformEdit, DuplicateDelayMode, DuplicateFrameRetention, EditorError, FrameClipboard,
-    FrameComparison, FrameEffectEdit, FrameSimilarityProvider, FrameTimeRangeError,
-    ReduceDelayMode, ReduceOptions, RemoveDuplicateFramesOptions, TimelineSelection,
-    TimelineSelectionError, YoyoOptions, YoyoScope, adjust_duration, copy_selected_frames,
-    cut_selected_frames, delete_frames, delete_frames_after, delete_frames_before,
-    edit_clip_transforms, edit_frame_effects, move_selected_left, move_selected_right,
-    override_duration, paste_frame_clipboard, reduce_frames, remove_duplicate_frames,
-    reverse_selected, scale_duration, select_frames_by_time_range, yoyo_frames,
+    ClipTransformEdit, DuplicateDelayMode, DuplicateFrameRetention, EditorError, EditorStatistics,
+    EditorStatisticsError, FrameClipboard, FrameComparison, FrameEffectEdit,
+    FrameSimilarityProvider, FrameTimeRangeError, ReduceDelayMode, ReduceOptions,
+    RemoveDuplicateFramesOptions, TimelineSelection, TimelineSelectionError, YoyoOptions,
+    YoyoScope, adjust_duration, copy_selected_frames, cut_selected_frames, delete_frames,
+    delete_frames_after, delete_frames_before, edit_clip_transforms, edit_frame_effects,
+    move_selected_left, move_selected_right, override_duration, paste_frame_clipboard,
+    project_statistics, reduce_frames, remove_duplicate_frames, reverse_selected, scale_duration,
+    select_frames_by_time_range, yoyo_frames,
 };
 use gif_from_screen_project::{
     ActiveProject, AssetIssue, JournalRecoveryReport, LockPolicy, OpenedProject, ProjectError,
@@ -190,6 +191,15 @@ impl EditorWorkspace {
     /// Returns the frame count in the single bounded application clipboard.
     pub(crate) fn clipboard_len(&self) -> usize {
         self.clipboard.as_ref().map_or(0, FrameClipboard::len)
+    }
+
+    /// Projects current timeline, selection, delay, canvas, and asset statistics.
+    pub(crate) fn statistics(&self) -> Result<EditorStatistics, EditorStatisticsError> {
+        project_statistics(
+            self.project.manifest(),
+            self.selection.selected().iter().copied(),
+            self.selection.current(),
+        )
     }
 
     /// Selects only `frame_id`.
