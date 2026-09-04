@@ -23,6 +23,9 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Import animated GIF files into editable projects with bounded decoding.
 - [x] Import PNG, JPEG, BMP, and WebP files into editable projects with bounded decoding.
 - [x] Crop, resize, rotate, and flip selected frames with journal-backed undo/redo.
+- [x] Select, keep, or delete an explicit half-open time range with variable-frame timing.
+- [x] Reduce frames, build Yoyo loops, scale delays, and remove rendered duplicates.
+- [x] Negotiate a real Wayland ScreenCast Portal session through the PipeWire FD handoff.
 
 ## Delivery gates
 
@@ -50,7 +53,7 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 
 - [x] Window capture and capture-only-changes.
 - [ ] Manual and periodic snapshots.
-- [ ] Duplicate removal, frame reduction, Yoyo, delay scaling.
+- [x] Duplicate removal, frame reduction, Yoyo, and delay scaling.
 - [ ] Text, title, drawing, shapes, watermark, border, shadow, privacy effects.
 - [ ] Fade and slide transitions.
 - [x] Palette, dithering, transparency, and delta-frame controls.
