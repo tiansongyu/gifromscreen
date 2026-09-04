@@ -26,8 +26,10 @@ pub use duplicates::{
     RemoveDuplicateFramesOptions, remove_duplicate_frames,
 };
 pub use frame_clipboard::{
-    CutFrameSelection, FrameClipboard, MAX_FRAME_CLIPBOARD_FRAMES, copy_selected_frames,
-    cut_selected_frames, paste_frame_clipboard,
+    CutFrameSelection, DEFAULT_FRAME_CLIPBOARD_HISTORY_CAPACITY, FrameClipboard,
+    FrameClipboardEntryId, FrameClipboardHistory, FrameClipboardHistoryEntry,
+    FrameClipboardHistoryError, MAX_FRAME_CLIPBOARD_FRAMES, MAX_FRAME_CLIPBOARD_HISTORY_CAPACITY,
+    copy_selected_frames, cut_selected_frames, paste_frame_clipboard,
 };
 pub use frame_effect::{FrameEffectEdit, MAX_FRAME_EFFECT_BLUR_RADIUS, edit_frame_effects};
 pub use frame_selection::{

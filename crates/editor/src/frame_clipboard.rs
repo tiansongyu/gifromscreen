@@ -1,11 +1,16 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use gif_from_screen_domain::{EditCommand, FrameClip, FrameId, ProjectManifest};
+use thiserror::Error;
 
 use crate::{EditorError, ensure_known_selection, remove_frames_atomically};
 
 /// Maximum number of clips retained by one application clipboard snapshot.
 pub const MAX_FRAME_CLIPBOARD_FRAMES: usize = 512;
+/// Default number of Copy/Cut snapshots retained by an editor session.
+pub const DEFAULT_FRAME_CLIPBOARD_HISTORY_CAPACITY: usize = 8;
+/// Hard bound preventing an accidental UI setting from retaining an unbounded history.
+pub const MAX_FRAME_CLIPBOARD_HISTORY_CAPACITY: usize = 64;
 
 /// One bounded, in-memory snapshot of copied frame clips.
 ///
@@ -32,6 +37,232 @@ impl FrameClipboard {
     pub fn frames(&self) -> &[FrameClip] {
         &self.frames
     }
+}
+
+/// Session-local stable identity for one clipboard-history snapshot.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FrameClipboardEntryId(u64);
+
+impl FrameClipboardEntryId {
+    /// Returns the monotonically assigned non-zero identity.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// One selectable clipboard-history entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrameClipboardHistoryEntry {
+    id: FrameClipboardEntryId,
+    clipboard: FrameClipboard,
+}
+
+impl FrameClipboardHistoryEntry {
+    /// Returns this entry's stable session identity.
+    pub const fn id(&self) -> FrameClipboardEntryId {
+        self.id
+    }
+
+    /// Borrows the lossless frame snapshot used by Paste.
+    pub const fn clipboard(&self) -> &FrameClipboard {
+        &self.clipboard
+    }
+
+    /// Returns the number of frames available for a compact history preview.
+    pub fn frame_count(&self) -> usize {
+        self.clipboard.len()
+    }
+
+    /// Returns the exact summed duration when it fits `u64` microseconds.
+    pub fn total_duration_us(&self) -> Option<u64> {
+        self.clipboard
+            .frames()
+            .iter()
+            .try_fold(0_u64, |total, frame| {
+                total.checked_add(frame.duration.get())
+            })
+    }
+}
+
+/// Bounded Copy/Cut history with a stable selected entry.
+///
+/// Entries iterate from oldest to newest. Pushing selects the new entry and evicts exactly the
+/// oldest entry at capacity. Selecting or deleting an entry never copies its frame payload. When
+/// the selected entry is deleted, the newest survivor becomes current.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrameClipboardHistory {
+    entries: VecDeque<FrameClipboardHistoryEntry>,
+    capacity: usize,
+    selected: Option<FrameClipboardEntryId>,
+    next_id: u64,
+}
+
+impl Default for FrameClipboardHistory {
+    fn default() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            capacity: DEFAULT_FRAME_CLIPBOARD_HISTORY_CAPACITY,
+            selected: None,
+            next_id: 1,
+        }
+    }
+}
+
+impl FrameClipboardHistory {
+    /// Creates an empty history with a caller-selected bounded capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero capacity or a value above
+    /// [`MAX_FRAME_CLIPBOARD_HISTORY_CAPACITY`].
+    pub fn new(capacity: usize) -> Result<Self, FrameClipboardHistoryError> {
+        if capacity == 0 {
+            return Err(FrameClipboardHistoryError::ZeroCapacity);
+        }
+        if capacity > MAX_FRAME_CLIPBOARD_HISTORY_CAPACITY {
+            return Err(FrameClipboardHistoryError::CapacityTooLarge {
+                requested: capacity,
+                maximum: MAX_FRAME_CLIPBOARD_HISTORY_CAPACITY,
+            });
+        }
+        Ok(Self {
+            entries: VecDeque::new(),
+            capacity,
+            selected: None,
+            next_id: 1,
+        })
+    }
+
+    /// Returns the configured entry bound.
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Returns the number of retained snapshots.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns whether no clipboard snapshot is retained.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Returns the selected history identity, if any.
+    pub const fn selected_id(&self) -> Option<FrameClipboardEntryId> {
+        self.selected
+    }
+
+    /// Iterates entries from oldest to newest.
+    pub fn entries(&self) -> impl DoubleEndedIterator<Item = &FrameClipboardHistoryEntry> {
+        self.entries.iter()
+    }
+
+    /// Returns the currently selected entry.
+    pub fn selected(&self) -> Option<&FrameClipboardHistoryEntry> {
+        let selected = self.selected?;
+        self.entries.iter().find(|entry| entry.id == selected)
+    }
+
+    /// Returns the currently selected snapshot used by Paste.
+    pub fn selected_clipboard(&self) -> Option<&FrameClipboard> {
+        self.selected().map(FrameClipboardHistoryEntry::clipboard)
+    }
+
+    /// Pushes and selects a snapshot, evicting the oldest entry only after all fallible checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty snapshot, exhausted session identities, or allocation
+    /// failure. Existing history and selection remain unchanged on error.
+    pub fn push(
+        &mut self,
+        clipboard: FrameClipboard,
+    ) -> Result<FrameClipboardEntryId, FrameClipboardHistoryError> {
+        if clipboard.is_empty() {
+            return Err(FrameClipboardHistoryError::EmptyClipboard);
+        }
+        if self.next_id == 0 {
+            return Err(FrameClipboardHistoryError::IdentityExhausted);
+        }
+        if self.entries.len() < self.capacity {
+            self.entries.try_reserve(1).map_err(|_| {
+                FrameClipboardHistoryError::AllocationFailed {
+                    requested: self.entries.len().saturating_add(1),
+                }
+            })?;
+        }
+
+        let id = FrameClipboardEntryId(self.next_id);
+        let next_id = self.next_id.checked_add(1).unwrap_or(0);
+        if self.entries.len() == self.capacity {
+            let _ = self.entries.pop_front();
+        }
+        self.entries
+            .push_back(FrameClipboardHistoryEntry { id, clipboard });
+        self.selected = Some(id);
+        self.next_id = next_id;
+        Ok(id)
+    }
+
+    /// Selects an existing entry without changing its position.
+    ///
+    /// Returns `false` and preserves the prior selection when `id` is stale or unknown.
+    pub fn select(&mut self, id: FrameClipboardEntryId) -> bool {
+        if self.entries.iter().any(|entry| entry.id == id) {
+            self.selected = Some(id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Removes one entry and returns its snapshot.
+    ///
+    /// Removing the selected entry selects the newest survivor. An unknown identity is a no-op.
+    pub fn remove(&mut self, id: FrameClipboardEntryId) -> Option<FrameClipboard> {
+        let index = self.entries.iter().position(|entry| entry.id == id)?;
+        let removed = self.entries.remove(index)?;
+        if self.selected == Some(id) {
+            self.selected = self.entries.back().map(FrameClipboardHistoryEntry::id);
+        }
+        Some(removed.clipboard)
+    }
+
+    /// Removes every entry while retaining capacity and monotonic identity state.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.selected = None;
+    }
+}
+
+/// Invalid or unavailable clipboard-history operation.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum FrameClipboardHistoryError {
+    /// A useful history must retain at least one entry.
+    #[error("frame clipboard history capacity must be greater than zero")]
+    ZeroCapacity,
+    /// The requested capacity exceeds the process-wide retention guardrail.
+    #[error("frame clipboard history capacity {requested} exceeds the maximum of {maximum}")]
+    CapacityTooLarge {
+        /// Rejected number of retained entries.
+        requested: usize,
+        /// Process-wide maximum entry count.
+        maximum: usize,
+    },
+    /// An externally constructed or future snapshot contains no frames.
+    #[error("cannot add an empty snapshot to frame clipboard history")]
+    EmptyClipboard,
+    /// Reserving the bounded deque failed without changing history.
+    #[error("could not allocate frame clipboard history for {requested} entries")]
+    AllocationFailed {
+        /// Entry count needed by the failed push.
+        requested: usize,
+    },
+    /// The session-local monotonically increasing identity space is exhausted.
+    #[error("frame clipboard history identity space is exhausted")]
+    IdentityExhausted,
 }
 
 /// Atomic cut result: the clipboard is installed only after `command` commits successfully.
@@ -469,5 +700,110 @@ mod tests {
             ),
             Err(EditorError::UnknownPasteAnchor(id)) if id == FrameId::from_u128(99)
         ));
+    }
+
+    #[test]
+    fn clipboard_history_evicts_oldest_and_selects_each_new_snapshot() {
+        let project = project(4);
+        let first = copy_selected_frames(&project, [FrameId::from_u128(1)]).unwrap();
+        let second = copy_selected_frames(&project, [FrameId::from_u128(2)]).unwrap();
+        let third = copy_selected_frames(&project, [FrameId::from_u128(3)]).unwrap();
+        let mut history = FrameClipboardHistory::new(2).unwrap();
+
+        let first_id = history.push(first).unwrap();
+        let second_id = history.push(second).unwrap();
+        assert!(history.select(first_id));
+        let third_id = history.push(third).unwrap();
+
+        assert_eq!(history.capacity(), 2);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history.selected_id(), Some(third_id));
+        assert_eq!(
+            history
+                .entries()
+                .map(FrameClipboardHistoryEntry::id)
+                .collect::<Vec<_>>(),
+            [second_id, third_id]
+        );
+        assert!(!history.select(first_id));
+        assert_eq!(history.selected().unwrap().frame_count(), 1);
+        assert_eq!(history.selected().unwrap().total_duration_us(), Some(3));
+    }
+
+    #[test]
+    fn clipboard_history_selection_removal_and_clear_have_stable_fallbacks() {
+        let project = project(4);
+        let mut history = FrameClipboardHistory::default();
+        let first = history
+            .push(copy_selected_frames(&project, [FrameId::from_u128(1)]).unwrap())
+            .unwrap();
+        let middle = history
+            .push(copy_selected_frames(&project, [FrameId::from_u128(2)]).unwrap())
+            .unwrap();
+        let newest = history
+            .push(copy_selected_frames(&project, [FrameId::from_u128(3)]).unwrap())
+            .unwrap();
+
+        assert!(history.select(first));
+        assert_eq!(
+            history.remove(middle).unwrap().frames()[0].id,
+            FrameId::from_u128(2)
+        );
+        assert_eq!(history.selected_id(), Some(first));
+        assert_eq!(history.remove(first).unwrap().len(), 1);
+        assert_eq!(history.selected_id(), Some(newest));
+        assert!(history.remove(FrameClipboardEntryId(99)).is_none());
+
+        history.clear();
+        assert!(history.is_empty());
+        assert!(history.selected_clipboard().is_none());
+        let after_clear = history
+            .push(copy_selected_frames(&project, [FrameId::from_u128(4)]).unwrap())
+            .unwrap();
+        assert_eq!(after_clear.get(), 4);
+    }
+
+    #[test]
+    fn clipboard_history_rejects_invalid_capacity_empty_entries_and_exhausted_ids_atomically() {
+        assert!(matches!(
+            FrameClipboardHistory::new(0),
+            Err(FrameClipboardHistoryError::ZeroCapacity)
+        ));
+        assert!(matches!(
+            FrameClipboardHistory::new(MAX_FRAME_CLIPBOARD_HISTORY_CAPACITY + 1),
+            Err(FrameClipboardHistoryError::CapacityTooLarge { .. })
+        ));
+
+        let mut history = FrameClipboardHistory::new(1).unwrap();
+        assert!(matches!(
+            history.push(FrameClipboard { frames: Vec::new() }),
+            Err(FrameClipboardHistoryError::EmptyClipboard)
+        ));
+        assert!(history.is_empty());
+
+        let project = project(2);
+        history.next_id = u64::MAX;
+        let final_id = history
+            .push(copy_selected_frames(&project, [FrameId::from_u128(1)]).unwrap())
+            .unwrap();
+        assert_eq!(final_id.get(), u64::MAX);
+        let before = history.clone();
+        assert!(matches!(
+            history.push(copy_selected_frames(&project, [FrameId::from_u128(2)]).unwrap()),
+            Err(FrameClipboardHistoryError::IdentityExhausted)
+        ));
+        assert_eq!(history, before);
+    }
+
+    #[test]
+    fn clipboard_history_preview_reports_duration_overflow_without_panicking() {
+        let mut clipboard = FrameClipboard {
+            frames: project(2).timeline.frames,
+        };
+        clipboard.frames[0].duration = DurationUs::new(u64::MAX).unwrap();
+        clipboard.frames[1].duration = DurationUs::new(1).unwrap();
+        let mut history = FrameClipboardHistory::default();
+        history.push(clipboard).unwrap();
+        assert_eq!(history.selected().unwrap().total_duration_us(), None);
     }
 }
