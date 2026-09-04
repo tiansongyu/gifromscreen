@@ -10,7 +10,8 @@ Implemented now:
 - once, finite, and infinite loop behavior;
 - deterministic local or memory-bounded global palettes with 2–256 entries;
 - selectable Median Cut, Grayscale, and Most Used built-in quantizers;
-- no dithering, ordered Bayer 4x4, and Floyd-Steinberg strategies;
+- no dithering, ordered Bayer 4x4, Floyd-Steinberg, Atkinson, Burkes,
+  Sierra Lite, Two-row Sierra, and full three-row Sierra strategies;
 - 1-bit transparency via an alpha threshold;
 - changed-rectangle encoding with disposal-to-background when opaque pixels
   become transparent;
@@ -30,6 +31,24 @@ let options = EncodeOptions {
 };
 ```
 
+Select dithering independently from palette generation:
+
+```rust
+use gif_from_screen_gif::{DitherMode, EncodeOptions};
+
+let options = EncodeOptions {
+    dither: DitherMode::Sierra,
+    ..EncodeOptions::default()
+};
+```
+
+`Bayer4x4` uses a fixed ordered matrix. The six error-diffusion modes scan
+left-to-right deterministically: `FloydSteinberg`, `Atkinson`, `Burkes`,
+`SierraLite`, `TwoRowSierra`, and `Sierra` (the full three-row variant).
+Transparent pixels neither receive nor emit diffusion error, and their hidden
+RGB values cannot alter neighboring opaque pixels. Every mapper cooperatively
+checks the export cancellation token while it works.
+
 `MedianCut` is the balanced general-purpose choice. `Grayscale` converts source
 colors to deterministic BT.601 luma values before palette reduction. `MostUsed`
 prioritizes frequent colors and resolves ties lexicographically. All three work
@@ -43,7 +62,6 @@ added behind the same application port:
 
 - fixed and custom palette planners;
 - NeuQuant/Octree/Wu quantizers;
-- Atkinson, Burkes, and Sierra-family dithering;
 - more aggressive transparent-rectangle and disposal optimization;
 - lossy similar-frame merging.
 

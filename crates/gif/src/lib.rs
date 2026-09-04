@@ -2,9 +2,11 @@
 //!
 //! The public port deals only in owned, full-canvas, straight-alpha sRGB RGBA8
 //! frames. The built-in adapter supports deterministic median-cut, grayscale,
-//! and most-used-color quantizers with local or global palettes. More
-//! sophisticated palette and delta-frame pipelines can be added without
-//! exposing the underlying `gif` crate.
+//! and most-used-color quantizers with local or global palettes. Palette
+//! mapping includes ordered Bayer and Floyd-Steinberg, Atkinson, Burkes, and
+//! Sierra-family error diffusion through [`DitherMode`]. More sophisticated
+//! palette and delta-frame pipelines can be added without exposing the
+//! underlying `gif` crate.
 
 #![forbid(unsafe_code)]
 

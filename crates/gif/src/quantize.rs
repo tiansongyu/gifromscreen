@@ -19,14 +19,31 @@ pub struct QuantizationSettings {
     pub reserve_transparency: bool,
 }
 
+/// Deterministic palette-mapping strategy used after color quantization.
+///
+/// Error-diffusion modes scan rows from left to right. Transparent pixels are
+/// assigned the palette's transparent entry without consuming, producing, or
+/// forwarding color error, so hidden RGB data cannot affect opaque output.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum DitherMode {
+    /// Map every pixel directly to its nearest palette entry.
     #[default]
     None,
     /// Ordered 4x4 Bayer dithering with a deterministic, moderate amplitude.
     Bayer4x4,
     /// Left-to-right Floyd-Steinberg error diffusion.
     FloydSteinberg,
+    /// Atkinson error diffusion, which intentionally diffuses only 3/4 of the
+    /// quantization error and therefore preserves stronger local contrast.
+    Atkinson,
+    /// Burkes two-row error diffusion.
+    Burkes,
+    /// Sierra Lite two-row error diffusion using three neighboring pixels.
+    SierraLite,
+    /// Two-row Sierra error diffusion.
+    TwoRowSierra,
+    /// Full three-row Sierra error diffusion.
+    Sierra,
 }
 
 /// Deterministic quantizer provided by the built-in encoder.
@@ -467,6 +484,46 @@ pub(crate) fn map_frame_to_palette(
             alpha_threshold,
             cancellation,
         ),
+        DitherMode::Atkinson => map_with_error_diffusion(
+            frame,
+            palette.transparent_index,
+            &opaque_colors,
+            alpha_threshold,
+            ATKINSON,
+            cancellation,
+        ),
+        DitherMode::Burkes => map_with_error_diffusion(
+            frame,
+            palette.transparent_index,
+            &opaque_colors,
+            alpha_threshold,
+            BURKES,
+            cancellation,
+        ),
+        DitherMode::SierraLite => map_with_error_diffusion(
+            frame,
+            palette.transparent_index,
+            &opaque_colors,
+            alpha_threshold,
+            SIERRA_LITE,
+            cancellation,
+        ),
+        DitherMode::TwoRowSierra => map_with_error_diffusion(
+            frame,
+            palette.transparent_index,
+            &opaque_colors,
+            alpha_threshold,
+            TWO_ROW_SIERRA,
+            cancellation,
+        ),
+        DitherMode::Sierra => map_with_error_diffusion(
+            frame,
+            palette.transparent_index,
+            &opaque_colors,
+            alpha_threshold,
+            SIERRA,
+            cancellation,
+        ),
     }
 }
 
@@ -616,6 +673,87 @@ fn map_with_bayer(
     Ok(indices)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DiffusionTap {
+    x: isize,
+    row: usize,
+    weight: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DiffusionKernel {
+    divisor: i32,
+    taps: &'static [DiffusionTap],
+}
+
+const fn tap(x: isize, row: usize, weight: i32) -> DiffusionTap {
+    DiffusionTap { x, row, weight }
+}
+
+const FLOYD_STEINBERG: DiffusionKernel = DiffusionKernel {
+    divisor: 16,
+    taps: &[tap(1, 0, 7), tap(-1, 1, 3), tap(0, 1, 5), tap(1, 1, 1)],
+};
+
+const ATKINSON: DiffusionKernel = DiffusionKernel {
+    divisor: 8,
+    taps: &[
+        tap(1, 0, 1),
+        tap(2, 0, 1),
+        tap(-1, 1, 1),
+        tap(0, 1, 1),
+        tap(1, 1, 1),
+        tap(0, 2, 1),
+    ],
+};
+
+const BURKES: DiffusionKernel = DiffusionKernel {
+    divisor: 32,
+    taps: &[
+        tap(1, 0, 8),
+        tap(2, 0, 4),
+        tap(-2, 1, 2),
+        tap(-1, 1, 4),
+        tap(0, 1, 8),
+        tap(1, 1, 4),
+        tap(2, 1, 2),
+    ],
+};
+
+const SIERRA_LITE: DiffusionKernel = DiffusionKernel {
+    divisor: 4,
+    taps: &[tap(1, 0, 2), tap(-1, 1, 1), tap(0, 1, 1)],
+};
+
+const TWO_ROW_SIERRA: DiffusionKernel = DiffusionKernel {
+    divisor: 16,
+    taps: &[
+        tap(1, 0, 4),
+        tap(2, 0, 3),
+        tap(-2, 1, 1),
+        tap(-1, 1, 2),
+        tap(0, 1, 3),
+        tap(1, 1, 2),
+        tap(2, 1, 1),
+    ],
+};
+
+const SIERRA: DiffusionKernel = DiffusionKernel {
+    divisor: 32,
+    taps: &[
+        tap(1, 0, 5),
+        tap(2, 0, 3),
+        tap(-2, 1, 2),
+        tap(-1, 1, 4),
+        tap(0, 1, 5),
+        tap(1, 1, 4),
+        tap(2, 1, 2),
+        tap(-1, 2, 2),
+        tap(0, 2, 3),
+        tap(1, 2, 2),
+    ],
+};
+
 fn map_with_floyd_steinberg(
     frame: &RgbaFrame,
     transparent_index: Option<u8>,
@@ -623,12 +761,38 @@ fn map_with_floyd_steinberg(
     alpha_threshold: Option<u8>,
     cancellation: &dyn CancellationToken,
 ) -> Result<Vec<u8>, QuantizationError> {
+    map_with_error_diffusion(
+        frame,
+        transparent_index,
+        palette,
+        alpha_threshold,
+        FLOYD_STEINBERG,
+        cancellation,
+    )
+}
+
+fn map_with_error_diffusion(
+    frame: &RgbaFrame,
+    transparent_index: Option<u8>,
+    palette: &[(u8, [u8; 3])],
+    alpha_threshold: Option<u8>,
+    kernel: DiffusionKernel,
+    cancellation: &dyn CancellationToken,
+) -> Result<Vec<u8>, QuantizationError> {
+    const ERROR_SCALE: i32 = 256;
+
     let lookup = build_color_lookup(palette, cancellation)?;
     let palette_by_index = palette_colors_by_index(palette);
     let width = usize::from(frame.width());
     let height = usize::from(frame.height());
-    let mut current_error = vec![[0_i32; 3]; width + 2];
-    let mut next_error = vec![[0_i32; 3]; width + 2];
+    let row_count = kernel.taps.iter().map(|tap| tap.row).max().unwrap_or(0) + 1;
+    let padding = kernel
+        .taps
+        .iter()
+        .map(|tap| tap.x.unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    let mut error_rows = vec![vec![[0_i32; 3]; width + padding * 2]; row_count];
     let mut indices = Vec::with_capacity(width * height);
 
     for y in 0..height {
@@ -637,6 +801,10 @@ fn map_with_floyd_steinberg(
             check_cancellation(pixel_index, cancellation)?;
             let pixel = &frame.pixels()[pixel_index * 4..pixel_index * 4 + 4];
             if is_transparent(pixel[3], alpha_threshold) {
+                // Discard any error aimed at a transparent pixel. Its hidden
+                // RGB values must neither influence output nor relay error to
+                // opaque neighbors.
+                error_rows[0][x + padding] = [0; 3];
                 indices.push(required_transparent_index(transparent_index)?);
                 continue;
             }
@@ -644,24 +812,35 @@ fn map_with_floyd_steinberg(
             let mut adjusted = [0_u8; 3];
             let mut scaled = [0_i32; 3];
             for channel in 0..3 {
-                scaled[channel] = (i32::from(pixel[channel]) * 16 + current_error[x + 1][channel])
-                    .clamp(0, 255 * 16);
-                adjusted[channel] = ((scaled[channel] + 8) / 16) as u8;
+                scaled[channel] = (i32::from(pixel[channel]) * ERROR_SCALE
+                    + error_rows[0][x + padding][channel])
+                    .clamp(0, 255 * ERROR_SCALE);
+                adjusted[channel] = ((scaled[channel] + ERROR_SCALE / 2) / ERROR_SCALE) as u8;
             }
             let palette_index = lookup[histogram_index(adjusted[0], adjusted[1], adjusted[2])];
             indices.push(palette_index);
             let chosen = palette_by_index[usize::from(palette_index)];
 
-            for channel in 0..3 {
-                let error = scaled[channel] - i32::from(chosen[channel]) * 16;
-                current_error[x + 2][channel] += error * 7 / 16;
-                next_error[x][channel] += error * 3 / 16;
-                next_error[x + 1][channel] += error * 5 / 16;
-                next_error[x + 2][channel] += error / 16;
+            for tap in kernel.taps {
+                let target_x = x as isize + tap.x;
+                let target_y = y + tap.row;
+                if target_x < 0 || target_x >= width as isize || target_y >= height {
+                    continue;
+                }
+                let target_x = target_x as usize;
+                let target_alpha = frame.pixels()[(target_y * width + target_x) * 4 + 3];
+                if is_transparent(target_alpha, alpha_threshold) {
+                    continue;
+                }
+                for channel in 0..3 {
+                    let error = scaled[channel] - i32::from(chosen[channel]) * ERROR_SCALE;
+                    error_rows[tap.row][target_x + padding][channel] +=
+                        error * tap.weight / kernel.divisor;
+                }
             }
         }
-        std::mem::swap(&mut current_error, &mut next_error);
-        next_error.fill([0; 3]);
+        error_rows.rotate_left(1);
+        error_rows[row_count - 1].fill([0; 3]);
     }
     Ok(indices)
 }
@@ -866,6 +1045,8 @@ fn color_distance(left: [u8; 3], right: [u8; 3]) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use crate::{CancellationFlag, NeverCancel};
 
     use super::*;
@@ -875,6 +1056,36 @@ mod tests {
         QuantizerStrategy::Grayscale,
         QuantizerStrategy::MostUsed,
     ];
+
+    const ERROR_DIFFUSION_MODES: [DitherMode; 6] = [
+        DitherMode::FloydSteinberg,
+        DitherMode::Atkinson,
+        DitherMode::Burkes,
+        DitherMode::SierraLite,
+        DitherMode::TwoRowSierra,
+        DitherMode::Sierra,
+    ];
+
+    #[derive(Debug)]
+    struct CancelAfterChecks {
+        checks: AtomicUsize,
+        allowed_checks: usize,
+    }
+
+    impl CancelAfterChecks {
+        const fn new(allowed_checks: usize) -> Self {
+            Self {
+                checks: AtomicUsize::new(0),
+                allowed_checks,
+            }
+        }
+    }
+
+    impl CancellationToken for CancelAfterChecks {
+        fn is_cancelled(&self) -> bool {
+            self.checks.fetch_add(1, Ordering::Relaxed) >= self.allowed_checks
+        }
+    }
 
     fn frame_from_pixels(pixels: &[[u8; 4]]) -> RgbaFrame {
         RgbaFrame::new(
@@ -1095,7 +1306,7 @@ mod tests {
     }
 
     #[test]
-    fn bayer_and_floyd_steinberg_dither_a_midpoint() {
+    fn bayer_dithers_a_midpoint() {
         let frame = RgbaFrame::new(8, 8, [128, 128, 128, 255].repeat(64), 10_000).unwrap();
         let palette = ColorPalette::new(vec![0, 0, 0, 255, 255, 255], None).unwrap();
         let none =
@@ -1103,19 +1314,95 @@ mod tests {
         let bayer =
             map_frame_to_palette(&frame, &palette, None, DitherMode::Bayer4x4, &NeverCancel)
                 .unwrap();
-        let floyd = map_frame_to_palette(
-            &frame,
-            &palette,
-            None,
-            DitherMode::FloydSteinberg,
-            &NeverCancel,
-        )
-        .unwrap();
 
         assert!(none.iter().all(|&index| index == none[0]));
         assert!(bayer.contains(&0) && bayer.contains(&1));
-        assert!(floyd.contains(&0) && floyd.contains(&1));
         assert_ne!(bayer, none);
-        assert_ne!(floyd, none);
+    }
+
+    #[test]
+    fn every_error_diffusion_mode_is_deterministic_bounded_and_dithers() {
+        let frame = RgbaFrame::new(16, 16, [128, 128, 128, 255].repeat(256), 10_000).unwrap();
+        let palette = ColorPalette::new(vec![0, 0, 0, 255, 255, 255], None).unwrap();
+        let none =
+            map_frame_to_palette(&frame, &palette, None, DitherMode::None, &NeverCancel).unwrap();
+
+        for mode in ERROR_DIFFUSION_MODES {
+            let first = map_frame_to_palette(&frame, &palette, None, mode, &NeverCancel).unwrap();
+            let second = map_frame_to_palette(&frame, &palette, None, mode, &NeverCancel).unwrap();
+
+            assert_eq!(first, second, "{mode:?} output must be deterministic");
+            assert!(
+                first.iter().all(|&index| index < 2),
+                "{mode:?} emitted an out-of-range palette index"
+            );
+            assert!(
+                first.contains(&0) && first.contains(&1),
+                "{mode:?} did not use both colors"
+            );
+            assert_ne!(first, none, "{mode:?} matched non-dithered output");
+        }
+    }
+
+    #[test]
+    fn transparent_pixels_do_not_contaminate_error_diffusion() {
+        let width = 16_u16;
+        let height = 8_u16;
+        let mut dark_hidden = Vec::with_capacity(usize::from(width * height) * 4);
+        let mut light_hidden = Vec::with_capacity(usize::from(width * height) * 4);
+        for index in 0..usize::from(width * height) {
+            let x = index % usize::from(width);
+            let transparent = x == 3 || x == 9;
+            let alpha = if transparent { 0 } else { 255 };
+            dark_hidden.extend_from_slice(&[if transparent { 0 } else { 128 }; 3]);
+            dark_hidden.push(alpha);
+            light_hidden.extend_from_slice(&[if transparent { 255 } else { 128 }; 3]);
+            light_hidden.push(alpha);
+        }
+        let dark_hidden = RgbaFrame::new(width, height, dark_hidden, 10_000).unwrap();
+        let light_hidden = RgbaFrame::new(width, height, light_hidden, 10_000).unwrap();
+        let palette = ColorPalette::new(vec![0, 0, 0, 0, 0, 0, 255, 255, 255], Some(0)).unwrap();
+
+        for mode in ERROR_DIFFUSION_MODES {
+            let first = map_frame_to_palette(&dark_hidden, &palette, Some(128), mode, &NeverCancel)
+                .unwrap();
+            let second =
+                map_frame_to_palette(&light_hidden, &palette, Some(128), mode, &NeverCancel)
+                    .unwrap();
+
+            assert_eq!(
+                first, second,
+                "{mode:?} leaked hidden transparent RGB into opaque pixels"
+            );
+            for (index, &palette_index) in first.iter().enumerate() {
+                let x = index % usize::from(width);
+                if x == 3 || x == 9 {
+                    assert_eq!(palette_index, 0, "{mode:?} lost transparency");
+                } else {
+                    assert!(
+                        (1..=2).contains(&palette_index),
+                        "{mode:?} emitted an invalid opaque index"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_error_diffusion_mode_checks_cancellation_during_mapping() {
+        let frame = RgbaFrame::new(128, 64, [128, 128, 128, 255].repeat(8_192), 10_000).unwrap();
+        let palette = ColorPalette::new(vec![0, 0, 0, 255, 255, 255], None).unwrap();
+
+        for mode in ERROR_DIFFUSION_MODES {
+            // Building the fixed lookup performs eight checks. Allow its
+            // checks plus the first mapping check, then cancel at pixel 4096.
+            let cancellation = CancelAfterChecks::new(9);
+            assert_eq!(
+                map_frame_to_palette(&frame, &palette, None, mode, &cancellation),
+                Err(QuantizationError::Cancelled),
+                "{mode:?} ignored periodic cancellation"
+            );
+            assert!(cancellation.checks.load(Ordering::Relaxed) >= 10);
+        }
     }
 }
