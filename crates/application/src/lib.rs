@@ -2,8 +2,14 @@
 
 //! Application-level state machines and use-case orchestration.
 
+mod project_export;
 mod recording_project;
 
+pub use project_export::{
+    NoopProjectExportProgress, ProjectExportPhase, ProjectExportProgress,
+    ProjectExportProgressSink, ProjectExportSnapshot, ProjectFrameSelection, ProjectGifExportError,
+    ProjectGifExportOptions, ProjectGifExportReport, export_project_snapshot_to_gif,
+};
 pub use recording_project::{
     PersistRecordingError, RecordingProjectOptions, persist_collected_recording,
 };

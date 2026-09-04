@@ -1,0 +1,1332 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use gif_from_screen_domain::{
+    AssetId, AssetKind, FrameClip, FrameId, ProjectId, ProjectManifest, ProjectRevision,
+    RasterEncoding,
+};
+use gif_from_screen_gif::{
+    BuiltinGifEncoder, CancellationToken as GifCancellationToken, EncodeOptions, EncodeProgress,
+    EncodeReport, FrameError, GifEncodeError, GifEncoder, IteratorFrameSource, ProgressSink,
+    RgbaFrame,
+};
+use gif_from_screen_project::{ActiveProject, AssetStore, ProjectError};
+use gif_from_screen_render::{
+    AssetProviderError, CancellationToken as RenderCancellationToken, CpuRenderer,
+    FrameAssetProvider, RenderError, RgbaSurface, SurfaceError,
+};
+use tempfile::NamedTempFile;
+use thiserror::Error;
+
+/// Lock-free, read-only inputs needed to export one project revision.
+///
+/// The manifest and content-addressed store handle are cloned from an active
+/// project. The snapshot owns no project lock, so it can be moved to a
+/// background thread after the [`ActiveProject`] is dropped.
+#[derive(Clone, Debug)]
+pub struct ProjectExportSnapshot {
+    manifest: ProjectManifest,
+    assets: AssetStore,
+}
+
+impl ProjectExportSnapshot {
+    /// Captures the current manifest revision and immutable asset-store handle.
+    pub fn from_active(project: &ActiveProject) -> Self {
+        Self {
+            manifest: project.manifest().clone(),
+            assets: project.assets().clone(),
+        }
+    }
+
+    /// Returns the immutable manifest revision represented by this snapshot.
+    pub const fn manifest(&self) -> &ProjectManifest {
+        &self.manifest
+    }
+}
+
+/// Frames included in an export and their presentation order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ProjectFrameSelection {
+    /// Export the complete timeline in manifest order.
+    #[default]
+    All,
+    /// Export exactly these frames in the supplied order.
+    Ordered(Vec<FrameId>),
+}
+
+/// Configuration for a project-to-GIF export.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectGifExportOptions {
+    /// Complete timeline or an explicitly ordered subset.
+    pub frames: ProjectFrameSelection,
+    /// Palette, timing, loop, transparency, delta, and dithering configuration.
+    pub encoding: EncodeOptions,
+    /// Whether a successfully encoded GIF may atomically replace an existing file.
+    pub overwrite_existing: bool,
+    /// Maximum combined bytes retained for source assets and rendered frames.
+    pub render_buffer_limit_bytes: u64,
+}
+
+impl Default for ProjectGifExportOptions {
+    fn default() -> Self {
+        Self {
+            frames: ProjectFrameSelection::All,
+            encoding: EncodeOptions::default(),
+            overwrite_existing: false,
+            render_buffer_limit_bytes: 512 * 1024 * 1024,
+        }
+    }
+}
+
+/// High-level phase of a project export.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ProjectExportPhase {
+    /// Validate selection and load immutable assets.
+    Preparing,
+    /// Apply clip transforms and effects with the deterministic CPU renderer.
+    Rendering,
+    /// Quantize and encode rendered frames as GIF.
+    Encoding,
+    /// Flush and synchronize the completed temporary file.
+    Syncing,
+    /// Atomically publish the synchronized file.
+    Committing,
+    /// Export and directory synchronization completed.
+    Complete,
+}
+
+/// Monotonic stage and frame counters reported during export.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProjectExportProgress {
+    /// Current export phase.
+    pub phase: ProjectExportPhase,
+    /// Logical project frames fully rendered so far.
+    pub frames_rendered: u64,
+    /// Logical rendered frames consumed by the GIF encoder so far.
+    pub frames_encoded: u64,
+    /// Exact number of selected logical frames.
+    pub total_frames: u64,
+}
+
+/// Receives project export progress on the worker thread.
+pub trait ProjectExportProgressSink {
+    /// Reports a monotonic export progress snapshot.
+    fn report(&mut self, progress: ProjectExportProgress);
+}
+
+impl<F> ProjectExportProgressSink for F
+where
+    F: FnMut(ProjectExportProgress),
+{
+    fn report(&mut self, progress: ProjectExportProgress) {
+        self(progress);
+    }
+}
+
+/// Progress sink for callers that do not need updates.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopProjectExportProgress;
+
+impl ProjectExportProgressSink for NoopProjectExportProgress {
+    fn report(&mut self, _progress: ProjectExportProgress) {}
+}
+
+/// Successful atomic GIF export metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectGifExportReport {
+    /// Project identifier captured by the export snapshot.
+    pub project_id: ProjectId,
+    /// Exact manifest revision captured by the export snapshot.
+    pub revision: ProjectRevision,
+    /// Number of selected logical frames.
+    pub selected_frames: u64,
+    /// Built-in encoder statistics.
+    pub encoding: EncodeReport,
+    /// Final committed output path.
+    pub output_path: PathBuf,
+    /// Synchronized temporary-file length immediately before commit.
+    pub bytes_written: u64,
+}
+
+/// Failure while selecting, rendering, encoding, or atomically committing GIF output.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ProjectGifExportError {
+    /// No timeline frame was selected.
+    #[error("project GIF export requires at least one frame")]
+    EmptySelection,
+
+    /// An explicitly selected frame id does not exist in the snapshot.
+    #[error("selected frame {frame_id} at position {selection_index} is not in the project")]
+    UnknownFrame {
+        /// Zero-based position in the explicit selection.
+        selection_index: usize,
+        /// Unknown stable frame identifier.
+        frame_id: FrameId,
+    },
+
+    /// An explicit selection contains the same frame more than once.
+    #[error(
+        "selected frame {frame_id} is duplicated at positions {first_index} and {duplicate_index}"
+    )]
+    DuplicateFrame {
+        /// Repeated stable frame identifier.
+        frame_id: FrameId,
+        /// First selection position using the identifier.
+        first_index: usize,
+        /// Later selection position using the identifier.
+        duplicate_index: usize,
+    },
+
+    /// A selected clip references no descriptor in the snapshot manifest.
+    #[error("frame {frame_id} references missing asset descriptor {asset_id}")]
+    MissingAssetDescriptor {
+        /// Selected frame referencing the descriptor.
+        frame_id: FrameId,
+        /// Missing content-addressed asset identifier.
+        asset_id: AssetId,
+    },
+
+    /// A selected clip references an asset that is not a frame raster.
+    #[error("frame {frame_id} references non-frame asset {asset_id}: {kind:?}")]
+    InvalidAssetKind {
+        /// Selected frame referencing the asset.
+        frame_id: FrameId,
+        /// Incompatible asset identifier.
+        asset_id: AssetId,
+        /// Incompatible descriptor kind.
+        kind: AssetKind,
+    },
+
+    /// The CPU renderer currently requires raw RGBA8 frame assets.
+    #[error("frame {frame_id} asset {asset_id} uses unsupported raster encoding {encoding:?}")]
+    UnsupportedAssetEncoding {
+        /// Selected frame referencing the asset.
+        frame_id: FrameId,
+        /// Incompatible asset identifier.
+        asset_id: AssetId,
+        /// Unsupported persisted encoding.
+        encoding: RasterEncoding,
+    },
+
+    /// A selected immutable asset file is missing.
+    #[error("frame {frame_id} asset file {asset_id} is missing at {path}", path = path.display())]
+    MissingAssetFile {
+        /// Selected frame referencing the missing file.
+        frame_id: FrameId,
+        /// Missing content-addressed asset identifier.
+        asset_id: AssetId,
+        /// Expected immutable asset path.
+        path: PathBuf,
+    },
+
+    /// A selected asset no longer matches its content digest.
+    #[error("frame {frame_id} asset {asset_id} is corrupt: {source}")]
+    CorruptAsset {
+        /// Selected frame referencing the corrupt asset.
+        frame_id: FrameId,
+        /// Corrupt content-addressed asset identifier.
+        asset_id: AssetId,
+        /// Original project-store integrity error.
+        #[source]
+        source: ProjectError,
+    },
+
+    /// A selected asset could not be read or verified.
+    #[error("could not read frame {frame_id} asset {asset_id}: {source}")]
+    ReadAsset {
+        /// Selected frame referencing the asset.
+        frame_id: FrameId,
+        /// Unreadable content-addressed asset identifier.
+        asset_id: AssetId,
+        /// Original project-store failure.
+        #[source]
+        source: ProjectError,
+    },
+
+    /// Descriptor byte length differs from verified asset content.
+    #[error(
+        "frame {frame_id} asset {asset_id} has {actual} bytes but its descriptor declares {expected}"
+    )]
+    AssetLengthMismatch {
+        /// Selected frame referencing the asset.
+        frame_id: FrameId,
+        /// Inconsistent content-addressed asset identifier.
+        asset_id: AssetId,
+        /// Byte length persisted in the descriptor.
+        expected: u64,
+        /// Verified asset-file byte length.
+        actual: u64,
+    },
+
+    /// Verified asset bytes do not form the descriptor's RGBA surface.
+    #[error("frame {frame_id} asset {asset_id} is not a valid RGBA surface: {source}")]
+    InvalidAssetSurface {
+        /// Selected frame referencing the asset.
+        frame_id: FrameId,
+        /// Invalid content-addressed asset identifier.
+        asset_id: AssetId,
+        /// Renderer surface validation failure.
+        #[source]
+        source: SurfaceError,
+    },
+
+    /// CPU transform/effect rendering failed for one frame.
+    #[error("could not render selected frame {frame_id} at position {selection_index}: {source}")]
+    RenderFrame {
+        /// Zero-based position in the resolved selection.
+        selection_index: usize,
+        /// Stable frame identifier being rendered.
+        frame_id: FrameId,
+        /// Deterministic renderer failure.
+        #[source]
+        source: RenderError,
+    },
+
+    /// A rendered surface exceeds GIF's 16-bit dimensions.
+    #[error("rendered frame {frame_id} dimensions {width}x{height} exceed the GIF canvas limit")]
+    RenderedDimensionsOutOfRange {
+        /// Stable frame identifier being rendered.
+        frame_id: FrameId,
+        /// Rendered width.
+        width: u32,
+        /// Rendered height.
+        height: u32,
+    },
+
+    /// A rendered surface could not be converted into an encoder frame.
+    #[error("rendered frame {frame_id} is invalid for GIF encoding: {source}")]
+    BuildGifFrame {
+        /// Stable frame identifier being converted.
+        frame_id: FrameId,
+        /// Encoder frame validation failure.
+        #[source]
+        source: FrameError,
+    },
+
+    /// Retained source and rendered RGBA buffers exceed the configured bound.
+    #[error(
+        "project export would retain {required_bytes} RGBA bytes, above the configured {limit_bytes}-byte limit"
+    )]
+    RenderBufferLimitExceeded {
+        /// Resident bytes required after accepting the current buffer.
+        required_bytes: u64,
+        /// Caller-configured resident RGBA bound.
+        limit_bytes: u64,
+    },
+
+    /// Built-in GIF encoding failed.
+    #[error("GIF encoding failed: {source}")]
+    Encode {
+        /// Built-in encoder or quantizer failure.
+        #[source]
+        source: GifEncodeError,
+    },
+
+    /// Cooperative cancellation was observed before atomic commit.
+    #[error("project GIF export was cancelled")]
+    Cancelled,
+
+    /// Output path has no usable file name.
+    #[error("GIF output path does not identify a file: {}", .0.display())]
+    InvalidOutputPath(PathBuf),
+
+    /// Existing output is protected by the default no-overwrite policy.
+    #[error("refusing to overwrite existing GIF output {}", .0.display())]
+    ExistingOutput(PathBuf),
+
+    /// Temporary-file creation, synchronization, commit, or directory sync failed.
+    #[error("could not {operation} {}: {source}", path.display())]
+    Io {
+        /// Stable failing operation name.
+        operation: &'static str,
+        /// Relevant output or parent path.
+        path: PathBuf,
+        /// Original filesystem failure.
+        #[source]
+        source: io::Error,
+    },
+
+    /// Atomic rename succeeded, but synchronizing its parent directory failed.
+    #[error(
+        "GIF output {} was committed, but its directory could not be synchronized; durability is uncertain: {source}",
+        path.display()
+    )]
+    CommitDurabilityUnknown {
+        /// Output path already published by the successful rename.
+        path: PathBuf,
+        /// Parent-directory synchronization failure.
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// Renders a lock-free project snapshot and atomically commits a GIF file.
+///
+/// This synchronous use case owns no UI or runtime state and is safe to move as
+/// a whole onto an application-managed background thread. The final path is
+/// untouched until rendering and encoding succeed, the temporary file is
+/// flushed and synchronized, and cancellation is checked one last time.
+/// Temporary files are automatically removed on every pre-commit failure.
+/// When replacement is enabled, the old output likewise remains untouched by
+/// every rendering, encoding, synchronization, and cancellation failure before
+/// the atomic rename. A failure to synchronize the directory after that rename
+/// is reported separately as [`ProjectGifExportError::CommitDurabilityUnknown`]
+/// because the new output is already visible and its crash durability is
+/// uncertain.
+///
+/// # Errors
+///
+/// Returns [`ProjectGifExportError`] for invalid selections, asset integrity or
+/// encoding mismatches, rendering/encoding failures, cancellation, protected
+/// existing output, or filesystem failures.
+pub fn export_project_snapshot_to_gif(
+    snapshot: &ProjectExportSnapshot,
+    output: impl AsRef<Path>,
+    options: &ProjectGifExportOptions,
+    cancellation: &dyn GifCancellationToken,
+    progress: &mut dyn ProjectExportProgressSink,
+) -> Result<ProjectGifExportReport, ProjectGifExportError> {
+    let output = output.as_ref().to_path_buf();
+    let parent = output_parent(&output)?;
+    ensure_not_cancelled(cancellation)?;
+    if !options.overwrite_existing && try_exists(&output, "inspect GIF output")? {
+        return Err(ProjectGifExportError::ExistingOutput(output));
+    }
+
+    let clips = select_clips(&snapshot.manifest, &options.frames)?;
+    let total_frames = u64::try_from(clips.len()).unwrap_or(u64::MAX);
+    let mut execution = ExportExecution::new(cancellation, progress, total_frames);
+    execution.report_phase(ProjectExportPhase::Preparing);
+    let (assets, source_bytes) = load_selected_assets(
+        snapshot,
+        &clips,
+        options.render_buffer_limit_bytes,
+        cancellation,
+    )?;
+    let provider = LoadedAssetProvider { assets };
+    let gif_frames = render_selected_frames(
+        &clips,
+        &provider,
+        source_bytes,
+        options.render_buffer_limit_bytes,
+        &mut execution,
+    )?;
+    let (encoding, bytes_written) =
+        encode_and_commit(gif_frames, &output, parent, options, &mut execution)?;
+    execution.report_phase(ProjectExportPhase::Complete);
+    Ok(ProjectGifExportReport {
+        project_id: snapshot.manifest.project_id,
+        revision: snapshot.manifest.revision,
+        selected_frames: total_frames,
+        encoding,
+        output_path: output,
+        bytes_written,
+    })
+}
+
+struct ExportExecution<'a> {
+    cancellation: &'a dyn GifCancellationToken,
+    progress: &'a mut dyn ProjectExportProgressSink,
+    state: ProjectExportProgress,
+}
+
+impl<'a> ExportExecution<'a> {
+    fn new(
+        cancellation: &'a dyn GifCancellationToken,
+        progress: &'a mut dyn ProjectExportProgressSink,
+        total_frames: u64,
+    ) -> Self {
+        Self {
+            cancellation,
+            progress,
+            state: ProjectExportProgress {
+                phase: ProjectExportPhase::Preparing,
+                frames_rendered: 0,
+                frames_encoded: 0,
+                total_frames,
+            },
+        }
+    }
+
+    fn report_phase(&mut self, phase: ProjectExportPhase) {
+        self.state.phase = phase;
+        self.progress.report(self.state);
+    }
+}
+
+fn render_selected_frames(
+    clips: &[FrameClip],
+    provider: &LoadedAssetProvider,
+    source_bytes: u64,
+    buffer_limit_bytes: u64,
+    execution: &mut ExportExecution<'_>,
+) -> Result<Vec<RgbaFrame>, ProjectGifExportError> {
+    let cpu_renderer = CpuRenderer::new();
+    let render_cancellation = RenderCancellationAdapter(execution.cancellation);
+    let mut gif_frames = Vec::with_capacity(clips.len());
+    let mut rendered_bytes = 0_u64;
+    execution.report_phase(ProjectExportPhase::Rendering);
+    for (selection_index, clip) in clips.iter().enumerate() {
+        ensure_not_cancelled(execution.cancellation)?;
+        let surface = cpu_renderer
+            .render_clip(clip, provider, &render_cancellation)
+            .map_err(|source| {
+                if execution.cancellation.is_cancelled() {
+                    ProjectGifExportError::Cancelled
+                } else {
+                    ProjectGifExportError::RenderFrame {
+                        selection_index,
+                        frame_id: clip.id,
+                        source,
+                    }
+                }
+            })?;
+        let frame_bytes = u64::try_from(surface.pixels().len()).unwrap_or(u64::MAX);
+        let required_bytes = source_bytes
+            .saturating_add(rendered_bytes)
+            .saturating_add(frame_bytes);
+        if required_bytes > buffer_limit_bytes {
+            return Err(ProjectGifExportError::RenderBufferLimitExceeded {
+                required_bytes,
+                limit_bytes: buffer_limit_bytes,
+            });
+        }
+        gif_frames.push(surface_to_gif_frame(surface, clip)?);
+        rendered_bytes = rendered_bytes.saturating_add(frame_bytes);
+        execution.state.frames_rendered = u64::try_from(gif_frames.len()).unwrap_or(u64::MAX);
+        execution.progress.report(execution.state);
+    }
+    Ok(gif_frames)
+}
+
+fn surface_to_gif_frame(
+    surface: RgbaSurface,
+    clip: &FrameClip,
+) -> Result<RgbaFrame, ProjectGifExportError> {
+    let width = u16::try_from(surface.width()).map_err(|_| {
+        ProjectGifExportError::RenderedDimensionsOutOfRange {
+            frame_id: clip.id,
+            width: surface.width(),
+            height: surface.height(),
+        }
+    })?;
+    let height = u16::try_from(surface.height()).map_err(|_| {
+        ProjectGifExportError::RenderedDimensionsOutOfRange {
+            frame_id: clip.id,
+            width: surface.width(),
+            height: surface.height(),
+        }
+    })?;
+    RgbaFrame::new(width, height, surface.into_pixels(), clip.duration.get()).map_err(|source| {
+        ProjectGifExportError::BuildGifFrame {
+            frame_id: clip.id,
+            source,
+        }
+    })
+}
+
+fn encode_and_commit(
+    gif_frames: Vec<RgbaFrame>,
+    output: &Path,
+    parent: &Path,
+    options: &ProjectGifExportOptions,
+    execution: &mut ExportExecution<'_>,
+) -> Result<(EncodeReport, u64), ProjectGifExportError> {
+    ensure_not_cancelled(execution.cancellation)?;
+    let mut temporary = create_temporary(parent, output)?;
+    execution.report_phase(ProjectExportPhase::Encoding);
+    let mut frame_source = IteratorFrameSource::new(gif_frames.into_iter());
+    let cancellation = execution.cancellation;
+    let encoding = {
+        let mut encode_progress = GifProgressAdapter {
+            sink: execution.progress,
+            state: &mut execution.state,
+        };
+        BuiltinGifEncoder::default()
+            .encode(
+                &mut frame_source,
+                temporary.as_file_mut(),
+                &options.encoding,
+                cancellation,
+                &mut encode_progress,
+            )
+            .map_err(|source| {
+                if cancellation.is_cancelled() {
+                    ProjectGifExportError::Cancelled
+                } else {
+                    ProjectGifExportError::Encode { source }
+                }
+            })?
+    };
+
+    ensure_not_cancelled(cancellation)?;
+    execution.state.frames_encoded = execution.state.total_frames;
+    execution.report_phase(ProjectExportPhase::Syncing);
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .map_err(|source| ProjectGifExportError::Io {
+            operation: "synchronize temporary GIF",
+            path: temporary.path().to_path_buf(),
+            source,
+        })?;
+    let bytes_written = temporary
+        .as_file()
+        .metadata()
+        .map_err(|source| ProjectGifExportError::Io {
+            operation: "inspect synchronized temporary GIF",
+            path: temporary.path().to_path_buf(),
+            source,
+        })?
+        .len();
+    ensure_not_cancelled(cancellation)?;
+    execution.report_phase(ProjectExportPhase::Committing);
+    persist_temporary(temporary, output, options.overwrite_existing)?;
+    sync_directory_after_commit(parent, output)?;
+    Ok((encoding, bytes_written))
+}
+
+fn select_clips(
+    manifest: &ProjectManifest,
+    selection: &ProjectFrameSelection,
+) -> Result<Vec<FrameClip>, ProjectGifExportError> {
+    match selection {
+        ProjectFrameSelection::All => {
+            if manifest.timeline.frames.is_empty() {
+                return Err(ProjectGifExportError::EmptySelection);
+            }
+            Ok(manifest.timeline.frames.clone())
+        }
+        ProjectFrameSelection::Ordered(frame_ids) => {
+            if frame_ids.is_empty() {
+                return Err(ProjectGifExportError::EmptySelection);
+            }
+            let available: BTreeMap<_, _> = manifest
+                .timeline
+                .frames
+                .iter()
+                .map(|clip| (clip.id, clip))
+                .collect();
+            let mut first_positions = BTreeMap::new();
+            let mut clips = Vec::with_capacity(frame_ids.len());
+            for (selection_index, frame_id) in frame_ids.iter().copied().enumerate() {
+                if let Some(first_index) = first_positions.insert(frame_id, selection_index) {
+                    return Err(ProjectGifExportError::DuplicateFrame {
+                        frame_id,
+                        first_index,
+                        duplicate_index: selection_index,
+                    });
+                }
+                let clip = available
+                    .get(&frame_id)
+                    .ok_or(ProjectGifExportError::UnknownFrame {
+                        selection_index,
+                        frame_id,
+                    })?;
+                clips.push((*clip).clone());
+            }
+            Ok(clips)
+        }
+    }
+}
+
+fn load_selected_assets(
+    snapshot: &ProjectExportSnapshot,
+    clips: &[FrameClip],
+    buffer_limit_bytes: u64,
+    cancellation: &dyn GifCancellationToken,
+) -> Result<(BTreeMap<AssetId, RgbaSurface>, u64), ProjectGifExportError> {
+    let mut loaded = BTreeMap::new();
+    let mut visited = BTreeSet::new();
+    let mut loaded_bytes = 0_u64;
+    for clip in clips {
+        ensure_not_cancelled(cancellation)?;
+        if !visited.insert(clip.asset_id) {
+            continue;
+        }
+        let descriptor = snapshot.manifest.assets.get(&clip.asset_id).ok_or(
+            ProjectGifExportError::MissingAssetDescriptor {
+                frame_id: clip.id,
+                asset_id: clip.asset_id,
+            },
+        )?;
+        let AssetKind::Frame { size, encoding } = &descriptor.kind else {
+            return Err(ProjectGifExportError::InvalidAssetKind {
+                frame_id: clip.id,
+                asset_id: clip.asset_id,
+                kind: descriptor.kind.clone(),
+            });
+        };
+        if *encoding != RasterEncoding::Rgba8 {
+            return Err(ProjectGifExportError::UnsupportedAssetEncoding {
+                frame_id: clip.id,
+                asset_id: clip.asset_id,
+                encoding: *encoding,
+            });
+        }
+        let asset_path = snapshot.assets.asset_path(clip.asset_id);
+        let actual = asset_file_length(&asset_path, clip)?;
+        if actual != descriptor.byte_len {
+            return Err(ProjectGifExportError::AssetLengthMismatch {
+                frame_id: clip.id,
+                asset_id: clip.asset_id,
+                expected: descriptor.byte_len,
+                actual,
+            });
+        }
+        let required_bytes = loaded_bytes.saturating_add(actual);
+        if required_bytes > buffer_limit_bytes {
+            return Err(ProjectGifExportError::RenderBufferLimitExceeded {
+                required_bytes,
+                limit_bytes: buffer_limit_bytes,
+            });
+        }
+        let pixels = read_asset(snapshot, clip)?;
+        let surface = RgbaSurface::new(*size, pixels).map_err(|source| {
+            ProjectGifExportError::InvalidAssetSurface {
+                frame_id: clip.id,
+                asset_id: clip.asset_id,
+                source,
+            }
+        })?;
+        loaded.insert(clip.asset_id, surface);
+        loaded_bytes = required_bytes;
+    }
+    Ok((loaded, loaded_bytes))
+}
+
+fn asset_file_length(path: &Path, clip: &FrameClip) -> Result<u64, ProjectGifExportError> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            Err(ProjectGifExportError::MissingAssetFile {
+                frame_id: clip.id,
+                asset_id: clip.asset_id,
+                path: path.to_path_buf(),
+            })
+        }
+        Err(source) => Err(ProjectGifExportError::Io {
+            operation: "inspect frame asset",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn read_asset(
+    snapshot: &ProjectExportSnapshot,
+    clip: &FrameClip,
+) -> Result<Vec<u8>, ProjectGifExportError> {
+    match snapshot.assets.read(clip.asset_id) {
+        Ok(pixels) => Ok(pixels),
+        Err(error) => {
+            if matches!(
+                &error,
+                ProjectError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound
+            ) {
+                return Err(ProjectGifExportError::MissingAssetFile {
+                    frame_id: clip.id,
+                    asset_id: clip.asset_id,
+                    path: snapshot.assets.asset_path(clip.asset_id),
+                });
+            }
+            if matches!(error, ProjectError::CorruptAsset { .. }) {
+                return Err(ProjectGifExportError::CorruptAsset {
+                    frame_id: clip.id,
+                    asset_id: clip.asset_id,
+                    source: error,
+                });
+            }
+            Err(ProjectGifExportError::ReadAsset {
+                frame_id: clip.id,
+                asset_id: clip.asset_id,
+                source: error,
+            })
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LoadedAssetProvider {
+    assets: BTreeMap<AssetId, RgbaSurface>,
+}
+
+impl FrameAssetProvider for LoadedAssetProvider {
+    fn load_rgba8(&self, asset_id: AssetId) -> Result<RgbaSurface, AssetProviderError> {
+        self.assets.get(&asset_id).cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("preloaded frame asset {asset_id} is unavailable"),
+            )
+            .into()
+        })
+    }
+}
+
+struct RenderCancellationAdapter<'a>(&'a dyn GifCancellationToken);
+
+impl RenderCancellationToken for RenderCancellationAdapter<'_> {
+    fn is_cancelled(&self) -> bool {
+        self.0.is_cancelled()
+    }
+}
+
+struct GifProgressAdapter<'a> {
+    sink: &'a mut dyn ProjectExportProgressSink,
+    state: &'a mut ProjectExportProgress,
+}
+
+impl ProgressSink for GifProgressAdapter<'_> {
+    fn report(&mut self, progress: EncodeProgress) {
+        self.state.phase = ProjectExportPhase::Encoding;
+        self.state.frames_encoded = progress.frames_read.min(self.state.total_frames);
+        self.sink.report(*self.state);
+    }
+}
+
+fn ensure_not_cancelled(
+    cancellation: &dyn GifCancellationToken,
+) -> Result<(), ProjectGifExportError> {
+    if cancellation.is_cancelled() {
+        Err(ProjectGifExportError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn output_parent(output: &Path) -> Result<&Path, ProjectGifExportError> {
+    output
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| ProjectGifExportError::InvalidOutputPath(output.to_path_buf()))?;
+    Ok(output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new(".")))
+}
+
+fn try_exists(path: &Path, operation: &'static str) -> Result<bool, ProjectGifExportError> {
+    path.try_exists()
+        .map_err(|source| ProjectGifExportError::Io {
+            operation,
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn create_temporary(parent: &Path, output: &Path) -> Result<NamedTempFile, ProjectGifExportError> {
+    tempfile::Builder::new()
+        .prefix(".gif-from-screen-")
+        .suffix(".partial")
+        .tempfile_in(parent)
+        .map_err(|source| ProjectGifExportError::Io {
+            operation: "create temporary GIF",
+            path: output.to_path_buf(),
+            source,
+        })
+}
+
+fn persist_temporary(
+    temporary: NamedTempFile,
+    output: &Path,
+    overwrite_existing: bool,
+) -> Result<(), ProjectGifExportError> {
+    let result = if overwrite_existing {
+        temporary.persist(output)
+    } else {
+        temporary.persist_noclobber(output)
+    };
+    match result {
+        Ok(file) => {
+            drop(file);
+            Ok(())
+        }
+        Err(error) if !overwrite_existing && error.error.kind() == io::ErrorKind::AlreadyExists => {
+            Err(ProjectGifExportError::ExistingOutput(output.to_path_buf()))
+        }
+        Err(error) => Err(ProjectGifExportError::Io {
+            operation: "atomically commit GIF",
+            path: output.to_path_buf(),
+            source: error.error,
+        }),
+    }
+}
+
+fn sync_directory_after_commit(
+    directory: &Path,
+    output: &Path,
+) -> Result<(), ProjectGifExportError> {
+    fs::File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| ProjectGifExportError::CommitDurabilityUnknown {
+            path: output.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+
+    use gif_from_screen_domain::{
+        AssetDescriptor, Canvas, CanvasBackground, CaptureMetadata, ClipTransform, ColorSpace,
+        DurationUs, EdgeWidths, EditCommand, Effect, FrameClip, PhysicalSize, ProjectId,
+        ProjectManifest, Rgba, UnixTimeMs,
+    };
+    use gif_from_screen_gif::CancellationFlag;
+    use gif_from_screen_project::LockPolicy;
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct TestClip {
+        id: FrameId,
+        pixels: Vec<u8>,
+        duration_us: u64,
+        transform: ClipTransform,
+        effects: Vec<Effect>,
+        encoding: RasterEncoding,
+    }
+
+    impl TestClip {
+        fn rgba(id: u128, pixels: &[u8], duration_us: u64) -> Self {
+            Self {
+                id: FrameId::from_u128(id),
+                pixels: pixels.to_vec(),
+                duration_us,
+                transform: ClipTransform::default(),
+                effects: Vec::new(),
+                encoding: RasterEncoding::Rgba8,
+            }
+        }
+    }
+
+    fn snapshot(
+        root: &Path,
+        size: PhysicalSize,
+        specs: &[TestClip],
+    ) -> (ProjectExportSnapshot, Vec<AssetId>) {
+        let manifest = ProjectManifest::new(
+            ProjectId::from_u128(99),
+            "export-test",
+            UnixTimeMs::new(123),
+            Canvas {
+                size,
+                color_space: ColorSpace::Srgb,
+                background: CanvasBackground::Transparent,
+            },
+        )
+        .unwrap();
+        let mut project = ActiveProject::create(root, manifest).unwrap();
+        let mut descriptors = BTreeMap::new();
+        let mut clips = Vec::new();
+        let mut asset_ids = Vec::new();
+        for spec in specs {
+            let asset_id = project.assets().put(&spec.pixels).unwrap();
+            asset_ids.push(asset_id);
+            descriptors.entry(asset_id).or_insert(AssetDescriptor {
+                id: asset_id,
+                byte_len: u64::try_from(spec.pixels.len()).unwrap(),
+                kind: AssetKind::Frame {
+                    size,
+                    encoding: spec.encoding,
+                },
+            });
+            clips.push(FrameClip {
+                id: spec.id,
+                asset_id,
+                duration: DurationUs::new(spec.duration_us).unwrap(),
+                transform: spec.transform,
+                capture_metadata: CaptureMetadata::default(),
+                effects: spec.effects.clone(),
+            });
+        }
+        let mut commands: Vec<_> = descriptors
+            .into_values()
+            .map(|asset| EditCommand::RegisterAsset { asset })
+            .collect();
+        commands.push(EditCommand::InsertFrames {
+            index: 0,
+            frames: clips,
+        });
+        project.commit(EditCommand::Compound { commands }).unwrap();
+        project.checkpoint_and_compact().unwrap();
+        let snapshot = ProjectExportSnapshot::from_active(&project);
+        drop(project);
+        (snapshot, asset_ids)
+    }
+
+    fn decode_rgba(path: &Path) -> Vec<(u16, Vec<u8>)> {
+        let mut options = gif::DecodeOptions::new();
+        options.set_color_output(gif::ColorOutput::RGBA);
+        let mut decoder = options.read_info(File::open(path).unwrap()).unwrap();
+        let mut frames = Vec::new();
+        while let Some(frame) = decoder.read_next_frame().unwrap() {
+            frames.push((frame.delay, frame.buffer.to_vec()));
+        }
+        frames
+    }
+
+    fn export(
+        snapshot: &ProjectExportSnapshot,
+        output: &Path,
+        options: &ProjectGifExportOptions,
+    ) -> Result<ProjectGifExportReport, ProjectGifExportError> {
+        let mut progress = NoopProjectExportProgress;
+        export_project_snapshot_to_gif(
+            snapshot,
+            output,
+            options,
+            &gif_from_screen_gif::NeverCancel,
+            &mut progress,
+        )
+    }
+
+    fn partial_files(directory: &Path) -> usize {
+        fs::read_dir(directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".partial"))
+            .count()
+    }
+
+    #[test]
+    fn explicit_selection_preserves_reverse_order_and_variable_durations() {
+        let directory = tempdir().unwrap();
+        let project_root = directory.path().join("project");
+        let red = [255, 0, 0, 255];
+        let green = [0, 255, 0, 255];
+        let blue = [0, 0, 255, 255];
+        let (snapshot, _) = snapshot(
+            &project_root,
+            PhysicalSize::new(1, 1).unwrap(),
+            &[
+                TestClip::rgba(1, &red, 10_000),
+                TestClip::rgba(2, &green, 20_000),
+                TestClip::rgba(3, &blue, 30_000),
+            ],
+        );
+        let output = directory.path().join("reverse.gif");
+        let options = ProjectGifExportOptions {
+            frames: ProjectFrameSelection::Ordered(vec![
+                FrameId::from_u128(3),
+                FrameId::from_u128(1),
+            ]),
+            ..ProjectGifExportOptions::default()
+        };
+
+        // Holding a newly opened project proves the snapshot/export path does
+        // not try to reacquire or retain the ActiveProject lock.
+        let _reopened = ActiveProject::open(&project_root, LockPolicy::FailIfPresent).unwrap();
+        let report = export(&snapshot, &output, &options).unwrap();
+        assert_eq!(report.selected_frames, 2);
+        assert_eq!(report.revision, ProjectRevision::new(1));
+        let frames = decode_rgba(&output);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0], (3, blue.to_vec()));
+        assert_eq!(frames[1], (1, red.to_vec()));
+    }
+
+    #[test]
+    fn cpu_renderer_applies_transform_then_effects_before_encoding() {
+        let directory = tempdir().unwrap();
+        let mut clip = TestClip::rgba(1, &[255, 0, 0, 255, 0, 0, 255, 255], 10_000);
+        clip.transform.flip_horizontal = true;
+        clip.effects.push(Effect::Border {
+            widths: EdgeWidths {
+                left: 1,
+                ..EdgeWidths::default()
+            },
+            color: Rgba {
+                red: 0,
+                green: 255,
+                blue: 0,
+                alpha: 255,
+            },
+        });
+        let (snapshot, _) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(2, 1).unwrap(),
+            &[clip],
+        );
+        let output = directory.path().join("rendered.gif");
+
+        export(&snapshot, &output, &ProjectGifExportOptions::default()).unwrap();
+
+        let frames = decode_rgba(&output);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].1,
+            [0, 255, 0, 255, 255, 0, 0, 255],
+            "left border is green and the flipped right pixel is original red"
+        );
+    }
+
+    #[test]
+    fn selection_rejects_empty_unknown_and_duplicate_ids() {
+        let directory = tempdir().unwrap();
+        let pixel = [1, 2, 3, 255];
+        let (snapshot, _) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(1, 1).unwrap(),
+            &[TestClip::rgba(1, &pixel, 10_000)],
+        );
+        let output = directory.path().join("selection.gif");
+
+        for selection in [
+            ProjectFrameSelection::Ordered(Vec::new()),
+            ProjectFrameSelection::Ordered(vec![FrameId::from_u128(2)]),
+            ProjectFrameSelection::Ordered(vec![FrameId::from_u128(1), FrameId::from_u128(1)]),
+        ] {
+            let options = ProjectGifExportOptions {
+                frames: selection,
+                ..ProjectGifExportOptions::default()
+            };
+            let error = export(&snapshot, &output, &options).unwrap_err();
+            assert!(matches!(
+                error,
+                ProjectGifExportError::EmptySelection
+                    | ProjectGifExportError::UnknownFrame { .. }
+                    | ProjectGifExportError::DuplicateFrame { .. }
+            ));
+            assert!(!output.exists());
+        }
+    }
+
+    #[test]
+    fn cancellation_during_encoding_cleans_partial_and_does_not_publish_output() {
+        let directory = tempdir().unwrap();
+        let pixel = [1, 2, 3, 255];
+        let (snapshot, _) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(1, 1).unwrap(),
+            &[TestClip::rgba(1, &pixel, 10_000)],
+        );
+        let output = directory.path().join("cancelled.gif");
+        let cancellation = CancellationFlag::default();
+        let cancel_from_progress = cancellation.clone();
+        let mut progress = move |snapshot: ProjectExportProgress| {
+            if snapshot.phase == ProjectExportPhase::Encoding {
+                cancel_from_progress.cancel();
+            }
+        };
+
+        let error = export_project_snapshot_to_gif(
+            &snapshot,
+            &output,
+            &ProjectGifExportOptions::default(),
+            &cancellation,
+            &mut progress,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProjectGifExportError::Cancelled));
+        assert!(!output.exists());
+        assert_eq!(partial_files(directory.path()), 0);
+    }
+
+    #[test]
+    fn cancelled_overwrite_preserves_the_previous_file() {
+        let directory = tempdir().unwrap();
+        let pixel = [1, 2, 3, 255];
+        let (snapshot, _) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(1, 1).unwrap(),
+            &[TestClip::rgba(1, &pixel, 10_000)],
+        );
+        let output = directory.path().join("preserved.gif");
+        fs::write(&output, b"previous GIF").unwrap();
+        let cancellation = CancellationFlag::default();
+        let cancel_from_progress = cancellation.clone();
+        let mut progress = move |snapshot: ProjectExportProgress| {
+            if snapshot.phase == ProjectExportPhase::Encoding {
+                cancel_from_progress.cancel();
+            }
+        };
+        let options = ProjectGifExportOptions {
+            overwrite_existing: true,
+            ..ProjectGifExportOptions::default()
+        };
+
+        let error = export_project_snapshot_to_gif(
+            &snapshot,
+            &output,
+            &options,
+            &cancellation,
+            &mut progress,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProjectGifExportError::Cancelled));
+        assert_eq!(fs::read(&output).unwrap(), b"previous GIF");
+        assert_eq!(partial_files(directory.path()), 0);
+    }
+
+    #[test]
+    fn resident_render_buffers_are_bounded_before_encoding() {
+        let directory = tempdir().unwrap();
+        let pixel = [1, 2, 3, 255];
+        let (snapshot, _) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(1, 1).unwrap(),
+            &[TestClip::rgba(1, &pixel, 10_000)],
+        );
+        let output = directory.path().join("bounded.gif");
+        let options = ProjectGifExportOptions {
+            // Four source bytes plus four rendered bytes require eight.
+            render_buffer_limit_bytes: 7,
+            ..ProjectGifExportOptions::default()
+        };
+
+        let error = export(&snapshot, &output, &options).unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectGifExportError::RenderBufferLimitExceeded {
+                required_bytes: 8,
+                limit_bytes: 7
+            }
+        ));
+        assert!(!output.exists());
+        assert_eq!(partial_files(directory.path()), 0);
+    }
+
+    #[test]
+    fn progress_reports_ordered_phases_and_monotonic_frame_counts() {
+        let directory = tempdir().unwrap();
+        let red = [255, 0, 0, 255];
+        let blue = [0, 0, 255, 255];
+        let (snapshot, _) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(1, 1).unwrap(),
+            &[
+                TestClip::rgba(1, &red, 10_000),
+                TestClip::rgba(2, &blue, 20_000),
+            ],
+        );
+        let output = directory.path().join("progress.gif");
+        let mut updates = Vec::new();
+        let mut progress = |update| updates.push(update);
+
+        export_project_snapshot_to_gif(
+            &snapshot,
+            &output,
+            &ProjectGifExportOptions::default(),
+            &gif_from_screen_gif::NeverCancel,
+            &mut progress,
+        )
+        .unwrap();
+
+        let phases = [
+            ProjectExportPhase::Preparing,
+            ProjectExportPhase::Rendering,
+            ProjectExportPhase::Encoding,
+            ProjectExportPhase::Syncing,
+            ProjectExportPhase::Committing,
+            ProjectExportPhase::Complete,
+        ];
+        let mut previous_position = None;
+        for phase in phases {
+            let position = updates
+                .iter()
+                .position(|update| update.phase == phase)
+                .expect("each export phase is reported");
+            assert!(previous_position.is_none_or(|previous| position > previous));
+            previous_position = Some(position);
+        }
+        assert!(
+            updates
+                .windows(2)
+                .all(|pair| pair[0].frames_rendered <= pair[1].frames_rendered
+                    && pair[0].frames_encoded <= pair[1].frames_encoded)
+        );
+        assert_eq!(updates.last().unwrap().total_frames, 2);
+        assert_eq!(updates.last().unwrap().frames_rendered, 2);
+        assert_eq!(updates.last().unwrap().frames_encoded, 2);
+    }
+
+    #[test]
+    fn default_policy_preserves_existing_output_without_partial_files() {
+        let directory = tempdir().unwrap();
+        let pixel = [1, 2, 3, 255];
+        let (snapshot, _) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(1, 1).unwrap(),
+            &[TestClip::rgba(1, &pixel, 10_000)],
+        );
+        let output = directory.path().join("existing.gif");
+        fs::write(&output, b"old output").unwrap();
+
+        let error = export(&snapshot, &output, &ProjectGifExportOptions::default()).unwrap_err();
+        assert!(matches!(error, ProjectGifExportError::ExistingOutput(path) if path == output));
+        assert_eq!(fs::read(&output).unwrap(), b"old output");
+        assert_eq!(partial_files(directory.path()), 0);
+    }
+
+    #[test]
+    fn corrupt_and_missing_assets_are_rejected_before_output_creation() {
+        let pixel = [1, 2, 3, 255];
+
+        let corrupt_directory = tempdir().unwrap();
+        let (corrupt_snapshot, corrupt_ids) = snapshot(
+            &corrupt_directory.path().join("project"),
+            PhysicalSize::new(1, 1).unwrap(),
+            &[TestClip::rgba(1, &pixel, 10_000)],
+        );
+        fs::write(corrupt_snapshot.assets.asset_path(corrupt_ids[0]), b"xxxx").unwrap();
+        let corrupt_output = corrupt_directory.path().join("corrupt.gif");
+        assert!(matches!(
+            export(
+                &corrupt_snapshot,
+                &corrupt_output,
+                &ProjectGifExportOptions::default()
+            ),
+            Err(ProjectGifExportError::CorruptAsset { .. })
+        ));
+        assert!(!corrupt_output.exists());
+
+        let missing_directory = tempdir().unwrap();
+        let (missing_snapshot, missing_ids) = snapshot(
+            &missing_directory.path().join("project"),
+            PhysicalSize::new(1, 1).unwrap(),
+            &[TestClip::rgba(1, &pixel, 10_000)],
+        );
+        fs::remove_file(missing_snapshot.assets.asset_path(missing_ids[0])).unwrap();
+        let missing_output = missing_directory.path().join("missing.gif");
+        assert!(matches!(
+            export(
+                &missing_snapshot,
+                &missing_output,
+                &ProjectGifExportOptions::default()
+            ),
+            Err(ProjectGifExportError::MissingAssetFile { .. })
+        ));
+        assert!(!missing_output.exists());
+    }
+
+    #[test]
+    fn unsupported_persisted_frame_encoding_is_rejected() {
+        let directory = tempdir().unwrap();
+        let pixel = [1, 2, 3, 255];
+        let mut clip = TestClip::rgba(1, &pixel, 10_000);
+        clip.encoding = RasterEncoding::Qoi;
+        let (snapshot, _) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(1, 1).unwrap(),
+            &[clip],
+        );
+        let output = directory.path().join("unsupported.gif");
+
+        assert!(matches!(
+            export(&snapshot, &output, &ProjectGifExportOptions::default()),
+            Err(ProjectGifExportError::UnsupportedAssetEncoding {
+                encoding: RasterEncoding::Qoi,
+                ..
+            })
+        ));
+        assert!(!output.exists());
+    }
+}

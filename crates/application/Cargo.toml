@@ -7,14 +7,16 @@ license.workspace = true
 
 [dependencies]
 gif-from-screen-domain = { path = "../domain" }
+gif-from-screen-gif = { path = "../gif" }
 gif-from-screen-project = { path = "../project" }
+gif-from-screen-render = { path = "../render" }
 gif-from-screen-workflow = { path = "../workflow" }
+tempfile.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 gif-from-screen-capture = { path = "../capture" }
-gif-from-screen-gif = { path = "../gif" }
-tempfile.workspace = true
+gif.workspace = true
 
 [lints]
 workspace = true
