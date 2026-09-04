@@ -391,6 +391,50 @@ fn controlled_stop_encodes_frames_collected_so_far() {
 }
 
 #[test]
+fn duration_limit_excludes_time_spent_paused() {
+    let backend = SyntheticCaptureBackend::new(vec![
+        frame(1, 0, 1, 1, 4, PixelFormat::Rgba8, vec![255, 0, 0, 255]),
+        frame(2, 5_000, 1, 1, 4, PixelFormat::Rgba8, vec![0, 255, 0, 255]),
+        frame(3, 10_000, 1, 1, 4, PixelFormat::Rgba8, vec![0, 0, 255, 255]),
+    ]);
+    let (controller, mut control) = RecordingController::channel();
+    let pause_controller = controller.clone();
+    let resume_controller = controller.clone();
+    let resume_thread = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(resume_controller.resume());
+    });
+    let mut requested_pause = false;
+    let recording = gif_from_screen_workflow::collect_controlled(
+        &backend,
+        request(),
+        &CollectOptions {
+            limit: CollectionLimit::Duration(Duration::from_millis(10)),
+            poll_interval: Duration::from_millis(1),
+            ..CollectOptions::default()
+        },
+        &mut control,
+        &NeverCancel,
+        &mut move |progress: WorkflowProgress| {
+            if !requested_pause
+                && progress.phase == WorkflowPhase::Capturing
+                && progress.frames_captured == 1
+            {
+                assert!(pause_controller.pause());
+                requested_pause = true;
+            }
+        },
+    )
+    .unwrap();
+    resume_thread.join().unwrap();
+
+    assert_eq!(recording.frames().len(), 2);
+    assert_eq!(recording.frames()[0].duration_us(), 5_000);
+    assert_eq!(recording.frames()[1].duration_us(), 5_000);
+    assert_eq!(recording.summary().duration_us, 10_000);
+}
+
+#[test]
 fn controlled_discard_never_creates_an_output() {
     let backend = SyntheticCaptureBackend::new(vec![
         frame(1, 0, 1, 1, 4, PixelFormat::Rgba8, vec![255, 0, 0, 255]),

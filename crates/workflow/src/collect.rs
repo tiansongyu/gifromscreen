@@ -278,7 +278,7 @@ fn duration_to_nonzero_micros(duration: Duration, name: &str) -> Result<u64, Wor
 
 fn collect_session(
     session: &mut dyn CaptureSession,
-    options: ValidatedOptions,
+    mut options: ValidatedOptions,
     cancellation: &dyn CancellationToken,
     progress: &mut dyn WorkflowProgressSink,
     mut control: Option<&mut RecordingControl>,
@@ -289,7 +289,9 @@ fn collect_session(
     let mut previous_sequence = None;
     let mut first_timestamp = None;
     let mut last_observed_timestamp = None;
+    let mut paused_at = None;
     let mut stream_index = 0_u64;
+    reset_duration_deadline(&mut options.limit)?;
 
     let stop_reason = loop {
         ensure_not_cancelled(cancellation)?;
@@ -300,10 +302,8 @@ fn collect_session(
                 ControlOutcome::Discard => return Err(WorkflowError::Discarded),
             }
         }
-        if duration_deadline_reached(options.limit) {
-            break StopReason::DurationReached;
-        }
         if session.state() == CaptureSessionState::Paused {
+            paused_at.get_or_insert_with(Instant::now);
             progress.report(WorkflowProgress::capture(
                 WorkflowPhase::Paused,
                 u64::try_from(captures.len()).unwrap_or(u64::MAX),
@@ -312,8 +312,14 @@ fn collect_session(
                     last_observed_timestamp,
                 )),
             ));
-            std::thread::sleep(bounded_poll_interval(options.limit, options.poll_interval));
+            std::thread::sleep(options.poll_interval);
             continue;
+        }
+        if let Some(started) = paused_at.take() {
+            extend_duration_deadline(&mut options.limit, started.elapsed())?;
+        }
+        if duration_deadline_reached(options.limit) {
+            break StopReason::DurationReached;
         }
         let poll_interval = bounded_poll_interval(options.limit, options.poll_interval);
         match session.poll_frame(poll_interval)? {
@@ -385,6 +391,39 @@ fn collect_session(
 
 fn duration_deadline_reached(limit: ValidatedLimit) -> bool {
     matches!(limit, ValidatedLimit::Duration { deadline, .. } if Instant::now() >= deadline)
+}
+
+fn reset_duration_deadline(limit: &mut ValidatedLimit) -> Result<(), WorkflowError> {
+    let ValidatedLimit::Duration {
+        duration_us,
+        deadline,
+    } = limit
+    else {
+        return Ok(());
+    };
+    *deadline = Instant::now()
+        .checked_add(Duration::from_micros(*duration_us))
+        .ok_or_else(|| {
+            WorkflowError::InvalidCollectionOption(
+                "collection duration is too large for a monotonic deadline".to_owned(),
+            )
+        })?;
+    Ok(())
+}
+
+fn extend_duration_deadline(
+    limit: &mut ValidatedLimit,
+    paused_for: Duration,
+) -> Result<(), WorkflowError> {
+    let ValidatedLimit::Duration { deadline, .. } = limit else {
+        return Ok(());
+    };
+    *deadline = deadline.checked_add(paused_for).ok_or_else(|| {
+        WorkflowError::InvalidCollectionOption(
+            "paused collection deadline overflowed the monotonic clock".to_owned(),
+        )
+    })?;
+    Ok(())
 }
 
 fn bounded_poll_interval(limit: ValidatedLimit, configured: Duration) -> Duration {

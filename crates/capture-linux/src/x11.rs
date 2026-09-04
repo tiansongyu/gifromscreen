@@ -5,6 +5,8 @@ use gif_from_screen_capture::{
 };
 #[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
 use gif_from_screen_capture::{CursorMetadata, PhysicalPosition, PhysicalRect, PhysicalSize};
+#[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
+use std::time::Duration;
 
 #[cfg(all(target_os = "linux", feature = "native-x11"))]
 mod native {
@@ -33,9 +35,10 @@ mod native {
         BackendDescriptor, BackendStatus, CaptureBackend, CaptureCapabilities, CaptureError,
         CaptureErrorKind, CaptureRequest, CaptureSession, CaptureSource, CaptureTarget,
         CapturedFrame, PhysicalPosition, PhysicalRect, PhysicalSize, RecoveryHint,
-        WindowFilterFacts, X11CursorSnapshot, composite_cursor, decode_text_property,
-        decode_u32_property, decode_zpixmap, ensure_fixed_canvas, format_window_source_id,
-        intersect_rect, parse_window_source_id, should_list_window, translate_region,
+        WindowFilterFacts, X11CursorSnapshot, active_session_elapsed, composite_cursor,
+        decode_text_property, decode_u32_property, decode_zpixmap, ensure_fixed_canvas,
+        format_window_source_id, intersect_rect, parse_window_source_id, should_list_window,
+        translate_region,
     };
     use crate::x11::{ByteOrder, PixelLayout};
 
@@ -541,6 +544,8 @@ mod native {
                 sequence: 0,
                 started_at: Instant::now(),
                 next_due: Instant::now(),
+                paused_at: None,
+                accumulated_pause: Duration::ZERO,
             }))
         }
     }
@@ -553,6 +558,8 @@ mod native {
         sequence: u64,
         started_at: Instant,
         next_due: Instant,
+        paused_at: Option<Instant>,
+        accumulated_pause: Duration,
     }
 
     impl X11CaptureSession {
@@ -607,6 +614,7 @@ mod native {
             if self.state != CaptureSessionState::Recording {
                 return Err(self.invalid_transition("pause"));
             }
+            self.paused_at = Some(Instant::now());
             self.state = CaptureSessionState::Paused;
             Ok(())
         }
@@ -615,7 +623,13 @@ mod native {
             if self.state != CaptureSessionState::Paused {
                 return Err(self.invalid_transition("resume"));
             }
-            self.next_due = Instant::now();
+            let now = Instant::now();
+            if let Some(paused_at) = self.paused_at.take() {
+                self.accumulated_pause = self
+                    .accumulated_pause
+                    .saturating_add(now.saturating_duration_since(paused_at));
+            }
+            self.next_due = now;
             self.state = CaptureSessionState::Recording;
             Ok(())
         }
@@ -670,7 +684,8 @@ mod native {
                     .unwrap_or_else(Instant::now);
             }
 
-            let elapsed = self.started_at.elapsed().as_micros();
+            let elapsed = active_session_elapsed(self.started_at.elapsed(), self.accumulated_pause)
+                .as_micros();
             let timestamp =
                 CaptureTimestamp::from_micros(u64::try_from(elapsed).unwrap_or(u64::MAX));
             match self.backend.capture_target(
@@ -1306,6 +1321,11 @@ mod native {
 }
 
 pub use native::X11CaptureBackend;
+
+#[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
+fn active_session_elapsed(elapsed: Duration, accumulated_pause: Duration) -> Duration {
+    elapsed.saturating_sub(accumulated_pause)
+}
 
 #[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
 fn ensure_fixed_canvas(expected: PhysicalSize, actual: PhysicalSize) -> Result<(), CaptureError> {
@@ -2126,6 +2146,18 @@ mod tests {
         assert_eq!(error.kind(), CaptureErrorKind::InvalidRequest);
         assert!(error.message().contains("fixed session canvas 640x480"));
         assert!(error.message().contains("start a new recording"));
+    }
+
+    #[test]
+    fn active_session_time_excludes_accumulated_pauses() {
+        assert_eq!(
+            active_session_elapsed(Duration::from_secs(9), Duration::from_secs(4)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            active_session_elapsed(Duration::from_secs(2), Duration::from_secs(3)),
+            Duration::ZERO
+        );
     }
 
     #[test]
