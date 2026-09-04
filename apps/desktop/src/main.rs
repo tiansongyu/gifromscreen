@@ -43,7 +43,7 @@ use gif_from_screen_gif::{
     CancellationFlag, CancellationToken as _, DeltaMode, DitherMode, EncodeOptions, LoopBehavior,
     PaletteMode, QuantizerStrategy, Transparency,
 };
-use gif_from_screen_project::{ActiveProject, LockPolicy, OpenedProject};
+use gif_from_screen_project::{ActiveProject, LockPolicy, OpenedProject, ProjectError};
 use gif_from_screen_workflow::{
     CollectOptions, CollectionLimit, FrameRetention, RecordingControl, RecordingController,
     RecordingFrameSink, RecordingFrameSinkError, TargetUpdateRequest, TargetUpdateStatus,
@@ -53,7 +53,9 @@ use import_gif_job::{ImportGifJob, ImportGifJobEvent, ImportGifJobState};
 use import_static_image_job::{
     ImportStaticImageJob, ImportStaticImageJobEvent, ImportStaticImageJobState,
 };
-use open_project_job::{OpenProjectJob, OpenProjectJobEvent, OpenProjectJobState};
+use open_project_job::{
+    OpenProjectJob, OpenProjectJobError, OpenProjectJobEvent, OpenProjectJobState,
+};
 use retarget::{RegionRetargetPlan, RetargetCompletion};
 use uuid::Uuid;
 
@@ -475,6 +477,7 @@ struct GifFromScreenApp {
     job: Option<RecordingJob>,
     progress: Option<WorkflowProgress>,
     open_project_path: String,
+    open_project_take_over_lock: bool,
     open_project_job: OpenProjectJob,
     import_gif_path: String,
     import_gif_job: ImportGifJob,
@@ -511,6 +514,7 @@ impl Default for GifFromScreenApp {
             job: None,
             progress: None,
             open_project_path: String::new(),
+            open_project_take_over_lock: false,
             open_project_job: OpenProjectJob::default(),
             import_gif_path: String::new(),
             import_gif_job: ImportGifJob::default(),
@@ -611,6 +615,7 @@ impl GifFromScreenApp {
             StartupIntent::OpenProject(path) => {
                 self.view = AppView::OpenProject;
                 self.open_project_path = path.to_string_lossy().into_owned();
+                self.open_project_take_over_lock = false;
                 if let Err(error) = self.start_open_project() {
                     self.notice = Some(format!("Could not open startup project: {error}"));
                 }
@@ -656,6 +661,7 @@ impl GifFromScreenApp {
                     true,
                 ) {
                     self.view = AppView::OpenProject;
+                    self.open_project_take_over_lock = false;
                     self.notice = None;
                 }
             });
@@ -713,22 +719,45 @@ impl GifFromScreenApp {
 
     fn show_open_project(&mut self, ui: &mut egui::Ui) {
         let running = self.open_project_job.state() == OpenProjectJobState::Running;
+        let controls_enabled = open_project_controls_enabled(self.open_project_job.state());
         ui.heading("Open editable project");
         ui.label("Choose an existing .gfsproj directory containing manifest.json.");
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             ui.label("Project directory");
             ui.add_enabled(
-                !running,
+                controls_enabled,
                 egui::TextEdit::singleline(&mut self.open_project_path)
                     .desired_width(420.0)
                     .hint_text("/path/to/animation.gfsproj"),
             );
         });
         ui.add_space(8.0);
+        ui.add_enabled_ui(controls_enabled, |ui| {
+            ui.checkbox(
+                &mut self.open_project_take_over_lock,
+                "I confirm the previous project owner has stopped; preserve and take over its lock",
+            );
+        });
+        if self.open_project_take_over_lock {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "Warning: takeover can corrupt the project if another process is still editing it. The old lock will be preserved as project.lock.stale-N.",
+            );
+        } else {
+            ui.weak(
+                "Safe default: an existing lock is rejected unchanged. Only take over after verifying the owner stopped; takeover while another process edits can corrupt the project.",
+            );
+        }
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
+            let open_label = if self.open_project_take_over_lock {
+                "Take over lock and open"
+            } else {
+                "Open"
+            };
             if ui
-                .add_enabled(!running, egui::Button::new("Open"))
+                .add_enabled(controls_enabled, egui::Button::new(open_label))
                 .clicked()
                 && let Err(error) = self.start_open_project()
             {
@@ -765,9 +794,16 @@ impl GifFromScreenApp {
             return Err("Select a .gfsproj directory first.".to_owned());
         }
         self.open_project_job
-            .start(PathBuf::from(path), LockPolicy::FailIfPresent)
+            .start(
+                PathBuf::from(path),
+                open_project_lock_policy(self.open_project_take_over_lock),
+            )
             .map_err(|error| error.to_string())?;
-        self.notice = Some("Opening project in the background…".to_owned());
+        self.notice = Some(if self.open_project_take_over_lock {
+            "Opening project with explicit stale-lock takeover…".to_owned()
+        } else {
+            "Opening project in the background…".to_owned()
+        });
         Ok(())
     }
 
@@ -1702,7 +1738,7 @@ impl GifFromScreenApp {
                 Ok(notice) => notice,
                 Err(error) => format!("Could not prepare opened project: {error}"),
             },
-            Some(Err(error)) => format!("Could not open project: {error}"),
+            Some(Err(error)) => open_project_error_notice(&error),
             None => "Project-open worker finished without a result.".to_owned(),
         });
     }
@@ -1806,6 +1842,7 @@ impl GifFromScreenApp {
         self.editor_preview_cache = EditorPreviewCache::new();
         self.editor_export_settings = EditorExportSettings::default();
         self.export_job = ExportJob::default();
+        self.open_project_take_over_lock = false;
         self.settings.output = output.to_string_lossy().into_owned();
         self.view = AppView::Editor;
         Ok(notice)
@@ -1834,11 +1871,7 @@ fn editor_result_notice(result: EditorUiResult) -> Option<String> {
             "Editor {:?} failed: {}",
             failure.operation, failure.message
         )),
-        Ok(
-            EditorUiAction::Selection(_)
-            | EditorUiAction::Project(_)
-            | EditorUiAction::Playback { .. },
-        ) => None,
+        Ok(_) => None,
     }
 }
 
@@ -2880,6 +2913,37 @@ const fn export_job_is_active(state: ExportJobState) -> bool {
     matches!(state, ExportJobState::Running | ExportJobState::Cancelling)
 }
 
+const fn open_project_controls_enabled(state: OpenProjectJobState) -> bool {
+    !matches!(state, OpenProjectJobState::Running)
+}
+
+const fn open_project_lock_policy(take_over_lock: bool) -> LockPolicy {
+    if take_over_lock {
+        LockPolicy::TakeOver
+    } else {
+        LockPolicy::FailIfPresent
+    }
+}
+
+fn open_project_error_notice(error: &OpenProjectJobError) -> String {
+    match error {
+        OpenProjectJobError::Project(source) => match source.as_ref() {
+            ProjectError::AlreadyLocked { path, owner } => {
+                let owner = owner.as_deref().map_or_else(
+                    || "owner metadata is unavailable".to_owned(),
+                    |owner| format!("owner: {owner}"),
+                );
+                format!(
+                    "Project {} is already locked ({owner}). Verify that process has stopped, then explicitly confirm stale-lock takeover to retry.",
+                    path.display()
+                )
+            }
+            _ => format!("Could not open project: {source}"),
+        },
+        OpenProjectJobError::WorkerExited => error.to_string(),
+    }
+}
+
 const fn can_navigate_back(
     view: AppView,
     open_state: OpenProjectJobState,
@@ -3373,7 +3437,8 @@ mod tests {
         create_incremental_recording_project, default_gif_path_for_project,
         edited_gif_path_for_import, editor_result_notice, export_job_is_active,
         export_result_notice, fit_dimensions, frame_retention, has_static_image_extension,
-        landing_cards_fit, map_preview_selection, parse_startup_intent, project_path_for_output,
+        landing_cards_fit, map_preview_selection, open_project_controls_enabled,
+        open_project_lock_policy, parse_startup_intent, project_path_for_output,
         recording_project_canvas, remove_completed_project, remove_recording_project_path,
         resize_nearest_rgba, resolve_export_selection, should_sync_retarget,
         show_editor_scroll_area, validate_export_output, validate_settings,
@@ -3879,6 +3944,11 @@ mod tests {
 
     #[test]
     fn running_open_job_locks_both_back_navigation_controls() {
+        assert_eq!(open_project_lock_policy(false), LockPolicy::FailIfPresent);
+        assert_eq!(open_project_lock_policy(true), LockPolicy::TakeOver);
+        assert!(!open_project_controls_enabled(OpenProjectJobState::Running));
+        assert!(open_project_controls_enabled(OpenProjectJobState::Idle));
+        assert!(open_project_controls_enabled(OpenProjectJobState::Finished));
         assert!(!can_navigate_back(
             AppView::OpenProject,
             OpenProjectJobState::Running,
@@ -4133,6 +4203,47 @@ mod tests {
         let notice = app.notice.as_deref().unwrap();
         assert!(notice.contains("Opened 1 frame"));
         assert!(notice.contains("enable Overwrite"));
+    }
+
+    #[test]
+    fn locked_project_requires_explicit_takeover_and_preserves_owner_lock() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("locked.gfsproj");
+        let original_owner = single_frame_project(&root);
+        let lock_path = root.join("project.lock");
+        let original_lock = fs::read(&lock_path).unwrap();
+        let mut app = GifFromScreenApp::default();
+        app.view = AppView::OpenProject;
+        app.open_project_path = root.to_string_lossy().into_owned();
+
+        assert!(!app.open_project_take_over_lock);
+        app.start_open_project().unwrap();
+        drain_open_job(&mut app);
+
+        assert_eq!(app.view, AppView::OpenProject);
+        assert_eq!(app.open_project_job.state(), OpenProjectJobState::Idle);
+        assert!(app.editor_workspace.is_none());
+        let notice = app.notice.as_deref().unwrap();
+        assert!(notice.contains("already locked"));
+        assert!(notice.contains("owner: pid "));
+        assert!(notice.contains("explicitly confirm"));
+        assert_eq!(fs::read(&lock_path).unwrap(), original_lock);
+        assert!(!root.join("project.lock.stale-1").exists());
+
+        app.open_project_take_over_lock = true;
+        app.start_open_project().unwrap();
+        drain_open_job(&mut app);
+
+        assert_eq!(app.view, AppView::Editor);
+        assert!(app.editor_workspace.is_some());
+        assert_eq!(
+            fs::read(root.join("project.lock.stale-1")).unwrap(),
+            original_lock
+        );
+        let replacement_lock = fs::read(&lock_path).unwrap();
+        assert_ne!(replacement_lock, original_lock);
+        drop(original_owner);
+        assert_eq!(fs::read(&lock_path).unwrap(), replacement_lock);
     }
 
     #[test]

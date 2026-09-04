@@ -419,17 +419,51 @@ mod tests {
     fn lock_conflict_is_a_typed_project_error() {
         let directory = tempdir().unwrap();
         let active = create_project(directory.path());
+        let lock_path = directory.path().join("project.lock");
         let mut job = OpenProjectJob::default();
         job.start(directory.path().to_owned(), LockPolicy::FailIfPresent)
             .unwrap();
         drain_until_finished(&mut job);
 
-        assert!(matches!(
-            job.result(),
-            Some(Err(OpenProjectJobError::Project(source)))
-                if matches!(source.as_ref(), ProjectError::AlreadyLocked { .. })
-        ));
+        let Some(Err(OpenProjectJobError::Project(source))) = job.result() else {
+            panic!("expected a typed project lock conflict");
+        };
+        let ProjectError::AlreadyLocked { path, owner } = source.as_ref() else {
+            panic!("expected AlreadyLocked, got {source}");
+        };
+        assert_eq!(path, &lock_path);
+        assert!(owner.as_deref().is_some_and(|owner| owner.contains("pid ")));
         drop(active);
+    }
+
+    #[test]
+    fn explicit_takeover_preserves_stale_lock_bytes_and_returns_the_project() {
+        let directory = tempdir().unwrap();
+        let active = create_project(directory.path());
+        let lock_path = directory.path().join("project.lock");
+        let original_lock = fs::read(&lock_path).unwrap();
+        let mut job = OpenProjectJob::default();
+
+        job.start(directory.path().to_owned(), LockPolicy::TakeOver)
+            .unwrap();
+        drain_until_finished(&mut job);
+
+        let opened = job.take_result().unwrap().unwrap();
+        assert_eq!(
+            opened.project.manifest().project_id,
+            ProjectId::from_u128(1)
+        );
+        assert_eq!(
+            fs::read(directory.path().join("project.lock.stale-1")).unwrap(),
+            original_lock
+        );
+        let replacement_lock = fs::read(&lock_path).unwrap();
+        assert_ne!(replacement_lock, original_lock);
+        drop(active);
+        assert_eq!(fs::read(&lock_path).unwrap(), replacement_lock);
+        drop(opened);
+        assert!(!lock_path.exists());
+        assert!(directory.path().join("project.lock.stale-1").is_file());
     }
 
     #[test]
