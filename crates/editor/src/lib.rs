@@ -12,6 +12,7 @@ use thiserror::Error;
 mod duplicates;
 mod frame_selection;
 mod selection;
+mod virtual_filmstrip;
 mod yoyo;
 
 pub use duplicates::{
@@ -23,6 +24,9 @@ pub use frame_selection::{
     select_frames_by_time_range,
 };
 pub use selection::{TimelineSelection, TimelineSelectionError};
+pub use virtual_filmstrip::{
+    MAX_VIRTUAL_FILMSTRIP_FRAMES, VirtualFilmstripError, VirtualFilmstripLayout,
+};
 pub use yoyo::{YoyoOptions, YoyoScope, yoyo_frames};
 
 /// Controls how removing frames affects the duration of the surviving timeline.
