@@ -8,6 +8,7 @@ mod editor_ui;
 mod editor_workspace;
 mod export_job;
 mod import_gif_job;
+mod import_static_image_job;
 mod open_project_job;
 mod retarget;
 
