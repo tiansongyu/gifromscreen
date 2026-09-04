@@ -6,6 +6,7 @@ mod import_project;
 mod project_export;
 mod recording_project;
 mod rgba_project;
+mod static_image_project;
 
 pub use import_project::{
     DecodedAnimationProjectOptions, IMPORTED_GIF_PRESET_NAME, PersistDecodedAnimationError,
@@ -19,6 +20,10 @@ pub use project_export::{
 };
 pub use recording_project::{
     PersistRecordingError, RecordingProjectOptions, persist_collected_recording,
+};
+pub use static_image_project::{
+    IMPORTED_STATIC_IMAGE_PRESET_NAME, PersistStaticImageError, StaticImageProjectOptions,
+    persist_decoded_static_image,
 };
 
 use thiserror::Error;

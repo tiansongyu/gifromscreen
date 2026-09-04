@@ -183,10 +183,28 @@ pub fn persist_decoded_animation(
     animation: DecodedAnimation,
     options: DecodedAnimationProjectOptions,
 ) -> Result<ActiveProject, PersistDecodedAnimationError> {
+    let repeat = map_loop_behavior(animation.loop_behavior());
+    persist_imported_animation(
+        root,
+        animation,
+        options,
+        "image/gif",
+        IMPORTED_GIF_PRESET_NAME,
+        repeat,
+    )
+}
+
+pub(crate) fn persist_imported_animation(
+    root: impl AsRef<Path>,
+    animation: DecodedAnimation,
+    options: DecodedAnimationProjectOptions,
+    media_type: &str,
+    preset_name: &str,
+    repeat: GifLoop,
+) -> Result<ActiveProject, PersistDecodedAnimationError> {
     if options.display_name.trim().is_empty() {
         return Err(PersistDecodedAnimationError::EmptyDisplayName);
     }
-    let loop_behavior = animation.loop_behavior();
     let width = animation.width();
     let height = animation.height();
     let decoded_frames = animation.into_frames();
@@ -201,11 +219,11 @@ pub fn persist_decoded_animation(
         .collect::<Vec<_>>();
     let mut export_presets = BTreeMap::new();
     export_presets.insert(
-        IMPORTED_GIF_PRESET_NAME.to_owned(),
+        preset_name.to_owned(),
         GifExportPreset {
             colors: 256,
             palette: GifPaletteStrategy::Adaptive,
-            repeat: map_loop_behavior(loop_behavior),
+            repeat,
             alpha_threshold: 1,
         },
     );
@@ -219,7 +237,7 @@ pub fn persist_decoded_animation(
             created_at: options.created_at,
             source_provenance: vec![SourceProvenance::Imported {
                 display_name: options.display_name,
-                media_type: "image/gif".to_owned(),
+                media_type: media_type.to_owned(),
             }],
             export_presets,
         },
