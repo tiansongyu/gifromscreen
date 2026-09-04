@@ -6,7 +6,9 @@ use gif_from_screen_capture::{
 
 #[cfg(all(target_os = "linux", feature = "native-x11"))]
 mod native {
+    use std::collections::{HashSet, VecDeque};
     use std::fmt::{Debug, Formatter};
+    use std::process;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
@@ -14,19 +16,22 @@ mod native {
 
     use gif_from_screen_capture::{
         CapabilityStatus, CaptureCadence, CaptureSessionState, CaptureSourceId, CaptureSourceKind,
-        CaptureTimestamp, CursorCaptureMode, FramePoll, PhysicalRect, PhysicalSize, PixelFormat,
+        CaptureTimestamp, CursorCaptureMode, FramePoll, PhysicalRect, PixelFormat,
     };
     use x11rb::connection::Connection;
     use x11rb::protocol::randr::ConnectionExt as _;
     use x11rb::protocol::xproto::{
-        ConnectionExt as _, ImageFormat, ImageOrder, Screen, VisualClass,
+        Atom, AtomEnum, ConnectionExt as _, ImageFormat, ImageOrder, MapState, Screen, VisualClass,
+        Window, WindowClass,
     };
     use x11rb::rust_connection::RustConnection;
 
     use super::{
         BackendDescriptor, BackendStatus, CaptureBackend, CaptureCapabilities, CaptureError,
         CaptureErrorKind, CaptureRequest, CaptureSession, CaptureSource, CaptureTarget,
-        CapturedFrame, RecoveryHint, decode_zpixmap, translate_region,
+        CapturedFrame, RecoveryHint, WindowFilterFacts, decode_text_property, decode_u32_property,
+        decode_zpixmap, format_window_source_id, intersect_rect, parse_window_source_id,
+        should_list_window, translate_region,
     };
     use crate::x11::{ByteOrder, PixelLayout};
 
@@ -40,7 +45,9 @@ mod native {
         connection: RustConnection,
         screen_index: usize,
         root: u32,
-        sources: Vec<X11Source>,
+        root_region: PhysicalRect,
+        monitor_sources: Vec<X11Source>,
+        atoms: X11Atoms,
         layout: PixelLayout,
         connected_at: Instant,
         direct_sequence: AtomicU64,
@@ -52,18 +59,45 @@ mod native {
         root_region: PhysicalRect,
     }
 
+    #[derive(Clone, Copy)]
+    struct X11Atoms {
+        net_client_list: Atom,
+        net_wm_name: Atom,
+        utf8_string: Atom,
+        net_wm_pid: Atom,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct ResolvedTarget {
+        root_region: PhysicalRect,
+        tracked_window: Option<(Window, PhysicalRect)>,
+    }
+
+    impl X11Atoms {
+        fn intern(connection: &RustConnection) -> Result<Self, CaptureError> {
+            Ok(Self {
+                net_client_list: intern_optional_atom(connection, b"_NET_CLIENT_LIST")?,
+                net_wm_name: intern_optional_atom(connection, b"_NET_WM_NAME")?,
+                utf8_string: intern_optional_atom(connection, b"UTF8_STRING")?,
+                net_wm_pid: intern_optional_atom(connection, b"_NET_WM_PID")?,
+            })
+        }
+    }
+
     impl Debug for X11CaptureBackend {
         fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
             formatter
                 .debug_struct("X11CaptureBackend")
                 .field("screen_index", &self.inner.screen_index)
                 .field("root", &self.inner.root)
-                .field("source_count", &self.inner.sources.len())
+                .field("monitor_source_count", &self.inner.monitor_sources.len())
                 .finish_non_exhaustive()
         }
     }
 
     impl X11CaptureBackend {
+        const WINDOW_CAPTURE_ATTEMPTS: usize = 3;
+
         /// Returns whether native X11 support is compiled into this build.
         pub const fn compiled() -> bool {
             true
@@ -87,13 +121,17 @@ mod native {
                 )
             })?;
 
-            let (root, layout, sources) = inspect_setup(&connection, screen_index)?;
+            let (root, root_region, layout, monitor_sources) =
+                inspect_setup(&connection, screen_index)?;
+            let atoms = X11Atoms::intern(&connection)?;
             Ok(Self {
                 inner: Arc::new(X11Inner {
                     connection,
                     screen_index,
                     root,
-                    sources,
+                    root_region,
+                    monitor_sources,
+                    atoms,
                     layout,
                     connected_at: Instant::now(),
                     direct_sequence: AtomicU64::new(0),
@@ -122,17 +160,70 @@ mod native {
             sequence: u64,
             timestamp: CaptureTimestamp,
         ) -> Result<CapturedFrame, CaptureError> {
-            let region = self.resolve_target(target)?;
-            let x = i16::try_from(region.origin().x).map_err(|_| {
+            for attempt in 0..Self::WINDOW_CAPTURE_ATTEMPTS {
+                let resolved = self.resolve_target(target)?;
+                let rgba = self.capture_root_pixels(resolved.root_region)?;
+
+                if let Some((window, expected_region)) = resolved.tracked_window {
+                    let current_region = self.live_window_region(window)?;
+                    if current_region != expected_region {
+                        if attempt + 1 < Self::WINDOW_CAPTURE_ATTEMPTS {
+                            continue;
+                        }
+                        return Err(CaptureError::new(
+                            CaptureErrorKind::SourceLost,
+                            format!(
+                                "X11 window 0x{window:08x} kept moving or resizing while a frame was captured"
+                            ),
+                            RecoveryHint::Retry,
+                        ));
+                    }
+                }
+
+                let size = resolved.root_region.size();
+                let stride = usize::try_from(size.width())
+                    .ok()
+                    .and_then(|width| width.checked_mul(4))
+                    .ok_or_else(|| CaptureError::invalid_frame("RGBA stride overflow"))?;
+                return CapturedFrame::new(
+                    sequence,
+                    timestamp,
+                    size,
+                    stride,
+                    PixelFormat::Rgba8,
+                    rgba,
+                );
+            }
+            Err(CaptureError::new(
+                CaptureErrorKind::SourceLost,
+                "X11 window capture could not stabilize",
+                RecoveryHint::Retry,
+            ))
+        }
+
+        fn capture_root_pixels(&self, requested: PhysicalRect) -> Result<Vec<u8>, CaptureError> {
+            // Reading the root keeps every target on the setup root visual and
+            // gives defined pixels when another window occludes the client.
+            // The trade-off is intentional: this records what the user sees,
+            // including overlapping windows, rather than an off-screen client
+            // backing store with compositor-dependent contents.
+            let clipped = intersect_rect(requested, self.inner.root_region).ok_or_else(|| {
+                CaptureError::new(
+                    CaptureErrorKind::SourceLost,
+                    "the selected X11 window is completely outside the visible root window",
+                    RecoveryHint::ChooseDifferentSource,
+                )
+            })?;
+            let x = i16::try_from(clipped.origin().x).map_err(|_| {
                 invalid_target("X11 capture x coordinate is outside the protocol's i16 range")
             })?;
-            let y = i16::try_from(region.origin().y).map_err(|_| {
+            let y = i16::try_from(clipped.origin().y).map_err(|_| {
                 invalid_target("X11 capture y coordinate is outside the protocol's i16 range")
             })?;
-            let width = u16::try_from(region.size().width()).map_err(|_| {
+            let width = u16::try_from(clipped.size().width()).map_err(|_| {
                 invalid_target("X11 capture width is outside the protocol's u16 range")
             })?;
-            let height = u16::try_from(region.size().height()).map_err(|_| {
+            let height = u16::try_from(clipped.size().height()).map_err(|_| {
                 invalid_target("X11 capture height is outside the protocol's u16 range")
             })?;
 
@@ -162,46 +253,136 @@ mod native {
                     RecoveryHint::Retry,
                 ));
             }
-            let rgba = decode_zpixmap(
+            let clipped_rgba = decode_zpixmap(
                 &reply.data,
                 u32::from(width),
                 u32::from(height),
                 self.inner.layout,
             )?;
-            let size = PhysicalSize::new(u32::from(width), u32::from(height))?;
-            let stride = usize::from(width)
-                .checked_mul(4)
-                .ok_or_else(|| CaptureError::invalid_frame("RGBA stride overflow"))?;
-            CapturedFrame::new(sequence, timestamp, size, stride, PixelFormat::Rgba8, rgba)
+            if clipped == requested {
+                return Ok(clipped_rgba);
+            }
+            pad_clipped_frame(requested, clipped, &clipped_rgba)
         }
 
-        fn resolve_target(&self, target: &CaptureTarget) -> Result<PhysicalRect, CaptureError> {
-            let source_id = target.source_id();
-            let source = self
-                .inner
-                .sources
-                .iter()
-                .find(|candidate| candidate.portable.id() == source_id)
-                .ok_or_else(|| {
-                    CaptureError::new(
-                        CaptureErrorKind::SourceNotFound,
-                        format!("X11 capture source '{source_id}' was not found"),
-                        RecoveryHint::ChooseDifferentSource,
-                    )
-                })?;
-
+        fn resolve_target(&self, target: &CaptureTarget) -> Result<ResolvedTarget, CaptureError> {
             match target {
-                CaptureTarget::Monitor(_) => Ok(source.root_region),
-                CaptureTarget::Region { region, .. } => {
-                    translate_region(source.root_region, *region)
+                CaptureTarget::Monitor(source_id) => {
+                    self.find_monitor(source_id).map(|source| ResolvedTarget {
+                        root_region: source.root_region,
+                        tracked_window: None,
+                    })
                 }
-                CaptureTarget::Window(_) => Err(CaptureError::new(
-                    CaptureErrorKind::UnsupportedCapability,
-                    "window capture is not implemented by the first X11 vertical slice",
-                    RecoveryHint::ChangeRequest,
-                )),
+                CaptureTarget::Window(source_id) => {
+                    let window = self.parse_window_id(source_id)?;
+                    let root_region = self.live_window_region(window)?;
+                    Ok(ResolvedTarget {
+                        root_region,
+                        tracked_window: Some((window, root_region)),
+                    })
+                }
+                CaptureTarget::Region { source, region } => {
+                    if let Some(monitor) = self
+                        .inner
+                        .monitor_sources
+                        .iter()
+                        .find(|candidate| candidate.portable.id() == source)
+                    {
+                        return Ok(ResolvedTarget {
+                            root_region: translate_region(monitor.root_region, *region)?,
+                            tracked_window: None,
+                        });
+                    }
+                    let window = self.parse_window_id(source)?;
+                    let window_region = self.live_window_region(window)?;
+                    Ok(ResolvedTarget {
+                        root_region: translate_region(window_region, *region)?,
+                        tracked_window: Some((window, window_region)),
+                    })
+                }
                 _ => Err(invalid_target("unknown capture target kind")),
             }
+        }
+
+        fn find_monitor(&self, source_id: &CaptureSourceId) -> Result<&X11Source, CaptureError> {
+            self.inner
+                .monitor_sources
+                .iter()
+                .find(|candidate| candidate.portable.id() == source_id)
+                .ok_or_else(|| source_not_found(source_id))
+        }
+
+        fn parse_window_id(&self, source_id: &CaptureSourceId) -> Result<Window, CaptureError> {
+            parse_window_source_id(source_id.as_str(), self.inner.screen_index)
+                .ok_or_else(|| source_not_found(source_id))
+        }
+
+        fn live_window_region(&self, window: Window) -> Result<PhysicalRect, CaptureError> {
+            let attributes = self
+                .inner
+                .connection
+                .get_window_attributes(window)
+                .map_err(|error| source_lost("inspect the selected X11 window", &error))?
+                .reply()
+                .map_err(|error| source_lost("inspect the selected X11 window", &error))?;
+            if attributes.map_state != MapState::VIEWABLE {
+                return Err(window_unavailable(window, "is no longer viewable"));
+            }
+            if attributes.class != WindowClass::INPUT_OUTPUT {
+                return Err(window_unavailable(window, "is not an InputOutput window"));
+            }
+            if attributes.override_redirect {
+                return Err(window_unavailable(
+                    window,
+                    "became an override-redirect helper window",
+                ));
+            }
+
+            let geometry = self
+                .inner
+                .connection
+                .get_geometry(window)
+                .map_err(|error| source_lost("query the selected X11 window geometry", &error))?
+                .reply()
+                .map_err(|error| source_lost("query the selected X11 window geometry", &error))?;
+            if geometry.width == 0 || geometry.height == 0 {
+                return Err(window_unavailable(window, "has an empty geometry"));
+            }
+            if geometry.root != self.inner.root {
+                return Err(window_unavailable(window, "moved to another X11 screen"));
+            }
+
+            let translated = self
+                .inner
+                .connection
+                .translate_coordinates(window, self.inner.root, 0, 0)
+                .map_err(|error| source_lost("translate the selected X11 window", &error))?
+                .reply()
+                .map_err(|error| source_lost("translate the selected X11 window", &error))?;
+            if !translated.same_screen {
+                return Err(window_unavailable(window, "moved to another X11 screen"));
+            }
+            let region = PhysicalRect::new(
+                i32::from(translated.dst_x),
+                i32::from(translated.dst_y),
+                u32::from(geometry.width),
+                u32::from(geometry.height),
+            )?;
+            if intersect_rect(region, self.inner.root_region).is_none() {
+                return Err(window_unavailable(
+                    window,
+                    "is completely outside the visible root window",
+                ));
+            }
+            if window_pid(&self.inner.connection, window, self.inner.atoms.net_wm_pid)
+                == Some(process::id())
+            {
+                return Err(window_unavailable(
+                    window,
+                    "belongs to this recorder and is intentionally excluded",
+                ));
+            }
+            Ok(region)
         }
 
         fn validate_request(&self, request: &CaptureRequest) -> Result<(), CaptureError> {
@@ -245,12 +426,20 @@ mod native {
         }
 
         fn list_sources(&self) -> Result<Vec<CaptureSource>, CaptureError> {
-            Ok(self
+            let mut sources: Vec<_> = self
                 .inner
-                .sources
+                .monitor_sources
                 .iter()
                 .map(|source| source.portable.clone())
-                .collect())
+                .collect();
+            sources.extend(enumerate_window_sources(
+                &self.inner.connection,
+                self.inner.screen_index,
+                self.inner.root,
+                self.inner.root_region,
+                self.inner.atoms,
+            )?);
+            Ok(sources)
         }
 
         fn start_session(
@@ -399,10 +588,292 @@ mod native {
         }
     }
 
+    fn intern_optional_atom(
+        connection: &RustConnection,
+        name: &[u8],
+    ) -> Result<Atom, CaptureError> {
+        connection
+            .intern_atom(true, name)
+            .map_err(|error| platform_error("send X11 InternAtom request", &error))?
+            .reply()
+            .map(|reply| reply.atom)
+            .map_err(|error| platform_error("receive X11 InternAtom reply", &error))
+    }
+
+    /// Enumerates selectable application windows on every call so newly
+    /// created and destroyed windows are reflected without reconnecting.
+    ///
+    /// The policy intentionally lists only viewable, non-empty `InputOutput`
+    /// windows that intersect the root. Override-redirect helpers (menus,
+    /// tooltips, drag icons) and windows whose `_NET_WM_PID` equals this
+    /// process are excluded. An absent PID is retained because remote/legacy
+    /// clients commonly omit it. EWMH clients may use an XID fallback label;
+    /// `QueryTree` fallback candidates need a real title to avoid exposing
+    /// internal widget windows.
+    fn enumerate_window_sources(
+        connection: &RustConnection,
+        screen_index: usize,
+        root: Window,
+        root_region: PhysicalRect,
+        atoms: X11Atoms,
+    ) -> Result<Vec<CaptureSource>, CaptureError> {
+        let (windows, from_ewmh) =
+            match ewmh_client_windows(connection, root, atoms.net_client_list) {
+                Some(windows) => (windows, true),
+                None => (query_tree_windows(connection, root)?, false),
+            };
+        let own_pid = process::id();
+        let mut seen = HashSet::new();
+        let mut sources = Vec::new();
+        for window in windows {
+            if window == 0 || window == root || !seen.insert(window) {
+                continue;
+            }
+            if let Some(source) = inspect_enumerated_window(
+                connection,
+                screen_index,
+                root,
+                root_region,
+                atoms,
+                window,
+                own_pid,
+                from_ewmh,
+            ) {
+                sources.push(source);
+            }
+        }
+        Ok(sources)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn inspect_enumerated_window(
+        connection: &RustConnection,
+        screen_index: usize,
+        root: Window,
+        root_region: PhysicalRect,
+        atoms: X11Atoms,
+        window: Window,
+        own_pid: u32,
+        from_ewmh: bool,
+    ) -> Option<CaptureSource> {
+        let attributes = connection
+            .get_window_attributes(window)
+            .ok()?
+            .reply()
+            .ok()?;
+        let geometry = connection.get_geometry(window).ok()?.reply().ok()?;
+        if geometry.root != root {
+            return None;
+        }
+        let translated = connection
+            .translate_coordinates(window, root, 0, 0)
+            .ok()?
+            .reply()
+            .ok()?;
+        if !translated.same_screen {
+            return None;
+        }
+        let region = PhysicalRect::new(
+            i32::from(translated.dst_x),
+            i32::from(translated.dst_y),
+            u32::from(geometry.width),
+            u32::from(geometry.height),
+        )
+        .ok()?;
+        let title = window_title(connection, window, atoms);
+        let facts = WindowFilterFacts {
+            viewable: attributes.map_state == MapState::VIEWABLE,
+            input_output: attributes.class == WindowClass::INPUT_OUTPUT,
+            override_redirect: attributes.override_redirect,
+            width: u32::from(geometry.width),
+            height: u32::from(geometry.height),
+            intersects_root: intersect_rect(region, root_region).is_some(),
+            owner_pid: window_pid(connection, window, atoms.net_wm_pid),
+            has_title: title.is_some(),
+            from_ewmh,
+        };
+        if !should_list_window(facts, own_pid) {
+            return None;
+        }
+
+        let name = title.unwrap_or_else(|| format!("Window 0x{window:08x}"));
+        let id = CaptureSourceId::new(format_window_source_id(screen_index, window)).ok()?;
+        CaptureSource::new(id, name, CaptureSourceKind::Window, Some(region), 1.0).ok()
+    }
+
+    fn ewmh_client_windows(
+        connection: &RustConnection,
+        root: Window,
+        net_client_list: Atom,
+    ) -> Option<Vec<Window>> {
+        if net_client_list == 0 {
+            return None;
+        }
+        let reply = connection
+            .get_property(false, root, net_client_list, AtomEnum::WINDOW, 0, u32::MAX)
+            .ok()?
+            .reply()
+            .ok()?;
+        if reply.type_ != u32::from(AtomEnum::WINDOW) {
+            return None;
+        }
+        decode_u32_property(reply.format, &reply.value)
+    }
+
+    fn query_tree_windows(
+        connection: &RustConnection,
+        root: Window,
+    ) -> Result<Vec<Window>, CaptureError> {
+        const MAX_FALLBACK_WINDOWS: usize = 16_384;
+
+        let children = connection
+            .query_tree(root)
+            .map_err(|error| platform_error("send X11 QueryTree fallback request", &error))?
+            .reply()
+            .map_err(|error| platform_error("receive X11 QueryTree fallback reply", &error))?
+            .children;
+        let mut queue: VecDeque<_> = children.into();
+        let mut seen = HashSet::new();
+        let mut windows = Vec::new();
+        while let Some(window) = queue.pop_front() {
+            if window == root || !seen.insert(window) {
+                continue;
+            }
+            windows.push(window);
+            if windows.len() >= MAX_FALLBACK_WINDOWS {
+                break;
+            }
+            let Some(children) = connection
+                .query_tree(window)
+                .ok()
+                .and_then(|cookie| cookie.reply().ok())
+                .map(|reply| reply.children)
+            else {
+                continue;
+            };
+            queue.extend(children);
+        }
+        Ok(windows)
+    }
+
+    fn window_title(
+        connection: &RustConnection,
+        window: Window,
+        atoms: X11Atoms,
+    ) -> Option<String> {
+        if atoms.net_wm_name != 0 && atoms.utf8_string != 0 {
+            let modern = connection
+                .get_property(
+                    false,
+                    window,
+                    atoms.net_wm_name,
+                    atoms.utf8_string,
+                    0,
+                    u32::MAX,
+                )
+                .ok()
+                .and_then(|cookie| cookie.reply().ok())
+                .filter(|reply| reply.type_ == atoms.utf8_string)
+                .and_then(|reply| decode_text_property(reply.format, &reply.value));
+            if modern.is_some() {
+                return modern;
+            }
+        }
+        connection
+            .get_property(false, window, AtomEnum::WM_NAME, AtomEnum::ANY, 0, u32::MAX)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .and_then(|reply| decode_text_property(reply.format, &reply.value))
+    }
+
+    fn window_pid(connection: &RustConnection, window: Window, net_wm_pid: Atom) -> Option<u32> {
+        if net_wm_pid == 0 {
+            return None;
+        }
+        let reply = connection
+            .get_property(false, window, net_wm_pid, AtomEnum::CARDINAL, 0, 1)
+            .ok()?
+            .reply()
+            .ok()?;
+        if reply.type_ != u32::from(AtomEnum::CARDINAL) {
+            return None;
+        }
+        decode_u32_property(reply.format, &reply.value)?
+            .into_iter()
+            .next()
+    }
+
+    fn pad_clipped_frame(
+        requested: PhysicalRect,
+        clipped: PhysicalRect,
+        clipped_rgba: &[u8],
+    ) -> Result<Vec<u8>, CaptureError> {
+        let requested_width = usize::try_from(requested.size().width())
+            .map_err(|_| CaptureError::invalid_frame("X11 requested width exceeds usize"))?;
+        let requested_height = usize::try_from(requested.size().height())
+            .map_err(|_| CaptureError::invalid_frame("X11 requested height exceeds usize"))?;
+        let clipped_width = usize::try_from(clipped.size().width())
+            .map_err(|_| CaptureError::invalid_frame("X11 clipped width exceeds usize"))?;
+        let clipped_height = usize::try_from(clipped.size().height())
+            .map_err(|_| CaptureError::invalid_frame("X11 clipped height exceeds usize"))?;
+        let clipped_stride = clipped_width
+            .checked_mul(4)
+            .ok_or_else(|| CaptureError::invalid_frame("X11 clipped stride overflow"))?;
+        let expected_clipped_len = clipped_stride
+            .checked_mul(clipped_height)
+            .ok_or_else(|| CaptureError::invalid_frame("X11 clipped frame size overflow"))?;
+        if clipped_rgba.len() != expected_clipped_len {
+            return Err(CaptureError::invalid_frame(
+                "X11 clipped RGBA frame has an unexpected byte count",
+            ));
+        }
+        let output_stride = requested_width
+            .checked_mul(4)
+            .ok_or_else(|| CaptureError::invalid_frame("X11 output stride overflow"))?;
+        let output_len = output_stride
+            .checked_mul(requested_height)
+            .ok_or_else(|| CaptureError::invalid_frame("X11 output frame size overflow"))?;
+        let mut output = vec![0_u8; output_len];
+        for pixel in output.chunks_exact_mut(4) {
+            pixel[3] = 255;
+        }
+
+        let x_offset = clipped
+            .origin()
+            .x
+            .checked_sub(requested.origin().x)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| CaptureError::invalid_frame("X11 clipped x offset is invalid"))?;
+        let y_offset = clipped
+            .origin()
+            .y
+            .checked_sub(requested.origin().y)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| CaptureError::invalid_frame("X11 clipped y offset is invalid"))?;
+        let destination_x = x_offset
+            .checked_mul(4)
+            .ok_or_else(|| CaptureError::invalid_frame("X11 destination x offset overflow"))?;
+        for row in 0..clipped_height {
+            let source_start = row
+                .checked_mul(clipped_stride)
+                .ok_or_else(|| CaptureError::invalid_frame("X11 source row offset overflow"))?;
+            let destination_start = y_offset
+                .checked_add(row)
+                .and_then(|row| row.checked_mul(output_stride))
+                .and_then(|offset| offset.checked_add(destination_x))
+                .ok_or_else(|| {
+                    CaptureError::invalid_frame("X11 destination row offset overflow")
+                })?;
+            output[destination_start..destination_start + clipped_stride]
+                .copy_from_slice(&clipped_rgba[source_start..source_start + clipped_stride]);
+        }
+        Ok(output)
+    }
+
     fn inspect_setup(
         connection: &RustConnection,
         screen_index: usize,
-    ) -> Result<(u32, PixelLayout, Vec<X11Source>), CaptureError> {
+    ) -> Result<(u32, PhysicalRect, PixelLayout, Vec<X11Source>), CaptureError> {
         let setup = connection.setup();
         let screen = setup.roots.get(screen_index).ok_or_else(|| {
             CaptureError::new(
@@ -447,8 +918,14 @@ mod native {
             blue_mask: visual.blue_mask,
         };
         layout.validate()?;
-        let sources = enumerate_sources(connection, screen_index, screen)?;
-        Ok((screen.root, layout, sources))
+        let root_region = PhysicalRect::new(
+            0,
+            0,
+            u32::from(screen.width_in_pixels),
+            u32::from(screen.height_in_pixels),
+        )?;
+        let sources = enumerate_monitor_sources(connection, screen_index, screen, root_region)?;
+        Ok((screen.root, root_region, layout, sources))
     }
 
     fn root_visual(screen: &Screen) -> Result<&x11rb::protocol::xproto::Visualtype, CaptureError> {
@@ -466,17 +943,12 @@ mod native {
             })
     }
 
-    fn enumerate_sources(
+    fn enumerate_monitor_sources(
         connection: &RustConnection,
         screen_index: usize,
         screen: &Screen,
+        root_region: PhysicalRect,
     ) -> Result<Vec<X11Source>, CaptureError> {
-        let root_region = PhysicalRect::new(
-            0,
-            0,
-            u32::from(screen.width_in_pixels),
-            u32::from(screen.height_in_pixels),
-        )?;
         let root_id = CaptureSourceId::new(format!("x11:screen:{screen_index}:root"))?;
         let root_source = CaptureSource::new(
             root_id,
@@ -536,8 +1008,9 @@ mod native {
     fn get_image_capabilities() -> CaptureCapabilities {
         CaptureCapabilities {
             monitor: CapabilityStatus::Available,
-            window: CapabilityStatus::Unavailable(
-                "window enumeration/capture is not implemented by the GetImage slice".to_owned(),
+            window: CapabilityStatus::Limited(
+                "captures the window's current root pixels; overlapping windows are included"
+                    .to_owned(),
             ),
             arbitrary_region: CapabilityStatus::Available,
             cursor_embedded: CapabilityStatus::Unavailable(
@@ -566,6 +1039,30 @@ mod native {
             CaptureErrorKind::InvalidRequest,
             message,
             RecoveryHint::ChangeRequest,
+        )
+    }
+
+    fn source_not_found(source_id: &CaptureSourceId) -> CaptureError {
+        CaptureError::new(
+            CaptureErrorKind::SourceNotFound,
+            format!("X11 capture source '{source_id}' was not found"),
+            RecoveryHint::ChooseDifferentSource,
+        )
+    }
+
+    fn window_unavailable(window: Window, reason: &str) -> CaptureError {
+        CaptureError::new(
+            CaptureErrorKind::SourceLost,
+            format!("X11 window 0x{window:08x} {reason}"),
+            RecoveryHint::ChooseDifferentSource,
+        )
+    }
+
+    fn platform_error(context: &str, error: &impl std::fmt::Display) -> CaptureError {
+        CaptureError::new(
+            CaptureErrorKind::Platform,
+            format!("failed to {context}: {error}"),
+            RecoveryHint::Retry,
         )
     }
 
@@ -653,6 +1150,101 @@ mod native {
 }
 
 pub use native::X11CaptureBackend;
+
+#[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowFilterFacts {
+    viewable: bool,
+    input_output: bool,
+    override_redirect: bool,
+    width: u32,
+    height: u32,
+    intersects_root: bool,
+    owner_pid: Option<u32>,
+    has_title: bool,
+    from_ewmh: bool,
+}
+
+#[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
+fn should_list_window(facts: WindowFilterFacts, own_pid: u32) -> bool {
+    facts.viewable
+        && facts.input_output
+        && !facts.override_redirect
+        && facts.width > 0
+        && facts.height > 0
+        && facts.intersects_root
+        && facts.owner_pid != Some(own_pid)
+        && (facts.from_ewmh || facts.has_title)
+}
+
+#[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
+fn format_window_source_id(screen_index: usize, window: u32) -> String {
+    format!("x11:screen:{screen_index}:window:0x{window:08x}")
+}
+
+#[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
+fn parse_window_source_id(source_id: &str, screen_index: usize) -> Option<u32> {
+    let prefix = format!("x11:screen:{screen_index}:window:0x");
+    let xid = source_id.strip_prefix(&prefix)?;
+    if xid.len() != 8 || !xid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(xid, 16)
+        .ok()
+        .filter(|window| *window != 0)
+}
+
+#[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
+fn decode_u32_property(format: u8, value: &[u8]) -> Option<Vec<u32>> {
+    if format != 32 || !value.len().is_multiple_of(4) {
+        return None;
+    }
+    Some(
+        value
+            .chunks_exact(4)
+            .map(|bytes| u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect(),
+    )
+}
+
+#[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
+fn decode_text_property(format: u8, value: &[u8]) -> Option<String> {
+    if format != 8 {
+        return None;
+    }
+    let text = value.split(|byte| *byte == 0).next().unwrap_or_default();
+    let normalized = String::from_utf8_lossy(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+#[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
+fn intersect_rect(
+    left: gif_from_screen_capture::PhysicalRect,
+    right: gif_from_screen_capture::PhysicalRect,
+) -> Option<gif_from_screen_capture::PhysicalRect> {
+    let x = i64::from(left.origin().x).max(i64::from(right.origin().x));
+    let y = i64::from(left.origin().y).max(i64::from(right.origin().y));
+    let left_edge = i64::from(left.origin().x) + i64::from(left.size().width());
+    let right_edge = i64::from(right.origin().x) + i64::from(right.size().width());
+    let bottom_left = i64::from(left.origin().y) + i64::from(left.size().height());
+    let bottom_right = i64::from(right.origin().y) + i64::from(right.size().height());
+    let width = left_edge.min(right_edge).checked_sub(x)?;
+    let height = bottom_left.min(bottom_right).checked_sub(y)?;
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    gif_from_screen_capture::PhysicalRect::new(
+        i32::try_from(x).ok()?,
+        i32::try_from(y).ok()?,
+        u32::try_from(width).ok()?,
+        u32::try_from(height).ok()?,
+    )
+    .ok()
+}
 
 #[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -839,7 +1431,7 @@ fn scale_mask(pixel: u32, mask: u32) -> u8 {
 mod tests {
     use gif_from_screen_capture::PhysicalRect;
     #[cfg(all(target_os = "linux", feature = "native-x11"))]
-    use gif_from_screen_capture::{CaptureBackend as _, CaptureSourceId};
+    use gif_from_screen_capture::{CaptureSourceId, CaptureSourceKind};
 
     use super::*;
 
@@ -901,6 +1493,113 @@ mod tests {
     }
 
     #[test]
+    fn parses_native_u32_properties_and_rejects_wrong_formats() {
+        let expected = [0x0123_4567_u32, 0x89ab_cdef];
+        let bytes: Vec<_> = expected
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect();
+        assert_eq!(decode_u32_property(32, &bytes).unwrap(), expected);
+        assert!(decode_u32_property(8, &bytes).is_none());
+        assert!(decode_u32_property(32, &bytes[..7]).is_none());
+    }
+
+    #[test]
+    fn parses_ewmh_text_without_nul_tail_or_layout_whitespace() {
+        assert_eq!(
+            decode_text_property(8, b"  GIF\n recorder  \0ignored"),
+            Some("GIF recorder".to_owned())
+        );
+        assert_eq!(decode_text_property(8, b" \t\n"), None);
+        assert_eq!(decode_text_property(32, b"title"), None);
+    }
+
+    #[test]
+    fn window_source_ids_round_trip_the_xid_and_screen() {
+        let id = format_window_source_id(2, 0x01ab_cdef);
+        assert_eq!(id, "x11:screen:2:window:0x01abcdef");
+        assert_eq!(parse_window_source_id(&id, 2), Some(0x01ab_cdef));
+        assert_eq!(parse_window_source_id(&id, 1), None);
+        assert_eq!(
+            parse_window_source_id("x11:screen:2:window:0x00000000", 2),
+            None
+        );
+        assert_eq!(parse_window_source_id("x11:screen:2:window:1234", 2), None);
+    }
+
+    #[test]
+    fn window_filter_excludes_invisible_empty_helpers_and_own_process() {
+        let own_pid = 42;
+        let eligible = WindowFilterFacts {
+            viewable: true,
+            input_output: true,
+            override_redirect: false,
+            width: 640,
+            height: 480,
+            intersects_root: true,
+            owner_pid: Some(7),
+            has_title: true,
+            from_ewmh: true,
+        };
+        assert!(should_list_window(eligible, own_pid));
+        assert!(!should_list_window(
+            WindowFilterFacts {
+                viewable: false,
+                ..eligible
+            },
+            own_pid
+        ));
+        assert!(!should_list_window(
+            WindowFilterFacts {
+                width: 0,
+                ..eligible
+            },
+            own_pid
+        ));
+        assert!(!should_list_window(
+            WindowFilterFacts {
+                override_redirect: true,
+                ..eligible
+            },
+            own_pid
+        ));
+        assert!(!should_list_window(
+            WindowFilterFacts {
+                owner_pid: Some(own_pid),
+                ..eligible
+            },
+            own_pid
+        ));
+        assert!(should_list_window(
+            WindowFilterFacts {
+                owner_pid: None,
+                has_title: false,
+                ..eligible
+            },
+            own_pid
+        ));
+        assert!(!should_list_window(
+            WindowFilterFacts {
+                has_title: false,
+                from_ewmh: false,
+                ..eligible
+            },
+            own_pid
+        ));
+    }
+
+    #[test]
+    fn rectangle_intersection_handles_partially_offscreen_windows() {
+        let root = PhysicalRect::new(0, 0, 1920, 1080).unwrap();
+        let window = PhysicalRect::new(-20, 100, 100, 50).unwrap();
+        assert_eq!(
+            intersect_rect(root, window),
+            Some(PhysicalRect::new(0, 100, 80, 50).unwrap())
+        );
+        assert!(intersect_rect(root, PhysicalRect::new(-100, -100, 50, 50).unwrap()).is_none());
+    }
+
+    #[test]
     fn disabled_build_returns_clear_error() {
         if X11CaptureBackend::compiled() {
             return;
@@ -921,12 +1620,14 @@ mod tests {
             eprintln!("skipping real X11 smoke test because DISPLAY is unset");
             return;
         };
-        let backend = X11CaptureBackend::connect(Some(&display)).unwrap();
-        let root = backend
-            .list_sources()
-            .unwrap()
-            .into_iter()
-            .next()
+        let Ok(backend) = X11CaptureBackend::connect(Some(&display)) else {
+            eprintln!("skipping real X11 smoke test because DISPLAY is not reachable");
+            return;
+        };
+        let sources = backend.list_sources().unwrap();
+        let root = sources
+            .iter()
+            .find(|source| source.kind() == CaptureSourceKind::Monitor)
             .expect("root source");
         let target = CaptureTarget::Region {
             source: CaptureSourceId::new(root.id().as_str()).unwrap(),
@@ -936,5 +1637,24 @@ mod tests {
         assert_eq!(frame.size().width(), 2);
         assert_eq!(frame.size().height(), 2);
         assert_eq!(frame.pixels().len(), 16);
+
+        let Some(window) = sources
+            .into_iter()
+            .find(|source| source.kind() == CaptureSourceKind::Window)
+        else {
+            eprintln!("skipping X11 window capture smoke check because no window is selectable");
+            return;
+        };
+        assert!(window.id().as_str().contains(":window:0x"));
+        match backend.capture_once(&CaptureTarget::Window(window.id().clone())) {
+            Ok(frame) => {
+                assert!(frame.size().width() > 0);
+                assert!(frame.size().height() > 0);
+            }
+            Err(error) if error.kind() == CaptureErrorKind::SourceLost => {
+                eprintln!("window vanished during optional smoke capture: {error}");
+            }
+            Err(error) => panic!("X11 window smoke capture failed: {error}"),
+        }
     }
 }
