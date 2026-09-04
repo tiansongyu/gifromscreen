@@ -497,7 +497,7 @@ mod tests {
         let existing = directory.path().join("existing.gfsproj");
         fs::create_dir(&existing).unwrap();
         fs::write(existing.join("sentinel"), b"keep").unwrap();
-        let valid = directory.path().join("retry.gfsproj");
+        let valid = directory.path().join("retry.GFSPROJ");
         let mut job = BlankProjectJob::default();
 
         assert!(matches!(
