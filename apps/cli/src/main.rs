@@ -4,25 +4,26 @@
 
 use std::{env, fs, io, path::Path, time::Duration};
 
+use gif_from_screen_application::{
+    NoopProjectExportProgress, ProjectExportSnapshot, ProjectFrameSelection,
+    ProjectGifExportOptions, export_project_snapshot_to_gif,
+};
 use gif_from_screen_capture::{
     CaptureBackend, CaptureCadence, CaptureRequest, CaptureTarget, CursorCaptureMode,
     PhysicalRect as CaptureRect,
 };
 use gif_from_screen_capture_linux::X11CaptureBackend;
 use gif_from_screen_domain::{
-    AssetDescriptor, AssetId, AssetKind, Canvas, CanvasBackground, CaptureMetadata, ClipTransform,
+    AssetDescriptor, AssetKind, Canvas, CanvasBackground, CaptureMetadata, ClipTransform,
     ColorSpace, DurationUs, EdgeWidths, EditCommand, Effect, FrameClip, FrameId,
     PhysicalRect as DomainRect, PhysicalSize, ProjectId, ProjectManifest, RasterEncoding, Rgba,
-    UnixTimeMs,
+    Timeline, UnixTimeMs,
 };
+use gif_from_screen_editor::{FrameExpressionError, parse_frame_expression};
 use gif_from_screen_gif::{
     BuiltinGifEncoder, EncodeOptions, NeverCancel as GifNeverCancel, RgbaFrame,
 };
 use gif_from_screen_project::{ActiveProject, LockPolicy};
-use gif_from_screen_render::{
-    AssetProviderError, CpuRenderer, FrameAssetProvider, NeverCancel as RenderNeverCancel,
-    RgbaSurface,
-};
 use gif_from_screen_workflow::{
     CollectOptions, CollectionLimit, NoopWorkflowProgress, RecordToGifOptions, record_to_gif,
 };
@@ -51,9 +52,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             write_demo_project(Path::new(&project), Path::new(&output))?;
         }
         "export" => {
-            let project = arguments.next().ok_or("missing PROJECT_DIRECTORY")?;
-            let output = arguments.next().ok_or("missing OUTPUT.gif")?;
-            export_project(Path::new(&project), Path::new(&output))?;
+            let parsed = parse_export_arguments(&mut arguments)?;
+            export_project(
+                Path::new(&parsed.project),
+                Path::new(&parsed.output),
+                parsed.frame_expression.as_deref(),
+            )?;
         }
         "sources-x11" => list_x11_sources()?,
         "record-x11" => {
@@ -75,7 +79,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn help() {
     println!(
-        "GifFromScreen CLI\n\nUSAGE:\n  gif-from-screen-cli doctor\n  gif-from-screen-cli demo [OUTPUT.gif]\n  gif-from-screen-cli demo-project PROJECT_DIRECTORY OUTPUT.gif\n  gif-from-screen-cli export PROJECT_DIRECTORY OUTPUT.gif\n  gif-from-screen-cli sources-x11\n  gif-from-screen-cli record-x11 OUTPUT.gif [DURATION_MS] [FPS] [X Y WIDTH HEIGHT]\n  gif-from-screen-cli version"
+        "GifFromScreen CLI\n\nUSAGE:\n  gif-from-screen-cli doctor\n  gif-from-screen-cli demo [OUTPUT.gif]\n  gif-from-screen-cli demo-project PROJECT_DIRECTORY OUTPUT.gif\n  gif-from-screen-cli export PROJECT_DIRECTORY OUTPUT.gif [FRAMES]\n  gif-from-screen-cli sources-x11\n  gif-from-screen-cli record-x11 OUTPUT.gif [DURATION_MS] [FPS] [X Y WIDTH HEIGHT]\n  gif-from-screen-cli version\n\nFRAMES is a one-based expression such as 1,3-5,9-7; ranges retain their written direction."
     );
 }
 
@@ -161,83 +165,77 @@ fn write_demo_project(
     }
     project.checkpoint_and_compact()?;
     drop(project);
-    export_project(project_root, output)
+    export_project(project_root, output, None)
 }
 
-fn export_project(project_root: &Path, output: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    if output.exists() {
-        return Err(format!("refusing to overwrite {}", output.display()).into());
+#[derive(Debug, Eq, PartialEq)]
+struct ExportArguments {
+    project: String,
+    output: String,
+    frame_expression: Option<String>,
+}
+
+fn parse_export_arguments(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<ExportArguments, Box<dyn std::error::Error>> {
+    let project = arguments.next().ok_or("missing PROJECT_DIRECTORY")?;
+    let output = arguments.next().ok_or("missing OUTPUT.gif")?;
+    let frame_expression = arguments.next();
+    if let Some(unexpected) = arguments.next() {
+        return Err(format!("unexpected argument after FRAMES: {unexpected}").into());
     }
+    Ok(ExportArguments {
+        project,
+        output,
+        frame_expression,
+    })
+}
+
+fn parse_project_frame_selection(
+    timeline: &Timeline,
+    frame_expression: Option<&str>,
+) -> Result<ProjectFrameSelection, FrameExpressionError> {
+    match frame_expression {
+        Some(expression) => Ok(ProjectFrameSelection::Ordered(parse_frame_expression(
+            timeline, expression,
+        )?)),
+        None => Ok(ProjectFrameSelection::All),
+    }
+}
+
+fn export_project(
+    project_root: &Path,
+    output: &Path,
+    frame_expression: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let opened = ActiveProject::open(project_root, LockPolicy::FailIfPresent)?;
     if !opened.asset_issues.is_empty() {
         return Err(format!("project has asset problems: {:?}", opened.asset_issues).into());
     }
-    let renderer = CpuRenderer::new();
-    let provider = ProjectAssetProvider {
-        project: &opened.project,
+    let snapshot = ProjectExportSnapshot::from_active(&opened.project);
+    let frames = parse_project_frame_selection(&snapshot.manifest().timeline, frame_expression)?;
+    let options = ProjectGifExportOptions {
+        frames,
+        ..ProjectGifExportOptions::default()
     };
-    let frames = opened
-        .project
-        .manifest()
-        .timeline
-        .frames
-        .iter()
-        .map(|clip| {
-            let surface = renderer.render_clip(clip, &provider, &RenderNeverCancel)?;
-            RgbaFrame::new(
-                u16::try_from(surface.width())?,
-                u16::try_from(surface.height())?,
-                surface.into_pixels(),
-                clip.duration.get(),
-            )
-            .map_err(Into::into)
-        })
-        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
-
-    let report = write_gif_frames(output, frames)?;
+    drop(opened);
+    let mut progress = NoopProjectExportProgress;
+    let report = export_project_snapshot_to_gif(
+        &snapshot,
+        output,
+        &options,
+        &GifNeverCancel,
+        &mut progress,
+    )?;
     println!(
-        "exported revision {} as {} GIF frames to {}",
-        opened.project.manifest().revision,
-        report.encoded_frames,
-        output.display()
+        "exported revision {}: {} selected frames became {} GIF frames ({} bytes) at {}",
+        report.revision,
+        report.selected_frames,
+        report.encoding.encoded_frames,
+        report.bytes_written,
+        report.output_path.display()
     );
     Ok(())
-}
-
-struct ProjectAssetProvider<'a> {
-    project: &'a ActiveProject,
-}
-
-impl FrameAssetProvider for ProjectAssetProvider<'_> {
-    fn load_rgba8(&self, asset_id: AssetId) -> Result<RgbaSurface, AssetProviderError> {
-        let descriptor = self
-            .project
-            .manifest()
-            .assets
-            .get(&asset_id)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("asset descriptor {asset_id} is missing"),
-                )
-            })?;
-        let AssetKind::Frame { size, encoding } = &descriptor.kind else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("asset {asset_id} is not a frame"),
-            )
-            .into());
-        };
-        if *encoding != RasterEncoding::Rgba8 {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("asset {asset_id} is not stored as raw RGBA8"),
-            )
-            .into());
-        }
-        let pixels = self.project.assets().read(asset_id)?;
-        RgbaSurface::new(*size, pixels).map_err(Into::into)
-    }
 }
 
 fn write_gif_frames(
@@ -449,4 +447,83 @@ fn doctor() {
 
 const fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn timeline_with_frames(count: u8) -> Timeline {
+        Timeline {
+            frames: (1..=count)
+                .map(|number| FrameClip {
+                    id: FrameId::from_u128(u128::from(number)),
+                    asset_id: gif_from_screen_domain::AssetId::from_digest([number; 32]),
+                    duration: DurationUs::new(10_000).unwrap(),
+                    transform: ClipTransform::default(),
+                    capture_metadata: CaptureMetadata::default(),
+                    effects: Vec::new(),
+                })
+                .collect(),
+            ..Timeline::default()
+        }
+    }
+
+    #[test]
+    fn parses_export_arguments_with_optional_frame_expression() {
+        let mut all = ["project", "output.gif"].into_iter().map(str::to_owned);
+        assert_eq!(
+            parse_export_arguments(&mut all).unwrap(),
+            ExportArguments {
+                project: "project".to_owned(),
+                output: "output.gif".to_owned(),
+                frame_expression: None,
+            }
+        );
+
+        let mut selected = ["project", "output.gif", "1,3-5,9-7"]
+            .into_iter()
+            .map(str::to_owned);
+        assert_eq!(
+            parse_export_arguments(&mut selected).unwrap(),
+            ExportArguments {
+                project: "project".to_owned(),
+                output: "output.gif".to_owned(),
+                frame_expression: Some("1,3-5,9-7".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_or_extra_export_arguments() {
+        let mut missing_output = ["project"].into_iter().map(str::to_owned);
+        assert_eq!(
+            parse_export_arguments(&mut missing_output)
+                .unwrap_err()
+                .to_string(),
+            "missing OUTPUT.gif"
+        );
+
+        let mut extra = ["project", "output.gif", "1-3", "unexpected"]
+            .into_iter()
+            .map(str::to_owned);
+        assert_eq!(
+            parse_export_arguments(&mut extra).unwrap_err().to_string(),
+            "unexpected argument after FRAMES: unexpected"
+        );
+    }
+
+    #[test]
+    fn parses_ordered_project_frame_selection() {
+        let timeline = timeline_with_frames(9);
+        assert_eq!(
+            parse_project_frame_selection(&timeline, None).unwrap(),
+            ProjectFrameSelection::All
+        );
+        assert_eq!(
+            parse_project_frame_selection(&timeline, Some("1,3-5,9-7")).unwrap(),
+            ProjectFrameSelection::Ordered([1, 3, 4, 5, 9, 8, 7].map(FrameId::from_u128).to_vec())
+        );
+        assert!(parse_project_frame_selection(&timeline, Some("10")).is_err());
+    }
 }
