@@ -23,8 +23,9 @@ GifFromScreen 是一个使用 Rust 实现的本地 GIF 录制与逐帧编辑工�
 - 录制时主界面隐藏，只保留独立、置顶的取景框和控制条。
 - 倒计时、开始、暂停、继续、录制中移动选区、停止和丢弃均由取景框控制。
 - 停止后自动创建同名 `.gfsproj`，进入带虚拟胶片条、逐帧预览、选择、排序、删除、延时和 undo/redo 的编辑器。
+- 编辑器可对选中帧进行精确裁剪、缩放、90° 旋转和水平/垂直翻转，操作会写入可恢复的项目历史。
 - 编辑器可在后台导出全部或选中帧，支持颜色数、循环、调色板、量化、抖动、透明和差分矩形选项。
-- 可打开已有 `.gfsproj`，或把 GIF 安全解码成新项目；静态 PNG/JPEG/BMP/WebP 的有界解码与项目持久化也已具备。
+- 可打开已有 `.gfsproj`，也可从界面或启动参数把 GIF、PNG、JPEG、BMP、WebP 安全解码成新项目。
 
 ## 开发命令
 
@@ -39,4 +40,5 @@ cargo run -p gif-from-screen-cli -- export animation.gfsproj output.gif '1,3-5,9
 cargo run -p gif-from-screen
 cargo run -p gif-from-screen -- --project /path/to/animation.gfsproj
 cargo run -p gif-from-screen -- --import-gif /path/to/animation.gif
+cargo run -p gif-from-screen -- --import-image /path/to/image.png
 ```

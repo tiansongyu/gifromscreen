@@ -21,6 +21,8 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Render the current frame preview and export all or selected frames through a cancellable background GIF job.
 - [x] Reopen existing projects with journal-recovery and asset-integrity reporting.
 - [x] Import animated GIF files into editable projects with bounded decoding.
+- [x] Import PNG, JPEG, BMP, and WebP files into editable projects with bounded decoding.
+- [x] Crop, resize, rotate, and flip selected frames with journal-backed undo/redo.
 
 ## Delivery gates
 
@@ -40,7 +42,7 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Countdown; record, pause, resume, stop, and discard are complete.
 - [ ] Project autosave and crash recovery.
 - [x] Filmstrip selection, delete, reorder, reverse, delays, undo/redo.
-- [ ] Crop and resize.
+- [x] Crop and resize.
 - [x] GIF colors, loop, duration, duplicate merge, progress, cancellation.
 - [ ] Flatpak and AppImage preview packages.
 
@@ -52,7 +54,8 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [ ] Text, title, drawing, shapes, watermark, border, shadow, privacy effects.
 - [ ] Fade and slide transitions.
 - [x] Palette, dithering, transparency, and delta-frame controls.
-- [ ] Image/GIF import, clipboard history, presets, and statistics.
+- [x] PNG/JPEG/BMP/WebP/GIF import.
+- [ ] Clipboard history, reusable presets, and project statistics.
 
 ### M3 — complete content sources
 
