@@ -3,19 +3,117 @@
 use std::fs;
 use std::io;
 use std::io::Cursor;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use gif_from_screen_capture::{
-    CaptureCadence, CaptureRequest, CaptureSourceId, CaptureTarget, CaptureTimestamp,
-    CapturedFrame, PhysicalSize, PixelFormat, SyntheticCaptureBackend,
+    BackendDescriptor, BackendStatus, CaptureBackend, CaptureCadence, CaptureCapabilities,
+    CaptureError, CaptureErrorKind, CaptureRequest, CaptureSession, CaptureSessionState,
+    CaptureSource, CaptureSourceId, CaptureTarget, CaptureTimestamp, CapturedFrame, FramePoll,
+    PhysicalSize, PixelFormat, SyntheticCaptureBackend,
 };
 use gif_from_screen_gif::{CancellationFlag, NeverCancel};
 use gif_from_screen_workflow::{
     CollectOptions, CollectionLimit, FrameRetention, NoopWorkflowProgress, RecordToGifOptions,
     RecordingController, RecordingFrameSink, RecordingFrameSinkError, RecordingFrameSinkOperation,
     WorkflowError, WorkflowPhase, WorkflowProgress, collect, collect_controlled_to_sink,
-    collect_controlled_with_sink, partial_output_path, record_to_gif, record_to_gif_controlled,
+    collect_controlled_with_sink, collect_prestarted_controlled_to_sink, partial_output_path,
+    record_to_gif, record_to_gif_controlled,
 };
+
+#[derive(Default)]
+struct SessionCallCounts {
+    resumes: AtomicUsize,
+    discards: AtomicUsize,
+}
+
+struct TrackingSession {
+    inner: Box<dyn CaptureSession>,
+    calls: Arc<SessionCallCounts>,
+}
+
+impl CaptureSession for TrackingSession {
+    fn state(&self) -> CaptureSessionState {
+        self.inner.state()
+    }
+
+    fn request(&self) -> &CaptureRequest {
+        self.inner.request()
+    }
+
+    fn update_target(&mut self, target: CaptureTarget) -> Result<(), CaptureError> {
+        self.inner.update_target(target)
+    }
+
+    fn pause(&mut self) -> Result<(), CaptureError> {
+        self.inner.pause()
+    }
+
+    fn resume(&mut self) -> Result<(), CaptureError> {
+        self.calls.resumes.fetch_add(1, Ordering::Relaxed);
+        self.inner.resume()
+    }
+
+    fn stop(&mut self) -> Result<(), CaptureError> {
+        self.inner.stop()
+    }
+
+    fn discard(&mut self) -> Result<(), CaptureError> {
+        self.calls.discards.fetch_add(1, Ordering::Relaxed);
+        self.inner.discard()
+    }
+
+    fn poll_frame(&mut self, timeout: Duration) -> Result<FramePoll, CaptureError> {
+        self.inner.poll_frame(timeout)
+    }
+}
+
+struct CountingBackend {
+    inner: SyntheticCaptureBackend,
+    starts: Arc<AtomicUsize>,
+    session_calls: Arc<SessionCallCounts>,
+}
+
+impl CountingBackend {
+    fn new(frames: Vec<CapturedFrame>) -> Self {
+        Self {
+            inner: SyntheticCaptureBackend::new(frames),
+            starts: Arc::new(AtomicUsize::new(0)),
+            session_calls: Arc::new(SessionCallCounts::default()),
+        }
+    }
+}
+
+impl CaptureBackend for CountingBackend {
+    fn descriptor(&self) -> BackendDescriptor {
+        self.inner.descriptor()
+    }
+
+    fn status(&self) -> BackendStatus {
+        self.inner.status()
+    }
+
+    fn capabilities(&self) -> CaptureCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn list_sources(&self) -> Result<Vec<CaptureSource>, CaptureError> {
+        self.inner.list_sources()
+    }
+
+    fn start_session(
+        &self,
+        request: CaptureRequest,
+    ) -> Result<Box<dyn CaptureSession>, CaptureError> {
+        self.starts.fetch_add(1, Ordering::Relaxed);
+        let inner = self.inner.start_session(request)?;
+        Ok(Box::new(TrackingSession {
+            inner,
+            calls: Arc::clone(&self.session_calls),
+        }))
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SinkEvent {
@@ -458,6 +556,159 @@ fn sink_only_collection_bounds_resident_frame_instead_of_total_recording() {
     assert_eq!(summary.frames, 3);
     assert_eq!(summary.rgba_bytes, 12);
     assert_eq!(summary.duration_us, 25_000);
+}
+
+#[test]
+fn prestarted_sink_collection_reuses_the_session_and_persists_its_frames() {
+    let backend = CountingBackend::new(vec![
+        frame(1, 0, 1, 1, 4, PixelFormat::Rgba8, vec![255, 0, 0, 255]),
+        frame(2, 10_000, 1, 1, 4, PixelFormat::Rgba8, vec![0, 255, 0, 255]),
+    ]);
+    let mut session = backend.start_session(request()).unwrap();
+    let (controller, mut control) = RecordingController::channel();
+    drop(controller);
+    let mut sink = TestFrameSink::default();
+
+    let summary = collect_prestarted_controlled_to_sink(
+        &mut *session,
+        &max_frames_options(2, 5_000),
+        &mut control,
+        &mut sink,
+        &NeverCancel,
+        &mut NoopWorkflowProgress,
+    )
+    .unwrap();
+
+    assert_eq!(backend.starts.load(Ordering::Relaxed), 1);
+    assert_eq!(summary.frames, 2);
+    assert_eq!(summary.duration_us, 15_000);
+    assert_eq!(
+        sink.events,
+        [
+            SinkEvent::Append {
+                frame_index: 0,
+                duration_us: 5_000,
+                pixels: vec![255, 0, 0, 255]
+            },
+            SinkEvent::Update {
+                frame_index: 0,
+                duration_us: 10_000
+            },
+            SinkEvent::Append {
+                frame_index: 1,
+                duration_us: 5_000,
+                pixels: vec![0, 255, 0, 255]
+            },
+            SinkEvent::Update {
+                frame_index: 1,
+                duration_us: 5_000
+            },
+        ]
+    );
+}
+
+#[test]
+fn prestarted_paused_session_resumes_through_the_existing_control_path() {
+    let backend = CountingBackend::new(vec![
+        frame(1, 0, 1, 1, 4, PixelFormat::Rgba8, vec![255, 0, 0, 255]),
+        frame(2, 10_000, 1, 1, 4, PixelFormat::Rgba8, vec![0, 255, 0, 255]),
+    ]);
+    let mut session = backend.start_session(request()).unwrap();
+    session.pause().unwrap();
+    let (controller, mut control) = RecordingController::channel();
+    assert!(controller.resume());
+    let mut sink = TestFrameSink::default();
+
+    let summary = collect_prestarted_controlled_to_sink(
+        &mut *session,
+        &max_frames_options(2, 5_000),
+        &mut control,
+        &mut sink,
+        &NeverCancel,
+        &mut NoopWorkflowProgress,
+    )
+    .unwrap();
+
+    assert_eq!(summary.frames, 2);
+    assert_eq!(backend.starts.load(Ordering::Relaxed), 1);
+    assert_eq!(backend.session_calls.resumes.load(Ordering::Relaxed), 1);
+    assert_eq!(session.state(), CaptureSessionState::Stopped);
+}
+
+#[test]
+fn prestarted_terminal_session_returns_a_typed_error() {
+    let backend = CountingBackend::new(vec![frame(
+        1,
+        0,
+        1,
+        1,
+        4,
+        PixelFormat::Rgba8,
+        vec![255, 0, 0, 255],
+    )]);
+    let mut session = backend.start_session(request()).unwrap();
+    session.stop().unwrap();
+    let (controller, mut control) = RecordingController::channel();
+    drop(controller);
+    let mut sink = TestFrameSink::default();
+
+    let error = collect_prestarted_controlled_to_sink(
+        &mut *session,
+        &max_frames_options(1, 5_000),
+        &mut control,
+        &mut sink,
+        &NeverCancel,
+        &mut NoopWorkflowProgress,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        WorkflowError::Capture(error)
+            if error.kind() == CaptureErrorKind::InvalidStateTransition
+    ));
+    assert_eq!(backend.session_calls.discards.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn prestarted_collection_discards_after_sink_failure() {
+    let backend = CountingBackend::new(vec![frame(
+        1,
+        0,
+        1,
+        1,
+        4,
+        PixelFormat::Rgba8,
+        vec![255, 0, 0, 255],
+    )]);
+    let mut session = backend.start_session(request()).unwrap();
+    let (controller, mut control) = RecordingController::channel();
+    drop(controller);
+    let mut sink = TestFrameSink {
+        fail: Some((RecordingFrameSinkOperation::AppendProvisionalFrame, 0)),
+        ..TestFrameSink::default()
+    };
+
+    let error = collect_prestarted_controlled_to_sink(
+        &mut *session,
+        &max_frames_options(1, 5_000),
+        &mut control,
+        &mut sink,
+        &NeverCancel,
+        &mut NoopWorkflowProgress,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        WorkflowError::FrameSink {
+            operation: RecordingFrameSinkOperation::AppendProvisionalFrame,
+            frame_index: 0,
+            ..
+        }
+    ));
+    assert_eq!(backend.session_calls.discards.load(Ordering::Relaxed), 1);
+    assert_eq!(session.state(), CaptureSessionState::Discarded);
 }
 
 #[test]

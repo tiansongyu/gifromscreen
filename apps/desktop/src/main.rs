@@ -9,6 +9,7 @@ mod editor_preview;
 mod editor_ui;
 mod editor_workspace;
 mod export_job;
+mod fixed_crop_session;
 mod import_gif_job;
 mod import_static_image_job;
 mod import_static_sequence_job;
@@ -53,6 +54,7 @@ use gif_from_screen_workflow::{
     CollectOptions, CollectionLimit, FrameRetention, RecordingControl, RecordingController,
     RecordingFrameSink, RecordingFrameSinkError, TargetUpdateRequest, TargetUpdateStatus,
     WorkflowError, WorkflowProgress, collect_controlled_to_sink,
+    collect_prestarted_controlled_to_sink,
 };
 use import_gif_job::{ImportGifJob, ImportGifJobEvent, ImportGifJobState};
 use import_static_image_job::{
@@ -442,6 +444,19 @@ struct RegionPicker {
 struct WaylandFrozenPreview {
     texture: egui::TextureHandle,
     source_size: gif_from_screen_capture::PhysicalSize,
+    selection: PhysicalRect,
+    drag_start: Option<egui::Pos2>,
+    drag_current: Option<egui::Pos2>,
+    drag_initial_region: Option<PhysicalRect>,
+}
+
+struct WaylandCropController {
+    texture: egui::TextureHandle,
+    source_size: gif_from_screen_capture::PhysicalSize,
+    region: PhysicalRect,
+    drag_start: Option<egui::Pos2>,
+    drag_current: Option<egui::Pos2>,
+    drag_initial_region: Option<PhysicalRect>,
 }
 
 struct RecorderOverlay {
@@ -453,7 +468,7 @@ struct RecorderOverlay {
 
 #[derive(Clone, Copy, Debug)]
 struct MainWindowSnapshot {
-    position: egui::Pos2,
+    position: Option<egui::Pos2>,
     size: egui::Vec2,
 }
 
@@ -514,6 +529,7 @@ struct GifFromScreenApp {
     source_catalog_job: CaptureSourceJob,
     wayland_prepare_job: WaylandPrepareJob,
     wayland_frozen_preview: Option<WaylandFrozenPreview>,
+    wayland_crop_controller: Option<WaylandCropController>,
     region_picker: Option<RegionPicker>,
     recorder_overlay: Option<RecorderOverlay>,
     main_window_snapshot: Option<MainWindowSnapshot>,
@@ -548,6 +564,7 @@ impl Default for GifFromScreenApp {
             source_catalog_job: CaptureSourceJob::default(),
             wayland_prepare_job: WaylandPrepareJob::default(),
             wayland_frozen_preview: None,
+            wayland_crop_controller: None,
             region_picker: None,
             recorder_overlay: None,
             main_window_snapshot: None,
@@ -608,16 +625,23 @@ impl eframe::App for GifFromScreenApp {
                     680.0, 440.0,
                 )));
                 context.send_viewport_cmd(egui::ViewportCommand::InnerSize(snapshot.size));
-                context.send_viewport_cmd(egui::ViewportCommand::OuterPosition(snapshot.position));
+                if let Some(position) = snapshot.position {
+                    context.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
+                }
             }
+            context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             context.send_viewport_cmd(egui::ViewportCommand::Focus);
             self.restore_main_window = false;
         }
         if self.recorder_overlay.is_some() {
             self.show_recorder_overlay(context);
         }
+        if self.wayland_crop_controller.is_some() {
+            self.show_wayland_crop_controller(context);
+        }
         if self.job.is_some()
             || self.recorder_overlay.is_some()
+            || self.wayland_crop_controller.is_some()
             || self.recording_countdown.is_active()
             || export_job_is_active(self.export_job.state())
             || self.open_project_job.state() == OpenProjectJobState::Running
@@ -697,6 +721,7 @@ impl GifFromScreenApp {
             || self.region_picker.is_some()
             || self.wayland_prepare_job.is_active()
             || self.wayland_frozen_preview.is_some()
+            || self.wayland_crop_controller.is_some()
         {
             FileDropActivity::Recording
         } else if self.open_project_job.state() != OpenProjectJobState::Idle {
@@ -1406,7 +1431,7 @@ impl GifFromScreenApp {
             .input(|input| {
                 let viewport = input.viewport();
                 Some(MainWindowSnapshot {
-                    position: viewport.outer_rect?.min,
+                    position: Some(viewport.outer_rect?.min),
                     size: viewport.inner_rect?.size(),
                 })
             })
@@ -1652,7 +1677,7 @@ impl GifFromScreenApp {
             }
             CountdownTick::Finished => {
                 context.request_repaint();
-                if self.recorder_overlay.is_some()
+                if (self.recorder_overlay.is_some() || self.wayland_crop_controller.is_some())
                     && self.job.is_none()
                     && let Err(error) = self.start_recording()
                 {
@@ -1663,6 +1688,9 @@ impl GifFromScreenApp {
     }
 
     fn start_recording(&mut self) -> Result<(), String> {
+        if self.wayland_crop_controller.is_some() {
+            return self.start_wayland_recording();
+        }
         validate_settings(&self.settings)?;
         let selected = self
             .sources
@@ -1733,6 +1761,45 @@ impl GifFromScreenApp {
             terminal_requested: false,
             retarget,
         });
+        Ok(())
+    }
+
+    fn start_wayland_recording(&mut self) -> Result<(), String> {
+        validate_settings(&self.settings)?;
+        if self.job.is_some() {
+            return Ok(());
+        }
+        let controller = self
+            .wayland_crop_controller
+            .as_ref()
+            .ok_or_else(|| "Wayland source-local controller is not open.".to_owned())?;
+        let region = controller.region;
+        if !region.fits_within(controller.source_size) {
+            return Err("Wayland crop is outside the prepared source.".to_owned());
+        }
+        let selected = self
+            .sources
+            .get(self.selected_source)
+            .ok_or_else(|| "No Wayland portal source is selected.".to_owned())?;
+        let mut settings = self.settings.clone();
+        apply_wayland_region_to_settings(&mut settings, region);
+        let worker = RecordingWorkerRequest {
+            project_path: project_path_for_output(Path::new(settings.output.trim()))?,
+            canvas: ProjectPhysicalSize::new(region.size().width(), region.size().height())
+                .map_err(|error| error.to_string())?,
+            source_id: selected.id().clone(),
+            source_kind: selected.kind(),
+            source_label: selected.name().to_owned(),
+            settings,
+        };
+        let job = self
+            .wayland_prepare_job
+            .commit_crop(region, worker)
+            .map_err(|error| error.to_string())?;
+        self.settings.region_enabled = true;
+        self.job = Some(job);
+        self.progress = None;
+        self.notice = Some("Wayland recording started from the prepared session…".to_owned());
         Ok(())
     }
 
@@ -1816,9 +1883,15 @@ impl GifFromScreenApp {
                                 image,
                                 egui::TextureOptions::LINEAR,
                             );
+                            let selection = initial_wayland_region(&self.settings, source_size);
+                            apply_wayland_region_to_settings(&mut self.settings, selection);
                             self.wayland_frozen_preview = Some(WaylandFrozenPreview {
                                 texture,
                                 source_size,
+                                selection,
+                                drag_start: None,
+                                drag_current: None,
+                                drag_initial_region: None,
                             });
                             self.notice = Some(format!(
                                 "Wayland source prepared at {}×{} pixels. The native session is paused and retained by its worker.",
@@ -1834,6 +1907,9 @@ impl GifFromScreenApp {
                 }
                 WaylandPrepareJobEvent::Finished => {
                     self.wayland_frozen_preview = None;
+                    if self.wayland_crop_controller.take().is_some() {
+                        self.restore_main_window = true;
+                    }
                     self.notice = Some(match self.wayland_prepare_job.take_result() {
                         Some(Ok(WaylandPrepareOutcome::Cancelled)) => {
                             "Wayland source preparation cancelled and its portal session closed."
@@ -1852,7 +1928,10 @@ impl GifFromScreenApp {
     #[allow(clippy::cast_precision_loss)]
     fn show_wayland_preparation(&mut self, ui: &mut egui::Ui) {
         ui.heading("Wayland source preparation");
-        if let Some(preview) = &self.wayland_frozen_preview {
+        let mut selected_from_drag = None;
+        let mut apply_exact = false;
+        let mut open_controller = false;
+        if let Some(preview) = &mut self.wayland_frozen_preview {
             ui.label(format!(
                 "Frozen {}×{} PipeWire frame",
                 preview.source_size.width(),
@@ -1862,16 +1941,27 @@ impl GifFromScreenApp {
                 "This is a source-local preview, not a window positioned over global desktop coordinates.",
             );
             ui.add_space(8.0);
-            let available = ui.available_size();
-            let texture_size = preview.texture.size_vec2();
-            let scale = (available.x.max(1.0) / texture_size.x)
-                .min((available.y - 90.0).max(1.0) / texture_size.y)
-                .min(1.0);
-            ui.add(egui::Image::new(&preview.texture).fit_to_exact_size(texture_size * scale));
+            selected_from_drag = draw_wayland_region_selector(ui, preview, true);
             ui.add_space(8.0);
-            ui.label(
-                "The same native session remains paused in the background. Region selection and recording commit are connected in the next slice.",
-            );
+            ui.horizontal(|ui| {
+                ui.label("X");
+                ui.add(egui::DragValue::new(&mut self.settings.region_x));
+                ui.label("Y");
+                ui.add(egui::DragValue::new(&mut self.settings.region_y));
+                ui.label("Width");
+                ui.add(egui::DragValue::new(&mut self.settings.region_width).range(1..=65_535));
+                ui.label("Height");
+                ui.add(egui::DragValue::new(&mut self.settings.region_height).range(1..=65_535));
+                apply_exact = ui.button("Apply exact region").clicked();
+            });
+            ui.label(format!(
+                "Selected {}×{} at {},{}",
+                preview.selection.size().width(),
+                preview.selection.size().height(),
+                preview.selection.origin().x,
+                preview.selection.origin().y
+            ));
+            open_controller = ui.button("Open source-local recorder controller").clicked();
         } else {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -1879,6 +1969,46 @@ impl GifFromScreenApp {
                     self.wayland_prepare_job.state(),
                 ));
             });
+        }
+        if let Some(region) = selected_from_drag {
+            if let Some(preview) = &mut self.wayland_frozen_preview {
+                preview.selection = region;
+            }
+            apply_wayland_region_to_settings(&mut self.settings, region);
+        }
+        if apply_exact {
+            let result = PhysicalRect::new(
+                self.settings.region_x,
+                self.settings.region_y,
+                self.settings.region_width,
+                self.settings.region_height,
+            )
+            .map_err(|error| error.to_string())
+            .and_then(|region| {
+                let source_size = self
+                    .wayland_frozen_preview
+                    .as_ref()
+                    .map(|preview| preview.source_size)
+                    .ok_or_else(|| "Wayland preview is no longer available.".to_owned())?;
+                region
+                    .fits_within(source_size)
+                    .then_some(region)
+                    .ok_or_else(|| {
+                        "The exact region must stay inside the frozen source frame.".to_owned()
+                    })
+            });
+            match result {
+                Ok(region) => {
+                    if let Some(preview) = &mut self.wayland_frozen_preview {
+                        preview.selection = region;
+                    }
+                    self.notice = Some("Exact Wayland source-local region applied.".to_owned());
+                }
+                Err(error) => self.notice = Some(error),
+            }
+        }
+        if open_controller && let Err(error) = self.open_wayland_crop_controller(ui.ctx()) {
+            self.notice = Some(error);
         }
         ui.add_space(8.0);
         let cancelling = self.wayland_prepare_job.state() == WaylandPrepareJobState::Cancelling;
@@ -1892,6 +2022,143 @@ impl GifFromScreenApp {
                     .to_owned(),
             );
         }
+    }
+
+    fn open_wayland_crop_controller(&mut self, context: &egui::Context) -> Result<(), String> {
+        if self.wayland_prepare_job.state() != WaylandPrepareJobState::Prepared {
+            return Err("The Wayland source is not ready yet.".to_owned());
+        }
+        let snapshot = context
+            .input(|input| {
+                let viewport = input.viewport();
+                Some(MainWindowSnapshot {
+                    position: viewport.outer_rect.map(|rect| rect.min),
+                    size: viewport.inner_rect?.size(),
+                })
+            })
+            .ok_or_else(|| "Could not read the main window size.".to_owned())?;
+        let preview = self
+            .wayland_frozen_preview
+            .take()
+            .ok_or_else(|| "The frozen Wayland preview is no longer available.".to_owned())?;
+        self.wayland_crop_controller = Some(WaylandCropController {
+            texture: preview.texture,
+            source_size: preview.source_size,
+            region: preview.selection,
+            drag_start: None,
+            drag_current: None,
+            drag_initial_region: None,
+        });
+        self.main_window_snapshot = Some(snapshot);
+        self.notice = Some(
+            "Source-local recorder controller opened. Its preview rectangle controls the crop; the window itself is not physically aligned to the desktop."
+                .to_owned(),
+        );
+        context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        context.request_repaint();
+        Ok(())
+    }
+
+    fn show_wayland_crop_controller(&mut self, context: &egui::Context) {
+        let stage = self.recorder_stage();
+        if stage == RecorderStage::Finalizing
+            && let Some(job) = &mut self.job
+        {
+            job.stop_retargeting();
+        }
+        let retarget_notice = self
+            .job
+            .as_mut()
+            .and_then(|job| job.poll_retarget(stage.allows_retargeting()));
+        if retarget_notice.is_some() {
+            self.notice = retarget_notice;
+        }
+        let Some(mut controller) = self.wayland_crop_controller.take() else {
+            return;
+        };
+        let progress = self.progress;
+        let frame = context.show_viewport_immediate(
+            recorder_viewport_id(),
+            egui::ViewportBuilder::default()
+                .with_title("GifFromScreen Wayland crop controller")
+                .with_inner_size([920.0, 650.0])
+                .with_min_inner_size([420.0, 320.0])
+                .with_decorations(true)
+                .with_resizable(true)
+                .with_always_on_top()
+                .with_taskbar(false),
+            |viewport_context, _class| {
+                draw_wayland_crop_controller(viewport_context, stage, progress, &mut controller)
+            },
+        );
+        let region = frame.region.unwrap_or(controller.region);
+        controller.region = region;
+        self.wayland_crop_controller = Some(controller);
+        apply_overlay_region(&mut self.settings, stage, region);
+        if should_sync_retarget(stage, frame.action)
+            && let Some(job) = &mut self.job
+        {
+            job.observe_target(region);
+        }
+        self.handle_wayland_controller_action(context, frame.action);
+    }
+
+    fn handle_wayland_controller_action(
+        &mut self,
+        context: &egui::Context,
+        action: RecorderOverlayAction,
+    ) {
+        match action {
+            RecorderOverlayAction::None => {}
+            RecorderOverlayAction::Start => {
+                if let Err(error) = self.begin_recording(context) {
+                    self.notice = Some(error);
+                }
+            }
+            RecorderOverlayAction::CancelCountdown => {
+                if self.recording_countdown.cancel() {
+                    self.notice = Some("Recording countdown cancelled.".to_owned());
+                }
+            }
+            RecorderOverlayAction::Pause => {
+                if let Some(job) = &mut self.job
+                    && job.controller.pause()
+                {
+                    job.paused = true;
+                }
+            }
+            RecorderOverlayAction::Resume => {
+                if let Some(job) = &mut self.job
+                    && job.controller.resume()
+                {
+                    job.paused = false;
+                }
+            }
+            RecorderOverlayAction::Stop => {
+                if let Some(job) = &mut self.job {
+                    job.stop_retargeting();
+                    let _ = job.controller.stop();
+                    self.notice = Some("Stopping and finalizing recoverable project…".to_owned());
+                }
+            }
+            RecorderOverlayAction::Discard | RecorderOverlayAction::Close => {
+                if let Some(job) = &mut self.job {
+                    job.stop_retargeting();
+                    let _ = job.controller.discard();
+                    job.cancellation.cancel();
+                    self.notice = Some("Discarding recording…".to_owned());
+                } else {
+                    self.close_wayland_crop_controller();
+                }
+            }
+        }
+    }
+
+    fn close_wayland_crop_controller(&mut self) {
+        self.recording_countdown.cancel();
+        self.wayland_crop_controller = None;
+        let _ = self.wayland_prepare_job.cancel();
+        self.restore_main_window = true;
     }
 
     fn refresh_sources(&mut self) {
@@ -2164,6 +2431,8 @@ impl GifFromScreenApp {
         self.job = None;
         self.recording_countdown.cancel();
         self.recorder_overlay = None;
+        self.wayland_crop_controller = None;
+        self.wayland_frozen_preview = None;
         self.restore_main_window = true;
     }
 }
@@ -2491,6 +2760,278 @@ const fn export_dither_label(choice: ExportDitherChoice) -> &'static str {
         ExportDitherChoice::Stucki => "Stucki",
         ExportDitherChoice::StevensonArce => "Stevenson–Arce",
     }
+}
+
+fn draw_wayland_crop_controller(
+    context: &egui::Context,
+    stage: RecorderStage,
+    progress: Option<WorkflowProgress>,
+    controller: &mut WaylandCropController,
+) -> RecorderOverlayFrame {
+    let mut action = draw_wayland_controller_toolbar(context, stage, progress, controller);
+    let region = egui::CentralPanel::default()
+        .frame(egui::Frame::new().fill(egui::Color32::from_rgb(16, 18, 22)))
+        .show(context, |ui| {
+            ui.label(
+                "Frozen source-local preview — this controller window is not a physical desktop frame.",
+            );
+            draw_source_region_selector(
+                ui,
+                &controller.texture,
+                controller.source_size,
+                controller.region,
+                &mut controller.drag_start,
+                &mut controller.drag_current,
+                &mut controller.drag_initial_region,
+                stage.allows_resizing(),
+            )
+        })
+        .inner;
+    if context.input(|input| input.viewport().close_requested()) {
+        action = RecorderOverlayAction::Close;
+    }
+    RecorderOverlayFrame { action, region }
+}
+
+fn draw_wayland_controller_toolbar(
+    context: &egui::Context,
+    stage: RecorderStage,
+    progress: Option<WorkflowProgress>,
+    controller: &mut WaylandCropController,
+) -> RecorderOverlayAction {
+    let mut action = RecorderOverlayAction::None;
+    egui::TopBottomPanel::bottom("wayland_crop_controls")
+        .exact_height(92.0)
+        .frame(
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(28, 30, 34))
+                .inner_margin(8),
+        )
+        .show(context, |ui| {
+            ui.horizontal(|ui| {
+                ui.strong(format!(
+                    "Crop {}×{} at {},{}",
+                    controller.region.size().width(),
+                    controller.region.size().height(),
+                    controller.region.origin().x,
+                    controller.region.origin().y
+                ));
+                show_wayland_crop_nudges(ui, controller);
+            });
+            ui.horizontal(|ui| match stage {
+                RecorderStage::Ready => {
+                    ui.label("Drag a new rectangle to resize before recording.");
+                    if ui.button("Start").clicked() {
+                        action = RecorderOverlayAction::Start;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        action = RecorderOverlayAction::Close;
+                    }
+                }
+                RecorderStage::Countdown(remaining) => {
+                    ui.strong(format!("Recording starts in {remaining}s"));
+                    if ui.button("Cancel countdown").clicked() {
+                        action = RecorderOverlayAction::CancelCountdown;
+                    }
+                }
+                RecorderStage::Recording => {
+                    show_overlay_progress(ui, progress);
+                    if ui.button("Pause").clicked() {
+                        action = RecorderOverlayAction::Pause;
+                    }
+                    if ui.button("Stop").clicked() {
+                        action = RecorderOverlayAction::Stop;
+                    }
+                    if ui.button("Discard").clicked() {
+                        action = RecorderOverlayAction::Discard;
+                    }
+                }
+                RecorderStage::Paused => {
+                    ui.label("Paused");
+                    if ui.button("Resume").clicked() {
+                        action = RecorderOverlayAction::Resume;
+                    }
+                    if ui.button("Stop").clicked() {
+                        action = RecorderOverlayAction::Stop;
+                    }
+                    if ui.button("Discard").clicked() {
+                        action = RecorderOverlayAction::Discard;
+                    }
+                }
+                RecorderStage::Finalizing => {
+                    ui.spinner();
+                    ui.label("Finalizing recoverable project…");
+                    if ui.button("Cancel").clicked() {
+                        action = RecorderOverlayAction::Discard;
+                    }
+                }
+            });
+        });
+    action
+}
+
+fn show_wayland_crop_nudges(ui: &mut egui::Ui, controller: &mut WaylandCropController) {
+    for (label, dx, dy) in [("←", -10, 0), ("→", 10, 0), ("↑", 0, -10), ("↓", 0, 10)] {
+        if ui.small_button(label).clicked() {
+            controller.region =
+                translate_source_region(controller.region, controller.source_size, dx, dy);
+        }
+    }
+    ui.weak("10 px source-local");
+}
+
+fn draw_wayland_region_selector(
+    ui: &mut egui::Ui,
+    preview: &mut WaylandFrozenPreview,
+    allow_resize: bool,
+) -> Option<PhysicalRect> {
+    draw_source_region_selector(
+        ui,
+        &preview.texture,
+        preview.source_size,
+        preview.selection,
+        &mut preview.drag_start,
+        &mut preview.drag_current,
+        &mut preview.drag_initial_region,
+        allow_resize,
+    )
+}
+
+fn initial_wayland_region(
+    settings: &RecordingSettings,
+    source_size: gif_from_screen_capture::PhysicalSize,
+) -> PhysicalRect {
+    if !settings.region_enabled {
+        return PhysicalRect::new(0, 0, source_size.width(), source_size.height())
+            .expect("a captured source has non-zero dimensions");
+    }
+    let width = settings.region_width.clamp(1, source_size.width());
+    let height = settings.region_height.clamp(1, source_size.height());
+    let maximum_x = i32::try_from(source_size.width() - width).unwrap_or(i32::MAX);
+    let maximum_y = i32::try_from(source_size.height() - height).unwrap_or(i32::MAX);
+    PhysicalRect::new(
+        settings.region_x.clamp(0, maximum_x),
+        settings.region_y.clamp(0, maximum_y),
+        width,
+        height,
+    )
+    .expect("clamped source-local region is non-empty")
+}
+
+fn apply_wayland_region_to_settings(settings: &mut RecordingSettings, region: PhysicalRect) {
+    settings.region_enabled = true;
+    settings.region_x = region.origin().x;
+    settings.region_y = region.origin().y;
+    settings.region_width = region.size().width();
+    settings.region_height = region.size().height();
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::too_many_arguments
+)]
+fn draw_source_region_selector(
+    ui: &mut egui::Ui,
+    texture: &egui::TextureHandle,
+    source_size: gif_from_screen_capture::PhysicalSize,
+    region: PhysicalRect,
+    drag_start: &mut Option<egui::Pos2>,
+    drag_current: &mut Option<egui::Pos2>,
+    drag_initial_region: &mut Option<PhysicalRect>,
+    allow_resize: bool,
+) -> Option<PhysicalRect> {
+    let available = ui.available_size();
+    let texture_size = texture.size_vec2();
+    let scale = (available.x.max(1.0) / texture_size.x)
+        .min((available.y - 16.0).max(1.0) / texture_size.y)
+        .min(1.0);
+    let response = ui.add(
+        egui::Image::new(texture)
+            .fit_to_exact_size(texture_size * scale)
+            .sense(egui::Sense::drag()),
+    );
+    if response.drag_started() {
+        *drag_start = response.interact_pointer_pos();
+        *drag_current = *drag_start;
+        *drag_initial_region = Some(region);
+    }
+    if response.dragged() {
+        *drag_current = response.interact_pointer_pos();
+    }
+    let candidate = match (*drag_start, *drag_current, *drag_initial_region) {
+        (Some(start), Some(current), Some(_initial)) if allow_resize => {
+            let selection = egui::Rect::from_two_pos(
+                clamp_to_rect(start, response.rect),
+                clamp_to_rect(current, response.rect),
+            );
+            map_preview_selection(
+                response.rect,
+                selection,
+                source_size.width(),
+                source_size.height(),
+            )
+        }
+        (Some(start), Some(current), Some(initial)) => {
+            let delta = current - start;
+            let dx = (delta.x / response.rect.width() * source_size.width() as f32).round() as i32;
+            let dy =
+                (delta.y / response.rect.height() * source_size.height() as f32).round() as i32;
+            Some(translate_source_region(initial, source_size, dx, dy))
+        }
+        _ => None,
+    };
+    let displayed = candidate.unwrap_or(region);
+    let selection_rect = source_region_on_preview(response.rect, displayed, source_size);
+    ui.painter().rect_stroke(
+        selection_rect,
+        0.0,
+        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(242, 153, 74)),
+        egui::StrokeKind::Inside,
+    );
+    if response.drag_stopped() {
+        *drag_start = None;
+        *drag_current = None;
+        *drag_initial_region = None;
+        candidate
+    } else {
+        None
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn source_region_on_preview(
+    preview: egui::Rect,
+    region: PhysicalRect,
+    source_size: gif_from_screen_capture::PhysicalSize,
+) -> egui::Rect {
+    let left =
+        preview.min.x + region.origin().x as f32 / source_size.width() as f32 * preview.width();
+    let top =
+        preview.min.y + region.origin().y as f32 / source_size.height() as f32 * preview.height();
+    let width = region.size().width() as f32 / source_size.width() as f32 * preview.width();
+    let height = region.size().height() as f32 / source_size.height() as f32 * preview.height();
+    egui::Rect::from_min_size(egui::pos2(left, top), egui::vec2(width, height))
+}
+
+fn translate_source_region(
+    region: PhysicalRect,
+    source_size: gif_from_screen_capture::PhysicalSize,
+    dx: i32,
+    dy: i32,
+) -> PhysicalRect {
+    let maximum_x = i64::from(source_size.width().saturating_sub(region.size().width()));
+    let maximum_y = i64::from(source_size.height().saturating_sub(region.size().height()));
+    let x = (i64::from(region.origin().x) + i64::from(dx)).clamp(0, maximum_x);
+    let y = (i64::from(region.origin().y) + i64::from(dy)).clamp(0, maximum_y);
+    PhysicalRect::new(
+        i32::try_from(x).unwrap_or(i32::MAX),
+        i32::try_from(y).unwrap_or(i32::MAX),
+        region.size().width(),
+        region.size().height(),
+    )
+    .unwrap_or(region)
 }
 
 fn draw_recorder_overlay(
@@ -3537,6 +4078,76 @@ fn run_incremental_x11_recording(
     }
 }
 
+fn run_incremental_prestarted_recording(
+    worker: &RecordingWorkerRequest,
+    session: &mut dyn gif_from_screen_capture::CaptureSession,
+    control: &mut RecordingControl,
+    cancellation: &CancellationFlag,
+    progress: &mut dyn gif_from_screen_workflow::WorkflowProgressSink,
+    on_finalizing: impl FnOnce(),
+) -> RecordingCompletion {
+    if cancellation.is_cancelled() {
+        let _ = session.discard();
+        return RecordingCompletion::Discarded {
+            cleanup_error: None,
+        };
+    }
+    let project = match create_incremental_recording_project(worker) {
+        Ok(project) => project,
+        Err(error) => {
+            let _ = session.discard();
+            return RecordingCompletion::Failed {
+                error: format!(
+                    "{error}; the prepared Wayland session was discarded before recording"
+                ),
+                recovery_path: None,
+            };
+        }
+    };
+    let mut sink = IncrementalProjectFrameSink::new(project);
+    let collection = session
+        .resume()
+        .map_err(WorkflowError::from)
+        .and_then(|()| {
+            collect_prestarted_controlled_to_sink(
+                session,
+                &collection_options(&worker.settings),
+                control,
+                &mut sink,
+                cancellation,
+                progress,
+            )
+        });
+    match collection {
+        Ok(_) => {
+            on_finalizing();
+            let recovery_path = sink.root().to_path_buf();
+            match sink.finish() {
+                Ok(project) => RecordingCompletion::Completed(Box::new(project)),
+                Err(error) => RecordingCompletion::Failed {
+                    error: error.to_string(),
+                    recovery_path: Some(recovery_path),
+                },
+            }
+        }
+        Err(WorkflowError::Discarded | WorkflowError::Cancelled) => {
+            let project_path = sink.root().to_path_buf();
+            drop(sink);
+            RecordingCompletion::Discarded {
+                cleanup_error: remove_recording_project_path(&project_path).err(),
+            }
+        }
+        Err(error) => {
+            let recovery_path = sink.root().to_path_buf();
+            drop(sink);
+            RecordingCompletion::Failed {
+                error: error.to_string(),
+                recovery_path: Some(recovery_path),
+            }
+        }
+    }
+}
+
 fn create_incremental_recording_project(
     worker: &RecordingWorkerRequest,
 ) -> Result<IncrementalRecordingProject, Box<dyn std::error::Error + Send + Sync>> {
@@ -3888,12 +4499,13 @@ mod tests {
         create_incremental_recording_project, default_gif_path_for_project,
         edited_gif_path_for_import, editor_result_notice, export_job_is_active,
         export_result_notice, file_drop_block_reason, fit_dimensions, frame_retention,
-        has_static_image_extension, landing_cards_fit, map_preview_selection,
-        open_project_controls_enabled, open_project_lock_policy, parse_startup_intent,
-        prepare_file_drop_route, project_path_for_output, recording_project_canvas,
-        remove_completed_project, remove_recording_project_path, resize_nearest_rgba,
-        resolve_export_selection, route_file_drop, should_sync_retarget, show_editor_scroll_area,
-        validate_export_output, validate_settings,
+        has_static_image_extension, initial_wayland_region, landing_cards_fit,
+        map_preview_selection, open_project_controls_enabled, open_project_lock_policy,
+        parse_startup_intent, prepare_file_drop_route, project_path_for_output,
+        recording_project_canvas, remove_completed_project, remove_recording_project_path,
+        resize_nearest_rgba, resolve_export_selection, route_file_drop, should_sync_retarget,
+        show_editor_scroll_area, translate_source_region, validate_export_output,
+        validate_settings,
     };
     use crate::editor_ui::{EditorUiAction, EditorUiFailure, EditorUiOperation};
     use crate::editor_workspace::EditorWorkspace;
@@ -5055,6 +5667,48 @@ mod tests {
         let mapped = map_preview_selection(preview, selection, 1_000, 500).unwrap();
         assert_eq!((mapped.origin().x, mapped.origin().y), (100, 50));
         assert_eq!((mapped.size().width(), mapped.size().height()), (500, 200));
+    }
+
+    #[test]
+    fn wayland_initial_region_clamps_exact_inputs_to_first_frame_geometry() {
+        let settings = RecordingSettings {
+            region_x: 900,
+            region_y: -20,
+            region_width: 400,
+            region_height: 800,
+            ..RecordingSettings::default()
+        };
+        let source = gif_from_screen_capture::PhysicalSize::new(1_000, 500).unwrap();
+        let region = initial_wayland_region(&settings, source);
+        assert_eq!((region.origin().x, region.origin().y), (600, 0));
+        assert_eq!((region.size().width(), region.size().height()), (400, 500));
+
+        let full = initial_wayland_region(
+            &RecordingSettings {
+                region_enabled: false,
+                ..settings
+            },
+            source,
+        );
+        assert_eq!(full, PhysicalRect::new(0, 0, 1_000, 500).unwrap());
+    }
+
+    #[test]
+    fn wayland_crop_translation_preserves_size_and_clamps_at_source_edges() {
+        let source = gif_from_screen_capture::PhysicalSize::new(1_000, 500).unwrap();
+        let initial = PhysicalRect::new(100, 100, 300, 200).unwrap();
+        assert_eq!(
+            translate_source_region(initial, source, 50, -25),
+            PhysicalRect::new(150, 75, 300, 200).unwrap()
+        );
+        assert_eq!(
+            translate_source_region(initial, source, 10_000, 10_000),
+            PhysicalRect::new(700, 300, 300, 200).unwrap()
+        );
+        assert_eq!(
+            translate_source_region(initial, source, -10_000, -10_000),
+            PhysicalRect::new(0, 0, 300, 200).unwrap()
+        );
     }
 
     #[test]

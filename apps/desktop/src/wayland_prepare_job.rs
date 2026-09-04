@@ -20,7 +20,15 @@ use gif_from_screen_capture::{
     PixelFormat,
 };
 use gif_from_screen_capture_linux::WaylandCaptureBackend;
+use gif_from_screen_gif::CancellationFlag;
+use gif_from_screen_workflow::{RecordingControl, RecordingController};
 use thiserror::Error;
+
+use crate::fixed_crop_session::FixedCropSession;
+use crate::{
+    JobMessage, RecordingCompletion, RecordingJob, RecordingRetarget, RecordingWorkerRequest,
+    run_incremental_prestarted_recording,
+};
 
 const PREPARE_THREAD_NAME: &str = "gfs-wayland-prepare";
 const FIRST_FRAME_POLL: Duration = Duration::from_millis(50);
@@ -169,6 +177,15 @@ pub(crate) enum WaylandPrepareJobStartError {
     Spawn(#[source] io::Error),
 }
 
+/// Failure to transfer the prepared session into recording.
+#[derive(Debug, Error)]
+pub(crate) enum WaylandCommitError {
+    #[error("Wayland source is not prepared (current state: {state:?})")]
+    NotPrepared { state: WaylandPrepareJobState },
+    #[error("Wayland preparation worker exited before accepting the selected crop")]
+    WorkerExited,
+}
+
 /// Non-blocking notifications returned from [`WaylandPrepareJob::drain`].
 #[derive(Debug)]
 pub(crate) enum WaylandPrepareJobEvent {
@@ -179,6 +196,13 @@ pub(crate) enum WaylandPrepareJobEvent {
 
 enum WorkerCommand {
     Cancel,
+    Commit {
+        crop: gif_from_screen_capture::PhysicalRect,
+        worker: RecordingWorkerRequest,
+        control: RecordingControl,
+        cancellation: CancellationFlag,
+        messages: Sender<JobMessage>,
+    },
 }
 
 enum WorkerMessage {
@@ -268,6 +292,45 @@ impl WaylandPrepareJob {
             self.state = WaylandPrepareJobState::Cancelling;
         }
         sent
+    }
+
+    pub(crate) fn commit_crop(
+        &mut self,
+        crop: gif_from_screen_capture::PhysicalRect,
+        worker: RecordingWorkerRequest,
+    ) -> Result<RecordingJob, WaylandCommitError> {
+        if self.state != WaylandPrepareJobState::Prepared {
+            return Err(WaylandCommitError::NotPrepared { state: self.state });
+        }
+        let source = worker.source_id.clone();
+        let cancellation = CancellationFlag::default();
+        let worker_cancellation = cancellation.clone();
+        let (controller, control) = RecordingController::channel();
+        let (messages, receiver) = mpsc::channel();
+        self.commands
+            .as_ref()
+            .ok_or(WaylandCommitError::WorkerExited)?
+            .send(WorkerCommand::Commit {
+                crop,
+                worker,
+                control,
+                cancellation: worker_cancellation,
+                messages,
+            })
+            .map_err(|_| WaylandCommitError::WorkerExited)?;
+
+        self.state = WaylandPrepareJobState::Idle;
+        self.commands = None;
+        self.receiver = None;
+        self.result = None;
+        Ok(RecordingJob {
+            receiver,
+            cancellation,
+            controller,
+            paused: false,
+            terminal_requested: false,
+            retarget: Some(RecordingRetarget::new(source, crop)),
+        })
     }
 
     /// Drains all currently available events without waiting for native work.
@@ -404,27 +467,12 @@ where
         return None;
     }
 
-    let preview = loop {
-        if cancellation_requested(commands) {
-            return Some(finish_cancel(&mut *session));
-        }
-        match session.poll_frame(FIRST_FRAME_POLL) {
-            Ok(FramePoll::Frame(frame)) => match FrozenSourcePreview::from_frame(&frame) {
-                Ok(preview) => break preview,
-                Err(error) => {
-                    let _ = session.discard();
-                    return Some(Err(error));
-                }
-            },
-            Ok(FramePoll::Pending) => {}
-            Ok(FramePoll::EndOfStream) => {
-                let _ = session.discard();
-                return Some(Err(WaylandPrepareJobError::EndedBeforePreview));
-            }
-            Err(error) => {
-                let _ = session.discard();
-                return Some(Err(WaylandPrepareJobError::Poll(error)));
-            }
+    let preview = match wait_for_first_preview(&mut *session, commands) {
+        Ok(Some(preview)) => preview,
+        Ok(None) => return Some(finish_cancel(&mut *session)),
+        Err(error) => {
+            let _ = session.discard();
+            return Some(Err(error));
         }
     };
 
@@ -432,6 +480,7 @@ where
         let _ = session.discard();
         return Some(Err(WaylandPrepareJobError::Pause(error)));
     }
+    let preview_size = preview.size();
     if events.send(WorkerMessage::Preview(preview)).is_err() {
         let _ = session.discard();
         return None;
@@ -441,6 +490,24 @@ where
         match commands.recv_timeout(HELD_SESSION_POLL) {
             Ok(WorkerCommand::Cancel) | Err(RecvTimeoutError::Disconnected) => {
                 return Some(finish_cancel(&mut *session));
+            }
+            Ok(WorkerCommand::Commit {
+                crop,
+                worker,
+                control,
+                cancellation,
+                messages,
+            }) => {
+                run_committed_recording(
+                    session,
+                    preview_size,
+                    crop,
+                    &worker,
+                    control,
+                    &cancellation,
+                    &messages,
+                );
+                return None;
             }
             Err(RecvTimeoutError::Timeout) => match session.poll_frame(Duration::ZERO) {
                 Ok(FramePoll::Pending) => {}
@@ -458,6 +525,66 @@ where
             },
         }
     }
+}
+
+fn wait_for_first_preview(
+    session: &mut dyn CaptureSession,
+    commands: &Receiver<WorkerCommand>,
+) -> Result<Option<FrozenSourcePreview>, WaylandPrepareJobError> {
+    loop {
+        if cancellation_requested(commands) {
+            return Ok(None);
+        }
+        match session
+            .poll_frame(FIRST_FRAME_POLL)
+            .map_err(WaylandPrepareJobError::Poll)?
+        {
+            FramePoll::Frame(frame) => {
+                return FrozenSourcePreview::from_frame(&frame).map(Some);
+            }
+            FramePoll::Pending => {}
+            FramePoll::EndOfStream => return Err(WaylandPrepareJobError::EndedBeforePreview),
+        }
+    }
+}
+
+fn run_committed_recording(
+    session: Box<dyn CaptureSession>,
+    source_size: PhysicalSize,
+    crop: gif_from_screen_capture::PhysicalRect,
+    worker: &RecordingWorkerRequest,
+    mut control: RecordingControl,
+    cancellation: &CancellationFlag,
+    messages: &Sender<JobMessage>,
+) {
+    let source_id = worker.source_id.clone();
+    let mut session = match FixedCropSession::new(session, source_id, source_size, crop) {
+        Ok(session) => session,
+        Err(error) => {
+            let _ = messages.send(JobMessage::Finished(RecordingCompletion::Failed {
+                error: format!(
+                    "{error}; the prepared Wayland session was discarded before recording"
+                ),
+                recovery_path: None,
+            }));
+            return;
+        }
+    };
+    let progress_messages = messages.clone();
+    let mut progress = move |snapshot| {
+        let _ = progress_messages.send(JobMessage::Progress(snapshot));
+    };
+    let completion = run_incremental_prestarted_recording(
+        worker,
+        &mut session,
+        &mut control,
+        cancellation,
+        &mut progress,
+        || {
+            let _ = messages.send(JobMessage::Persisting);
+        },
+    );
+    let _ = messages.send(JobMessage::Finished(completion));
 }
 
 fn start_full_source_session(
@@ -497,6 +624,7 @@ fn finish_cancel(
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         sync::{Arc, Mutex, mpsc},
         thread::ThreadId,
         time::Duration,
@@ -521,9 +649,19 @@ mod tests {
     }
 
     fn frame(format: PixelFormat, stride: usize, pixels: Vec<u8>) -> CapturedFrame {
+        frame_at(0, 10, format, stride, pixels)
+    }
+
+    fn frame_at(
+        sequence: u64,
+        micros: u64,
+        format: PixelFormat,
+        stride: usize,
+        pixels: Vec<u8>,
+    ) -> CapturedFrame {
         CapturedFrame::new(
-            0,
-            CaptureTimestamp::from_micros(10),
+            sequence,
+            CaptureTimestamp::from_micros(micros),
             PhysicalSize::new(2, 1).unwrap(),
             stride,
             format,
@@ -539,12 +677,13 @@ mod tests {
         start_thread: Option<ThreadId>,
         pause_thread: Option<ThreadId>,
         discard_thread: Option<ThreadId>,
+        start_calls: usize,
     }
 
     struct FakeSession {
         request: CaptureRequest,
         state: CaptureSessionState,
-        first: Option<CapturedFrame>,
+        frames: VecDeque<CapturedFrame>,
         signals: Arc<Mutex<FakeSignals>>,
         discarded: Option<Sender<()>>,
     }
@@ -598,14 +737,14 @@ mod tests {
                 return Ok(FramePoll::Pending);
             }
             Ok(self
-                .first
-                .take()
+                .frames
+                .pop_front()
                 .map_or(FramePoll::Pending, FramePoll::Frame))
         }
     }
 
     struct FakeBackend {
-        frame: Mutex<Option<CapturedFrame>>,
+        frames: Mutex<Option<VecDeque<CapturedFrame>>>,
         signals: Arc<Mutex<FakeSignals>>,
         discarded: Mutex<Option<Sender<()>>>,
         start_gate: Mutex<Option<Receiver<()>>>,
@@ -635,11 +774,14 @@ mod tests {
             &self,
             request: CaptureRequest,
         ) -> Result<Box<dyn CaptureSession>, CaptureError> {
-            self.signals.lock().unwrap().start_thread = Some(thread::current().id());
+            let mut signals = self.signals.lock().unwrap();
+            signals.start_thread = Some(thread::current().id());
+            signals.start_calls += 1;
+            drop(signals);
             if let Some(gate) = self.start_gate.lock().unwrap().take() {
                 let _ = gate.recv();
             }
-            let frame = self.frame.lock().unwrap().take().ok_or_else(|| {
+            let frames = self.frames.lock().unwrap().take().ok_or_else(|| {
                 CaptureError::new(
                     CaptureErrorKind::SourceLost,
                     "test frame already taken",
@@ -649,7 +791,7 @@ mod tests {
             Ok(Box::new(FakeSession {
                 request,
                 state: CaptureSessionState::Recording,
-                first: Some(frame),
+                frames,
                 signals: self.signals.clone(),
                 discarded: self.discarded.lock().unwrap().take(),
             }))
@@ -657,13 +799,13 @@ mod tests {
     }
 
     fn backend(
-        frame: CapturedFrame,
+        frames: impl IntoIterator<Item = CapturedFrame>,
         signals: Arc<Mutex<FakeSignals>>,
         discarded: Sender<()>,
         start_gate: Option<Receiver<()>>,
     ) -> Box<dyn CaptureBackend> {
         Box::new(FakeBackend {
-            frame: Mutex::new(Some(frame)),
+            frames: Mutex::new(Some(frames.into_iter().collect())),
             signals,
             discarded: Mutex::new(Some(discarded)),
             start_gate: Mutex::new(start_gate),
@@ -715,7 +857,7 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let mut job = WaylandPrepareJob::default();
         let backend = backend(
-            frame(PixelFormat::Rgba8, 8, vec![1, 2, 3, 4, 5, 6, 7, 8]),
+            [frame(PixelFormat::Rgba8, 8, vec![1, 2, 3, 4, 5, 6, 7, 8])],
             signals,
             discarded_tx,
             Some(release_rx),
@@ -749,7 +891,7 @@ mod tests {
         let (discarded_tx, discarded_rx) = mpsc::channel();
         let mut job = WaylandPrepareJob::default();
         let backend = backend(
-            frame(PixelFormat::Rgba8, 8, vec![1, 2, 3, 4, 5, 6, 7, 8]),
+            [frame(PixelFormat::Rgba8, 8, vec![1, 2, 3, 4, 5, 6, 7, 8])],
             signals.clone(),
             discarded_tx,
             None,
@@ -780,7 +922,7 @@ mod tests {
         let (discarded_tx, discarded_rx) = mpsc::channel();
         let mut job = WaylandPrepareJob::default();
         let backend = backend(
-            frame(PixelFormat::Rgba8, 8, vec![1, 2, 3, 4, 5, 6, 7, 8]),
+            [frame(PixelFormat::Rgba8, 8, vec![1, 2, 3, 4, 5, 6, 7, 8])],
             signals.clone(),
             discarded_tx,
             None,
@@ -792,5 +934,103 @@ mod tests {
         drop(job);
         discarded_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(signals.lock().unwrap().discarded);
+    }
+
+    #[test]
+    fn nonzero_countdown_commits_the_same_session_and_persists_cropped_frames() {
+        use crate::RecordingSettings;
+        use crate::countdown::{CountdownStart, CountdownTick, RecordingCountdown};
+        use gif_from_screen_domain::PhysicalSize as ProjectSize;
+        use tempfile::tempdir;
+
+        let signals = Arc::new(Mutex::new(FakeSignals::default()));
+        let (discarded_tx, _discarded_rx) = mpsc::channel();
+        let frames = [
+            frame_at(
+                0,
+                10,
+                PixelFormat::Rgba8,
+                8,
+                vec![1, 2, 3, 255, 4, 5, 6, 255],
+            ),
+            frame_at(
+                1,
+                100,
+                PixelFormat::Rgba8,
+                8,
+                vec![10, 11, 12, 255, 20, 21, 22, 255],
+            ),
+            frame_at(
+                2,
+                100_100,
+                PixelFormat::Rgba8,
+                8,
+                vec![30, 31, 32, 255, 40, 41, 42, 255],
+            ),
+        ];
+        let backend = backend(frames, signals.clone(), discarded_tx, None);
+        let mut preparation = WaylandPrepareJob::default();
+        preparation
+            .start_with(source_without_geometry(), 30, move || Ok(backend))
+            .unwrap();
+        let _ = wait_for_preview(&mut preparation);
+
+        let started_at = std::time::Instant::now();
+        let mut countdown = RecordingCountdown::default();
+        assert_eq!(countdown.start(started_at, 2), CountdownStart::Started);
+        assert_eq!(
+            countdown.tick(started_at + Duration::from_secs(2)),
+            CountdownTick::Finished
+        );
+
+        let directory = tempdir().unwrap();
+        let output = directory.path().join("wayland.gif");
+        let project_path = directory.path().join("wayland.gfsproj");
+        let crop = gif_from_screen_capture::PhysicalRect::new(1, 0, 1, 1).unwrap();
+        let worker = RecordingWorkerRequest {
+            settings: RecordingSettings {
+                output: output.to_string_lossy().into_owned(),
+                duration_ms: 100,
+                fps: 30,
+                countdown_seconds: 2,
+                changes_only: false,
+                region_enabled: true,
+                region_x: 1,
+                region_y: 0,
+                region_width: 1,
+                region_height: 1,
+            },
+            source_id: CaptureSourceId::new("wayland:portal:monitor").unwrap(),
+            source_kind: CaptureSourceKind::Monitor,
+            source_label: "Portal monitor".to_owned(),
+            project_path: project_path.clone(),
+            canvas: ProjectSize::new(1, 1).unwrap(),
+        };
+        let recording = preparation.commit_crop(crop, worker).unwrap();
+        let completion = loop {
+            match recording
+                .receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+            {
+                JobMessage::Finished(completion) => break completion,
+                JobMessage::Progress(_) | JobMessage::Persisting => {}
+            }
+        };
+        let RecordingCompletion::Completed(project) = completion else {
+            panic!("prepared recording did not complete successfully");
+        };
+        assert_eq!(signals.lock().unwrap().start_calls, 1);
+        assert_eq!(
+            project.manifest().canvas.size,
+            ProjectSize::new(1, 1).unwrap()
+        );
+        assert_eq!(project.manifest().timeline.frames.len(), 1);
+        let clip = &project.manifest().timeline.frames[0];
+        assert_eq!(
+            project.assets().read(clip.asset_id).unwrap(),
+            [20, 21, 22, 255]
+        );
+        assert_eq!(project.layout().root, project_path);
     }
 }

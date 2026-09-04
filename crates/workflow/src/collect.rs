@@ -1,8 +1,8 @@
 use std::time::{Duration, Instant};
 
 use gif_from_screen_capture::{
-    CaptureBackend, CaptureRequest, CaptureSession, CaptureSessionState, CapturedFrame, FramePoll,
-    PhysicalSize, PixelFormat,
+    CaptureBackend, CaptureError, CaptureErrorKind, CaptureRequest, CaptureSession,
+    CaptureSessionState, CapturedFrame, FramePoll, PhysicalSize, PixelFormat, RecoveryHint,
 };
 use gif_from_screen_gif::{CancellationToken, RgbaFrame};
 
@@ -295,20 +295,97 @@ pub fn collect_controlled_to_sink(
         Duration::ZERO,
     ));
     let mut session = backend.start_session(request)?;
-    let result = reset_duration_deadline(&mut options.limit).and_then(|()| {
-        collect_session_to_sink(
-            &mut *session,
-            options,
+    let result = collect_prestarted_controlled_to_sink_inner(
+        &mut *session,
+        &mut options,
+        control,
+        sink,
+        cancellation,
+        progress,
+    );
+    if result.is_err() {
+        discard_best_effort(&mut *session);
+    }
+    result
+}
+
+/// Collects an already-started controlled capture directly into a durable sink.
+///
+/// The session must initially be in [`CaptureSessionState::Recording`] or
+/// [`CaptureSessionState::Paused`]. This function never creates or restarts a
+/// capture session, allowing a caller to retain a session that was opened for
+/// source selection or a frozen preview without displaying a second native
+/// chooser. A paused session remains paused until its [`RecordingControl`]
+/// receives a resume request.
+///
+/// Timing, pause, retarget, stop, discard, persistence, and memory-bound
+/// semantics match [`collect_controlled_to_sink`]. On any error or cancellation,
+/// the supplied session is discarded on a best-effort basis.
+///
+/// # Errors
+///
+/// Returns [`WorkflowError::Capture`] with
+/// [`CaptureErrorKind::InvalidStateTransition`] when the session is not initially
+/// recording or paused. Other errors match [`collect_controlled_to_sink`].
+pub fn collect_prestarted_controlled_to_sink(
+    session: &mut dyn CaptureSession,
+    options: &CollectOptions,
+    control: &mut RecordingControl,
+    sink: &mut dyn RecordingFrameSink,
+    cancellation: &dyn CancellationToken,
+    progress: &mut dyn WorkflowProgressSink,
+) -> Result<CollectionSummary, WorkflowError> {
+    let result = (|| {
+        let mut options = validate_options(options)?;
+        ensure_not_cancelled(cancellation)?;
+        progress.report(WorkflowProgress::capture(
+            WorkflowPhase::StartingCapture,
+            0,
+            Duration::ZERO,
+        ));
+        collect_prestarted_controlled_to_sink_inner(
+            session,
+            &mut options,
             control,
             sink,
             cancellation,
             progress,
         )
-    });
+    })();
     if result.is_err() {
-        discard_best_effort(&mut *session);
+        discard_best_effort(session);
     }
     result
+}
+
+fn collect_prestarted_controlled_to_sink_inner(
+    session: &mut dyn CaptureSession,
+    options: &mut ValidatedOptions,
+    control: &mut RecordingControl,
+    sink: &mut dyn RecordingFrameSink,
+    cancellation: &dyn CancellationToken,
+    progress: &mut dyn WorkflowProgressSink,
+) -> Result<CollectionSummary, WorkflowError> {
+    validate_prestarted_session_state(session.state())?;
+    reset_duration_deadline(&mut options.limit)?;
+    collect_session_to_sink(session, *options, control, sink, cancellation, progress)
+}
+
+fn validate_prestarted_session_state(state: CaptureSessionState) -> Result<(), WorkflowError> {
+    if matches!(
+        state,
+        CaptureSessionState::Recording | CaptureSessionState::Paused
+    ) {
+        return Ok(());
+    }
+    Err(CaptureError::new(
+        CaptureErrorKind::InvalidStateTransition,
+        format!(
+            "cannot collect a pre-started capture session in {state:?} state; expected Recording or Paused"
+        ),
+        RecoveryHint::None,
+    )
+    .into())
 }
 
 fn collect_internal(

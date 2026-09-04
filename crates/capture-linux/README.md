@@ -27,7 +27,9 @@ an explicit `UnsupportedCapability` error; there is no silent X11 fallback.
 Frames use active-session timestamps (paused time is excluded), cadence is
 deadline anchored, and a three-frame bounded channel drops late frames without
 rewriting sequence numbers or timestamps. Sequence gaps therefore expose
-backpressure to callers.
+backpressure to callers. Resuming first drains frames queued before the pause
+acknowledgement, so frozen-preview/setup pixels cannot leak into a later
+recording interval.
 
 Monitor/window choice remains in the trusted compositor dialog. Region capture
 is a source-local crop of the selected stream, and `update_target` can move that

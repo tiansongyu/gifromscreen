@@ -440,6 +440,10 @@ impl CaptureSession for WaylandCaptureSession {
         if self.state != CaptureSessionState::Paused {
             return Err(self.invalid_transition("resume"));
         }
+        // The PipeWire worker is still inactive, so no producer can race this
+        // drain. Frames queued between the preview poll and pause acknowledgement
+        // belong to preparation time and must never become recording frames.
+        drain_queued_frames(&self.frames);
         self.send_command(|reply| WorkerCommand::SetActive {
             active: true,
             reply,
@@ -505,6 +509,10 @@ impl CaptureSession for WaylandCaptureSession {
             }
         }
     }
+}
+
+fn drain_queued_frames(frames: &Receiver<CapturedFrame>) {
+    while frames.try_recv().is_ok() {}
 }
 
 impl Drop for WaylandCaptureSession {
@@ -1731,6 +1739,24 @@ mod tests {
         let after_drop = receiver.recv().unwrap();
         assert_eq!(after_drop.sequence(), 2);
         assert_eq!(after_drop.captured_at().as_micros(), 30);
+    }
+
+    #[test]
+    fn resume_boundary_discards_every_preparation_frame_before_reactivation() {
+        let (sender, receiver) = mpsc::sync_channel(FRAME_CHANNEL_CAPACITY);
+        for sequence in 0..u64::try_from(FRAME_CHANNEL_CAPACITY).unwrap() {
+            sender
+                .send(captured_frame(sequence, sequence + 10))
+                .unwrap();
+        }
+
+        drain_queued_frames(&receiver);
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+
+        sender.send(captured_frame(9, 90)).unwrap();
+        let fresh = receiver.recv().unwrap();
+        assert_eq!(fresh.sequence(), 9);
+        assert_eq!(fresh.captured_at().as_micros(), 90);
     }
 
     #[test]
