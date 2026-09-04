@@ -4,8 +4,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use gif_from_screen_domain::{
-    AssetId, AssetKind, FrameClip, FrameId, ProjectId, ProjectManifest, ProjectRevision,
-    RasterEncoding,
+    AssetId, AssetKind, FrameClip, FrameId, MAX_TRANSITION_STEPS, ProjectId, ProjectManifest,
+    ProjectRevision, RasterEncoding, Transition, TransitionId,
 };
 use gif_from_screen_gif::{
     BuiltinGifEncoder, CancellationToken as GifCancellationToken, EncodeOptions, EncodeProgress,
@@ -15,7 +15,8 @@ use gif_from_screen_gif::{
 use gif_from_screen_project::{ActiveProject, AssetStore, ProjectError};
 use gif_from_screen_render::{
     AssetProviderError, CancellationToken as RenderCancellationToken, CpuRenderer,
-    FrameAssetProvider, RenderError, RgbaSurface, SurfaceError,
+    FrameAssetProvider, RenderError, RenderLimits, RgbaSurface, SurfaceError, TransitionProgress,
+    render_transition,
 };
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -108,7 +109,7 @@ pub struct ProjectExportProgress {
     pub frames_rendered: u64,
     /// Logical rendered frames consumed by the GIF encoder so far.
     pub frames_encoded: u64,
-    /// Exact number of selected logical frames.
+    /// Exact output-frame count, including generated transition intermediates.
     pub total_frames: u64,
 }
 
@@ -319,6 +320,75 @@ pub enum ProjectGifExportError {
         limit_bytes: u64,
     },
 
+    /// Resident render-buffer accounting overflowed `u64` before comparison with the limit.
+    #[error("project export render-buffer byte accounting overflowed")]
+    RenderBufferSizeOverflow,
+
+    /// More than one transition targets the same ordered frame pair.
+    #[error(
+        "transitions {first_transition_id} and {duplicate_transition_id} both target frames {from_frame} -> {to_frame}"
+    )]
+    DuplicateTransitionEndpoints {
+        /// Identifier of the first transition for this pair.
+        first_transition_id: TransitionId,
+        /// Identifier of the later ambiguous transition.
+        duplicate_transition_id: TransitionId,
+        /// Outgoing endpoint.
+        from_frame: FrameId,
+        /// Incoming endpoint.
+        to_frame: FrameId,
+    },
+
+    /// An applicable transition has an invalid intermediate-frame count.
+    #[error("transition {} has invalid step count {steps}", transition.id)]
+    InvalidTransitionSteps {
+        /// Invalid applicable transition.
+        transition: Transition,
+        /// Rejected intermediate-frame count.
+        steps: u16,
+    },
+
+    /// An applicable transition cannot give every intermediate frame a positive duration.
+    #[error(
+        "transition {} duration {duration_us}us is shorter than its {steps} steps",
+        transition.id
+    )]
+    TransitionDurationTooShort {
+        /// Invalid applicable transition.
+        transition: Transition,
+        /// Total duration available for intermediates.
+        duration_us: u64,
+        /// Positive intermediate-frame count.
+        steps: u16,
+    },
+
+    /// Selected originals plus transition frames exceed a representable count.
+    #[error("selected output frame count overflows this platform")]
+    OutputFrameCountOverflow,
+
+    /// Selected originals plus transition durations exceed `u64` microseconds.
+    #[error("selected output duration exceeds the supported microsecond range")]
+    OutputDurationOverflow,
+
+    /// Growing the rendered-frame metadata vector failed.
+    #[error("could not allocate metadata for {requested} rendered GIF frames")]
+    OutputFrameAllocationFailed {
+        /// Metadata entries requested at the failed growth point.
+        requested: usize,
+    },
+
+    /// Rendering one transition intermediate failed.
+    #[error("could not render transition {} step {step}: {source}", transition.id)]
+    RenderTransition {
+        /// Transition being rendered.
+        transition: Transition,
+        /// One-based intermediate step.
+        step: u16,
+        /// Deterministic renderer failure.
+        #[source]
+        source: RenderError,
+    },
+
     /// Built-in GIF encoding failed.
     #[error("GIF encoding failed: {source}")]
     Encode {
@@ -399,7 +469,11 @@ pub fn export_project_snapshot_to_gif(
     }
 
     let clips = select_clips(&snapshot.manifest, &options.frames)?;
-    let total_frames = u64::try_from(clips.len()).unwrap_or(u64::MAX);
+    let selected_frames =
+        u64::try_from(clips.len()).map_err(|_| ProjectGifExportError::OutputFrameCountOverflow)?;
+    let transitions = applicable_transitions(&snapshot.manifest, &clips)?;
+    let total_frames = expanded_frame_count(clips.len(), &transitions)?;
+    validate_expanded_duration(&clips, &transitions)?;
     let mut execution = ExportExecution::new(cancellation, progress, total_frames);
     execution.report_phase(ProjectExportPhase::Preparing);
     let (assets, source_bytes) = load_selected_assets(
@@ -411,6 +485,7 @@ pub fn export_project_snapshot_to_gif(
     let provider = LoadedAssetProvider { assets };
     let gif_frames = render_selected_frames(
         &clips,
+        &transitions,
         &provider,
         source_bytes,
         options.render_buffer_limit_bytes,
@@ -422,7 +497,7 @@ pub fn export_project_snapshot_to_gif(
     Ok(ProjectGifExportReport {
         project_id: snapshot.manifest.project_id,
         revision: snapshot.manifest.revision,
-        selected_frames: total_frames,
+        selected_frames,
         encoding,
         output_path: output,
         bytes_written,
@@ -459,75 +534,330 @@ impl<'a> ExportExecution<'a> {
     }
 }
 
+fn applicable_transitions(
+    manifest: &ProjectManifest,
+    clips: &[FrameClip],
+) -> Result<Vec<Option<Transition>>, ProjectGifExportError> {
+    let positions: BTreeMap<_, _> = manifest
+        .timeline
+        .frames
+        .iter()
+        .enumerate()
+        .map(|(index, frame)| (frame.id, index))
+        .collect();
+    let mut transitions_by_endpoint = BTreeMap::new();
+    for transition in &manifest.timeline.transitions {
+        let endpoints = (transition.from_frame, transition.to_frame);
+        if let Some(first) = transitions_by_endpoint.insert(endpoints, transition) {
+            return Err(ProjectGifExportError::DuplicateTransitionEndpoints {
+                first_transition_id: first.id,
+                duplicate_transition_id: transition.id,
+                from_frame: transition.from_frame,
+                to_frame: transition.to_frame,
+            });
+        }
+    }
+    clips
+        .windows(2)
+        .map(|pair| {
+            let forward_adjacent = positions
+                .get(&pair[0].id)
+                .zip(positions.get(&pair[1].id))
+                .is_some_and(|(from, to)| from.checked_add(1) == Some(*to));
+            if !forward_adjacent {
+                return Ok(None);
+            }
+            let transition = transitions_by_endpoint
+                .get(&(pair[0].id, pair[1].id))
+                .map(|transition| (*transition).clone());
+            if let Some(transition) = &transition {
+                validate_transition_timing(transition)?;
+            }
+            Ok(transition)
+        })
+        .collect()
+}
+
+fn validate_transition_timing(transition: &Transition) -> Result<(), ProjectGifExportError> {
+    if transition.steps == 0 || transition.steps > MAX_TRANSITION_STEPS {
+        return Err(ProjectGifExportError::InvalidTransitionSteps {
+            transition: transition.clone(),
+            steps: transition.steps,
+        });
+    }
+    if transition.duration.get() < u64::from(transition.steps) {
+        return Err(ProjectGifExportError::TransitionDurationTooShort {
+            transition: transition.clone(),
+            duration_us: transition.duration.get(),
+            steps: transition.steps,
+        });
+    }
+    Ok(())
+}
+
+fn expanded_frame_count(
+    selected_frames: usize,
+    transitions: &[Option<Transition>],
+) -> Result<u64, ProjectGifExportError> {
+    let count = transitions
+        .iter()
+        .flatten()
+        .try_fold(selected_frames, |total, transition| {
+            total.checked_add(usize::from(transition.steps))
+        })
+        .ok_or(ProjectGifExportError::OutputFrameCountOverflow)?;
+    u64::try_from(count).map_err(|_| ProjectGifExportError::OutputFrameCountOverflow)
+}
+
+fn validate_expanded_duration(
+    clips: &[FrameClip],
+    transitions: &[Option<Transition>],
+) -> Result<(), ProjectGifExportError> {
+    let mut total = 0_u64;
+    for duration_us in clips.iter().map(|clip| clip.duration.get()).chain(
+        transitions
+            .iter()
+            .flatten()
+            .map(|transition| transition.duration.get()),
+    ) {
+        total = total
+            .checked_add(duration_us)
+            .ok_or(ProjectGifExportError::OutputDurationOverflow)?;
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the bounded two-surface lookahead keeps output ordering and memory accounting auditable"
+)]
 fn render_selected_frames(
     clips: &[FrameClip],
+    transitions: &[Option<Transition>],
     provider: &LoadedAssetProvider,
     source_bytes: u64,
     buffer_limit_bytes: u64,
     execution: &mut ExportExecution<'_>,
 ) -> Result<Vec<RgbaFrame>, ProjectGifExportError> {
-    let cpu_renderer = CpuRenderer::new();
+    let cpu_renderer = CpuRenderer::with_limits(RenderLimits {
+        max_surface_bytes: usize::try_from(buffer_limit_bytes).unwrap_or(usize::MAX),
+    });
     let render_cancellation = RenderCancellationAdapter(execution.cancellation);
-    let mut gif_frames = Vec::with_capacity(clips.len());
+    let mut gif_frames = Vec::new();
     let mut rendered_bytes = 0_u64;
     execution.report_phase(ProjectExportPhase::Rendering);
-    for (selection_index, clip) in clips.iter().enumerate() {
-        ensure_not_cancelled(execution.cancellation)?;
-        let surface = cpu_renderer
-            .render_clip(clip, provider, &render_cancellation)
-            .map_err(|source| {
-                if execution.cancellation.is_cancelled() {
-                    ProjectGifExportError::Cancelled
-                } else {
-                    ProjectGifExportError::RenderFrame {
-                        selection_index,
-                        frame_id: clip.id,
-                        source,
+    let mut current = render_clip_surface(
+        &cpu_renderer,
+        &clips[0],
+        0,
+        provider,
+        &render_cancellation,
+        execution,
+    )?;
+    ensure_render_buffer(
+        source_bytes,
+        rendered_bytes,
+        &[u64::try_from(current.pixels().len()).unwrap_or(u64::MAX)],
+        buffer_limit_bytes,
+    )?;
+
+    for selection_index in 0..clips.len().saturating_sub(1) {
+        let next_clip = &clips[selection_index + 1];
+        let next = render_clip_surface(
+            &cpu_renderer,
+            next_clip,
+            selection_index + 1,
+            provider,
+            &render_cancellation,
+            execution,
+        )?;
+        let current_bytes = u64::try_from(current.pixels().len()).unwrap_or(u64::MAX);
+        let next_bytes = u64::try_from(next.pixels().len()).unwrap_or(u64::MAX);
+        ensure_render_buffer(
+            source_bytes,
+            rendered_bytes,
+            &[current_bytes, next_bytes],
+            buffer_limit_bytes,
+        )?;
+
+        let mut intermediate_frames = Vec::new();
+        let mut intermediate_bytes = 0_u64;
+        if let Some(transition) = &transitions[selection_index] {
+            intermediate_frames
+                .try_reserve_exact(usize::from(transition.steps))
+                .map_err(|_| ProjectGifExportError::OutputFrameAllocationFailed {
+                    requested: usize::from(transition.steps),
+                })?;
+            let denominator = u32::from(transition.steps) + 1;
+            for step in 1..=transition.steps {
+                ensure_not_cancelled(execution.cancellation)?;
+                ensure_render_buffer(
+                    source_bytes,
+                    rendered_bytes,
+                    &[current_bytes, next_bytes, intermediate_bytes, current_bytes],
+                    buffer_limit_bytes,
+                )?;
+                let progress =
+                    TransitionProgress::new(u32::from(step), denominator).map_err(|source| {
+                        ProjectGifExportError::RenderTransition {
+                            transition: transition.clone(),
+                            step,
+                            source,
+                        }
+                    })?;
+                let surface = render_transition(
+                    &current,
+                    &next,
+                    &transition.kind,
+                    progress,
+                    &render_cancellation,
+                )
+                .map_err(|source| {
+                    if execution.cancellation.is_cancelled() {
+                        ProjectGifExportError::Cancelled
+                    } else {
+                        ProjectGifExportError::RenderTransition {
+                            transition: transition.clone(),
+                            step,
+                            source,
+                        }
                     }
-                }
-            })?;
-        let frame_bytes = u64::try_from(surface.pixels().len()).unwrap_or(u64::MAX);
-        let required_bytes = source_bytes
-            .saturating_add(rendered_bytes)
-            .saturating_add(frame_bytes);
-        if required_bytes > buffer_limit_bytes {
-            return Err(ProjectGifExportError::RenderBufferLimitExceeded {
-                required_bytes,
-                limit_bytes: buffer_limit_bytes,
-            });
+                })?;
+                let duration_us = transition_step_duration(transition, step - 1);
+                intermediate_bytes = intermediate_bytes
+                    .checked_add(u64::try_from(surface.pixels().len()).unwrap_or(u64::MAX))
+                    .ok_or(ProjectGifExportError::RenderBufferSizeOverflow)?;
+                intermediate_frames.push(surface_to_gif_frame(
+                    surface,
+                    transition.from_frame,
+                    duration_us,
+                )?);
+            }
         }
-        gif_frames.push(surface_to_gif_frame(surface, clip)?);
-        rendered_bytes = rendered_bytes.saturating_add(frame_bytes);
-        execution.state.frames_rendered = u64::try_from(gif_frames.len()).unwrap_or(u64::MAX);
-        execution.progress.report(execution.state);
+
+        let current_clip = &clips[selection_index];
+        append_gif_frame(
+            &mut gif_frames,
+            surface_to_gif_frame(current, current_clip.id, current_clip.duration.get())?,
+            &mut rendered_bytes,
+            execution,
+        )?;
+        for frame in intermediate_frames {
+            append_gif_frame(&mut gif_frames, frame, &mut rendered_bytes, execution)?;
+        }
+        current = next;
     }
+    let last = clips.last().ok_or(ProjectGifExportError::EmptySelection)?;
+    append_gif_frame(
+        &mut gif_frames,
+        surface_to_gif_frame(current, last.id, last.duration.get())?,
+        &mut rendered_bytes,
+        execution,
+    )?;
     Ok(gif_frames)
 }
 
 fn surface_to_gif_frame(
     surface: RgbaSurface,
-    clip: &FrameClip,
+    frame_id: FrameId,
+    duration_us: u64,
 ) -> Result<RgbaFrame, ProjectGifExportError> {
     let width = u16::try_from(surface.width()).map_err(|_| {
         ProjectGifExportError::RenderedDimensionsOutOfRange {
-            frame_id: clip.id,
+            frame_id,
             width: surface.width(),
             height: surface.height(),
         }
     })?;
     let height = u16::try_from(surface.height()).map_err(|_| {
         ProjectGifExportError::RenderedDimensionsOutOfRange {
-            frame_id: clip.id,
+            frame_id,
             width: surface.width(),
             height: surface.height(),
         }
     })?;
-    RgbaFrame::new(width, height, surface.into_pixels(), clip.duration.get()).map_err(|source| {
-        ProjectGifExportError::BuildGifFrame {
-            frame_id: clip.id,
-            source,
-        }
-    })
+    RgbaFrame::new(width, height, surface.into_pixels(), duration_us)
+        .map_err(|source| ProjectGifExportError::BuildGifFrame { frame_id, source })
+}
+
+fn render_clip_surface(
+    renderer: &CpuRenderer,
+    clip: &FrameClip,
+    selection_index: usize,
+    provider: &LoadedAssetProvider,
+    cancellation: &RenderCancellationAdapter<'_>,
+    execution: &ExportExecution<'_>,
+) -> Result<RgbaSurface, ProjectGifExportError> {
+    ensure_not_cancelled(execution.cancellation)?;
+    renderer
+        .render_clip(clip, provider, cancellation)
+        .map_err(|source| {
+            if execution.cancellation.is_cancelled() {
+                ProjectGifExportError::Cancelled
+            } else {
+                ProjectGifExportError::RenderFrame {
+                    selection_index,
+                    frame_id: clip.id,
+                    source,
+                }
+            }
+        })
+}
+
+fn transition_step_duration(transition: &Transition, zero_based_step: u16) -> u64 {
+    let steps = u64::from(transition.steps);
+    let base = transition.duration.get() / steps;
+    let remainder = transition.duration.get() % steps;
+    base + u64::from(u64::from(zero_based_step) < remainder)
+}
+
+fn ensure_render_buffer(
+    source_bytes: u64,
+    rendered_bytes: u64,
+    working_buffers: &[u64],
+    limit_bytes: u64,
+) -> Result<(), ProjectGifExportError> {
+    let required_bytes = working_buffers.iter().try_fold(
+        source_bytes
+            .checked_add(rendered_bytes)
+            .ok_or(ProjectGifExportError::RenderBufferSizeOverflow)?,
+        |total, bytes| {
+            total
+                .checked_add(*bytes)
+                .ok_or(ProjectGifExportError::RenderBufferSizeOverflow)
+        },
+    )?;
+    if required_bytes > limit_bytes {
+        Err(ProjectGifExportError::RenderBufferLimitExceeded {
+            required_bytes,
+            limit_bytes,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn append_gif_frame(
+    frames: &mut Vec<RgbaFrame>,
+    frame: RgbaFrame,
+    rendered_bytes: &mut u64,
+    execution: &mut ExportExecution<'_>,
+) -> Result<(), ProjectGifExportError> {
+    ensure_not_cancelled(execution.cancellation)?;
+    let requested = frames
+        .len()
+        .checked_add(1)
+        .ok_or(ProjectGifExportError::OutputFrameCountOverflow)?;
+    frames
+        .try_reserve(1)
+        .map_err(|_| ProjectGifExportError::OutputFrameAllocationFailed { requested })?;
+    *rendered_bytes = rendered_bytes
+        .checked_add(u64::try_from(frame.pixels().len()).unwrap_or(u64::MAX))
+        .ok_or(ProjectGifExportError::RenderBufferSizeOverflow)?;
+    frames.push(frame);
+    execution.state.frames_rendered = u64::try_from(frames.len()).unwrap_or(u64::MAX);
+    execution.progress.report(execution.state);
+    Ok(())
 }
 
 fn encode_and_commit(
@@ -679,7 +1009,9 @@ fn load_selected_assets(
                 actual,
             });
         }
-        let required_bytes = loaded_bytes.saturating_add(actual);
+        let required_bytes = loaded_bytes
+            .checked_add(actual)
+            .ok_or(ProjectGifExportError::RenderBufferSizeOverflow)?;
         if required_bytes > buffer_limit_bytes {
             return Err(ProjectGifExportError::RenderBufferLimitExceeded {
                 required_bytes,
@@ -876,7 +1208,8 @@ mod tests {
     use gif_from_screen_domain::{
         AssetDescriptor, Canvas, CanvasBackground, CaptureMetadata, ClipTransform, ColorSpace,
         DurationUs, EdgeWidths, EditCommand, Effect, FrameClip, PhysicalSize, ProjectId,
-        ProjectManifest, Rgba, UnixTimeMs,
+        ProjectManifest, Rgba, SlideDirection, Transition, TransitionId, TransitionKind,
+        UnixTimeMs,
     };
     use gif_from_screen_gif::CancellationFlag;
     use gif_from_screen_project::LockPolicy;
@@ -994,6 +1327,260 @@ mod tests {
             .filter_map(Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".partial"))
             .count()
+    }
+
+    fn add_transition(
+        snapshot: &mut ProjectExportSnapshot,
+        from: u128,
+        to: u128,
+        duration_us: u64,
+        steps: u16,
+        kind: TransitionKind,
+    ) {
+        snapshot.manifest.timeline.transitions.push(Transition {
+            id: TransitionId::from_u128(from * 100 + to),
+            from_frame: FrameId::from_u128(from),
+            to_frame: FrameId::from_u128(to),
+            duration: DurationUs::new(duration_us).unwrap(),
+            steps,
+            kind,
+        });
+    }
+
+    #[test]
+    fn fade_transition_exports_intermediates_with_exact_added_timing_and_progress() {
+        let directory = tempdir().unwrap();
+        let red = [255, 0, 0, 255];
+        let blue = [0, 0, 255, 255];
+        let (mut snapshot, _) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(1, 1).unwrap(),
+            &[
+                TestClip::rgba(1, &red, 10_000),
+                TestClip::rgba(2, &blue, 20_000),
+            ],
+        );
+        add_transition(&mut snapshot, 1, 2, 20_000, 2, TransitionKind::FadeToNext);
+        let output = directory.path().join("fade.gif");
+        let mut updates = Vec::new();
+        let report = export_project_snapshot_to_gif(
+            &snapshot,
+            &output,
+            &ProjectGifExportOptions::default(),
+            &gif_from_screen_gif::NeverCancel,
+            &mut |update| updates.push(update),
+        )
+        .unwrap();
+
+        assert_eq!(report.selected_frames, 2);
+        assert_eq!(report.encoding.input_frames, 4);
+        assert_eq!(report.encoding.input_duration_us, 50_000);
+        assert_eq!(
+            decode_rgba(&output),
+            [
+                (1, red.to_vec()),
+                (1, vec![170, 0, 85, 255]),
+                (1, vec![85, 0, 170, 255]),
+                (2, blue.to_vec()),
+            ]
+        );
+        assert_eq!(updates.last().unwrap().total_frames, 4);
+        assert_eq!(updates.last().unwrap().frames_rendered, 4);
+        assert_eq!(updates.last().unwrap().frames_encoded, 4);
+    }
+
+    #[test]
+    fn slide_transition_pixels_and_duration_remainder_are_deterministic() {
+        let directory = tempdir().unwrap();
+        let red_green = [255, 0, 0, 255, 0, 255, 0, 255];
+        let blue_yellow = [0, 0, 255, 255, 255, 255, 0, 255];
+        let (mut snapshot, _) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(2, 1).unwrap(),
+            &[
+                TestClip::rgba(1, &red_green, 10_000),
+                TestClip::rgba(2, &blue_yellow, 10_000),
+            ],
+        );
+        add_transition(
+            &mut snapshot,
+            1,
+            2,
+            10_000,
+            1,
+            TransitionKind::Slide {
+                direction: SlideDirection::Left,
+            },
+        );
+        let output = directory.path().join("slide.gif");
+        export(&snapshot, &output, &ProjectGifExportOptions::default()).unwrap();
+        let frames = decode_rgba(&output);
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[1].0, 1);
+        assert_eq!(frames[1].1, [0, 255, 0, 255, 0, 0, 255, 255]);
+
+        let transition = Transition {
+            id: TransitionId::from_u128(1),
+            from_frame: FrameId::from_u128(1),
+            to_frame: FrameId::from_u128(2),
+            duration: DurationUs::new(10).unwrap(),
+            steps: 3,
+            kind: TransitionKind::FadeToNext,
+        };
+        assert_eq!(
+            (0..3)
+                .map(|step| transition_step_duration(&transition, step))
+                .collect::<Vec<_>>(),
+            [4, 3, 3]
+        );
+    }
+
+    #[test]
+    fn reverse_and_nonadjacent_selections_do_not_apply_transitions() {
+        let directory = tempdir().unwrap();
+        let colors = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
+        let specs = colors
+            .iter()
+            .enumerate()
+            .map(|(index, color)| TestClip::rgba(u128::try_from(index).unwrap() + 1, color, 10_000))
+            .collect::<Vec<_>>();
+        let (mut snapshot, _) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(1, 1).unwrap(),
+            &specs,
+        );
+        add_transition(&mut snapshot, 1, 2, 10_000, 1, TransitionKind::FadeToNext);
+        add_transition(&mut snapshot, 2, 3, 10_000, 1, TransitionKind::FadeToNext);
+
+        for (name, selection) in [
+            (
+                "reverse",
+                vec![FrameId::from_u128(2), FrameId::from_u128(1)],
+            ),
+            ("gap", vec![FrameId::from_u128(1), FrameId::from_u128(3)]),
+        ] {
+            let output = directory.path().join(format!("{name}.gif"));
+            let options = ProjectGifExportOptions {
+                frames: ProjectFrameSelection::Ordered(selection),
+                ..ProjectGifExportOptions::default()
+            };
+            let report = export(&snapshot, &output, &options).unwrap();
+            assert_eq!(report.encoding.input_frames, 2);
+            assert_eq!(decode_rgba(&output).len(), 2);
+        }
+    }
+
+    #[test]
+    fn transition_memory_and_cancellation_are_checked_before_encoding() {
+        let directory = tempdir().unwrap();
+        let red = [255, 0, 0, 255];
+        let blue = [0, 0, 255, 255];
+        let (mut snapshot, _) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(1, 1).unwrap(),
+            &[
+                TestClip::rgba(1, &red, 10_000),
+                TestClip::rgba(2, &blue, 10_000),
+            ],
+        );
+        add_transition(&mut snapshot, 1, 2, 10_000, 1, TransitionKind::FadeToNext);
+        let bounded_output = directory.path().join("bounded-transition.gif");
+        let bounded = ProjectGifExportOptions {
+            render_buffer_limit_bytes: 19,
+            ..ProjectGifExportOptions::default()
+        };
+        assert!(matches!(
+            export(&snapshot, &bounded_output, &bounded),
+            Err(ProjectGifExportError::RenderBufferLimitExceeded {
+                required_bytes: 20,
+                limit_bytes: 19,
+            })
+        ));
+        assert!(!bounded_output.exists());
+
+        let cancellation = CancellationFlag::default();
+        let cancel_from_progress = cancellation.clone();
+        let cancelled_output = directory.path().join("cancel-transition.gif");
+        let error = export_project_snapshot_to_gif(
+            &snapshot,
+            &cancelled_output,
+            &ProjectGifExportOptions::default(),
+            &cancellation,
+            &mut move |progress: ProjectExportProgress| {
+                if progress.phase == ProjectExportPhase::Rendering && progress.frames_rendered == 1
+                {
+                    cancel_from_progress.cancel();
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProjectGifExportError::Cancelled));
+        assert!(!cancelled_output.exists());
+    }
+
+    #[test]
+    fn expanded_output_duration_overflow_is_typed_before_rendering() {
+        let directory = tempdir().unwrap();
+        let pixel = [1, 2, 3, 255];
+        let (snapshot, _) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(1, 1).unwrap(),
+            &[
+                TestClip::rgba(1, &pixel, 10_000),
+                TestClip::rgba(2, &pixel, 10_000),
+            ],
+        );
+        let mut clips = snapshot.manifest.timeline.frames.clone();
+        clips[0].duration = DurationUs::new(u64::MAX).unwrap();
+        clips[1].duration = DurationUs::new(1).unwrap();
+
+        assert!(matches!(
+            validate_expanded_duration(&clips, &[None]),
+            Err(ProjectGifExportError::OutputDurationOverflow)
+        ));
+        assert!(matches!(
+            ensure_render_buffer(u64::MAX, 1, &[], u64::MAX),
+            Err(ProjectGifExportError::RenderBufferSizeOverflow)
+        ));
+        let transition = Transition {
+            id: TransitionId::from_u128(1),
+            from_frame: FrameId::from_u128(1),
+            to_frame: FrameId::from_u128(2),
+            duration: DurationUs::new(1).unwrap(),
+            steps: 1,
+            kind: TransitionKind::FadeToNext,
+        };
+        assert!(matches!(
+            expanded_frame_count(usize::MAX, &[Some(transition)]),
+            Err(ProjectGifExportError::OutputFrameCountOverflow)
+        ));
+    }
+
+    #[test]
+    fn duplicate_transition_endpoints_are_rejected_in_export_snapshot() {
+        let directory = tempdir().unwrap();
+        let pixel = [1, 2, 3, 255];
+        let (mut snapshot, _) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(1, 1).unwrap(),
+            &[
+                TestClip::rgba(1, &pixel, 10_000),
+                TestClip::rgba(2, &pixel, 10_000),
+            ],
+        );
+        add_transition(&mut snapshot, 1, 2, 10_000, 1, TransitionKind::FadeToNext);
+        let mut duplicate = snapshot.manifest.timeline.transitions[0].clone();
+        duplicate.id = TransitionId::from_u128(999);
+        snapshot.manifest.timeline.transitions.push(duplicate);
+
+        assert!(matches!(
+            export(
+                &snapshot,
+                &directory.path().join("duplicate-transition.gif"),
+                &ProjectGifExportOptions::default(),
+            ),
+            Err(ProjectGifExportError::DuplicateTransitionEndpoints { .. })
+        ));
     }
 
     #[test]

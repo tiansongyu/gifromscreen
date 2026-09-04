@@ -927,6 +927,7 @@ mod tests {
                 from_frame: pair[0].id,
                 to_frame: pair[1].id,
                 duration: DurationUs::new(1).unwrap(),
+                steps: 1,
                 kind: TransitionKind::FadeToNext,
             })
             .collect();

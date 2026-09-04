@@ -120,12 +120,28 @@ pub enum ValidationIssue {
     DuplicateTransitionId {
         transition_id: TransitionId,
     },
+    DuplicateTransitionEndpoints {
+        first_transition_id: TransitionId,
+        duplicate_transition_id: TransitionId,
+        from_frame: FrameId,
+        to_frame: FrameId,
+    },
     TransitionFrameMissing {
         transition_id: TransitionId,
         frame_id: FrameId,
     },
     TransitionFramesNotAdjacent {
         transition_id: TransitionId,
+    },
+    InvalidTransitionSteps {
+        transition_id: TransitionId,
+        steps: u16,
+        maximum: u16,
+    },
+    TransitionDurationTooShort {
+        transition_id: TransitionId,
+        duration_us: u64,
+        steps: u16,
     },
     TransitionTooLong {
         transition_id: TransitionId,

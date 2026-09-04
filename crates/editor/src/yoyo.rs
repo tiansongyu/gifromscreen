@@ -274,6 +274,7 @@ mod tests {
             from_frame: id(from),
             to_frame: id(to),
             duration: DurationUs::new(1).unwrap(),
+            steps: 1,
             kind: TransitionKind::FadeToNext,
         }
     }

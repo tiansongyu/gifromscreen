@@ -442,6 +442,7 @@ mod tests {
             from_frame: FrameId::from_u128(from),
             to_frame: FrameId::from_u128(to),
             duration: DurationUs::new(duration).unwrap(),
+            steps: 1,
             kind: TransitionKind::FadeToNext,
         }
     }
