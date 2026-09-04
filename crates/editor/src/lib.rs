@@ -10,12 +10,14 @@ use gif_from_screen_domain::{
 use thiserror::Error;
 
 mod duplicates;
+mod selection;
 mod yoyo;
 
 pub use duplicates::{
     DuplicateDelayMode, DuplicateFrameRetention, FrameComparison, FrameSimilarityProvider,
     RemoveDuplicateFramesOptions, remove_duplicate_frames,
 };
+pub use selection::{TimelineSelection, TimelineSelectionError};
 pub use yoyo::{YoyoOptions, YoyoScope, yoyo_frames};
 
 /// Controls how removing frames affects the duration of the surviving timeline.
