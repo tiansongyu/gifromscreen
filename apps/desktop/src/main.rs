@@ -48,6 +48,9 @@ use gif_from_screen_workflow::{
     collect_controlled,
 };
 use import_gif_job::{ImportGifJob, ImportGifJobEvent, ImportGifJobState};
+use import_static_image_job::{
+    ImportStaticImageJob, ImportStaticImageJobEvent, ImportStaticImageJobState,
+};
 use open_project_job::{OpenProjectJob, OpenProjectJobEvent, OpenProjectJobState};
 use retarget::{RegionRetargetPlan, RetargetCompletion};
 use uuid::Uuid;
@@ -71,6 +74,7 @@ enum AppView {
     Landing,
     OpenProject,
     ImportGif,
+    ImportImage,
     ScreenRecorder,
     Editor,
 }
@@ -80,6 +84,7 @@ enum StartupIntent {
     None,
     OpenProject(PathBuf),
     ImportGif(PathBuf),
+    ImportImage(PathBuf),
     Invalid(String),
 }
 
@@ -388,6 +393,8 @@ struct GifFromScreenApp {
     open_project_job: OpenProjectJob,
     import_gif_path: String,
     import_gif_job: ImportGifJob,
+    import_image_path: String,
+    import_image_job: ImportStaticImageJob,
     editor_workspace: Option<EditorWorkspace>,
     editor_ui_state: EditorUiState,
     editor_preview_cache: EditorPreviewCache,
@@ -422,6 +429,8 @@ impl Default for GifFromScreenApp {
             open_project_job: OpenProjectJob::default(),
             import_gif_path: String::new(),
             import_gif_job: ImportGifJob::default(),
+            import_image_path: String::new(),
+            import_image_job: ImportStaticImageJob::default(),
             editor_workspace: None,
             editor_ui_state: EditorUiState::default(),
             editor_preview_cache: EditorPreviewCache::new(),
@@ -446,6 +455,7 @@ impl eframe::App for GifFromScreenApp {
         self.receive_export_messages();
         self.receive_open_project_messages();
         self.receive_import_gif_messages();
+        self.receive_import_image_messages();
         self.advance_recording_countdown(context);
         if self.restore_main_window {
             if let Some(snapshot) = self.main_window_snapshot.take() {
@@ -468,6 +478,7 @@ impl eframe::App for GifFromScreenApp {
             || export_job_is_active(self.export_job.state())
             || self.open_project_job.state() == OpenProjectJobState::Running
             || self.import_gif_job.state() == ImportGifJobState::Running
+            || self.import_image_job.state() == ImportStaticImageJobState::Running
         {
             context.request_repaint_after(Duration::from_millis(33));
         }
@@ -478,6 +489,7 @@ impl eframe::App for GifFromScreenApp {
                     self.view,
                     self.open_project_job.state(),
                     self.import_gif_job.state(),
+                    self.import_image_job.state(),
                 );
                 if self.view != AppView::Landing
                     && ui
@@ -496,6 +508,7 @@ impl eframe::App for GifFromScreenApp {
             AppView::Landing => self.show_landing(ui),
             AppView::OpenProject => self.show_open_project(ui),
             AppView::ImportGif => self.show_import_gif(ui),
+            AppView::ImportImage => self.show_import_image(ui),
             AppView::ScreenRecorder => self.show_screen_recorder(ui),
             AppView::Editor => self.show_editor(ui),
         });
@@ -522,6 +535,13 @@ impl GifFromScreenApp {
                 self.import_gif_path = path.to_string_lossy().into_owned();
                 if let Err(error) = self.start_import_gif() {
                     self.notice = Some(format!("Could not import startup GIF: {error}"));
+                }
+            }
+            StartupIntent::ImportImage(path) => {
+                self.view = AppView::ImportImage;
+                self.import_image_path = path.to_string_lossy().into_owned();
+                if let Err(error) = self.start_import_image() {
+                    self.notice = Some(format!("Could not import startup image: {error}"));
                 }
             }
             StartupIntent::Invalid(message) => self.notice = Some(message),
@@ -569,18 +589,30 @@ impl GifFromScreenApp {
                             .to_owned(),
                     );
                 }
-                let _ = landing_action(
+                if landing_action(
                     &mut columns[1],
-                    "Webcam recorder",
-                    "Create an animated GIF from a camera.",
-                    false,
-                );
+                    "Import image",
+                    "Import PNG, JPEG, BMP, or WebP as a one-frame project.",
+                    true,
+                ) {
+                    self.view = AppView::ImportImage;
+                    self.notice = Some(
+                        "Static image import uses strict 16K and 512 MiB limits with a 100 ms frame. Import cannot currently be cancelled once started."
+                            .to_owned(),
+                    );
+                }
             });
 
             ui.add_space(12.0);
             ui.columns(LANDING_COLUMN_COUNT, |columns| {
                 let _ = landing_action(
                     &mut columns[0],
+                    "Webcam recorder",
+                    "Create an animated GIF from a camera.",
+                    false,
+                );
+                let _ = landing_action(
+                    &mut columns[1],
                     "Drawing board",
                     "Record drawing strokes as an animation.",
                     false,
@@ -623,6 +655,7 @@ impl GifFromScreenApp {
                         self.view,
                         self.open_project_job.state(),
                         self.import_gif_job.state(),
+                        self.import_image_job.state(),
                     ),
                     egui::Button::new("Back"),
                 )
@@ -687,6 +720,7 @@ impl GifFromScreenApp {
                         self.view,
                         self.open_project_job.state(),
                         self.import_gif_job.state(),
+                        self.import_image_job.state(),
                     ),
                     egui::Button::new("Back"),
                 )
@@ -715,6 +749,74 @@ impl GifFromScreenApp {
             .map_err(|error| error.to_string())?;
         self.notice = Some(
             "Importing GIF in the background. The bounded decode/persist operation cannot be cancelled."
+                .to_owned(),
+        );
+        Ok(())
+    }
+
+    fn show_import_image(&mut self, ui: &mut egui::Ui) {
+        let running = self.import_image_job.state() == ImportStaticImageJobState::Running;
+        ui.heading("Import static image as editable project");
+        ui.label(
+            "Choose a regular PNG, JPEG, BMP, or WebP file. A sibling <stem>.gfsproj will be created.",
+        );
+        ui.weak(
+            "Safety limits: 16K dimensions and 512 MiB decoded RGBA. The single frame lasts 100 ms. This operation cannot currently be cancelled.",
+        );
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.label("Image file");
+            ui.add_enabled(
+                !running,
+                egui::TextEdit::singleline(&mut self.import_image_path)
+                    .desired_width(420.0)
+                    .hint_text("/path/to/image.png"),
+            );
+        });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!running, egui::Button::new("Import"))
+                .clicked()
+                && let Err(error) = self.start_import_image()
+            {
+                self.notice = Some(format!("Could not start image import: {error}"));
+            }
+            if ui
+                .add_enabled(
+                    can_navigate_back(
+                        self.view,
+                        self.open_project_job.state(),
+                        self.import_gif_job.state(),
+                        self.import_image_job.state(),
+                    ),
+                    egui::Button::new("Back"),
+                )
+                .clicked()
+            {
+                self.view = AppView::Landing;
+            }
+            if running {
+                ui.spinner();
+                ui.label("Decoding and creating project… this operation is not cancellable.");
+            }
+        });
+        if let Some(notice) = &self.notice {
+            ui.add_space(12.0);
+            ui.label(notice);
+        }
+    }
+
+    fn start_import_image(&mut self) -> Result<(), String> {
+        let path = self.import_image_path.trim();
+        if path.is_empty() {
+            return Err("Select a PNG, JPEG, BMP, or WebP file first.".to_owned());
+        }
+        self.import_image_job
+            .start(PathBuf::from(path))
+            .map_err(|error| error.to_string())?;
+        self.notice = Some(
+            "Importing static image in the background. The bounded decode/persist operation cannot be cancelled."
                 .to_owned(),
         );
         Ok(())
@@ -1548,6 +1650,53 @@ impl GifFromScreenApp {
         Ok(format!(
             "Imported {} frame(s) into {}. Default GIF output is {} and will not overwrite the source.",
             summary.frames,
+            summary.project_path.display(),
+            output.display()
+        ))
+    }
+
+    fn receive_import_image_messages(&mut self) {
+        let finished = self
+            .import_image_job
+            .drain()
+            .into_iter()
+            .any(|event| event == ImportStaticImageJobEvent::Finished);
+        if !finished {
+            return;
+        }
+        let result = self.import_image_job.take_result();
+        self.import_image_job = ImportStaticImageJob::default();
+        self.notice = Some(match result {
+            Some(Ok(project)) => match self.activate_imported_image(project) {
+                Ok(notice) => notice,
+                Err(error) => format!("Could not prepare imported image project: {error}"),
+            },
+            Some(Err(error)) => format!(
+                "Could not import image: {error}. You can correct the path or file and retry."
+            ),
+            None => {
+                "Image import worker finished without a result. You can retry safely.".to_owned()
+            }
+        });
+    }
+
+    fn activate_imported_image(&mut self, project: ActiveProject) -> Result<String, String> {
+        let source = Path::new(self.import_image_path.trim());
+        let output = source.with_extension("gif");
+        let output_exists = output.exists();
+        let summary = activate_editor(&mut self.view, &mut self.editor_workspace, project)?;
+        self.editor_ui_state = EditorUiState::default();
+        self.editor_preview_cache = EditorPreviewCache::new();
+        self.editor_export_settings = EditorExportSettings::default();
+        self.export_job = ExportJob::default();
+        self.settings.output = output.to_string_lossy().into_owned();
+        let existing = if output_exists {
+            " The default GIF already exists; enable Overwrite before exporting."
+        } else {
+            ""
+        };
+        Ok(format!(
+            "Imported image into {} as one 100 ms frame. Default GIF output is {}.{existing}",
             summary.project_path.display(),
             output.display()
         ))
@@ -2554,10 +2703,13 @@ const fn can_navigate_back(
     view: AppView,
     open_state: OpenProjectJobState,
     import_state: ImportGifJobState,
+    image_state: ImportStaticImageJobState,
 ) -> bool {
     !((matches!(view, AppView::OpenProject) && matches!(open_state, OpenProjectJobState::Running))
         || (matches!(view, AppView::ImportGif)
-            && matches!(import_state, ImportGifJobState::Running)))
+            && matches!(import_state, ImportGifJobState::Running))
+        || (matches!(view, AppView::ImportImage)
+            && matches!(image_state, ImportStaticImageJobState::Running)))
 }
 
 fn export_result_notice(result: Result<ProjectGifExportReport, ExportJobError>) -> String {
@@ -2876,9 +3028,16 @@ fn parse_startup_intent(arguments: impl IntoIterator<Item = OsString>) -> Startu
             return StartupIntent::Invalid("--import-gif requires a .gif path".to_owned());
         };
         (StartupIntentKind::Gif, PathBuf::from(path))
+    } else if first == OsStr::new("--import-image") {
+        let Some(path) = arguments.next() else {
+            return StartupIntent::Invalid(
+                "--import-image requires a PNG, JPG/JPEG, BMP, or WebP path".to_owned(),
+            );
+        };
+        (StartupIntentKind::Image, PathBuf::from(path))
     } else if first.to_string_lossy().starts_with('-') {
         return StartupIntent::Invalid(format!(
-            "Unknown desktop argument '{}'. Use --project PATH or --import-gif PATH.",
+            "Unknown desktop argument '{}'. Use --project PATH, --import-gif PATH, or --import-image PATH.",
             first.to_string_lossy()
         ));
     } else {
@@ -2889,6 +3048,8 @@ fn parse_startup_intent(arguments: impl IntoIterator<Item = OsString>) -> Startu
             .is_some_and(|extension| extension.eq_ignore_ascii_case("gif"))
         {
             StartupIntentKind::Gif
+        } else if has_static_image_extension(&path) {
+            StartupIntentKind::Image
         } else {
             StartupIntentKind::Project
         };
@@ -2903,6 +3064,7 @@ fn parse_startup_intent(arguments: impl IntoIterator<Item = OsString>) -> Startu
     match kind {
         StartupIntentKind::Project => StartupIntent::OpenProject(path),
         StartupIntentKind::Gif => StartupIntent::ImportGif(path),
+        StartupIntentKind::Image => StartupIntent::ImportImage(path),
     }
 }
 
@@ -2910,6 +3072,17 @@ fn parse_startup_intent(arguments: impl IntoIterator<Item = OsString>) -> Startu
 enum StartupIntentKind {
     Project,
     Gif,
+    Image,
+}
+
+fn has_static_image_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            ["png", "jpg", "jpeg", "bmp", "webp"]
+                .iter()
+                .any(|allowed| extension.eq_ignore_ascii_case(allowed))
+        })
 }
 
 fn main() -> eframe::Result {
@@ -2949,7 +3122,7 @@ mod tests {
     use gif_from_screen_domain::{
         AssetDescriptor, AssetKind, Canvas, CanvasBackground, CaptureMetadata, ClipTransform,
         ColorSpace, DurationUs, EditCommand, FrameClip, FrameId, PhysicalSize as DomainSize,
-        ProjectId, ProjectManifest, ProjectRevision, RasterEncoding, UnixTimeMs,
+        ProjectId, ProjectManifest, ProjectRevision, RasterEncoding, SourceProvenance, UnixTimeMs,
     };
     use gif_from_screen_gif::{
         BuiltinGifEncoder, DeltaMode, DitherMode, EncodeOptions, EncodeReport, LoopBehavior,
@@ -2965,14 +3138,15 @@ mod tests {
         RecorderStage, RecordingSettings, StartupIntent, activate_editor, apply_overlay_region,
         build_project_export_options, can_navigate_back, collection_limit, collection_options,
         default_gif_path_for_project, edited_gif_path_for_import, export_job_is_active,
-        export_result_notice, fit_dimensions, frame_retention, landing_cards_fit,
-        map_preview_selection, parse_startup_intent, project_path_for_output,
+        export_result_notice, fit_dimensions, frame_retention, has_static_image_extension,
+        landing_cards_fit, map_preview_selection, parse_startup_intent, project_path_for_output,
         remove_completed_project, resize_nearest_rgba, resolve_export_selection,
         should_sync_retarget, show_editor_scroll_area, validate_export_output, validate_settings,
     };
     use crate::editor_workspace::EditorWorkspace;
     use crate::export_job::{ExportJobError, ExportJobState};
     use crate::import_gif_job::ImportGifJobState;
+    use crate::import_static_image_job::ImportStaticImageJobState;
     use crate::open_project_job::OpenProjectJobState;
     use gif_from_screen_workflow::{CollectionLimit, FrameRetention};
 
@@ -3008,7 +3182,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_startup_arguments_route_projects_and_gifs_without_flag_guessing() {
+    fn desktop_startup_arguments_route_projects_gifs_and_static_images() {
         assert_eq!(
             parse_startup_intent(Vec::<OsString>::new()),
             StartupIntent::None
@@ -3026,17 +3200,36 @@ mod tests {
             StartupIntent::ImportGif(PathBuf::from("/tmp/demo.GIF"))
         );
         assert_eq!(
+            parse_startup_intent(["--import-image", "/tmp/photo.data"].map(OsString::from)),
+            StartupIntent::ImportImage(PathBuf::from("/tmp/photo.data"))
+        );
+        for extension in ["png", "JPG", "jpeg", "BMP", "webp"] {
+            let path = PathBuf::from(format!("/tmp/image.{extension}"));
+            assert_eq!(
+                parse_startup_intent([path.clone().into_os_string()]),
+                StartupIntent::ImportImage(path)
+            );
+        }
+        assert_eq!(
             parse_startup_intent([OsString::from("/tmp/demo.gfsproj")]),
             StartupIntent::OpenProject(PathBuf::from("/tmp/demo.gfsproj"))
         );
         assert!(matches!(
             parse_startup_intent([OsString::from("--unknown")]),
-            StartupIntent::Invalid(message) if message.contains("Unknown desktop argument")
+            StartupIntent::Invalid(message)
+                if message.contains("Unknown desktop argument")
+                    && message.contains("--import-image")
         ));
         assert!(matches!(
             parse_startup_intent(["--project", "one", "two"].map(OsString::from)),
             StartupIntent::Invalid(message) if message.contains("Unexpected extra")
         ));
+        assert!(matches!(
+            parse_startup_intent([OsString::from("--import-image")]),
+            StartupIntent::Invalid(message) if message.contains("requires")
+        ));
+        assert!(has_static_image_extension(Path::new("photo.JPEG")));
+        assert!(!has_static_image_extension(Path::new("animation.gif")));
     }
 
     #[test]
@@ -3330,11 +3523,32 @@ mod tests {
             .unwrap();
     }
 
+    const STATIC_PNG_ALPHA: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 1, 1, 3,
+        0, 0, 0, 206, 236, 237, 201, 0, 0, 0, 6, 80, 76, 84, 69, 0, 255, 0, 255, 0, 0, 209, 155,
+        74, 174, 0, 0, 0, 1, 116, 82, 78, 83, 64, 54, 58, 153, 246, 0, 0, 0, 10, 73, 68, 65, 84, 8,
+        215, 99, 104, 0, 0, 0, 130, 0, 129, 221, 67, 106, 244, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66,
+        96, 130,
+    ];
+
+    fn write_import_png(path: &Path) {
+        fs::write(path, STATIC_PNG_ALPHA).unwrap();
+    }
+
     fn drain_import_job(app: &mut GifFromScreenApp) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while app.import_gif_job.state() == ImportGifJobState::Running {
             app.receive_import_gif_messages();
             assert!(Instant::now() < deadline, "GIF import job timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn drain_import_image_job(app: &mut GifFromScreenApp) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.import_image_job.state() == ImportStaticImageJobState::Running {
+            app.receive_import_image_messages();
+            assert!(Instant::now() < deadline, "image import job timed out");
             std::thread::sleep(Duration::from_millis(1));
         }
     }
@@ -3369,18 +3583,21 @@ mod tests {
             AppView::OpenProject,
             OpenProjectJobState::Running,
             ImportGifJobState::Idle,
+            ImportStaticImageJobState::Idle,
         ));
         for state in [OpenProjectJobState::Idle, OpenProjectJobState::Finished] {
             assert!(can_navigate_back(
                 AppView::OpenProject,
                 state,
                 ImportGifJobState::Idle,
+                ImportStaticImageJobState::Idle,
             ));
         }
         assert!(can_navigate_back(
             AppView::Editor,
             OpenProjectJobState::Running,
             ImportGifJobState::Running,
+            ImportStaticImageJobState::Running,
         ));
     }
 
@@ -3390,19 +3607,128 @@ mod tests {
             AppView::ImportGif,
             OpenProjectJobState::Idle,
             ImportGifJobState::Running,
+            ImportStaticImageJobState::Idle,
         ));
         for state in [ImportGifJobState::Idle, ImportGifJobState::Finished] {
             assert!(can_navigate_back(
                 AppView::ImportGif,
                 OpenProjectJobState::Idle,
                 state,
+                ImportStaticImageJobState::Idle,
             ));
         }
         assert!(can_navigate_back(
             AppView::OpenProject,
             OpenProjectJobState::Idle,
             ImportGifJobState::Running,
+            ImportStaticImageJobState::Running,
         ));
+    }
+
+    #[test]
+    fn running_static_image_import_locks_top_and_page_back_navigation() {
+        assert!(!can_navigate_back(
+            AppView::ImportImage,
+            OpenProjectJobState::Idle,
+            ImportGifJobState::Idle,
+            ImportStaticImageJobState::Running,
+        ));
+        for state in [
+            ImportStaticImageJobState::Idle,
+            ImportStaticImageJobState::Finished,
+        ] {
+            assert!(can_navigate_back(
+                AppView::ImportImage,
+                OpenProjectJobState::Idle,
+                ImportGifJobState::Idle,
+                state,
+            ));
+        }
+    }
+
+    #[test]
+    fn startup_png_import_enters_editor_with_preview_and_detected_provenance() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("alpha.png");
+        let output = directory.path().join("alpha.gif");
+        write_import_png(&source);
+        fs::write(&output, b"existing GIF").unwrap();
+        let mut app = GifFromScreenApp::default();
+        app.editor_ui_state.frame_number_input = "99".to_owned();
+        app.editor_export_settings.overwrite = true;
+
+        app.apply_startup_intent(StartupIntent::ImportImage(source.clone()));
+        assert_eq!(app.view, AppView::ImportImage);
+        assert_eq!(
+            app.import_image_job.state(),
+            ImportStaticImageJobState::Running
+        );
+        drain_import_image_job(&mut app);
+
+        assert_eq!(
+            app.import_image_job.state(),
+            ImportStaticImageJobState::Idle
+        );
+        assert_eq!(app.view, AppView::Editor);
+        assert_eq!(Path::new(&app.settings.output), output);
+        assert_eq!(fs::read(&output).unwrap(), b"existing GIF");
+        assert_eq!(app.editor_ui_state.frame_number_input, "1");
+        assert_eq!(app.editor_export_settings, EditorExportSettings::default());
+        let (workspace_slot, preview_cache) =
+            (&app.editor_workspace, &mut app.editor_preview_cache);
+        let workspace = workspace_slot.as_ref().unwrap();
+        assert_eq!(
+            workspace.project_root(),
+            directory.path().join("alpha.gfsproj")
+        );
+        assert!(matches!(
+            workspace.manifest().source_provenance.as_slice(),
+            [SourceProvenance::Imported {
+                display_name,
+                media_type
+            }] if display_name == "alpha.png" && media_type == "image/png"
+        ));
+        let frame = &workspace.manifest().timeline.frames[0];
+        assert_eq!(frame.duration.get(), 100_000);
+        let context = egui::Context::default();
+        let preview = preview_cache
+            .preview(
+                workspace.active_project(),
+                workspace.selection().current().unwrap(),
+                &context,
+                [64, 64],
+            )
+            .unwrap();
+        assert_eq!(preview.rendered_size, [2, 1]);
+        assert!(app.notice.as_deref().unwrap().contains("enable Overwrite"));
+    }
+
+    #[test]
+    fn malformed_static_image_resets_job_and_can_retry() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("retry.png");
+        fs::write(&source, b"broken").unwrap();
+        let mut app = GifFromScreenApp::default();
+        app.view = AppView::ImportImage;
+        app.import_image_path = source.to_string_lossy().into_owned();
+
+        app.start_import_image().unwrap();
+        drain_import_image_job(&mut app);
+
+        assert_eq!(
+            app.import_image_job.state(),
+            ImportStaticImageJobState::Idle
+        );
+        assert_eq!(app.view, AppView::ImportImage);
+        assert!(app.editor_workspace.is_none());
+        assert!(app.notice.as_deref().unwrap().contains("You can correct"));
+        assert!(!source.with_extension("gfsproj").exists());
+
+        write_import_png(&source);
+        app.start_import_image().unwrap();
+        drain_import_image_job(&mut app);
+        assert_eq!(app.view, AppView::Editor);
+        assert!(app.editor_workspace.is_some());
     }
 
     #[test]
