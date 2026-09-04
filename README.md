@@ -25,5 +25,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features
 cargo run -p gif-from-screen-cli -- doctor
+cargo run -p gif-from-screen-cli -- sources-x11
+cargo run -p gif-from-screen-cli -- record-x11 capture.gif 3000 10 0 0 640 480
 cargo run -p gif-from-screen
 ```

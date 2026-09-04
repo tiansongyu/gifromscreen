@@ -7,22 +7,22 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Freeze ScreenToGif 2.43.2 as the behavioral reference.
 - [x] Select the Rust desktop architecture and define the Linux capability boundary.
 - [x] Initialize a Rust workspace, desktop shell, diagnostics CLI, and recorder state machine.
-- [ ] Complete the domain model and crash-recoverable project store.
-- [ ] Complete a built-in GIF encoder vertical slice and round-trip tests.
-- [ ] Complete capture contracts, a synthetic source, and Linux runtime detection.
-- [ ] Connect the CLI vertical slice: synthetic capture -> project -> GIF.
-- [ ] Connect the first desktop vertical slice.
+- [x] Complete the domain model and crash-recoverable project store.
+- [x] Complete a built-in GIF encoder vertical slice and round-trip tests.
+- [x] Complete capture contracts, a synthetic source, and Linux runtime detection.
+- [x] Connect the CLI vertical slice: synthetic capture -> project -> GIF.
+- [x] Connect the first desktop X11 record-to-GIF vertical slice.
 
 ## Delivery gates
 
 ### S0 — architecture validation
 
-- [ ] X11 real screen/region capture.
+- [x] X11 real screen/region capture through GetImage.
 - [ ] GNOME Wayland Portal + PipeWire capture.
 - [ ] KDE Wayland Portal + PipeWire capture.
 - [ ] Bounded queue and dropped-frame timing compensation.
 - [ ] Long-recording frame-store benchmark.
-- [ ] GIF timing, loop, transparency, and disposal round-trip corpus.
+- [x] Initial GIF timing, loop, transparency, delta and disposal round-trip corpus.
 - [ ] 50,000-frame virtualized timeline prototype.
 
 ### M1 — usable alpha
@@ -68,4 +68,3 @@ The Linux version is complete only when every non-macOS item in `FEATURE_MATRIX.
 
 1. implemented and linked to an automated/manual acceptance result, or
 2. explicitly documented as unavailable because of a verified Wayland capability restriction, with a usable fallback.
-
