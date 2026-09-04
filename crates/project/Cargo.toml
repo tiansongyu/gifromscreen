@@ -1,0 +1,19 @@
+[package]
+name = "gif-from-screen-project"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Crash-safe active project, journal, and content-addressed asset storage"
+
+[dependencies]
+blake3.workspace = true
+gif-from-screen-domain = { path = "../domain" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
