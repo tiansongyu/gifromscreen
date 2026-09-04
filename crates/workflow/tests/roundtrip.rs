@@ -302,7 +302,11 @@ fn controlled_stop_encodes_frames_collected_so_far() {
     let (controller, mut control) = RecordingController::channel();
     let progress_controller = controller.clone();
     let options = RecordToGifOptions {
-        collection: max_frames_options(3, 15_000),
+        collection: CollectOptions {
+            limit: CollectionLimit::UntilStopped,
+            tail_frame_duration: Duration::from_millis(15),
+            ..CollectOptions::default()
+        },
         ..RecordToGifOptions::default()
     };
 

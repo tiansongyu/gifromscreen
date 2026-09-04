@@ -19,6 +19,11 @@ const DEFAULT_FRAME_BUFFER_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum CollectionLimit {
+    /// Continue until the source ends or a controlled recording receives Stop.
+    ///
+    /// Callers using an endless native source should use
+    /// [`crate::collect_controlled`] or provide a cancellation token.
+    UntilStopped,
     /// Stop after this span of session timestamps, measured from the first
     /// retained frame. A boundary frame at or beyond the span is not retained.
     Duration(Duration),
@@ -112,6 +117,7 @@ struct ValidatedOptions {
 
 #[derive(Clone, Copy, Debug)]
 enum ValidatedLimit {
+    UntilStopped,
     Duration { duration_us: u64, deadline: Instant },
     MaxFrames(u64),
 }
@@ -209,6 +215,7 @@ fn validate_options(options: &CollectOptions) -> Result<ValidatedOptions, Workfl
     let tail_duration_us =
         duration_to_nonzero_micros(options.tail_frame_duration, "tail frame duration")?;
     let limit = match options.limit {
+        CollectionLimit::UntilStopped => ValidatedLimit::UntilStopped,
         CollectionLimit::Duration(duration) => {
             let duration_us = duration_to_nonzero_micros(duration, "collection duration")?;
             let deadline = Instant::now().checked_add(duration).ok_or_else(|| {
@@ -345,20 +352,20 @@ fn bounded_poll_interval(limit: ValidatedLimit, configured: Duration) -> Duratio
         ValidatedLimit::Duration { deadline, .. } => deadline
             .checked_duration_since(Instant::now())
             .map_or(Duration::ZERO, |remaining| remaining.min(configured)),
-        ValidatedLimit::MaxFrames(_) => configured,
+        ValidatedLimit::UntilStopped | ValidatedLimit::MaxFrames(_) => configured,
     }
 }
 
 const fn duration_span_reached(limit: ValidatedLimit, first: u64, current: u64) -> bool {
     match limit {
         ValidatedLimit::Duration { duration_us, .. } => current - first >= duration_us,
-        ValidatedLimit::MaxFrames(_) => false,
+        ValidatedLimit::UntilStopped | ValidatedLimit::MaxFrames(_) => false,
     }
 }
 
 fn frame_limit_reached(limit: ValidatedLimit, retained: usize) -> bool {
     match limit {
-        ValidatedLimit::Duration { .. } => false,
+        ValidatedLimit::UntilStopped | ValidatedLimit::Duration { .. } => false,
         ValidatedLimit::MaxFrames(maximum) => {
             u64::try_from(retained).unwrap_or(u64::MAX) >= maximum
         }

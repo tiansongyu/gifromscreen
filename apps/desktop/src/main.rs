@@ -29,6 +29,7 @@ use retarget::{RegionRetargetPlan, RetargetCompletion};
 const APP_NAME: &str = "GifFromScreen";
 const RECORDER_BORDER_POINTS: f32 = 4.0;
 const RECORDER_TOOLBAR_POINTS: f32 = 76.0;
+const MAX_RECORDING_DURATION_MS: u64 = 3_600_000;
 
 fn recorder_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("gif-from-screen-recorder-frame")
@@ -63,7 +64,7 @@ impl Default for RecordingSettings {
             .into_owned();
         Self {
             output,
-            duration_ms: 3_000,
+            duration_ms: 0,
             fps: 10,
             countdown_seconds: 3,
             region_enabled: true,
@@ -462,8 +463,11 @@ impl GifFromScreenApp {
                 ui.label("Output GIF");
                 ui.text_edit_singleline(&mut self.settings.output);
                 ui.end_row();
-                ui.label("Maximum duration (ms)");
-                ui.add(egui::DragValue::new(&mut self.settings.duration_ms).range(1..=60_000));
+                ui.label("Maximum duration (ms, 0 = manual stop)");
+                ui.add(
+                    egui::DragValue::new(&mut self.settings.duration_ms)
+                        .range(0..=MAX_RECORDING_DURATION_MS),
+                );
                 ui.end_row();
                 ui.label("Frames per second");
                 ui.add(egui::DragValue::new(&mut self.settings.fps).range(1..=60));
@@ -1589,8 +1593,10 @@ const fn should_sync_retarget(stage: RecorderStage, action: RecorderOverlayActio
 }
 
 fn validate_settings(settings: &RecordingSettings) -> Result<(), String> {
-    if settings.duration_ms == 0 || settings.duration_ms > 60_000 {
-        return Err("Duration must be between 1 and 60000 ms.".into());
+    if settings.duration_ms > MAX_RECORDING_DURATION_MS {
+        return Err(format!(
+            "Maximum duration must be 0 (manual stop) or at most {MAX_RECORDING_DURATION_MS} ms."
+        ));
     }
     if !(1..=60).contains(&settings.fps) {
         return Err("FPS must be between 1 and 60.".into());
@@ -1645,9 +1651,14 @@ fn run_x11_recording(
     };
     let mut request = CaptureRequest::new(target, CaptureCadence::fixed_fps(settings.fps)?);
     request.cursor = CursorCaptureMode::Embedded;
+    let limit = if settings.duration_ms == 0 {
+        CollectionLimit::UntilStopped
+    } else {
+        CollectionLimit::Duration(Duration::from_millis(settings.duration_ms))
+    };
     let options = RecordToGifOptions {
         collection: CollectOptions {
-            limit: CollectionLimit::Duration(Duration::from_millis(settings.duration_ms)),
+            limit,
             tail_frame_duration: Duration::from_micros(1_000_000 / u64::from(settings.fps)),
             ..CollectOptions::default()
         },
@@ -1714,9 +1725,9 @@ mod tests {
     use eframe::egui;
 
     use super::{
-        MAX_COUNTDOWN_SECONDS, RecorderOverlayAction, RecorderStage, RecordingSettings,
-        apply_overlay_region, fit_dimensions, map_preview_selection, resize_nearest_rgba,
-        should_sync_retarget, validate_settings,
+        MAX_COUNTDOWN_SECONDS, MAX_RECORDING_DURATION_MS, RecorderOverlayAction, RecorderStage,
+        RecordingSettings, apply_overlay_region, fit_dimensions, map_preview_selection,
+        resize_nearest_rgba, should_sync_retarget, validate_settings,
     };
 
     #[test]
@@ -1731,6 +1742,12 @@ mod tests {
         settings.countdown_seconds = MAX_COUNTDOWN_SECONDS + 1;
         assert!(validate_settings(&settings).is_err());
         settings.countdown_seconds = 0;
+        assert!(validate_settings(&settings).is_ok());
+        settings.duration_ms = MAX_RECORDING_DURATION_MS;
+        assert!(validate_settings(&settings).is_ok());
+        settings.duration_ms = MAX_RECORDING_DURATION_MS + 1;
+        assert!(validate_settings(&settings).is_err());
+        settings.duration_ms = 0;
         assert!(validate_settings(&settings).is_ok());
         settings.fps = 0;
         assert!(validate_settings(&settings).is_err());
