@@ -61,9 +61,11 @@ pub enum DitherMode {
 /// shared global palette. [`MedianCut`](Self::MedianCut) is the general-purpose
 /// default, [`Grayscale`](Self::Grayscale) deliberately removes hue, and
 /// [`MostUsed`](Self::MostUsed) favors the most frequent source colors, and
-/// [`Octree`](Self::Octree) prunes a bounded RGB octree. [`NeuQuant`](Self::NeuQuant)
-/// trains a bounded Kohonen network over a deterministic sample. The remaining
-/// variants use immutable predefined palettes with a reserved transparency slot.
+/// [`Octree`](Self::Octree) prunes a bounded RGB octree, [`Wu`](Self::Wu)
+/// optimizes variance over a fixed 33³ moment lattice, and
+/// [`NeuQuant`](Self::NeuQuant) trains a bounded Kohonen network over a
+/// deterministic sample. The remaining variants use immutable predefined
+/// palettes with a reserved transparency slot.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum QuantizerStrategy {
@@ -76,6 +78,8 @@ pub enum QuantizerStrategy {
     MostUsed,
     /// A deterministic, population-pruned RGB octree.
     Octree,
+    /// Variance-minimizing Wu quantization over a bounded RGB moment lattice.
+    Wu,
     /// Bounded deterministic NeuQuant neural-network color reduction.
     NeuQuant,
     /// Fixed 216-color web-safe cube plus a reserved transparent entry.
@@ -382,6 +386,17 @@ pub struct MostUsedQuantizer;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OctreeQuantizer;
 
+/// Deterministic, bounded-memory Wu color quantizer.
+///
+/// The source first enters the shared 5-bit/channel histogram. Five integral
+/// moments (population, RGB sums, and squared magnitude) are then accumulated
+/// over a 33×33×33 lattice. Palette boxes are split by the greatest reduction
+/// in within-box variance; ties retain stable box, R/G/B axis, and ascending-cut
+/// order. The histogram and moment lattice have fixed size independent of input
+/// frame dimensions and count.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WuQuantizer;
+
 /// Deterministic NeuQuant adapter with bounded training memory.
 ///
 /// Transparent pixels are excluded from training and reserve palette index
@@ -395,20 +410,46 @@ pub struct OctreeQuantizer;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NeuQuantQuantizer;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct HistogramBin {
     red_sum: u64,
     green_sum: u64,
     blue_sum: u64,
+    squared_sum: u64,
     count: u64,
 }
 
 impl HistogramBin {
-    fn add(&mut self, red: u8, green: u8, blue: u8) {
-        self.red_sum += u64::from(red);
-        self.green_sum += u64::from(green);
-        self.blue_sum += u64::from(blue);
-        self.count += 1;
+    fn add(&mut self, red: u8, green: u8, blue: u8) -> Result<(), QuantizationError> {
+        let squared = u64::from(red) * u64::from(red)
+            + u64::from(green) * u64::from(green)
+            + u64::from(blue) * u64::from(blue);
+        let red_sum = self
+            .red_sum
+            .checked_add(u64::from(red))
+            .ok_or_else(histogram_moment_overflow)?;
+        let green_sum = self
+            .green_sum
+            .checked_add(u64::from(green))
+            .ok_or_else(histogram_moment_overflow)?;
+        let blue_sum = self
+            .blue_sum
+            .checked_add(u64::from(blue))
+            .ok_or_else(histogram_moment_overflow)?;
+        let squared_sum = self
+            .squared_sum
+            .checked_add(squared)
+            .ok_or_else(histogram_moment_overflow)?;
+        let count = self
+            .count
+            .checked_add(1)
+            .ok_or_else(histogram_moment_overflow)?;
+        self.red_sum = red_sum;
+        self.green_sum = green_sum;
+        self.blue_sum = blue_sum;
+        self.squared_sum = squared_sum;
+        self.count = count;
+        Ok(())
     }
 
     fn average(self) -> [u8; 3] {
@@ -419,6 +460,12 @@ impl HistogramBin {
             (self.blue_sum / self.count) as u8,
         ]
     }
+}
+
+fn histogram_moment_overflow() -> QuantizationError {
+    QuantizationError::InvalidPalette(
+        "RGB histogram moment overflowed its u64 accumulator".to_owned(),
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -632,6 +679,286 @@ fn octree_branch(color: [u8; 3], depth: u8) -> usize {
     usize::from((color[0] >> shift) & 1) << 2
         | usize::from((color[1] >> shift) & 1) << 1
         | usize::from((color[2] >> shift) & 1)
+}
+
+const WU_SIDE: usize = HISTOGRAM_CHANNEL_SIZE + 1;
+const WU_MOMENT_LEN: usize = WU_SIDE * WU_SIDE * WU_SIDE;
+const WU_CANCELLATION_INTERVAL: usize = 256;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct WuMoment {
+    weight: u64,
+    red: u64,
+    green: u64,
+    blue: u64,
+    squared: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WuCube {
+    red_min: u8,
+    red_max: u8,
+    green_min: u8,
+    green_max: u8,
+    blue_min: u8,
+    blue_max: u8,
+}
+
+impl WuCube {
+    const FULL: Self = Self {
+        red_min: 0,
+        red_max: HISTOGRAM_CHANNEL_SIZE as u8,
+        green_min: 0,
+        green_max: HISTOGRAM_CHANNEL_SIZE as u8,
+        blue_min: 0,
+        blue_max: HISTOGRAM_CHANNEL_SIZE as u8,
+    };
+}
+
+#[derive(Clone, Copy, Debug)]
+enum WuAxis {
+    Red,
+    Green,
+    Blue,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WuSplit {
+    cube_index: usize,
+    left: WuCube,
+    right: WuCube,
+    gain: f64,
+}
+
+fn build_wu_moments(
+    histogram: &[HistogramBin],
+    cancellation: &dyn CancellationToken,
+) -> Result<Vec<WuMoment>, QuantizationError> {
+    if histogram.len() != HISTOGRAM_LEN {
+        return Err(QuantizationError::InvalidPalette(format!(
+            "Wu histogram has {} bins, expected {HISTOGRAM_LEN}",
+            histogram.len()
+        )));
+    }
+    let mut moments = Vec::new();
+    moments.try_reserve_exact(WU_MOMENT_LEN).map_err(|_| {
+        QuantizationError::InvalidPalette(format!(
+            "could not allocate bounded {WU_MOMENT_LEN}-cell Wu moment lattice"
+        ))
+    })?;
+    moments.resize(WU_MOMENT_LEN, WuMoment::default());
+
+    let mut visited = 0_usize;
+    for red in 1..WU_SIDE {
+        for green in 1..WU_SIDE {
+            for blue in 1..WU_SIDE {
+                if visited.is_multiple_of(WU_CANCELLATION_INTERVAL) {
+                    check_now(cancellation)?;
+                }
+                visited = visited.wrapping_add(1);
+                let bin = histogram[histogram_cell(red - 1, green - 1, blue - 1)];
+                let raw = WuMoment {
+                    weight: bin.count,
+                    red: bin.red_sum,
+                    green: bin.green_sum,
+                    blue: bin.blue_sum,
+                    squared: bin.squared_sum,
+                };
+                let prefix = combine_wu_moments(&[
+                    (raw, 1),
+                    (moments[wu_cell(red - 1, green, blue)], 1),
+                    (moments[wu_cell(red, green - 1, blue)], 1),
+                    (moments[wu_cell(red, green, blue - 1)], 1),
+                    (moments[wu_cell(red - 1, green - 1, blue)], -1),
+                    (moments[wu_cell(red - 1, green, blue - 1)], -1),
+                    (moments[wu_cell(red, green - 1, blue - 1)], -1),
+                    (moments[wu_cell(red - 1, green - 1, blue - 1)], 1),
+                ])?;
+                moments[wu_cell(red, green, blue)] = prefix;
+            }
+        }
+    }
+    check_now(cancellation)?;
+    Ok(moments)
+}
+
+fn combine_wu_moments(terms: &[(WuMoment, i8)]) -> Result<WuMoment, QuantizationError> {
+    let component = |read: fn(WuMoment) -> u64| {
+        let value = terms.iter().fold(0_i128, |sum, (moment, sign)| {
+            sum + i128::from(read(*moment)) * i128::from(*sign)
+        });
+        u64::try_from(value).map_err(|_| {
+            QuantizationError::InvalidPalette(
+                "Wu integral-moment arithmetic exceeded its unsigned range".to_owned(),
+            )
+        })
+    };
+    Ok(WuMoment {
+        weight: component(|moment| moment.weight)?,
+        red: component(|moment| moment.red)?,
+        green: component(|moment| moment.green)?,
+        blue: component(|moment| moment.blue)?,
+        squared: component(|moment| moment.squared)?,
+    })
+}
+
+fn wu_volume(moments: &[WuMoment], cube: WuCube) -> Result<WuMoment, QuantizationError> {
+    // Wu's 33³ prefix lattice represents each quantized box as
+    // (minimum, maximum] on every axis. This is the eight-corner volume
+    // formula from Xiaolin Wu, "Efficient Statistical Computations for
+    // Optimal Color Quantization" (Graphics Gems II).
+    let r0 = usize::from(cube.red_min);
+    let r1 = usize::from(cube.red_max);
+    let g0 = usize::from(cube.green_min);
+    let g1 = usize::from(cube.green_max);
+    let b0 = usize::from(cube.blue_min);
+    let b1 = usize::from(cube.blue_max);
+    combine_wu_moments(&[
+        (moments[wu_cell(r1, g1, b1)], 1),
+        (moments[wu_cell(r1, g1, b0)], -1),
+        (moments[wu_cell(r1, g0, b1)], -1),
+        (moments[wu_cell(r0, g1, b1)], -1),
+        (moments[wu_cell(r1, g0, b0)], 1),
+        (moments[wu_cell(r0, g1, b0)], 1),
+        (moments[wu_cell(r0, g0, b1)], 1),
+        (moments[wu_cell(r0, g0, b0)], -1),
+    ])
+}
+
+fn best_wu_split(
+    cubes: &[WuCube],
+    moments: &[WuMoment],
+    cancellation: &dyn CancellationToken,
+) -> Result<Option<WuSplit>, QuantizationError> {
+    let mut best = None;
+    let mut visited = 0_usize;
+    // Strict `>` updates make exact ties deterministic: the existing box is
+    // chosen first, then R/G/B here, then the ascending cut.
+    for (cube_index, &cube) in cubes.iter().enumerate() {
+        let parent_variance = wu_variance(wu_volume(moments, cube)?);
+        for axis in [WuAxis::Red, WuAxis::Green, WuAxis::Blue] {
+            let (minimum, maximum) = wu_axis_bounds(cube, axis);
+            for cut in minimum + 1..maximum {
+                if visited.is_multiple_of(WU_CANCELLATION_INTERVAL) {
+                    check_now(cancellation)?;
+                }
+                visited = visited.wrapping_add(1);
+                let (left, right) = split_wu_cube(cube, axis, cut);
+                let left_moment = wu_volume(moments, left)?;
+                let right_moment = wu_volume(moments, right)?;
+                if left_moment.weight == 0 || right_moment.weight == 0 {
+                    continue;
+                }
+                let gain = parent_variance - wu_variance(left_moment) - wu_variance(right_moment);
+                if gain > 0.0 && best.is_none_or(|current: WuSplit| gain > current.gain) {
+                    best = Some(WuSplit {
+                        cube_index,
+                        left,
+                        right,
+                        gain,
+                    });
+                }
+            }
+        }
+    }
+    Ok(best)
+}
+
+fn make_wu_palette(
+    histogram: &[HistogramBin],
+    color_limit: usize,
+    cancellation: &dyn CancellationToken,
+) -> Result<Vec<[u8; 3]>, QuantizationError> {
+    check_now(cancellation)?;
+    let moments = build_wu_moments(histogram, cancellation)?;
+    if wu_volume(&moments, WuCube::FULL)?.weight == 0 {
+        return Ok(Vec::new());
+    }
+    let mut cubes = Vec::with_capacity(color_limit);
+    cubes.push(WuCube::FULL);
+    while cubes.len() < color_limit {
+        check_now(cancellation)?;
+        let Some(split) = best_wu_split(&cubes, &moments, cancellation)? else {
+            break;
+        };
+        cubes[split.cube_index] = split.left;
+        cubes.push(split.right);
+    }
+    let mut palette = Vec::with_capacity(cubes.len());
+    for (index, cube) in cubes.into_iter().enumerate() {
+        check_cancellation(index, cancellation)?;
+        let moment = wu_volume(&moments, cube)?;
+        if moment.weight != 0 {
+            palette.push(wu_centroid(moment));
+        }
+    }
+    palette.sort_unstable();
+    palette.dedup();
+    check_now(cancellation)?;
+    Ok(palette)
+}
+
+const fn histogram_cell(red: usize, green: usize, blue: usize) -> usize {
+    red * HISTOGRAM_CHANNEL_SIZE * HISTOGRAM_CHANNEL_SIZE + green * HISTOGRAM_CHANNEL_SIZE + blue
+}
+
+const fn wu_cell(red: usize, green: usize, blue: usize) -> usize {
+    red * WU_SIDE * WU_SIDE + green * WU_SIDE + blue
+}
+
+const fn wu_axis_bounds(cube: WuCube, axis: WuAxis) -> (u8, u8) {
+    match axis {
+        WuAxis::Red => (cube.red_min, cube.red_max),
+        WuAxis::Green => (cube.green_min, cube.green_max),
+        WuAxis::Blue => (cube.blue_min, cube.blue_max),
+    }
+}
+
+const fn split_wu_cube(mut cube: WuCube, axis: WuAxis, cut: u8) -> (WuCube, WuCube) {
+    let mut right = cube;
+    match axis {
+        WuAxis::Red => {
+            cube.red_max = cut;
+            right.red_min = cut;
+        }
+        WuAxis::Green => {
+            cube.green_max = cut;
+            right.green_min = cut;
+        }
+        WuAxis::Blue => {
+            cube.blue_max = cut;
+            right.blue_min = cut;
+        }
+    }
+    (cube, right)
+}
+
+fn wu_mean_score(moment: WuMoment) -> f64 {
+    if moment.weight == 0 {
+        return 0.0;
+    }
+    let red = moment.red as f64;
+    let green = moment.green as f64;
+    let blue = moment.blue as f64;
+    (red * red + green * green + blue * blue) / moment.weight as f64
+}
+
+fn wu_variance(moment: WuMoment) -> f64 {
+    if moment.weight == 0 {
+        0.0
+    } else {
+        (moment.squared as f64 - wu_mean_score(moment)).max(0.0)
+    }
+}
+
+fn wu_centroid(moment: WuMoment) -> [u8; 3] {
+    debug_assert_ne!(moment.weight, 0);
+    let channel = |sum: u64| u8::try_from((sum / moment.weight).min(255)).unwrap_or(255);
+    [
+        channel(moment.red),
+        channel(moment.green),
+        channel(moment.blue),
+    ]
 }
 
 const NEUQUANT_MIN_TRAINING_COLORS: usize = 64;
@@ -916,6 +1243,29 @@ impl FrameQuantizer for OctreeQuantizer {
     }
 }
 
+impl FrameQuantizer for WuQuantizer {
+    fn quantize(
+        &self,
+        frame: &RgbaFrame,
+        settings: QuantizationSettings,
+        cancellation: &dyn CancellationToken,
+    ) -> Result<IndexedFrame, QuantizationError> {
+        quantize_frame(self, frame, settings, cancellation)
+    }
+
+    fn build_global_palette(
+        &self,
+        frames: &[RgbaFrame],
+        settings: QuantizationSettings,
+        cancellation: &dyn CancellationToken,
+    ) -> Result<ColorPalette, QuantizationError> {
+        let (histogram, has_transparency) = build_rgb_histogram(frames, settings, cancellation)?;
+        let opaque_limit = opaque_color_limit(settings.max_colors, has_transparency);
+        let opaque_palette = make_wu_palette(&histogram, opaque_limit, cancellation)?;
+        finish_palette(opaque_palette, has_transparency)
+    }
+}
+
 impl FrameQuantizer for NeuQuantQuantizer {
     fn quantize(
         &self,
@@ -968,6 +1318,7 @@ impl FrameQuantizer for QuantizerStrategy {
             Self::Grayscale => GrayscaleQuantizer.quantize(frame, settings, cancellation),
             Self::MostUsed => MostUsedQuantizer.quantize(frame, settings, cancellation),
             Self::Octree => OctreeQuantizer.quantize(frame, settings, cancellation),
+            Self::Wu => WuQuantizer.quantize(frame, settings, cancellation),
             Self::NeuQuant => NeuQuantQuantizer.quantize(frame, settings, cancellation),
             Self::WebSafe216 => predefined_strategy_quantizer(PredefinedPalette::WebSafe216)?
                 .quantize(frame, settings, cancellation),
@@ -995,6 +1346,7 @@ impl FrameQuantizer for QuantizerStrategy {
                 MostUsedQuantizer.build_global_palette(frames, settings, cancellation)
             }
             Self::Octree => OctreeQuantizer.build_global_palette(frames, settings, cancellation),
+            Self::Wu => WuQuantizer.build_global_palette(frames, settings, cancellation),
             Self::NeuQuant => {
                 NeuQuantQuantizer.build_global_palette(frames, settings, cancellation)
             }
@@ -1057,7 +1409,7 @@ fn build_rgb_histogram(
                 continue;
             }
             let index = histogram_index(pixel[0], pixel[1], pixel[2]);
-            histogram[index].add(pixel[0], pixel[1], pixel[2]);
+            histogram[index].add(pixel[0], pixel[1], pixel[2])?;
         }
     }
     Ok((histogram, has_transparency))
@@ -1815,11 +2167,12 @@ mod tests {
 
     use super::*;
 
-    const STRATEGIES: [QuantizerStrategy; 5] = [
+    const STRATEGIES: [QuantizerStrategy; 6] = [
         QuantizerStrategy::MedianCut,
         QuantizerStrategy::Grayscale,
         QuantizerStrategy::MostUsed,
         QuantizerStrategy::Octree,
+        QuantizerStrategy::Wu,
         QuantizerStrategy::NeuQuant,
     ];
 
@@ -1908,7 +2261,7 @@ mod tests {
             let green =
                 ((((index / HISTOGRAM_CHANNEL_SIZE) % HISTOGRAM_CHANNEL_SIZE) << 3) | 4) as u8;
             let blue = (((index % HISTOGRAM_CHANNEL_SIZE) << 3) | 4) as u8;
-            bin.add(red, green, blue);
+            bin.add(red, green, blue).unwrap();
         }
         histogram
     }
@@ -2388,6 +2741,204 @@ mod tests {
             Err(QuantizationError::Cancelled)
         ));
         assert!(reduction_cancellation.checks.load(Ordering::Relaxed) >= 4);
+    }
+
+    #[test]
+    fn wu_prefix_boundaries_include_each_histogram_bin_exactly_once() {
+        let mut histogram = vec![HistogramBin::default(); HISTOGRAM_LEN];
+        histogram[histogram_cell(0, 0, 0)].add(1, 2, 3).unwrap();
+        histogram[histogram_cell(1, 0, 0)].add(9, 10, 11).unwrap();
+        histogram[histogram_cell(31, 31, 31)]
+            .add(255, 254, 253)
+            .unwrap();
+        let moments = build_wu_moments(&histogram, &NeverCancel).unwrap();
+        assert_eq!(moments.len(), WU_MOMENT_LEN);
+
+        let first_red_bin = WuCube {
+            red_min: 0,
+            red_max: 1,
+            green_min: 0,
+            green_max: 1,
+            blue_min: 0,
+            blue_max: 1,
+        };
+        assert_eq!(
+            wu_volume(&moments, first_red_bin).unwrap().weight,
+            1,
+            "lower-exclusive/upper-inclusive moment coordinates are off by one"
+        );
+        let first_two_red_bins = WuCube {
+            red_max: 2,
+            ..first_red_bin
+        };
+        assert_eq!(wu_volume(&moments, first_two_red_bins).unwrap().weight, 2);
+        let total = wu_volume(&moments, WuCube::FULL).unwrap();
+        assert_eq!(total.weight, 3);
+        assert_eq!(total.red, 265);
+        assert_eq!(total.green, 266);
+        assert_eq!(total.blue, 267);
+        assert_eq!(
+            total.squared,
+            1 + 4 + 9 + 81 + 100 + 121 + 65_025 + 64_516 + 64_009
+        );
+    }
+
+    #[test]
+    fn wu_split_ties_use_box_then_rgb_axis_then_ascending_cut() {
+        let mut histogram = vec![HistogramBin::default(); HISTOGRAM_LEN];
+        for red in [0, 255] {
+            for green in [0, 255] {
+                for blue in [0, 255] {
+                    histogram[histogram_index(red, green, blue)]
+                        .add(red, green, blue)
+                        .unwrap();
+                }
+            }
+        }
+        let moments = build_wu_moments(&histogram, &NeverCancel).unwrap();
+        let split = best_wu_split(&[WuCube::FULL, WuCube::FULL], &moments, &NeverCancel)
+            .unwrap()
+            .unwrap();
+        assert_eq!(split.cube_index, 0);
+        assert_eq!(split.left.red_max, 1);
+        assert_eq!(split.left.green_max, HISTOGRAM_CHANNEL_SIZE as u8);
+        assert_eq!(split.left.blue_max, HISTOGRAM_CHANNEL_SIZE as u8);
+    }
+
+    #[test]
+    fn wu_palette_is_golden_stable_and_reserves_transparency_zero() {
+        let first_frame = frame_from_pixels(&[
+            [10, 20, 240, 255],
+            [10, 240, 20, 255],
+            [240, 10, 20, 255],
+            [240, 240, 10, 255],
+            [250, 250, 250, 0],
+        ]);
+        let second_frame = frame_from_pixels(&[
+            [20, 30, 250, 255],
+            [20, 250, 30, 255],
+            [250, 20, 30, 255],
+            [250, 250, 20, 255],
+        ]);
+        let forward = WuQuantizer
+            .build_global_palette(
+                &[first_frame.clone(), second_frame.clone()],
+                settings(5),
+                &NeverCancel,
+            )
+            .unwrap();
+        let reversed = WuQuantizer
+            .build_global_palette(&[second_frame, first_frame], settings(5), &NeverCancel)
+            .unwrap();
+        assert_eq!(forward, reversed);
+        assert_eq!(forward.transparent_index(), Some(0));
+        assert_eq!(
+            palette_entries(&forward),
+            vec![
+                [0, 0, 0],
+                [15, 25, 245],
+                [15, 245, 25],
+                [245, 15, 25],
+                [245, 245, 15],
+            ]
+        );
+    }
+
+    #[test]
+    fn wu_photo_corpus_has_bounded_error_and_independent_palette() {
+        let frames = [photo_like_frame(0), photo_like_frame(1)];
+        let settings = settings(32);
+        let wu = WuQuantizer
+            .build_global_palette(&frames, settings, &NeverCancel)
+            .unwrap();
+        let repeated = WuQuantizer
+            .build_global_palette(&frames, settings, &NeverCancel)
+            .unwrap();
+        assert_eq!(wu, repeated);
+        assert!(wu.color_count() <= 32);
+
+        let median = MedianCutQuantizer
+            .build_global_palette(&frames, settings, &NeverCancel)
+            .unwrap();
+        let octree = OctreeQuantizer
+            .build_global_palette(&frames, settings, &NeverCancel)
+            .unwrap();
+        assert_ne!(palette_entries(&wu), palette_entries(&median));
+        assert_ne!(palette_entries(&wu), palette_entries(&octree));
+
+        let palette = palette_entries(&wu);
+        let mut squared_error = 0_u64;
+        let mut channels = 0_u64;
+        for frame in &frames {
+            let indices =
+                map_frame_to_palette(frame, &wu, None, DitherMode::None, &NeverCancel).unwrap();
+            for (pixel, index) in frame.pixels().as_chunks::<4>().0.iter().zip(indices) {
+                let color = palette[usize::from(index)];
+                for channel in 0..3 {
+                    let error = i64::from(pixel[channel]) - i64::from(color[channel]);
+                    squared_error += u64::try_from(error * error).unwrap();
+                    channels += 1;
+                }
+            }
+        }
+        let mean_squared_channel_error = squared_error / channels;
+        assert!(
+            mean_squared_channel_error <= 700,
+            "Wu color corpus MSE was {mean_squared_channel_error}"
+        );
+    }
+
+    #[test]
+    fn wu_memory_bound_empty_single_color_and_overflow_are_explicit() {
+        assert_eq!(WU_MOMENT_LEN, 33 * 33 * 33);
+        assert!(std::mem::size_of::<WuMoment>() * WU_MOMENT_LEN < 2 * 1024 * 1024);
+
+        let empty = WuQuantizer
+            .build_global_palette(&[], settings(2), &NeverCancel)
+            .unwrap();
+        assert_eq!(empty.color_count(), 2);
+        let single = frame_from_pixels(&[[12, 34, 56, 255]; 4]);
+        let palette = WuQuantizer
+            .build_global_palette(&[single], settings(256), &NeverCancel)
+            .unwrap();
+        assert_eq!(palette.color_count(), 2);
+        assert!(palette_entries(&palette).contains(&[12, 34, 56]));
+
+        let maximum = make_wu_palette(&complete_octree_histogram(), 256, &NeverCancel).unwrap();
+        assert_eq!(maximum.len(), 256);
+
+        let mut overflowing = HistogramBin {
+            count: u64::MAX,
+            ..HistogramBin::default()
+        };
+        assert!(matches!(
+            overflowing.add(1, 2, 3),
+            Err(QuantizationError::InvalidPalette(message)) if message.contains("overflowed")
+        ));
+        assert_eq!(
+            overflowing,
+            HistogramBin {
+                count: u64::MAX,
+                ..HistogramBin::default()
+            }
+        );
+    }
+
+    #[test]
+    fn wu_checks_cancellation_during_moments_and_split_search() {
+        let histogram = complete_octree_histogram();
+        let during_moments = CancelAfterChecks::new(2);
+        assert!(matches!(
+            build_wu_moments(&histogram, &during_moments),
+            Err(QuantizationError::Cancelled)
+        ));
+
+        let moments = build_wu_moments(&histogram, &NeverCancel).unwrap();
+        let during_split = CancelAfterChecks::new(0);
+        assert!(matches!(
+            best_wu_split(&[WuCube::FULL], &moments, &during_split),
+            Err(QuantizationError::Cancelled)
+        ));
     }
 
     #[test]

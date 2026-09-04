@@ -64,6 +64,11 @@ fn quantizer_roundtrip(strategy: QuantizerStrategy) {
             transparency: Transparency::AlphaThreshold(128),
             palette_mode,
             quantizer: strategy,
+            dither: if strategy == QuantizerStrategy::Wu {
+                DitherMode::FloydSteinberg
+            } else {
+                DitherMode::None
+            },
             ..EncodeOptions::default()
         };
         let mut first_bytes = Vec::new();
@@ -133,6 +138,11 @@ fn most_used_roundtrips_with_local_and_global_palettes() {
 #[test]
 fn octree_roundtrips_with_local_and_global_palettes() {
     quantizer_roundtrip(QuantizerStrategy::Octree);
+}
+
+#[test]
+fn wu_roundtrips_local_global_dither_and_transparency() {
+    quantizer_roundtrip(QuantizerStrategy::Wu);
 }
 
 #[test]

@@ -9,8 +9,8 @@ Implemented now:
 - exact duplicate-frame merging;
 - once, finite, and infinite loop behavior;
 - deterministic local or memory-bounded global palettes with 2–256 entries;
-- selectable Median Cut, Grayscale, Most Used, Octree, and NeuQuant built-in
-  quantizers;
+- selectable Median Cut, Grayscale, Most Used, Octree, Wu, and NeuQuant
+  built-in quantizers;
 - custom fixed palettes plus Web Safe 216, monochrome, and Windows 16 presets;
 - no dithering, ordered Bayer 4x4, Floyd-Steinberg, Atkinson, Burkes,
   Sierra Lite, Two-row Sierra, full three-row Sierra, Jarvis–Judice–Ninke,
@@ -59,10 +59,16 @@ prioritizes frequent colors and resolves ties lexicographically. `Octree` builds
 a fixed-depth RGB tree from the bounded 5-bit/channel histogram, collapses the
 least-populated deepest nodes with Morton-path tie-breaking, and emits frontier
 leaves in Morton order. A complete tree is capped at 37,449 nodes, independent
-of input dimensions or frame count. All five strategies work with
-`PaletteMode::LocalPerFrame` and `PaletteMode::Global`, reserve transparency
-inside the requested color count, and honor cooperative cancellation. Supplying
-a custom `FrameQuantizer` through `BuiltinGifEncoder::new` overrides the option.
+of input dimensions or frame count. `Wu` builds population, RGB, and
+squared-error integral moments on a fixed 33×33×33 lattice, then repeatedly
+applies the cut with the greatest reduction in within-box variance. Exact ties
+retain box order, then RGB axis order, then the lowest cut. Its shared
+32³ histogram plus moment lattice use under 3 MiB regardless of input dimensions
+or frame count, and accumulator overflow is reported rather than saturated. All
+six learned strategies work with `PaletteMode::LocalPerFrame` and
+`PaletteMode::Global`, reserve transparency inside the requested color count,
+and honor cooperative cancellation. Supplying a custom `FrameQuantizer` through
+`BuiltinGifEncoder::new` overrides the option.
 
 `NeuQuant` trains the permissively licensed `color_quant` implementation on an
 even deterministic sample capped at 65,536 opaque pixels. Training always uses
@@ -98,7 +104,6 @@ public palette definition.
 replaceable. Additional palette/optimization implementations can therefore be
 added behind the same application port:
 
-- Wu quantization;
 - more aggressive transparent-rectangle and disposal optimization;
 - lossy similar-frame merging.
 

@@ -2,10 +2,10 @@
 //!
 //! The public port deals only in owned, full-canvas, straight-alpha sRGB RGBA8
 //! frames. The built-in adapter supports deterministic median-cut, grayscale,
-//! most-used-color, bounded octree, and bounded-sample NeuQuant quantizers with
-//! local or global palettes, plus validated custom and predefined fixed
-//! palettes through [`FixedPaletteQuantizer`]. Palette mapping includes ordered
-//! Bayer and Floyd-Steinberg, Atkinson, Burkes, and Sierra-family,
+//! most-used-color, bounded octree, variance-minimizing Wu, and bounded-sample
+//! NeuQuant quantizers with local or global palettes, plus validated custom and
+//! predefined fixed palettes through [`FixedPaletteQuantizer`]. Palette mapping
+//! includes ordered Bayer and Floyd-Steinberg, Atkinson, Burkes, and Sierra-family,
 //! Jarvis–Judice–Ninke, Stucki, and Stevenson–Arce error diffusion through
 //! [`DitherMode`]. More sophisticated palette and delta-frame pipelines can be
 //! added without exposing the underlying `gif` crate.
@@ -33,7 +33,7 @@ pub use frame::{DirtyRect, RgbaFrame};
 pub use quantize::{
     ColorPalette, DitherMode, FixedPaletteQuantizer, FrameQuantizer, GrayscaleQuantizer,
     IndexedFrame, MedianCutQuantizer, MostUsedQuantizer, NeuQuantQuantizer, OctreeQuantizer,
-    PredefinedPalette, QuantizationSettings, QuantizerStrategy,
+    PredefinedPalette, QuantizationSettings, QuantizerStrategy, WuQuantizer,
 };
 pub use source::{IteratorFrameSource, RgbaFrameSource};
 pub use timing::{GIF_TICK_US, GifTimingQuantizer};
