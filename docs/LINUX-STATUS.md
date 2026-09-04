@@ -16,6 +16,11 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Move and resize the recorder frame before capture; keep its border and controls outside the GIF.
 - [x] Move the fixed-size X11 capture area during countdown, recording, or pause without restarting the session.
 - [x] Start, pause, resume, stop-and-save, and discard from the recorder frame.
+- [x] Persist stopped recordings as recoverable editable projects instead of flattening them immediately.
+- [x] Edit frame selection, ordering, deletion, and variable delays in a virtualized timeline.
+- [x] Render the current frame preview and export all or selected frames through a cancellable background GIF job.
+- [x] Reopen existing projects with journal-recovery and asset-integrity reporting.
+- [x] Import animated GIF files into editable projects with bounded decoding.
 
 ## Delivery gates
 
@@ -27,26 +32,26 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [ ] Bounded queue and dropped-frame timing compensation.
 - [ ] Long-recording frame-store benchmark.
 - [x] Initial GIF timing, loop, transparency, delta and disposal round-trip corpus.
-- [ ] 50,000-frame virtualized timeline prototype.
+- [x] 50,000-frame virtualized timeline prototype.
 
 ### M1 — usable alpha
 
 - [x] X11 monitor, window, and region recorder.
 - [x] Countdown; record, pause, resume, stop, and discard are complete.
 - [ ] Project autosave and crash recovery.
-- [ ] Filmstrip selection, delete, reorder, reverse, delays, undo/redo.
+- [x] Filmstrip selection, delete, reorder, reverse, delays, undo/redo.
 - [ ] Crop and resize.
-- [ ] GIF colors, loop, duration, duplicate merge, progress, cancellation.
+- [x] GIF colors, loop, duration, duplicate merge, progress, cancellation.
 - [ ] Flatpak and AppImage preview packages.
 
 ### M2 — editor parity
 
-- [ ] Window capture and capture-only-changes.
+- [x] Window capture and capture-only-changes.
 - [ ] Manual and periodic snapshots.
 - [ ] Duplicate removal, frame reduction, Yoyo, delay scaling.
 - [ ] Text, title, drawing, shapes, watermark, border, shadow, privacy effects.
 - [ ] Fade and slide transitions.
-- [ ] Palette, dithering, transparency, and delta-frame controls.
+- [x] Palette, dithering, transparency, and delta-frame controls.
 - [ ] Image/GIF import, clipboard history, presets, and statistics.
 
 ### M3 — complete content sources
