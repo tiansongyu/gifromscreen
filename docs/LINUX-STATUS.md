@@ -35,6 +35,11 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Show overflow-safe timing, selection, canvas, and asset statistics.
 - [x] Route dropped project, GIF, PNG, JPEG, BMP, and WebP paths into background jobs.
 - [x] Create, replace, remove, preview-render, and GIF-export Fade/Slide transitions.
+- [x] Create transparent or solid blank animations from a bounded desktop form.
+- [x] Import ordered static-image sequences with timing, loop, reordering, and multi-file drop controls.
+- [x] Retain, select, remove, and clear a bounded multi-entry frame clipboard history.
+- [x] Preview and export timed raster, shape, and pressure-drawing overlays through one compositor.
+- [x] Add bounded Wu quantization and deterministic Dotted, Blue Noise, and Interleaved Noise dithering.
 
 ## Delivery gates
 
@@ -63,12 +68,14 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Window capture and capture-only-changes.
 - [ ] Manual and periodic snapshots.
 - [x] Duplicate removal, frame reduction, Yoyo, and delay scaling.
-- [ ] Text, title, drawing, shapes, watermark, border, shadow, privacy effects.
+- [ ] Text/title and authoring UI for drawing, shapes, and raster watermarks.
+- [x] Border, shadow, blur, pixelate, darken, and lighten frame effects.
+- [x] Raster watermark, shape, and pressure-drawing preview/export rendering.
 - [x] Fade and slide transitions.
 - [x] Palette, dithering, transparency, and delta-frame controls.
 - [x] PNG/JPEG/BMP/WebP/GIF import.
-- [x] Single-slot frame clipboard and project statistics.
-- [ ] Multi-entry clipboard history and reusable presets.
+- [x] Bounded multi-entry frame clipboard history and project statistics.
+- [ ] Reusable editing/export presets.
 
 ### M3 — complete content sources
 
