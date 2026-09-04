@@ -2,6 +2,7 @@
 
 //! Desktop entry point for the Linux-first `GifFromScreen` application.
 
+mod blank_project_job;
 mod countdown;
 mod editor_preview;
 mod editor_ui;
