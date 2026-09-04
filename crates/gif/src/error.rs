@@ -66,6 +66,21 @@ pub enum QuantizationError {
     #[error("quantizer produced palette index {index} for a {colors}-color palette")]
     PaletteIndexOutOfBounds { index: u8, colors: usize },
 
+    /// A fixed palette cannot be truncated to satisfy the encoder color limit.
+    #[error(
+        "fixed palette contains {palette_colors} colors, above the configured maximum of {max_colors}"
+    )]
+    FixedPaletteExceedsColorLimit {
+        /// Number of entries in the caller-supplied palette.
+        palette_colors: usize,
+        /// Maximum entries allowed by the current encoding options.
+        max_colors: u16,
+    },
+
+    /// Transparent pixels or disposal require a designated fixed entry.
+    #[error("fixed palette has no transparent entry required by the frame or disposal policy")]
+    FixedPaletteMissingTransparency,
+
     #[error("the selected quantizer does not support {0}")]
     Unsupported(String),
 }

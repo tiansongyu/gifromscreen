@@ -1,9 +1,9 @@
 use std::io::Cursor;
 
 use gif_from_screen_gif::{
-    BuiltinGifEncoder, CancellationFlag, DeltaMode, EncodeOptions, EncodePhase, EncodeProgress,
-    GifEncodeError, GifEncoder, IteratorFrameSource, LoopBehavior, PaletteMode, QuantizerStrategy,
-    RgbaFrame, Transparency,
+    BuiltinGifEncoder, CancellationFlag, DeltaMode, DitherMode, EncodeOptions, EncodePhase,
+    EncodeProgress, FixedPaletteQuantizer, GifEncodeError, GifEncoder, IteratorFrameSource,
+    LoopBehavior, PaletteMode, QuantizationError, QuantizerStrategy, RgbaFrame, Transparency,
 };
 
 fn solid_frame(color: [u8; 4], duration_us: u64) -> RgbaFrame {
@@ -138,6 +138,84 @@ fn octree_roundtrips_with_local_and_global_palettes() {
 #[test]
 fn neuquant_roundtrips_with_local_and_global_palettes() {
     quantizer_roundtrip(QuantizerStrategy::NeuQuant);
+}
+
+#[test]
+fn fixed_palette_roundtrips_local_global_bayer_and_floyd() {
+    let mut first_pixels = [128, 128, 128, 255].repeat(64);
+    first_pixels[3] = 0;
+    let mut second_pixels = [160, 160, 160, 255].repeat(64);
+    second_pixels[7] = 0;
+    let frames = [
+        RgbaFrame::new(8, 8, first_pixels, 10_000).unwrap(),
+        RgbaFrame::new(8, 8, second_pixels, 20_000).unwrap(),
+    ];
+
+    for palette_mode in [PaletteMode::LocalPerFrame, PaletteMode::Global] {
+        for dither in [DitherMode::Bayer4x4, DitherMode::FloydSteinberg] {
+            let options = EncodeOptions {
+                max_colors: 3,
+                merge_duplicate_frames: false,
+                transparency: Transparency::AlphaThreshold(128),
+                palette_mode,
+                dither,
+                ..EncodeOptions::default()
+            };
+            let quantizer =
+                FixedPaletteQuantizer::new(vec![0, 0, 0, 0, 0, 0, 255, 255, 255], Some(0)).unwrap();
+            let mut bytes = Vec::new();
+            BuiltinGifEncoder::new(Box::new(quantizer))
+                .encode_frames(frames.clone(), &mut bytes, &options)
+                .unwrap();
+
+            let mut indexed = gif::DecodeOptions::new()
+                .read_info(Cursor::new(&bytes))
+                .unwrap();
+            if palette_mode == PaletteMode::Global {
+                assert!(indexed.global_palette().is_some());
+            }
+            while let Some(frame) = indexed.read_next_frame().unwrap() {
+                assert_eq!(
+                    frame.palette.is_some(),
+                    palette_mode == PaletteMode::LocalPerFrame
+                );
+                assert_eq!(frame.transparent, Some(0));
+            }
+
+            let mut rgba_options = gif::DecodeOptions::new();
+            rgba_options.set_color_output(gif::ColorOutput::RGBA);
+            let mut rgba = rgba_options.read_info(Cursor::new(bytes)).unwrap();
+            assert_eq!(rgba.read_next_frame().unwrap().unwrap().buffer[3], 0);
+            assert_eq!(rgba.read_next_frame().unwrap().unwrap().buffer[7], 0);
+        }
+    }
+}
+
+#[test]
+fn fixed_palette_encoder_rejects_max_color_conflict() {
+    for palette_mode in [PaletteMode::LocalPerFrame, PaletteMode::Global] {
+        let quantizer =
+            FixedPaletteQuantizer::new(vec![0, 0, 0, 128, 128, 128, 255, 255, 255], None).unwrap();
+        let options = EncodeOptions {
+            max_colors: 2,
+            palette_mode,
+            ..EncodeOptions::default()
+        };
+        let mut bytes = Vec::new();
+        assert!(matches!(
+            BuiltinGifEncoder::new(Box::new(quantizer)).encode_frames(
+                [solid_frame([128, 128, 128, 255], 10_000)],
+                &mut bytes,
+                &options,
+            ),
+            Err(GifEncodeError::Quantization(
+                QuantizationError::FixedPaletteExceedsColorLimit {
+                    palette_colors: 3,
+                    max_colors: 2,
+                }
+            ))
+        ));
+    }
 }
 
 #[test]

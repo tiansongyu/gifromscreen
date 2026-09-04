@@ -11,6 +11,7 @@ Implemented now:
 - deterministic local or memory-bounded global palettes with 2–256 entries;
 - selectable Median Cut, Grayscale, Most Used, Octree, and NeuQuant built-in
   quantizers;
+- custom fixed palettes plus Web Safe 216, monochrome, and Windows 16 presets;
 - no dithering, ordered Bayer 4x4, Floyd-Steinberg, Atkinson, Burkes,
   Sierra Lite, Two-row Sierra, full three-row Sierra, Jarvis–Judice–Ninke,
   Stucki, and Stevenson–Arce strategies;
@@ -71,11 +72,32 @@ tie-breaking. Transparent pixels never enter the network and index zero remains
 reserved exclusively for transparency. Global source-frame buffering remains
 governed by `EncodeOptions::global_palette_buffer_limit_bytes`.
 
+Fixed palettes bypass palette learning while retaining the same nearest-color,
+ordered-dither, and error-diffusion mapping pipeline:
+
+```rust
+use gif_from_screen_gif::{BuiltinGifEncoder, FixedPaletteQuantizer, PredefinedPalette};
+
+let monochrome = FixedPaletteQuantizer::from_predefined(PredefinedPalette::Monochrome);
+let encoder = BuiltinGifEncoder::new(Box::new(monochrome));
+# let _ = encoder;
+```
+
+`FixedPaletteQuantizer::new` accepts 2–256 tightly packed RGB entries and an
+optional existing transparent index. Predefined palettes can prepend a
+transparent entry with `from_predefined_with_transparency`. That entry is never
+used for opaque pixels, even when an opaque entry has identical RGB values.
+Local and global modes return the same fixed palette. If a frame needs
+transparency but none is designated, or `EncodeOptions::max_colors` is smaller
+than the fixed palette, encoding fails explicitly and never truncates colors.
+`WebSafe216` uses the six channel levels 00/33/66/99/CC/FF in RGB order;
+`Windows16` uses the conventional Windows/HTML 16-color ordering encoded in the
+public palette definition.
+
 `RgbaFrame` carries an optional dirty rectangle and `FrameQuantizer` remains
 replaceable. Additional palette/optimization implementations can therefore be
 added behind the same application port:
 
-- fixed and custom palette planners;
 - Wu quantization;
 - more aggressive transparent-rectangle and disposal optimization;
 - lossy similar-frame merging.

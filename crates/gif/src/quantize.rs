@@ -108,6 +108,161 @@ impl ColorPalette {
     }
 }
 
+/// Built-in fixed RGB palettes with publicly documented definitions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PredefinedPalette {
+    /// The 216-color web-safe cube, ordered RGB with channel levels
+    /// `00`, `33`, `66`, `99`, `CC`, and `FF`.
+    WebSafe216,
+    /// Two-color black (`#000000`) and white (`#FFFFFF`).
+    Monochrome,
+    /// The classic 16-color Windows/HTML palette in conventional index order.
+    Windows16,
+}
+
+impl PredefinedPalette {
+    /// Returns the number of RGB entries in this palette.
+    pub const fn color_count(self) -> usize {
+        match self {
+            Self::WebSafe216 => 216,
+            Self::Monochrome => 2,
+            Self::Windows16 => 16,
+        }
+    }
+
+    /// Materializes tightly packed RGB entries in stable palette order.
+    pub fn colors(self) -> Vec<u8> {
+        match self {
+            Self::WebSafe216 => {
+                const LEVELS: [u8; 6] = [0x00, 0x33, 0x66, 0x99, 0xcc, 0xff];
+                let mut colors = Vec::with_capacity(self.color_count() * 3);
+                for red in LEVELS {
+                    for green in LEVELS {
+                        for blue in LEVELS {
+                            colors.extend_from_slice(&[red, green, blue]);
+                        }
+                    }
+                }
+                colors
+            }
+            Self::Monochrome => vec![0, 0, 0, 255, 255, 255],
+            Self::Windows16 => vec![
+                0x00, 0x00, 0x00, // black
+                0x80, 0x00, 0x00, // maroon
+                0x00, 0x80, 0x00, // green
+                0x80, 0x80, 0x00, // olive
+                0x00, 0x00, 0x80, // navy
+                0x80, 0x00, 0x80, // purple
+                0x00, 0x80, 0x80, // teal
+                0xc0, 0xc0, 0xc0, // silver
+                0x80, 0x80, 0x80, // gray
+                0xff, 0x00, 0x00, // red
+                0x00, 0xff, 0x00, // lime
+                0xff, 0xff, 0x00, // yellow
+                0x00, 0x00, 0xff, // blue
+                0xff, 0x00, 0xff, // fuchsia
+                0x00, 0xff, 0xff, // aqua
+                0xff, 0xff, 0xff, // white
+            ],
+        }
+    }
+}
+
+/// Quantizer that maps every frame to one immutable caller-selected palette.
+///
+/// A designated transparent entry stays in the returned palette for every
+/// local and global frame, even when a particular frame is opaque. Opaque
+/// pixels never map to that entry. If transparency is required but no entry is
+/// designated, quantization fails explicitly. Likewise, a palette larger than
+/// [`QuantizationSettings::max_colors`] is rejected rather than truncated.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FixedPaletteQuantizer {
+    palette: ColorPalette,
+}
+
+impl FixedPaletteQuantizer {
+    /// Validates and constructs a custom tightly packed RGB palette.
+    ///
+    /// `transparent_index` designates an existing entry; duplicate RGB values
+    /// are allowed because an opaque entry may intentionally share its visible
+    /// color with the transparent entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QuantizationError`] unless there are 2–256 complete RGB
+    /// entries and the optional transparent index is in range.
+    pub fn new(colors: Vec<u8>, transparent_index: Option<u8>) -> Result<Self, QuantizationError> {
+        Ok(Self {
+            palette: ColorPalette::new(colors, transparent_index)?,
+        })
+    }
+
+    /// Creates an opaque built-in palette.
+    pub fn from_predefined(predefined: PredefinedPalette) -> Self {
+        Self {
+            palette: ColorPalette {
+                colors: predefined.colors(),
+                transparent_index: None,
+            },
+        }
+    }
+
+    /// Prepends a designated transparent color to a built-in palette.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QuantizationError`] if adding the entry would exceed GIF's
+    /// 256-color limit.
+    pub fn from_predefined_with_transparency(
+        predefined: PredefinedPalette,
+        transparent_rgb: [u8; 3],
+    ) -> Result<Self, QuantizationError> {
+        let mut colors = Vec::with_capacity((predefined.color_count() + 1) * 3);
+        colors.extend_from_slice(&transparent_rgb);
+        colors.extend_from_slice(&predefined.colors());
+        Self::new(colors, Some(0))
+    }
+
+    /// Borrows the immutable validated palette.
+    pub const fn palette(&self) -> &ColorPalette {
+        &self.palette
+    }
+
+    fn palette_for(
+        &self,
+        frames: &[RgbaFrame],
+        settings: QuantizationSettings,
+        cancellation: &dyn CancellationToken,
+    ) -> Result<ColorPalette, QuantizationError> {
+        validate_settings(settings)?;
+        check_now(cancellation)?;
+        if self.palette.color_count() > usize::from(settings.max_colors) {
+            return Err(QuantizationError::FixedPaletteExceedsColorLimit {
+                palette_colors: self.palette.color_count(),
+                max_colors: settings.max_colors,
+            });
+        }
+        if self.palette.transparent_index.is_none() {
+            if settings.reserve_transparency {
+                return Err(QuantizationError::FixedPaletteMissingTransparency);
+            }
+            let mut visited = 0_usize;
+            for frame in frames {
+                for pixel in frame.pixels().as_chunks::<4>().0 {
+                    check_cancellation(visited, cancellation)?;
+                    visited = visited.wrapping_add(1);
+                    if is_transparent(pixel[3], settings.alpha_threshold) {
+                        return Err(QuantizationError::FixedPaletteMissingTransparency);
+                    }
+                }
+            }
+        }
+        check_now(cancellation)?;
+        Ok(self.palette.clone())
+    }
+}
+
 /// Palette and index data ready for a GIF frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexedFrame {
@@ -771,6 +926,26 @@ impl FrameQuantizer for NeuQuantQuantizer {
         cancellation: &dyn CancellationToken,
     ) -> Result<ColorPalette, QuantizationError> {
         make_neuquant_palette(frames, settings, cancellation)
+    }
+}
+
+impl FrameQuantizer for FixedPaletteQuantizer {
+    fn quantize(
+        &self,
+        frame: &RgbaFrame,
+        settings: QuantizationSettings,
+        cancellation: &dyn CancellationToken,
+    ) -> Result<IndexedFrame, QuantizationError> {
+        quantize_frame(self, frame, settings, cancellation)
+    }
+
+    fn build_global_palette(
+        &self,
+        frames: &[RgbaFrame],
+        settings: QuantizationSettings,
+        cancellation: &dyn CancellationToken,
+    ) -> Result<ColorPalette, QuantizationError> {
+        self.palette_for(frames, settings, cancellation)
     }
 }
 
@@ -1911,6 +2086,150 @@ mod tests {
             palette_entries(&first),
             vec![[0, 0, 0], [255, 0, 0], [0, 255, 0]]
         );
+    }
+
+    #[test]
+    fn predefined_palettes_match_their_public_color_definitions() {
+        assert_eq!(
+            PredefinedPalette::Monochrome.colors(),
+            [0, 0, 0, 255, 255, 255]
+        );
+        assert_eq!(
+            PredefinedPalette::Windows16.colors(),
+            [
+                0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x80, 0x80, 0x00, 0x00, 0x00,
+                0x80, 0x80, 0x00, 0x80, 0x00, 0x80, 0x80, 0xc0, 0xc0, 0xc0, 0x80, 0x80, 0x80, 0xff,
+                0x00, 0x00, 0x00, 0xff, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0xff,
+                0x00, 0xff, 0xff, 0xff, 0xff, 0xff,
+            ]
+        );
+        let web_safe = PredefinedPalette::WebSafe216.colors();
+        assert_eq!(web_safe.len(), 216 * 3);
+        assert_eq!(&web_safe[0..3], &[0x00, 0x00, 0x00]);
+        assert_eq!(&web_safe[3..6], &[0x00, 0x00, 0x33]);
+        assert_eq!(&web_safe[18..21], &[0x00, 0x33, 0x00]);
+        assert_eq!(&web_safe[108..111], &[0x33, 0x00, 0x00]);
+        assert_eq!(&web_safe[645..648], &[0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn fixed_palette_constructor_strictly_validates_entries_and_transparency() {
+        assert!(matches!(
+            FixedPaletteQuantizer::new(vec![0, 0, 0], None),
+            Err(QuantizationError::InvalidPalette(_))
+        ));
+        assert!(matches!(
+            FixedPaletteQuantizer::new(vec![0; 7], None),
+            Err(QuantizationError::InvalidPalette(_))
+        ));
+        assert!(matches!(
+            FixedPaletteQuantizer::new(vec![0; 257 * 3], None),
+            Err(QuantizationError::InvalidPalette(_))
+        ));
+        assert_eq!(
+            FixedPaletteQuantizer::new(vec![0, 0, 0, 255, 255, 255], Some(2)),
+            Err(QuantizationError::PaletteIndexOutOfBounds {
+                index: 2,
+                colors: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn fixed_palette_keeps_transparent_and_identical_opaque_entries_distinct() {
+        let quantizer = FixedPaletteQuantizer::new(
+            vec![
+                0, 0, 0, // transparent black
+                0, 0, 0, // opaque black
+                255, 255, 255,
+            ],
+            Some(0),
+        )
+        .unwrap();
+        let frame = frame_from_pixels(&[[77, 88, 99, 0], [0, 0, 0, 255], [255, 255, 255, 255]]);
+        let indexed = quantizer
+            .quantize(&frame, settings(3), &NeverCancel)
+            .unwrap();
+        assert_eq!(indexed.palette(), quantizer.palette().colors());
+        assert_eq!(indexed.transparent_index(), Some(0));
+        assert_eq!(indexed.indices(), [0, 1, 2]);
+        assert_eq!(
+            quantizer
+                .build_global_palette(&[frame], settings(3), &NeverCancel)
+                .unwrap(),
+            quantizer.palette().clone()
+        );
+    }
+
+    #[test]
+    fn fixed_palette_rejects_limit_conflicts_and_missing_transparency() {
+        let windows = FixedPaletteQuantizer::from_predefined(PredefinedPalette::Windows16);
+        let opaque = frame_from_pixels(&[[12, 34, 56, 255]]);
+        assert_eq!(
+            windows.build_global_palette(&[opaque], settings(15), &NeverCancel),
+            Err(QuantizationError::FixedPaletteExceedsColorLimit {
+                palette_colors: 16,
+                max_colors: 15,
+            })
+        );
+
+        let monochrome = FixedPaletteQuantizer::from_predefined(PredefinedPalette::Monochrome);
+        let transparent = frame_from_pixels(&[[1, 2, 3, 0]]);
+        assert_eq!(
+            monochrome.quantize(&transparent, settings(2), &NeverCancel),
+            Err(QuantizationError::FixedPaletteMissingTransparency)
+        );
+        let mut reserved = settings(2);
+        reserved.reserve_transparency = true;
+        assert_eq!(
+            monochrome.build_global_palette(&[], reserved, &NeverCancel),
+            Err(QuantizationError::FixedPaletteMissingTransparency)
+        );
+    }
+
+    #[test]
+    fn fixed_palette_uses_existing_ordered_and_error_diffusion_mappers() {
+        let quantizer = FixedPaletteQuantizer::from_predefined(PredefinedPalette::Monochrome);
+        let frame = RgbaFrame::new(8, 8, [128, 128, 128, 255].repeat(64), 10_000).unwrap();
+        let none = map_frame_to_palette(
+            &frame,
+            quantizer.palette(),
+            None,
+            DitherMode::None,
+            &NeverCancel,
+        )
+        .unwrap();
+        for dither in [DitherMode::Bayer4x4, DitherMode::FloydSteinberg] {
+            let mapped =
+                map_frame_to_palette(&frame, quantizer.palette(), None, dither, &NeverCancel)
+                    .unwrap();
+            assert!(mapped.contains(&0) && mapped.contains(&1));
+            assert_ne!(mapped, none);
+        }
+    }
+
+    #[test]
+    fn fixed_palette_honors_cancellation() {
+        let quantizer = FixedPaletteQuantizer::from_predefined(PredefinedPalette::Monochrome);
+        let cancellation = CancellationFlag::default();
+        cancellation.cancel();
+        let frame = frame_from_pixels(&[[128, 128, 128, 255]]);
+        assert_eq!(
+            quantizer.quantize(&frame, settings(2), &cancellation),
+            Err(QuantizationError::Cancelled)
+        );
+        assert_eq!(
+            quantizer.build_global_palette(&[frame], settings(2), &cancellation),
+            Err(QuantizationError::Cancelled)
+        );
+
+        let large = RgbaFrame::new(128, 64, [128, 128, 128, 255].repeat(8_192), 10_000).unwrap();
+        let during_scan = CancelAfterChecks::new(2);
+        assert_eq!(
+            quantizer.build_global_palette(&[large], settings(2), &during_scan),
+            Err(QuantizationError::Cancelled)
+        );
+        assert!(during_scan.checks.load(Ordering::Relaxed) >= 3);
     }
 
     #[test]
