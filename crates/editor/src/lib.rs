@@ -11,6 +11,7 @@ use thiserror::Error;
 
 mod clip_transform;
 mod duplicates;
+mod frame_clipboard;
 mod frame_effect;
 mod frame_selection;
 mod selection;
@@ -21,6 +22,10 @@ pub use clip_transform::{ClipTransformEdit, edit_clip_transforms};
 pub use duplicates::{
     DuplicateDelayMode, DuplicateFrameRetention, FrameComparison, FrameSimilarityProvider,
     RemoveDuplicateFramesOptions, remove_duplicate_frames,
+};
+pub use frame_clipboard::{
+    CutFrameSelection, FrameClipboard, MAX_FRAME_CLIPBOARD_FRAMES, copy_selected_frames,
+    cut_selected_frames, paste_frame_clipboard,
 };
 pub use frame_effect::{FrameEffectEdit, MAX_FRAME_EFFECT_BLUR_RADIUS, edit_frame_effects};
 pub use frame_selection::{
@@ -773,6 +778,26 @@ pub enum EditorError {
     /// An internal selection transformation produced a different item count.
     #[error("selection transformation changed the number of selected frames")]
     SelectionCardinalityMismatch,
+    /// A single application clipboard snapshot exceeded its explicit frame limit.
+    #[error("frame clipboard selected {selected} frames; maximum is {maximum}")]
+    FrameClipboardTooLarge {
+        /// Number of selected frames requested for Copy/Cut.
+        selected: usize,
+        /// Maximum clips retained by one clipboard snapshot.
+        maximum: usize,
+    },
+    /// Cutting the selection would remove every frame from the timeline.
+    #[error("cannot cut all {frame_count} timeline frames")]
+    CutWouldEmptyTimeline {
+        /// Current timeline frame count, all of which were selected.
+        frame_count: usize,
+    },
+    /// Paste requires a previously copied non-empty frame snapshot.
+    #[error("frame clipboard is empty")]
+    EmptyFrameClipboard,
+    /// The requested current-frame insertion anchor is stale.
+    #[error("paste anchor frame {0} does not exist")]
+    UnknownPasteAnchor(FrameId),
     /// A Yoyo range needs enough frames to produce a meaningful reverse leg.
     #[error(
         "yoyo requires at least {minimum_frames} frame(s) for these endpoint settings, got {actual_frames}"

@@ -12,13 +12,14 @@ use gif_from_screen_domain::{
     DurationUs, EditCommand, Effect, FrameId, PhysicalRect, PhysicalSize, ProjectManifest, TimeUs,
 };
 use gif_from_screen_editor::{
-    ClipTransformEdit, DuplicateDelayMode, DuplicateFrameRetention, EditorError, FrameComparison,
-    FrameEffectEdit, FrameSimilarityProvider, FrameTimeRangeError, ReduceDelayMode, ReduceOptions,
-    RemoveDuplicateFramesOptions, TimelineSelection, TimelineSelectionError, YoyoOptions,
-    YoyoScope, adjust_duration, delete_frames, delete_frames_after, delete_frames_before,
+    ClipTransformEdit, DuplicateDelayMode, DuplicateFrameRetention, EditorError, FrameClipboard,
+    FrameComparison, FrameEffectEdit, FrameSimilarityProvider, FrameTimeRangeError,
+    ReduceDelayMode, ReduceOptions, RemoveDuplicateFramesOptions, TimelineSelection,
+    TimelineSelectionError, YoyoOptions, YoyoScope, adjust_duration, copy_selected_frames,
+    cut_selected_frames, delete_frames, delete_frames_after, delete_frames_before,
     edit_clip_transforms, edit_frame_effects, move_selected_left, move_selected_right,
-    override_duration, reduce_frames, remove_duplicate_frames, reverse_selected, scale_duration,
-    select_frames_by_time_range, yoyo_frames,
+    override_duration, paste_frame_clipboard, reduce_frames, remove_duplicate_frames,
+    reverse_selected, scale_duration, select_frames_by_time_range, yoyo_frames,
 };
 use gif_from_screen_project::{
     ActiveProject, AssetIssue, JournalRecoveryReport, LockPolicy, OpenedProject, ProjectError,
@@ -48,6 +49,7 @@ pub(crate) struct EditorWorkspace {
     dirty: bool,
     journal_recovery: Option<JournalRecoveryReport>,
     asset_issues: Vec<AssetIssue>,
+    clipboard: Option<FrameClipboard>,
 }
 
 impl EditorWorkspace {
@@ -113,6 +115,7 @@ impl EditorWorkspace {
             dirty: false,
             journal_recovery: None,
             asset_issues: Vec::new(),
+            clipboard: None,
         })
     }
 
@@ -182,6 +185,11 @@ impl EditorWorkspace {
     /// Returns the configured maximum number of undo and redo entries.
     pub(crate) const fn history_limit(&self) -> usize {
         self.history_limit
+    }
+
+    /// Returns the frame count in the single bounded application clipboard.
+    pub(crate) fn clipboard_len(&self) -> usize {
+        self.clipboard.as_ref().map_or(0, FrameClipboard::len)
     }
 
     /// Selects only `frame_id`.
@@ -337,6 +345,42 @@ impl EditorWorkspace {
         let selected = self.selected_frame_ids()?;
         let command = delete_frames_atomically(self.project.manifest(), selected);
         self.execute(command)
+    }
+
+    /// Copies the current selection without changing project revision or history.
+    pub(crate) fn copy_selection(&mut self) -> Result<usize, EditorWorkspaceError> {
+        let selected = self.selected_frame_ids()?;
+        let clipboard = copy_selected_frames(self.project.manifest(), selected)?;
+        let count = clipboard.len();
+        self.clipboard = Some(clipboard);
+        Ok(count)
+    }
+
+    /// Atomically cuts the selection and installs its clipboard only after commit succeeds.
+    pub(crate) fn cut_selection(&mut self) -> Result<usize, EditorWorkspaceError> {
+        let selected = self.selected_frame_ids()?;
+        let cut = cut_selected_frames(self.project.manifest(), selected)?;
+        let count = cut.clipboard.len();
+        self.execute(cut.command)?;
+        self.clipboard = Some(cut.clipboard);
+        Ok(count)
+    }
+
+    /// Pastes fresh-ID clones after current frame, or at the end with no current frame.
+    pub(crate) fn paste_after_current(&mut self) -> Result<usize, EditorWorkspaceError> {
+        let clipboard = self
+            .clipboard
+            .as_ref()
+            .ok_or(EditorWorkspaceError::EmptyClipboard)?;
+        let count = clipboard.len();
+        let command = paste_frame_clipboard(
+            self.project.manifest(),
+            clipboard,
+            self.selection.current(),
+            || FrameId::from_u128(Uuid::new_v4().as_u128()),
+        )?;
+        self.execute(command)?;
+        Ok(count)
     }
 
     /// Deletes every frame before the earliest selected frame.
@@ -824,6 +868,9 @@ pub(crate) enum EditorWorkspaceError {
         /// Maximum frames accepted by one synchronous scan.
         maximum: usize,
     },
+    /// Paste was requested before a successful Copy or Cut.
+    #[error("application frame clipboard is empty; copy or cut frames first")]
+    EmptyClipboard,
     /// Session history must retain at least one entry.
     #[error("editor history limit must be greater than zero")]
     ZeroHistoryLimit,
@@ -1688,5 +1735,84 @@ mod tests {
         assert!(reopened.journal_recovery().unwrap().is_clean());
         assert_eq!(durations(&reopened), [100]);
         assert_eq!(reopened.asset_issues(), asset_issues);
+    }
+
+    #[test]
+    fn copy_paste_is_bounded_journaled_undoable_and_reopenable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = create_workspace(&directory, &[10, 20, 30, 40], 8);
+        workspace.select_only(frame_id(2)).unwrap();
+        workspace.toggle_selection(frame_id(3)).unwrap();
+        let revision = workspace.manifest().revision;
+
+        assert_eq!(workspace.copy_selection().unwrap(), 2);
+        assert_eq!(workspace.clipboard_len(), 2);
+        assert_eq!(workspace.manifest().revision, revision);
+        assert!(!workspace.can_undo());
+
+        workspace.select_only(frame_id(1)).unwrap();
+        assert_eq!(workspace.paste_after_current().unwrap(), 2);
+        assert_eq!(workspace.manifest().timeline.frames.len(), 6);
+        let pasted_ids = [
+            workspace.manifest().timeline.frames[1].id,
+            workspace.manifest().timeline.frames[2].id,
+        ];
+        assert!(!pasted_ids.contains(&frame_id(2)));
+        assert!(!pasted_ids.contains(&frame_id(3)));
+        assert_eq!(workspace.clipboard_len(), 2);
+        assert!(workspace.undo().unwrap());
+        assert_eq!(order(&workspace), [1, 2, 3, 4]);
+        assert!(workspace.redo().unwrap());
+        assert_eq!(workspace.manifest().timeline.frames[1].id, pasted_ids[0]);
+        assert_eq!(workspace.manifest().timeline.frames[2].id, pasted_ids[1]);
+        drop(workspace);
+
+        let reopened =
+            EditorWorkspace::open(directory.path(), LockPolicy::FailIfPresent, 8).unwrap();
+        assert_eq!(reopened.manifest().timeline.frames.len(), 6);
+        assert_eq!(reopened.manifest().timeline.frames[1].id, pasted_ids[0]);
+        assert_eq!(reopened.clipboard_len(), 0);
+    }
+
+    #[test]
+    fn cut_and_failed_copy_replace_clipboard_only_after_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = create_workspace(&directory, &[10, 20, 30, 40], 8);
+        workspace.select_only(frame_id(1)).unwrap();
+        workspace.copy_selection().unwrap();
+        assert_eq!(workspace.clipboard_len(), 1);
+
+        workspace.select_only(frame_id(2)).unwrap();
+        workspace.toggle_selection(frame_id(3)).unwrap();
+        assert_eq!(workspace.cut_selection().unwrap(), 2);
+        assert_eq!(workspace.clipboard_len(), 2);
+        assert_eq!(order(&workspace), [1, 4]);
+        assert!(workspace.undo().unwrap());
+        assert_eq!(order(&workspace), [1, 2, 3, 4]);
+
+        workspace.select_all();
+        assert!(matches!(
+            workspace.cut_selection(),
+            Err(EditorWorkspaceError::Editor(
+                EditorError::CutWouldEmptyTimeline { .. }
+            ))
+        ));
+        assert_eq!(workspace.clipboard_len(), 2);
+        workspace.clear_selection();
+        assert!(workspace.copy_selection().is_err());
+        assert_eq!(workspace.clipboard_len(), 2);
+    }
+
+    #[test]
+    fn paste_without_clipboard_is_friendly_and_does_not_create_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = create_workspace(&directory, &[10], 4);
+
+        assert!(matches!(
+            workspace.paste_after_current(),
+            Err(EditorWorkspaceError::EmptyClipboard)
+        ));
+        assert!(!workspace.is_dirty());
+        assert!(!workspace.can_undo());
     }
 }

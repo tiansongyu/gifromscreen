@@ -208,6 +208,9 @@ pub(crate) enum EditorUiOperation {
     PlaybackStep,
     Undo,
     Redo,
+    Cut,
+    Copy,
+    Paste,
     DeleteSelection,
     DeleteBeforeSelection,
     DeleteAfterSelection,
@@ -244,6 +247,10 @@ pub(crate) enum EditorUiAction {
     Project(EditorUiOperation),
     Playback {
         playing: bool,
+    },
+    Clipboard {
+        operation: EditorUiOperation,
+        frames: usize,
     },
     Notice {
         operation: EditorUiOperation,
@@ -300,6 +307,7 @@ fn show_editor_summary(ui: &mut egui::Ui, workspace: &EditorWorkspace) {
             workspace.manifest().timeline.frames.len()
         ));
         ui.label(format!("{} selected", workspace.selection().len()));
+        ui.label(format!("Clipboard: {} frame(s)", workspace.clipboard_len()));
         if workspace.is_dirty() {
             ui.strong("Journaled · checkpoint pending");
         }
@@ -636,6 +644,37 @@ fn show_edit_toolbar(
                 results,
                 EditorUiOperation::Redo,
                 false,
+            );
+        }
+        if ui.button("Cut").clicked() {
+            let result = workspace.cut_selection().map(|_| ());
+            record_project_result(
+                workspace,
+                state,
+                now,
+                results,
+                EditorUiOperation::Cut,
+                result,
+            );
+        }
+        if ui.button("Copy").clicked() {
+            match workspace.copy_selection() {
+                Ok(frames) => results.push(Ok(EditorUiAction::Clipboard {
+                    operation: EditorUiOperation::Copy,
+                    frames,
+                })),
+                Err(error) => push_failure(results, EditorUiOperation::Copy, error),
+            }
+        }
+        if ui.button("Paste").clicked() {
+            let result = workspace.paste_after_current().map(|_| ());
+            record_project_result(
+                workspace,
+                state,
+                now,
+                results,
+                EditorUiOperation::Paste,
+                result,
             );
         }
         if ui.button("Delete").clicked() {
