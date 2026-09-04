@@ -8,6 +8,7 @@ mod project_export;
 mod recording_project;
 mod rgba_project;
 mod static_image_project;
+mod static_image_sequence_project;
 
 pub use blank_project::{
     BLANK_ANIMATION_PRESET_NAME, BlankAnimationProjectOptions, CreateBlankAnimationError,
@@ -31,6 +32,10 @@ pub use recording_project::{
 pub use static_image_project::{
     IMPORTED_STATIC_IMAGE_PRESET_NAME, PersistStaticImageError, StaticImageProjectOptions,
     persist_decoded_static_image,
+};
+pub use static_image_sequence_project::{
+    IMPORTED_STATIC_SEQUENCE_PRESET_NAME, PersistStaticImageSequenceError,
+    StaticImageSequenceProjectOptions, persist_decoded_static_image_sequence,
 };
 
 use thiserror::Error;

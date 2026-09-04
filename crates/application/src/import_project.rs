@@ -253,7 +253,7 @@ const fn map_loop_behavior(loop_behavior: LoopBehavior) -> GifLoop {
     }
 }
 
-fn map_persist_error(error: PersistRgbaProjectError) -> PersistDecodedAnimationError {
+pub(crate) fn map_persist_error(error: PersistRgbaProjectError) -> PersistDecodedAnimationError {
     match error {
         PersistRgbaProjectError::EmptyFrames => PersistDecodedAnimationError::EmptyAnimation,
         PersistRgbaProjectError::InsufficientFrameIds { required, provided } => {
