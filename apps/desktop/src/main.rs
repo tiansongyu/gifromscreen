@@ -6,6 +6,7 @@ mod blank_project_job;
 mod blank_project_ui;
 mod capture_source_job;
 mod countdown;
+mod custom_palette_input;
 mod editor_preview;
 mod editor_ui;
 mod editor_workspace;
@@ -37,6 +38,7 @@ use blank_project_ui::{
 };
 use capture_source_job::{CaptureSourceJob, CaptureSourceJobState};
 use countdown::{CountdownStart, CountdownTick, MAX_COUNTDOWN_SECONDS, RecordingCountdown};
+use custom_palette_input::parse_custom_palette;
 use editor_preview::EditorPreviewCache;
 use editor_ui::{EditorUiAction, EditorUiResult, EditorUiState, show_editor_ui};
 use editor_workspace::EditorWorkspace;
@@ -305,12 +307,14 @@ enum ExportQuantizerChoice {
     #[default]
     MedianCut,
     Octree,
+    Wu,
     Grayscale,
     MostUsed,
     NeuQuant,
     WebSafe216,
     Monochrome,
     Windows16,
+    Custom,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -318,6 +322,9 @@ enum ExportDitherChoice {
     #[default]
     None,
     Bayer,
+    Dotted,
+    BlueNoise,
+    InterleavedNoise,
     FloydSteinberg,
     Atkinson,
     Burkes,
@@ -342,6 +349,9 @@ struct EditorExportSettings {
     max_colors: u16,
     palette: ExportPaletteChoice,
     quantizer: ExportQuantizerChoice,
+    custom_palette_text: String,
+    custom_transparency_enabled: bool,
+    custom_transparent_index: u16,
     dither: ExportDitherChoice,
     delta: bool,
     alpha_threshold: u8,
@@ -357,6 +367,9 @@ impl Default for EditorExportSettings {
             max_colors: 256,
             palette: ExportPaletteChoice::Local,
             quantizer: ExportQuantizerChoice::MedianCut,
+            custom_palette_text: "#000000\n#FFFFFF".to_owned(),
+            custom_transparency_enabled: false,
+            custom_transparent_index: 0,
             dither: ExportDitherChoice::None,
             delta: false,
             alpha_threshold: 1,
@@ -2885,12 +2898,14 @@ fn show_export_configuration(
                         for choice in [
                             ExportQuantizerChoice::MedianCut,
                             ExportQuantizerChoice::Octree,
+                            ExportQuantizerChoice::Wu,
                             ExportQuantizerChoice::Grayscale,
                             ExportQuantizerChoice::MostUsed,
                             ExportQuantizerChoice::NeuQuant,
                             ExportQuantizerChoice::WebSafe216,
                             ExportQuantizerChoice::Monochrome,
                             ExportQuantizerChoice::Windows16,
+                            ExportQuantizerChoice::Custom,
                         ] {
                             ui.selectable_value(
                                 &mut settings.quantizer,
@@ -2907,6 +2922,41 @@ fn show_export_configuration(
             });
             ui.end_row();
 
+            if settings.quantizer == ExportQuantizerChoice::Custom {
+                ui.label("Custom colors");
+                ui.vertical(|ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut settings.custom_palette_text)
+                            .code_editor()
+                            .desired_rows(4)
+                            .desired_width(430.0)
+                            .hint_text("#000000, #FFFFFF"),
+                    );
+                    ui.weak(
+                        "2..=256 strict #RRGGBB entries separated by commas or whitespace; count must not exceed Maximum colors.",
+                    );
+                });
+                ui.end_row();
+
+                ui.label("Custom transparency");
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(
+                            &mut settings.custom_transparency_enabled,
+                            "Use transparent palette index",
+                        );
+                        ui.add_enabled(
+                            settings.custom_transparency_enabled,
+                            egui::DragValue::new(&mut settings.custom_transparent_index)
+                                .range(0..=u16::from(u8::MAX)),
+                        );
+                        ui.weak("zero-based");
+                    });
+                    ui.weak("Required when rendered pixels cross the alpha threshold.");
+                });
+                ui.end_row();
+            }
+
             ui.label("Dither");
             egui::ComboBox::from_id_salt("editor_export_dither")
                 .selected_text(export_dither_label(settings.dither))
@@ -2914,6 +2964,9 @@ fn show_export_configuration(
                     for choice in [
                         ExportDitherChoice::None,
                         ExportDitherChoice::Bayer,
+                        ExportDitherChoice::Dotted,
+                        ExportDitherChoice::BlueNoise,
+                        ExportDitherChoice::InterleavedNoise,
                         ExportDitherChoice::FloydSteinberg,
                         ExportDitherChoice::Atkinson,
                         ExportDitherChoice::Burkes,
@@ -2970,12 +3023,14 @@ const fn export_quantizer_label(choice: ExportQuantizerChoice) -> &'static str {
     match choice {
         ExportQuantizerChoice::MedianCut => "Median cut",
         ExportQuantizerChoice::Octree => "Octree",
+        ExportQuantizerChoice::Wu => "Wu variance",
         ExportQuantizerChoice::Grayscale => "Grayscale",
         ExportQuantizerChoice::MostUsed => "Most used",
         ExportQuantizerChoice::NeuQuant => "NeuQuant",
         ExportQuantizerChoice::WebSafe216 => "Web safe 216 (fixed)",
         ExportQuantizerChoice::Monochrome => "Monochrome (fixed)",
         ExportQuantizerChoice::Windows16 => "Windows 16 (fixed)",
+        ExportQuantizerChoice::Custom => "Custom palette",
     }
 }
 
@@ -2983,6 +3038,9 @@ const fn export_dither_label(choice: ExportDitherChoice) -> &'static str {
     match choice {
         ExportDitherChoice::None => "None",
         ExportDitherChoice::Bayer => "Bayer 4×4",
+        ExportDitherChoice::Dotted => "Dotted halftone",
+        ExportDitherChoice::BlueNoise => "Blue noise",
+        ExportDitherChoice::InterleavedNoise => "Interleaved gradient noise",
         ExportDitherChoice::FloydSteinberg => "Floyd–Steinberg",
         ExportDitherChoice::Atkinson => "Atkinson",
         ExportDitherChoice::Burkes => "Burkes",
@@ -3960,6 +4018,23 @@ fn build_project_export_options(
     if !(2..=256).contains(&settings.max_colors) {
         return Err("Maximum colors must be between 2 and 256.".to_owned());
     }
+    let custom_palette = if settings.quantizer == ExportQuantizerChoice::Custom {
+        let transparent_index = settings
+            .custom_transparency_enabled
+            .then_some(settings.custom_transparent_index);
+        let palette = parse_custom_palette(&settings.custom_palette_text, transparent_index)
+            .map_err(|error| format!("Invalid custom palette: {error}"))?;
+        if palette.color_count() > usize::from(settings.max_colors) {
+            return Err(format!(
+                "Custom palette contains {} colors, above Maximum colors {}.",
+                palette.color_count(),
+                settings.max_colors
+            ));
+        }
+        Some(palette)
+    } else {
+        None
+    };
     if let Some(required) = fixed_palette_required_colors(settings.quantizer)
         && settings.max_colors < required
     {
@@ -3975,8 +4050,13 @@ fn build_project_export_options(
         ExportPaletteChoice::Global => PaletteMode::Global,
     };
     let quantizer = match settings.quantizer {
-        ExportQuantizerChoice::MedianCut => QuantizerStrategy::MedianCut,
+        // A validated custom palette bypasses adaptive quantization. Keep a
+        // deterministic fallback in the encoder options for auditability.
+        ExportQuantizerChoice::MedianCut | ExportQuantizerChoice::Custom => {
+            QuantizerStrategy::MedianCut
+        }
         ExportQuantizerChoice::Octree => QuantizerStrategy::Octree,
+        ExportQuantizerChoice::Wu => QuantizerStrategy::Wu,
         ExportQuantizerChoice::Grayscale => QuantizerStrategy::Grayscale,
         ExportQuantizerChoice::MostUsed => QuantizerStrategy::MostUsed,
         ExportQuantizerChoice::NeuQuant => QuantizerStrategy::NeuQuant,
@@ -3987,6 +4067,9 @@ fn build_project_export_options(
     let dither = match settings.dither {
         ExportDitherChoice::None => DitherMode::None,
         ExportDitherChoice::Bayer => DitherMode::Bayer4x4,
+        ExportDitherChoice::Dotted => DitherMode::Dotted,
+        ExportDitherChoice::BlueNoise => DitherMode::BlueNoise,
+        ExportDitherChoice::InterleavedNoise => DitherMode::InterleavedNoise,
         ExportDitherChoice::FloydSteinberg => DitherMode::FloydSteinberg,
         ExportDitherChoice::Atkinson => DitherMode::Atkinson,
         ExportDitherChoice::Burkes => DitherMode::Burkes,
@@ -4003,6 +4086,7 @@ fn build_project_export_options(
     };
     Ok(ProjectGifExportOptions {
         frames,
+        custom_palette,
         encoding: EncodeOptions {
             max_colors: settings.max_colors,
             loop_behavior,
@@ -4029,9 +4113,11 @@ const fn fixed_palette_required_colors(choice: ExportQuantizerChoice) -> Option<
         ExportQuantizerChoice::Windows16 => Some(17),
         ExportQuantizerChoice::MedianCut
         | ExportQuantizerChoice::Octree
+        | ExportQuantizerChoice::Wu
         | ExportQuantizerChoice::Grayscale
         | ExportQuantizerChoice::MostUsed
-        | ExportQuantizerChoice::NeuQuant => None,
+        | ExportQuantizerChoice::NeuQuant
+        | ExportQuantizerChoice::Custom => None,
     }
 }
 
@@ -5392,6 +5478,9 @@ mod tests {
             max_colors: 128,
             palette: ExportPaletteChoice::Global,
             quantizer: ExportQuantizerChoice::Octree,
+            custom_palette_text: "#000000\n#FFFFFF".to_owned(),
+            custom_transparency_enabled: false,
+            custom_transparent_index: 0,
             dither: ExportDitherChoice::Sierra,
             delta: true,
             alpha_threshold: 42,
@@ -5415,7 +5504,10 @@ mod tests {
         );
         assert_eq!(options.encoding.loop_behavior, LoopBehavior::Finite(7));
         assert!(options.overwrite_existing);
+    }
 
+    #[test]
+    fn advanced_quantizer_and_dither_choices_map_to_encoder_strategies() {
         for (choice, expected) in [
             (
                 ExportQuantizerChoice::MedianCut,
@@ -5425,6 +5517,7 @@ mod tests {
                 ExportQuantizerChoice::Grayscale,
                 QuantizerStrategy::Grayscale,
             ),
+            (ExportQuantizerChoice::Wu, QuantizerStrategy::Wu),
             (ExportQuantizerChoice::MostUsed, QuantizerStrategy::MostUsed),
             (ExportQuantizerChoice::NeuQuant, QuantizerStrategy::NeuQuant),
             (
@@ -5453,6 +5546,12 @@ mod tests {
         for (choice, expected) in [
             (ExportDitherChoice::None, DitherMode::None),
             (ExportDitherChoice::Bayer, DitherMode::Bayer4x4),
+            (ExportDitherChoice::Dotted, DitherMode::Dotted),
+            (ExportDitherChoice::BlueNoise, DitherMode::BlueNoise),
+            (
+                ExportDitherChoice::InterleavedNoise,
+                DitherMode::InterleavedNoise,
+            ),
             (
                 ExportDitherChoice::FloydSteinberg,
                 DitherMode::FloydSteinberg,
@@ -5488,6 +5587,130 @@ mod tests {
         )
         .unwrap_err();
         assert!(fixed_limit_error.contains("at least 217 colors"));
+    }
+
+    #[test]
+    fn custom_palette_maps_modes_limits_transparency_and_packed_rgb() {
+        for (palette, expected_mode) in [
+            (ExportPaletteChoice::Local, PaletteMode::LocalPerFrame),
+            (ExportPaletteChoice::Global, PaletteMode::Global),
+        ] {
+            let custom = build_project_export_options(
+                &EditorExportSettings {
+                    max_colors: 3,
+                    palette,
+                    quantizer: ExportQuantizerChoice::Custom,
+                    custom_palette_text: "#000000, #A0b1C2\n#FFFFFF".to_owned(),
+                    custom_transparency_enabled: true,
+                    custom_transparent_index: 1,
+                    dither: ExportDitherChoice::BlueNoise,
+                    ..EditorExportSettings::default()
+                },
+                ProjectFrameSelection::All,
+            )
+            .unwrap();
+            let custom_palette = custom.custom_palette.unwrap();
+            assert_eq!(custom.encoding.palette_mode, expected_mode);
+            assert_eq!(custom.encoding.dither, DitherMode::BlueNoise);
+            assert_eq!(custom.encoding.max_colors, 3);
+            assert_eq!(custom_palette.color_count(), 3);
+            assert_eq!(
+                custom_palette.packed_rgb(),
+                [0, 0, 0, 0xA0, 0xB1, 0xC2, 255, 255, 255]
+            );
+            assert_eq!(custom_palette.transparent_index(), Some(1));
+        }
+
+        for settings in [
+            EditorExportSettings {
+                max_colors: 2,
+                quantizer: ExportQuantizerChoice::Custom,
+                custom_palette_text: "#000000 #808080 #FFFFFF".to_owned(),
+                ..EditorExportSettings::default()
+            },
+            EditorExportSettings {
+                quantizer: ExportQuantizerChoice::Custom,
+                custom_palette_text: "black, white".to_owned(),
+                ..EditorExportSettings::default()
+            },
+            EditorExportSettings {
+                quantizer: ExportQuantizerChoice::Custom,
+                custom_transparency_enabled: true,
+                custom_transparent_index: 2,
+                ..EditorExportSettings::default()
+            },
+        ] {
+            assert!(build_project_export_options(&settings, ProjectFrameSelection::All).is_err());
+        }
+
+        let ignored_custom_text = build_project_export_options(
+            &EditorExportSettings {
+                custom_palette_text: "invalid unless Custom is selected".to_owned(),
+                ..EditorExportSettings::default()
+            },
+            ProjectFrameSelection::All,
+        )
+        .unwrap();
+        assert!(ignored_custom_text.custom_palette.is_none());
+    }
+
+    #[test]
+    fn invalid_custom_palette_is_rejected_before_background_export_starts() {
+        let directory = tempdir().unwrap();
+        let project_root = directory.path().join("project.gfsproj");
+        let output = directory.path().join("invalid-custom.gif");
+        let project = single_frame_project(&project_root);
+        let mut app = GifFromScreenApp::default();
+        activate_editor(&mut app.view, &mut app.editor_workspace, project).unwrap();
+        app.settings.output = output.to_string_lossy().into_owned();
+        app.editor_export_settings.quantizer = ExportQuantizerChoice::Custom;
+        app.editor_export_settings.custom_palette_text = "#000000, not-a-color".to_owned();
+
+        let error = app.start_editor_export().unwrap_err();
+
+        assert!(error.contains("Invalid custom palette"));
+        assert_eq!(app.export_job.state(), ExportJobState::Idle);
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn valid_custom_palette_runs_through_background_export() {
+        let directory = tempdir().unwrap();
+        let project_root = directory.path().join("project.gfsproj");
+        let output = directory.path().join("custom.gif");
+        let project = single_frame_project(&project_root);
+        let mut app = GifFromScreenApp::default();
+        activate_editor(&mut app.view, &mut app.editor_workspace, project).unwrap();
+        app.settings.output = output.to_string_lossy().into_owned();
+        app.editor_export_settings = EditorExportSettings {
+            max_colors: 2,
+            palette: ExportPaletteChoice::Global,
+            quantizer: ExportQuantizerChoice::Custom,
+            custom_palette_text: "#000000 #0C2238".to_owned(),
+            dither: ExportDitherChoice::Dotted,
+            alpha_threshold: 0,
+            ..EditorExportSettings::default()
+        };
+
+        app.start_editor_export().unwrap();
+        assert_eq!(app.export_job.state(), ExportJobState::Running);
+        drain_export_job(&mut app);
+
+        assert!(output.is_file());
+        assert_eq!(app.export_job.state(), ExportJobState::Idle);
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("Exported 1 selected frame")
+        );
+        let decoded = gif_from_screen_media::decode_gif(
+            fs::File::open(&output).unwrap(),
+            &gif_from_screen_media::GifDecodeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(decoded.frames().len(), 1);
+        assert_eq!(decoded.frames()[0].rgba(), [12, 34, 56, 255]);
     }
 
     #[test]
@@ -5697,6 +5920,15 @@ mod tests {
         while app.blank_project_job.state() == BlankProjectJobState::Running {
             app.receive_blank_project_messages();
             assert!(Instant::now() < deadline, "blank-project job timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn drain_export_job(app: &mut GifFromScreenApp) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.export_job.state() != ExportJobState::Idle {
+            app.receive_export_messages();
+            assert!(Instant::now() < deadline, "GIF export job timed out");
             std::thread::sleep(Duration::from_millis(1));
         }
     }
