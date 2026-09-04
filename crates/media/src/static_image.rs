@@ -28,6 +28,18 @@ pub enum StaticImageFormat {
     WebP,
 }
 
+impl StaticImageFormat {
+    /// Canonical media type for source provenance, independent of filenames.
+    pub const fn media_type(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::Bmp => "image/bmp",
+            Self::WebP => "image/webp",
+        }
+    }
+}
+
 impl fmt::Display for StaticImageFormat {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -36,6 +48,30 @@ impl fmt::Display for StaticImageFormat {
             Self::Bmp => "BMP",
             Self::WebP => "WebP",
         })
+    }
+}
+
+/// A decoded one-frame animation together with its content-detected format.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecodedStaticImage {
+    format: StaticImageFormat,
+    animation: DecodedAnimation,
+}
+
+impl DecodedStaticImage {
+    /// Returns the format detected from the input signature.
+    pub const fn format(&self) -> StaticImageFormat {
+        self.format
+    }
+
+    /// Borrows the normalized one-frame animation.
+    pub const fn animation(&self) -> &DecodedAnimation {
+        &self.animation
+    }
+
+    /// Consumes the result and returns its normalized animation.
+    pub fn into_animation(self) -> DecodedAnimation {
+        self.animation
     }
 }
 
@@ -210,6 +246,23 @@ pub enum StaticImageDecodeError {
 
 /// Decodes one PNG, JPEG, BMP, or static WebP into a one-frame animation.
 ///
+/// This compatibility wrapper delegates once to
+/// [`decode_static_image_with_format`] and discards only the detected-format
+/// field; it never probes or decodes the stream a second time.
+///
+/// # Errors
+///
+/// Returns [`StaticImageDecodeError`] under the same conditions as
+/// [`decode_static_image_with_format`].
+pub fn decode_static_image<R: BufRead + Seek>(
+    reader: R,
+    options: &StaticImageDecodeOptions,
+) -> Result<DecodedAnimation, StaticImageDecodeError> {
+    decode_static_image_with_format(reader, options).map(DecodedStaticImage::into_animation)
+}
+
+/// Decodes a static raster and retains its content-detected format.
+///
 /// The function identifies content rather than trusting a filename. A header
 /// pass obtains dimensions, native decoded bytes, and EXIF orientation before
 /// full pixel decoding. Oriented dimensions, one-frame capacity, output pixel
@@ -229,10 +282,10 @@ pub enum StaticImageDecodeError {
 /// Returns [`StaticImageDecodeError`] for unidentified or disallowed formats,
 /// stream failures, malformed headers/pixels, unsupported codec features, or
 /// any configured dimension, frame, pixel, memory, or address-space limit.
-pub fn decode_static_image<R: BufRead + Seek>(
+pub fn decode_static_image_with_format<R: BufRead + Seek>(
     mut reader: R,
     options: &StaticImageDecodeOptions,
-) -> Result<DecodedAnimation, StaticImageDecodeError> {
+) -> Result<DecodedStaticImage, StaticImageDecodeError> {
     let start = reader
         .stream_position()
         .map_err(|source| StaticImageDecodeError::Io {
@@ -250,12 +303,7 @@ pub fn decode_static_image<R: BufRead + Seek>(
         .ok_or(StaticImageDecodeError::UnknownFormat)?;
     drop(guessed);
     let format = supported_format(image_format)?;
-    reader
-        .seek(SeekFrom::Start(start))
-        .map_err(|source| StaticImageDecodeError::Io {
-            operation: "rewind",
-            source,
-        })?;
+    rewind(&mut reader, start, "rewind")?;
 
     // The first decoder only parses metadata, but still receives strict edge
     // and allocation bounds because codec construction itself handles
@@ -283,12 +331,7 @@ pub fn decode_static_image<R: BufRead + Seek>(
         .map_err(|_| StaticImageDecodeError::AddressSpaceExceeded { bytes: rgba_bytes })?;
     drop(header_decoder);
 
-    reader
-        .seek(SeekFrom::Start(start))
-        .map_err(|source| StaticImageDecodeError::Io {
-            operation: "rewind after header inspection",
-            source,
-        })?;
+    rewind(&mut reader, start, "rewind after header inspection")?;
     let mut decode_reader = ImageReader::with_format(reader, image_format);
     let mut decoder_limits = Limits::default();
     decoder_limits.max_image_width = Some(raw_dimensions.0);
@@ -329,15 +372,29 @@ pub fn decode_static_image<R: BufRead + Seek>(
             actual: dimensions.1,
             limit: options.limits.max_height,
         })?;
-    Ok(DecodedAnimation {
-        width,
-        height,
-        frames: vec![DecodedFrame {
-            rgba,
-            duration_us: options.frame_duration_us.get(),
-        }],
-        loop_behavior: LoopBehavior::Once,
+    Ok(DecodedStaticImage {
+        format,
+        animation: DecodedAnimation {
+            width,
+            height,
+            frames: vec![DecodedFrame {
+                rgba,
+                duration_us: options.frame_duration_us.get(),
+            }],
+            loop_behavior: LoopBehavior::Once,
+        },
     })
+}
+
+fn rewind(
+    reader: &mut (impl Seek + ?Sized),
+    position: u64,
+    operation: &'static str,
+) -> Result<(), StaticImageDecodeError> {
+    reader
+        .seek(SeekFrom::Start(position))
+        .map(|_| ())
+        .map_err(|source| StaticImageDecodeError::Io { operation, source })
 }
 
 fn supported_format(format: ImageFormat) -> Result<StaticImageFormat, StaticImageDecodeError> {
@@ -519,6 +576,36 @@ mod tests {
         assert_eq!(decoded.frames().len(), 1);
         assert_eq!(decoded.frames()[0].duration_us(), 42_000);
         assert_eq!(decoded.frames()[0].rgba(), RGBA_FIXTURE);
+    }
+
+    #[test]
+    fn with_format_result_exposes_borrowed_and_owned_animation() {
+        let fixtures = [
+            (
+                StaticImageFormat::Png,
+                "image/png",
+                encode_rgba(ImageFormat::Png),
+            ),
+            (StaticImageFormat::Jpeg, "image/jpeg", encode_rgb_jpeg()),
+            (
+                StaticImageFormat::Bmp,
+                "image/bmp",
+                encode_rgba(ImageFormat::Bmp),
+            ),
+            (
+                StaticImageFormat::WebP,
+                "image/webp",
+                encode_rgba(ImageFormat::WebP),
+            ),
+        ];
+        for (expected_format, expected_media_type, bytes) in fixtures {
+            let decoded = decode_static_image_with_format(Cursor::new(bytes), &options()).unwrap();
+            assert_eq!(decoded.format(), expected_format);
+            assert_eq!(decoded.format().media_type(), expected_media_type);
+            assert_eq!(decoded.animation().frames().len(), 1);
+            let borrowed = decoded.animation().clone();
+            assert_eq!(decoded.into_animation(), borrowed);
+        }
     }
 
     #[test]

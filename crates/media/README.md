@@ -6,6 +6,7 @@ Implemented inputs:
 
 - animated GIF through `decode_gif`, composited into complete RGBA8 canvases;
 - static PNG, JPEG, BMP, and WebP through `decode_static_image`;
+- detected format plus decoded pixels through `decode_static_image_with_format`;
 - straight-alpha RGBA8 output with positive per-frame microsecond durations;
 - content-based format detection rather than filename extensions;
 - dimension, frame-count, retained-pixel, decoder-memory, and address-space
@@ -25,6 +26,14 @@ let options = StaticImageDecodeOptions::default();
 let result = decode_static_image(Cursor::new(png_bytes), &options);
 # let _ = result;
 ```
+
+Call `decode_static_image_with_format` when source provenance needs a reliable
+media type. Its `DecodedStaticImage::format()` value comes from the same content
+probe used for decoding, and `StaticImageFormat::media_type()` returns the
+canonical MIME string without consulting a filename. `animation()` borrows the
+normalized result and `into_animation()` consumes the wrapper. The original
+`decode_static_image` API remains a compatibility wrapper and does not repeat
+probing or decoding.
 
 The static decoder first identifies an allowlisted format and constructs a
 bounded header decoder. It validates the oriented dimensions, one-frame
