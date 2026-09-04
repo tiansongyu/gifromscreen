@@ -223,6 +223,9 @@ pub(crate) enum EditorUiOperation {
     AddEffect,
     ReplaceEffect,
     ClearEffects,
+    SaveCheckpoint,
+    SaveAndCompact,
+    RepairJournal,
     ApplyCrop,
     ClearCrop,
     Resize,
@@ -235,11 +238,17 @@ pub(crate) enum EditorUiOperation {
 }
 
 /// Successful state change emitted by [`show_editor_ui`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum EditorUiAction {
     Selection(EditorUiOperation),
     Project(EditorUiOperation),
-    Playback { playing: bool },
+    Playback {
+        playing: bool,
+    },
+    Notice {
+        operation: EditorUiOperation,
+        message: String,
+    },
 }
 
 /// Recoverable editor UI failure returned to the application shell.
@@ -267,6 +276,7 @@ pub(crate) fn show_editor_ui(
     advance_playback(ui.ctx(), workspace, state, now, &mut results);
 
     show_editor_summary(ui, workspace);
+    show_project_storage_toolbar(ui, workspace, &mut results);
     ui.separator();
     show_navigation_toolbar(ui, workspace, state, now, &mut results);
     show_selection_toolbar(ui, workspace, state, now, &mut results);
@@ -300,6 +310,52 @@ fn show_editor_summary(ui: &mut egui::Ui, workspace: &EditorWorkspace) {
             );
         }
     });
+}
+
+fn show_project_storage_toolbar(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    results: &mut Vec<EditorUiResult>,
+) {
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Save checkpoint").clicked() {
+            match workspace.checkpoint() {
+                Ok(()) => push_notice(
+                    results,
+                    EditorUiOperation::SaveCheckpoint,
+                    "Project manifest checkpoint saved.",
+                ),
+                Err(error) => push_failure(results, EditorUiOperation::SaveCheckpoint, error),
+            }
+        }
+        if ui.button("Save & compact").clicked() {
+            match workspace.checkpoint_and_compact() {
+                Ok(()) => push_notice(
+                    results,
+                    EditorUiOperation::SaveAndCompact,
+                    "Project checkpoint saved and journal compacted.",
+                ),
+                Err(error) => push_failure(results, EditorUiOperation::SaveAndCompact, error),
+            }
+        }
+        if workspace.journal_requires_repair() && ui.button("Repair journal").clicked() {
+            match workspace.repair_journal() {
+                Ok(preserved) => push_notice(
+                    results,
+                    EditorUiOperation::RepairJournal,
+                    repair_journal_notice(preserved.as_deref()),
+                ),
+                Err(error) => push_failure(results, EditorUiOperation::RepairJournal, error),
+            }
+        }
+    });
+}
+
+fn repair_journal_notice(preserved: Option<&std::path::Path>) -> String {
+    preserved.map_or_else(
+        || "Journal is already clean; no repair was needed.".to_owned(),
+        |path| format!("Rejected journal preserved at {}.", path.display()),
+    )
 }
 
 #[allow(
@@ -1650,6 +1706,17 @@ fn push_failure(
     }));
 }
 
+fn push_notice(
+    results: &mut Vec<EditorUiResult>,
+    operation: EditorUiOperation,
+    message: impl Into<String>,
+) {
+    results.push(Ok(EditorUiAction::Notice {
+        operation,
+        message: message.into(),
+    }));
+}
+
 fn current_frame_index(workspace: &EditorWorkspace) -> Option<usize> {
     let current = workspace.selection().current()?;
     workspace
@@ -1786,12 +1853,13 @@ mod tests {
     };
 
     use super::{
-        EditorUiOperation, EditorUiState, EffectChoice, FILMSTRIP_ITEM_WIDTH, OrientationControl,
-        PlaybackClock, build_effect, duplicate_delay_label, duplicate_retention_label,
-        effect_choice_label, frame_click_operation, orientation_operation, parse_crop,
-        parse_duration_us, parse_effect_index, parse_keep_every, parse_output_size,
-        parse_similarity_threshold, parse_time_ms, parse_time_range, reduce_delay_label,
-        to_ui_points, visible_widget_range, yoyo_scope_label,
+        EditorUiAction, EditorUiOperation, EditorUiState, EffectChoice, FILMSTRIP_ITEM_WIDTH,
+        OrientationControl, PlaybackClock, build_effect, duplicate_delay_label,
+        duplicate_retention_label, effect_choice_label, frame_click_operation,
+        orientation_operation, parse_crop, parse_duration_us, parse_effect_index, parse_keep_every,
+        parse_output_size, parse_similarity_threshold, parse_time_ms, parse_time_range,
+        push_notice, reduce_delay_label, repair_journal_notice, to_ui_points, visible_widget_range,
+        yoyo_scope_label,
     };
 
     #[test]
@@ -1977,6 +2045,27 @@ mod tests {
         assert!(build_effect(&state).is_err());
         state.effect_index_input = "0".to_owned();
         assert!(parse_effect_index(&state).is_err());
+    }
+
+    #[test]
+    fn repair_success_action_retains_the_preserved_journal_path() {
+        let path = std::path::Path::new("/tmp/project/journal.rejected-1.ndjson");
+        let message = repair_journal_notice(Some(path));
+        assert!(message.contains(path.to_string_lossy().as_ref()));
+        let mut results = Vec::new();
+        push_notice(
+            &mut results,
+            EditorUiOperation::RepairJournal,
+            message.clone(),
+        );
+        assert_eq!(
+            results,
+            [Ok(EditorUiAction::Notice {
+                operation: EditorUiOperation::RepairJournal,
+                message,
+            })]
+        );
+        assert!(repair_journal_notice(None).contains("already clean"));
     }
 
     #[test]

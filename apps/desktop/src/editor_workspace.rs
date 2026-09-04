@@ -3,7 +3,10 @@
     reason = "the persistent editor view-model precedes its egui integration"
 )]
 
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 use gif_from_screen_domain::{
     DurationUs, EditCommand, Effect, FrameId, PhysicalRect, PhysicalSize, ProjectManifest, TimeUs,
@@ -149,6 +152,13 @@ impl EditorWorkspace {
     /// A workspace created with [`Self::from_active`] has no opening report.
     pub(crate) const fn journal_recovery(&self) -> Option<&JournalRecoveryReport> {
         self.journal_recovery.as_ref()
+    }
+
+    /// Returns whether the opening report found a journal tail that must be repaired.
+    pub(crate) fn journal_requires_repair(&self) -> bool {
+        self.journal_recovery
+            .as_ref()
+            .is_some_and(|report| !report.is_clean())
     }
 
     /// Returns missing or length-mismatched assets discovered while opening.
@@ -575,10 +585,10 @@ impl EditorWorkspace {
     /// Atomically refreshes the manifest snapshot while retaining the journal and history.
     pub(crate) fn checkpoint(&mut self) -> Result<(), EditorWorkspaceError> {
         self.project.checkpoint()?;
-        self.dirty = self
-            .journal_recovery
-            .as_ref()
-            .is_some_and(|report| !report.is_clean());
+        self.dirty = self.journal_requires_repair();
+        if !self.dirty {
+            self.mark_recovery_clean(false);
+        }
         Ok(())
     }
 
@@ -586,7 +596,22 @@ impl EditorWorkspace {
     pub(crate) fn checkpoint_and_compact(&mut self) -> Result<(), EditorWorkspaceError> {
         self.project.checkpoint_and_compact()?;
         self.dirty = false;
+        self.mark_recovery_clean(true);
         Ok(())
+    }
+
+    /// Preserves and replaces a rejected journal tail, returning its forensic backup path.
+    ///
+    /// A clean project returns `None` without changing dirty state or history. Successful repair
+    /// checkpoints the recovered manifest, restores project writability, marks recovery clean, and
+    /// leaves asset issues and undo/redo history untouched.
+    pub(crate) fn repair_journal(&mut self) -> Result<Option<PathBuf>, EditorWorkspaceError> {
+        let preserved = self.project.repair_journal()?;
+        if preserved.is_some() {
+            self.dirty = false;
+            self.mark_recovery_clean(true);
+        }
+        Ok(preserved)
     }
 
     fn selected_frame_ids(&self) -> Result<Vec<FrameId>, EditorWorkspaceError> {
@@ -627,6 +652,23 @@ impl EditorWorkspace {
         let selected = self.selected_frame_ids()?;
         let command = edit_frame_effects(self.project.manifest(), selected, edit)?;
         self.execute(command)
+    }
+
+    fn mark_recovery_clean(&mut self, journal_compacted: bool) {
+        let revision = self.project.manifest().revision;
+        if let Some(report) = &mut self.journal_recovery {
+            report.snapshot_revision = revision;
+            report.recovered_revision = revision;
+            report.already_snapshotted_records = if journal_compacted {
+                0
+            } else {
+                report
+                    .already_snapshotted_records
+                    .saturating_add(report.replayed_records)
+            };
+            report.replayed_records = 0;
+            report.stop_reason = None;
+        }
     }
 }
 
@@ -789,7 +831,7 @@ pub(crate) enum EditorWorkspaceError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, io::Write};
 
     use gif_from_screen_domain::{
         AssetDescriptor, AssetId, AssetKind, Canvas, CanvasBackground, CaptureMetadata,
@@ -1574,5 +1616,77 @@ mod tests {
         )
         .unwrap();
         assert_eq!(&reopened_render.pixels()[..4], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn clean_save_and_repair_noop_preserve_undo_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = create_workspace(&directory, &[100], 8);
+        workspace.select_only(frame_id(1)).unwrap();
+        workspace.adjust_selection_duration(20).unwrap();
+        assert!(workspace.is_dirty());
+        assert!(workspace.can_undo());
+
+        assert_eq!(workspace.repair_journal().unwrap(), None);
+        assert!(workspace.is_dirty());
+        assert!(workspace.can_undo());
+        workspace.checkpoint().unwrap();
+        assert!(!workspace.is_dirty());
+        assert!(workspace.can_undo());
+        assert!(workspace.undo().unwrap());
+        assert_eq!(durations(&workspace), [100]);
+        assert!(workspace.is_dirty());
+        workspace.checkpoint_and_compact().unwrap();
+        assert!(!workspace.is_dirty());
+        assert!(!workspace.can_undo());
+        assert!(workspace.can_redo());
+    }
+
+    #[test]
+    fn invalid_tail_repair_preserves_forensics_assets_and_restores_editability() {
+        let directory = tempfile::tempdir().unwrap();
+        drop(ActiveProject::create(directory.path(), manifest(&[100])).unwrap());
+        let journal = directory.path().join("journal.ndjson");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap();
+        file.write_all(b"{torn-journal\n").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let opened = ActiveProject::open(directory.path(), LockPolicy::FailIfPresent).unwrap();
+        assert!(!opened.journal_recovery.is_clean());
+        let mut workspace = EditorWorkspace::from_opened(opened, 8).unwrap();
+        let asset_issues = workspace.asset_issues().to_vec();
+        assert!(workspace.journal_requires_repair());
+        assert!(workspace.is_dirty());
+
+        let preserved = workspace.repair_journal().unwrap().unwrap();
+        assert!(preserved.is_file());
+        assert!(
+            std::fs::read(&preserved)
+                .unwrap()
+                .windows(b"{torn-journal".len())
+                .any(|window| window == b"{torn-journal")
+        );
+        assert!(!workspace.journal_requires_repair());
+        assert!(!workspace.is_dirty());
+        assert_eq!(workspace.asset_issues(), asset_issues);
+        let recovery = workspace.journal_recovery().unwrap();
+        assert!(recovery.is_clean());
+        assert_eq!(recovery.snapshot_revision, workspace.manifest().revision);
+        assert_eq!(recovery.replayed_records, 0);
+
+        workspace.select_first().unwrap();
+        workspace.adjust_selection_duration(20).unwrap();
+        assert!(workspace.undo().unwrap());
+        assert_eq!(durations(&workspace), [100]);
+        drop(workspace);
+
+        let reopened =
+            EditorWorkspace::open(directory.path(), LockPolicy::FailIfPresent, 8).unwrap();
+        assert!(reopened.journal_recovery().unwrap().is_clean());
+        assert_eq!(durations(&reopened), [100]);
+        assert_eq!(reopened.asset_issues(), asset_issues);
     }
 }
