@@ -19,7 +19,7 @@ gif-from-screen-capture = { path = "../capture" }
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.13", optional = true }
 pipewire = { version = "0.10", optional = true }
-x11rb = { version = "0.14", optional = true, features = ["randr"] }
+x11rb = { version = "0.14", optional = true, features = ["randr", "xfixes"] }
 
 [lints]
 workspace = true

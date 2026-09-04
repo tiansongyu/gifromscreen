@@ -3,6 +3,8 @@ use gif_from_screen_capture::{
     CaptureErrorKind, CaptureRequest, CaptureSession, CaptureSource, CaptureTarget, CapturedFrame,
     RecoveryHint,
 };
+#[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
+use gif_from_screen_capture::{CursorMetadata, PhysicalPosition, PhysicalRect};
 
 #[cfg(all(target_os = "linux", feature = "native-x11"))]
 mod native {
@@ -16,10 +18,11 @@ mod native {
 
     use gif_from_screen_capture::{
         CapabilityStatus, CaptureCadence, CaptureSessionState, CaptureSourceId, CaptureSourceKind,
-        CaptureTimestamp, CursorCaptureMode, FramePoll, PhysicalRect, PixelFormat,
+        CaptureTimestamp, CursorCaptureMode, FramePoll, PixelFormat,
     };
-    use x11rb::connection::Connection;
+    use x11rb::connection::{Connection, RequestConnection};
     use x11rb::protocol::randr::ConnectionExt as _;
+    use x11rb::protocol::xfixes::{self, ConnectionExt as _};
     use x11rb::protocol::xproto::{
         Atom, AtomEnum, ConnectionExt as _, ImageFormat, ImageOrder, MapState, Screen, VisualClass,
         Window, WindowClass,
@@ -29,7 +32,8 @@ mod native {
     use super::{
         BackendDescriptor, BackendStatus, CaptureBackend, CaptureCapabilities, CaptureError,
         CaptureErrorKind, CaptureRequest, CaptureSession, CaptureSource, CaptureTarget,
-        CapturedFrame, RecoveryHint, WindowFilterFacts, decode_text_property, decode_u32_property,
+        CapturedFrame, PhysicalPosition, PhysicalRect, RecoveryHint, WindowFilterFacts,
+        X11CursorSnapshot, composite_cursor, decode_text_property, decode_u32_property,
         decode_zpixmap, format_window_source_id, intersect_rect, parse_window_source_id,
         should_list_window, translate_region,
     };
@@ -49,6 +53,7 @@ mod native {
         monitor_sources: Vec<X11Source>,
         atoms: X11Atoms,
         layout: PixelLayout,
+        xfixes_version: Option<(u32, u32)>,
         connected_at: Instant,
         direct_sequence: AtomicU64,
     }
@@ -91,6 +96,7 @@ mod native {
                 .field("screen_index", &self.inner.screen_index)
                 .field("root", &self.inner.root)
                 .field("monitor_source_count", &self.inner.monitor_sources.len())
+                .field("xfixes_version", &self.inner.xfixes_version)
                 .finish_non_exhaustive()
         }
     }
@@ -124,6 +130,7 @@ mod native {
             let (root, root_region, layout, monitor_sources) =
                 inspect_setup(&connection, screen_index)?;
             let atoms = X11Atoms::intern(&connection)?;
+            let xfixes_version = negotiate_xfixes(&connection)?;
             Ok(Self {
                 inner: Arc::new(X11Inner {
                     connection,
@@ -133,6 +140,7 @@ mod native {
                     monitor_sources,
                     atoms,
                     layout,
+                    xfixes_version,
                     connected_at: Instant::now(),
                     direct_sequence: AtomicU64::new(0),
                 }),
@@ -151,18 +159,30 @@ mod native {
             let elapsed = self.inner.connected_at.elapsed().as_micros();
             let timestamp =
                 CaptureTimestamp::from_micros(u64::try_from(elapsed).unwrap_or(u64::MAX));
-            self.capture_target(target, sequence, timestamp)
+            self.capture_target(target, CursorCaptureMode::Hidden, sequence, timestamp)
         }
 
         fn capture_target(
             &self,
             target: &CaptureTarget,
+            cursor_mode: CursorCaptureMode,
             sequence: u64,
             timestamp: CaptureTimestamp,
         ) -> Result<CapturedFrame, CaptureError> {
+            let cursor_mode = self.effective_cursor_mode(cursor_mode);
             for attempt in 0..Self::WINDOW_CAPTURE_ATTEMPTS {
                 let resolved = self.resolve_target(target)?;
-                let rgba = self.capture_root_pixels(resolved.root_region)?;
+                let mut rgba = self.capture_root_pixels(resolved.root_region)?;
+                let cursor = match cursor_mode {
+                    CursorCaptureMode::Hidden => None,
+                    CursorCaptureMode::Embedded | CursorCaptureMode::Metadata => {
+                        Some(self.capture_cursor()?)
+                    }
+                    CursorCaptureMode::Automatic => {
+                        unreachable!("effective X11 cursor mode always resolves Automatic")
+                    }
+                    _ => return Err(invalid_target("unknown cursor capture mode")),
+                };
 
                 if let Some((window, expected_region)) = resolved.tracked_window {
                     let current_region = self.live_window_region(window)?;
@@ -185,14 +205,35 @@ mod native {
                     .ok()
                     .and_then(|width| width.checked_mul(4))
                     .ok_or_else(|| CaptureError::invalid_frame("RGBA stride overflow"))?;
-                return CapturedFrame::new(
+                let cursor_metadata = match (cursor_mode, cursor) {
+                    (CursorCaptureMode::Embedded, Some(cursor)) => {
+                        composite_cursor(&mut rgba, stride, resolved.root_region, &cursor)?;
+                        None
+                    }
+                    (CursorCaptureMode::Metadata, Some(cursor)) => {
+                        Some(cursor.metadata(resolved.root_region)?)
+                    }
+                    (CursorCaptureMode::Hidden, None) => None,
+                    _ => {
+                        return Err(CaptureError::new(
+                            CaptureErrorKind::Platform,
+                            "X11 cursor capture resolved to an inconsistent internal state",
+                            RecoveryHint::Retry,
+                        ));
+                    }
+                };
+                let frame = CapturedFrame::new(
                     sequence,
                     timestamp,
                     size,
                     stride,
                     PixelFormat::Rgba8,
                     rgba,
-                );
+                )?;
+                return Ok(match cursor_metadata {
+                    Some(cursor) => frame.with_cursor(cursor),
+                    None => frame,
+                });
             }
             Err(CaptureError::new(
                 CaptureErrorKind::SourceLost,
@@ -385,16 +426,56 @@ mod native {
             Ok(region)
         }
 
+        /// Resolves `Automatic` to separately editable metadata whenever
+        /// `XFixes` is usable. This deliberately prefers metadata over embedding
+        /// so callers retain pointer position/hotspot information. If `XFixes`
+        /// is absent, automatic capture degrades to a hidden pointer while an
+        /// explicit metadata/embedded request is rejected by validation.
+        fn effective_cursor_mode(&self, requested: CursorCaptureMode) -> CursorCaptureMode {
+            match requested {
+                CursorCaptureMode::Automatic if self.inner.xfixes_version.is_some() => {
+                    CursorCaptureMode::Metadata
+                }
+                CursorCaptureMode::Automatic => CursorCaptureMode::Hidden,
+                mode => mode,
+            }
+        }
+
+        fn capture_cursor(&self) -> Result<X11CursorSnapshot, CaptureError> {
+            if self.inner.xfixes_version.is_none() {
+                return Err(xfixes_unavailable());
+            }
+            let reply = self
+                .inner
+                .connection
+                .xfixes_get_cursor_image()
+                .map_err(|error| source_lost("send XFixes GetCursorImage request", &error))?
+                .reply()
+                .map_err(|error| source_lost("receive XFixes GetCursorImage reply", &error))?;
+            X11CursorSnapshot::new(
+                PhysicalPosition {
+                    x: i32::from(reply.x),
+                    y: i32::from(reply.y),
+                },
+                u32::from(reply.width),
+                u32::from(reply.height),
+                PhysicalPosition {
+                    x: i32::from(reply.xhot),
+                    y: i32::from(reply.yhot),
+                },
+                reply.cursor_serial,
+                reply.cursor_image,
+            )
+        }
+
         fn validate_request(&self, request: &CaptureRequest) -> Result<(), CaptureError> {
             self.resolve_target(&request.target)?;
             match request.cursor {
                 CursorCaptureMode::Hidden | CursorCaptureMode::Automatic => {}
                 CursorCaptureMode::Embedded | CursorCaptureMode::Metadata => {
-                    return Err(CaptureError::new(
-                        CaptureErrorKind::UnsupportedCapability,
-                        "cursor capture is not implemented by the GetImage X11 path",
-                        RecoveryHint::ChangeRequest,
-                    ));
+                    if self.inner.xfixes_version.is_none() {
+                        return Err(xfixes_unavailable());
+                    }
                 }
                 _ => return Err(invalid_target("unknown cursor capture mode")),
             }
@@ -422,7 +503,7 @@ mod native {
         }
 
         fn capabilities(&self) -> CaptureCapabilities {
-            get_image_capabilities()
+            get_image_capabilities(self.inner.xfixes_version)
         }
 
         fn list_sources(&self) -> Result<Vec<CaptureSource>, CaptureError> {
@@ -566,10 +647,12 @@ mod native {
             let elapsed = self.started_at.elapsed().as_micros();
             let timestamp =
                 CaptureTimestamp::from_micros(u64::try_from(elapsed).unwrap_or(u64::MAX));
-            match self
-                .backend
-                .capture_target(&self.request.target, self.sequence, timestamp)
-            {
+            match self.backend.capture_target(
+                &self.request.target,
+                self.request.cursor,
+                self.sequence,
+                timestamp,
+            ) {
                 Ok(frame) => {
                     self.sequence = self.sequence.checked_add(1).ok_or_else(|| {
                         CaptureError::new(
@@ -598,6 +681,28 @@ mod native {
             .reply()
             .map(|reply| reply.atom)
             .map_err(|error| platform_error("receive X11 InternAtom reply", &error))
+    }
+
+    fn negotiate_xfixes(connection: &RustConnection) -> Result<Option<(u32, u32)>, CaptureError> {
+        let extension = connection
+            .extension_information(xfixes::X11_EXTENSION_NAME)
+            .map_err(|error| platform_error("query the XFixes extension", &error))?;
+        if extension.is_none() {
+            return Ok(None);
+        }
+
+        // Version negotiation is mandatory before any XFixes request. Version
+        // 1 introduced GetCursorImage; 6.0 is the newest protocol version
+        // represented by x11rb 0.14.
+        let reply = connection
+            .xfixes_query_version(6, 0)
+            .map_err(|error| platform_error("send XFixes QueryVersion request", &error))?
+            .reply()
+            .map_err(|error| platform_error("receive XFixes QueryVersion reply", &error))?;
+        if reply.major_version < 1 {
+            return Ok(None);
+        }
+        Ok(Some((reply.major_version, reply.minor_version)))
     }
 
     /// Enumerates selectable application windows on every call so newly
@@ -834,7 +939,9 @@ mod native {
             .checked_mul(requested_height)
             .ok_or_else(|| CaptureError::invalid_frame("X11 output frame size overflow"))?;
         let mut output = vec![0_u8; output_len];
-        for pixel in output.chunks_exact_mut(4) {
+        let (pixels, remainder) = output.as_chunks_mut::<4>();
+        debug_assert!(remainder.is_empty());
+        for pixel in pixels {
             pixel[3] = 255;
         }
 
@@ -1005,7 +1112,25 @@ mod native {
         Ok(sources)
     }
 
-    fn get_image_capabilities() -> CaptureCapabilities {
+    fn get_image_capabilities(xfixes_version: Option<(u32, u32)>) -> CaptureCapabilities {
+        let (cursor_embedded, cursor_metadata) = if let Some((major, minor)) = xfixes_version {
+            (
+                CapabilityStatus::Available,
+                CapabilityStatus::Limited(format!(
+                    "XFixes {major}.{minor} returns editable position, hotspot, and a stable shape hash; \
+                     the shared CapturedFrame model needs an optional immutable RGBA8 cursor image \
+                     keyed by shape_id to carry separate cursor pixels. \
+                     Automatic mode prefers this metadata representation"
+                )),
+            )
+        } else {
+            let reason =
+                "the connected X11 server does not provide XFixes GetCursorImage".to_owned();
+            (
+                CapabilityStatus::Unavailable(reason.clone()),
+                CapabilityStatus::Unavailable(reason),
+            )
+        };
         CaptureCapabilities {
             monitor: CapabilityStatus::Available,
             window: CapabilityStatus::Limited(
@@ -1013,12 +1138,8 @@ mod native {
                     .to_owned(),
             ),
             arbitrary_region: CapabilityStatus::Available,
-            cursor_embedded: CapabilityStatus::Unavailable(
-                "XFixes cursor composition is not implemented yet".to_owned(),
-            ),
-            cursor_metadata: CapabilityStatus::Unavailable(
-                "XFixes cursor metadata is not implemented yet".to_owned(),
-            ),
+            cursor_embedded,
+            cursor_metadata,
             passive_mouse_buttons: CapabilityStatus::Unavailable(
                 "XInput mouse metadata is not implemented yet".to_owned(),
             ),
@@ -1038,6 +1159,14 @@ mod native {
         CaptureError::new(
             CaptureErrorKind::InvalidRequest,
             message,
+            RecoveryHint::ChangeRequest,
+        )
+    }
+
+    fn xfixes_unavailable() -> CaptureError {
+        CaptureError::new(
+            CaptureErrorKind::UnsupportedCapability,
+            "cursor capture requires XFixes GetCursorImage, which is unavailable on this X11 server",
             RecoveryHint::ChangeRequest,
         )
     }
@@ -1197,15 +1326,11 @@ fn parse_window_source_id(source_id: &str, screen_index: usize) -> Option<u32> {
 
 #[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
 fn decode_u32_property(format: u8, value: &[u8]) -> Option<Vec<u32>> {
-    if format != 32 || !value.len().is_multiple_of(4) {
+    let (values, remainder) = value.as_chunks::<4>();
+    if format != 32 || !remainder.is_empty() {
         return None;
     }
-    Some(
-        value
-            .chunks_exact(4)
-            .map(|bytes| u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-            .collect(),
-    )
+    Some(values.iter().copied().map(u32::from_ne_bytes).collect())
 }
 
 #[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
@@ -1244,6 +1369,267 @@ fn intersect_rect(
         u32::try_from(height).ok()?,
     )
     .ok()
+}
+
+/// One `XFixes` cursor image. The protocol stores pixels as premultiplied ARGB
+/// and reports `position_root` at the cursor hotspot, not its top-left corner.
+#[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct X11CursorSnapshot {
+    position_root: PhysicalPosition,
+    width: u32,
+    height: u32,
+    hotspot: PhysicalPosition,
+    serial: u32,
+    premultiplied_argb: Vec<u32>,
+}
+
+#[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
+impl X11CursorSnapshot {
+    fn new(
+        position_root: PhysicalPosition,
+        width: u32,
+        height: u32,
+        hotspot: PhysicalPosition,
+        serial: u32,
+        premultiplied_argb: Vec<u32>,
+    ) -> Result<Self, CaptureError> {
+        if width == 0 || height == 0 {
+            return Err(CaptureError::invalid_frame(
+                "XFixes returned an empty cursor image",
+            ));
+        }
+        let expected_pixels = usize::try_from(width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .ok_or_else(|| CaptureError::invalid_frame("XFixes cursor size overflow"))?;
+        if premultiplied_argb.len() != expected_pixels {
+            return Err(CaptureError::invalid_frame(format!(
+                "XFixes returned {} cursor pixels but {expected_pixels} were expected",
+                premultiplied_argb.len()
+            )));
+        }
+        if hotspot.x < 0
+            || hotspot.y < 0
+            || u32::try_from(hotspot.x).is_ok_and(|x| x >= width)
+            || u32::try_from(hotspot.y).is_ok_and(|y| y >= height)
+        {
+            return Err(CaptureError::invalid_frame(
+                "XFixes returned a cursor hotspot outside its image",
+            ));
+        }
+        Ok(Self {
+            position_root,
+            width,
+            height,
+            hotspot,
+            serial,
+            premultiplied_argb,
+        })
+    }
+
+    fn metadata(&self, capture_region: PhysicalRect) -> Result<CursorMetadata, CaptureError> {
+        // Compatibility note: the shared frame model has no cursor bitmap
+        // field. The smallest future extension is an optional immutable RGBA8
+        // image (size, stride, pixels) on CursorMetadata, keyed by shape_id so
+        // unchanged shapes need not duplicate pixel storage on every frame.
+        let relative_x = i64::from(self.position_root.x) - i64::from(capture_region.origin().x);
+        let relative_y = i64::from(self.position_root.y) - i64::from(capture_region.origin().y);
+        let position = PhysicalPosition {
+            x: i32::try_from(relative_x).map_err(|_| {
+                CaptureError::invalid_frame("XFixes cursor x coordinate exceeds i32")
+            })?,
+            y: i32::try_from(relative_y).map_err(|_| {
+                CaptureError::invalid_frame("XFixes cursor y coordinate exceeds i32")
+            })?,
+        };
+        Ok(CursorMetadata {
+            position,
+            hotspot: self.hotspot,
+            visible: self.has_visible_pixel_in(capture_region),
+            shape_id: Some(format!(
+                "x11-xfixes:{:08x}:{:016x}",
+                self.serial,
+                cursor_shape_hash(self)
+            )),
+        })
+    }
+
+    fn pointer_inside(&self, capture_region: PhysicalRect) -> bool {
+        let x = i64::from(self.position_root.x) - i64::from(capture_region.origin().x);
+        let y = i64::from(self.position_root.y) - i64::from(capture_region.origin().y);
+        x >= 0
+            && y >= 0
+            && x < i64::from(capture_region.size().width())
+            && y < i64::from(capture_region.size().height())
+    }
+
+    fn has_visible_pixel_in(&self, capture_region: PhysicalRect) -> bool {
+        if !self.pointer_inside(capture_region) {
+            return false;
+        }
+        let cursor_left = i64::from(self.position_root.x) - i64::from(self.hotspot.x);
+        let cursor_top = i64::from(self.position_root.y) - i64::from(self.hotspot.y);
+        let capture_left = i64::from(capture_region.origin().x);
+        let capture_top = i64::from(capture_region.origin().y);
+        let capture_right = capture_left + i64::from(capture_region.size().width());
+        let capture_bottom = capture_top + i64::from(capture_region.size().height());
+        let Ok(width) = usize::try_from(self.width) else {
+            return false;
+        };
+
+        self.premultiplied_argb
+            .iter()
+            .enumerate()
+            .any(|(index, pixel)| {
+                if pixel >> 24 == 0 {
+                    return false;
+                }
+                let x = cursor_left + i64::try_from(index % width).unwrap_or(i64::MAX);
+                let y = cursor_top + i64::try_from(index / width).unwrap_or(i64::MAX);
+                x >= capture_left && x < capture_right && y >= capture_top && y < capture_bottom
+            })
+    }
+}
+
+#[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
+fn cursor_shape_hash(cursor: &X11CursorSnapshot) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn add_bytes(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+
+    let mut hash = FNV_OFFSET_BASIS;
+    add_bytes(&mut hash, &cursor.width.to_be_bytes());
+    add_bytes(&mut hash, &cursor.height.to_be_bytes());
+    add_bytes(&mut hash, &cursor.hotspot.x.to_be_bytes());
+    add_bytes(&mut hash, &cursor.hotspot.y.to_be_bytes());
+    for pixel in &cursor.premultiplied_argb {
+        add_bytes(&mut hash, &pixel.to_be_bytes());
+    }
+    hash
+}
+
+/// Composites an `XFixes` premultiplied-ARGB cursor over an opaque RGBA frame.
+/// The pointer hotspot must itself be inside the requested capture region;
+/// cursor pixels outside the frame are cropped rather than shifting the image.
+#[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
+fn composite_cursor(
+    destination: &mut [u8],
+    destination_stride: usize,
+    capture_region: PhysicalRect,
+    cursor: &X11CursorSnapshot,
+) -> Result<bool, CaptureError> {
+    let minimum_stride = usize::try_from(capture_region.size().width())
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .ok_or_else(|| CaptureError::invalid_frame("X11 cursor destination stride overflow"))?;
+    if destination_stride < minimum_stride {
+        return Err(CaptureError::invalid_frame(
+            "X11 cursor destination stride is too short",
+        ));
+    }
+    let required_len = usize::try_from(capture_region.size().height())
+        .ok()
+        .and_then(|height| destination_stride.checked_mul(height))
+        .ok_or_else(|| CaptureError::invalid_frame("X11 cursor destination size overflow"))?;
+    if destination.len() < required_len {
+        return Err(CaptureError::invalid_frame(
+            "X11 cursor destination buffer is too short",
+        ));
+    }
+    if !cursor.pointer_inside(capture_region) {
+        return Ok(false);
+    }
+
+    let cursor_left = i64::from(cursor.position_root.x) - i64::from(cursor.hotspot.x);
+    let cursor_top = i64::from(cursor.position_root.y) - i64::from(cursor.hotspot.y);
+    let capture_left = i64::from(capture_region.origin().x);
+    let capture_top = i64::from(capture_region.origin().y);
+    let frame_width = i64::from(capture_region.size().width());
+    let frame_height = i64::from(capture_region.size().height());
+    let cursor_width = usize::try_from(cursor.width)
+        .map_err(|_| CaptureError::invalid_frame("XFixes cursor width exceeds usize"))?;
+    let cursor_height = usize::try_from(cursor.height)
+        .map_err(|_| CaptureError::invalid_frame("XFixes cursor height exceeds usize"))?;
+    let mut drew_pixel = false;
+
+    for source_y in 0..cursor_height {
+        let frame_y = cursor_top
+            + i64::try_from(source_y)
+                .map_err(|_| CaptureError::invalid_frame("XFixes cursor y exceeds i64"))?
+            - capture_top;
+        if frame_y < 0 || frame_y >= frame_height {
+            continue;
+        }
+        for source_x in 0..cursor_width {
+            let frame_x = cursor_left
+                + i64::try_from(source_x)
+                    .map_err(|_| CaptureError::invalid_frame("XFixes cursor x exceeds i64"))?
+                - capture_left;
+            if frame_x < 0 || frame_x >= frame_width {
+                continue;
+            }
+            let source_index = source_y
+                .checked_mul(cursor_width)
+                .and_then(|offset| offset.checked_add(source_x))
+                .ok_or_else(|| CaptureError::invalid_frame("XFixes cursor index overflow"))?;
+            let source = cursor.premultiplied_argb[source_index];
+            if source >> 24 == 0 {
+                continue;
+            }
+            let destination_offset = usize::try_from(frame_y)
+                .ok()
+                .and_then(|y| y.checked_mul(destination_stride))
+                .and_then(|offset| {
+                    usize::try_from(frame_x)
+                        .ok()
+                        .and_then(|x| x.checked_mul(4))
+                        .and_then(|x| offset.checked_add(x))
+                })
+                .ok_or_else(|| {
+                    CaptureError::invalid_frame("X11 cursor destination offset overflow")
+                })?;
+            let destination_pixel: &mut [u8; 4] = destination
+                .get_mut(destination_offset..destination_offset + 4)
+                .and_then(|pixel| pixel.try_into().ok())
+                .ok_or_else(|| {
+                    CaptureError::invalid_frame("X11 cursor destination pixel is out of bounds")
+                })?;
+            blend_premultiplied_argb_over_opaque_rgba(destination_pixel, source);
+            drew_pixel = true;
+        }
+    }
+    Ok(drew_pixel)
+}
+
+#[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
+fn blend_premultiplied_argb_over_opaque_rgba(destination: &mut [u8; 4], source: u32) {
+    let alpha = u8::try_from(source >> 24).unwrap_or(255);
+    if alpha == 0 {
+        return;
+    }
+    let source_rgb = [
+        u8::try_from((source >> 16) & 0xff).unwrap_or(255),
+        u8::try_from((source >> 8) & 0xff).unwrap_or(255),
+        u8::try_from(source & 0xff).unwrap_or(255),
+    ];
+    let inverse_alpha = 255_u16 - u16::from(alpha);
+    for channel in 0..3 {
+        let retained = (u16::from(destination[channel]) * inverse_alpha + 127) / 255;
+        destination[channel] =
+            u8::try_from(u16::from(source_rgb[channel]) + retained).unwrap_or(255);
+    }
+    destination[3] = 255;
 }
 
 #[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
@@ -1429,9 +1815,14 @@ fn scale_mask(pixel: u32, mask: u32) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(target_os = "linux", feature = "native-x11"))]
+    use std::time::Duration;
+
     use gif_from_screen_capture::PhysicalRect;
     #[cfg(all(target_os = "linux", feature = "native-x11"))]
-    use gif_from_screen_capture::{CaptureSourceId, CaptureSourceKind};
+    use gif_from_screen_capture::{
+        CaptureCadence, CaptureSourceId, CaptureSourceKind, CursorCaptureMode, FramePoll,
+    };
 
     use super::*;
 
@@ -1444,6 +1835,44 @@ mod tests {
         green_mask: 0x0000_ff00,
         blue_mask: 0x0000_00ff,
     };
+
+    fn cursor(
+        position_x: i32,
+        position_y: i32,
+        width: u32,
+        height: u32,
+        hotspot_x: i32,
+        hotspot_y: i32,
+        pixels: Vec<u32>,
+    ) -> X11CursorSnapshot {
+        X11CursorSnapshot::new(
+            PhysicalPosition {
+                x: position_x,
+                y: position_y,
+            },
+            width,
+            height,
+            PhysicalPosition {
+                x: hotspot_x,
+                y: hotspot_y,
+            },
+            0x1234_abcd,
+            pixels,
+        )
+        .unwrap()
+    }
+
+    fn opaque_black_rgba(width: usize, height: usize) -> Vec<u8> {
+        let mut pixels = vec![0_u8; width * height * 4];
+        {
+            let (pixel_chunks, remainder) = pixels.as_chunks_mut::<4>();
+            assert!(remainder.is_empty());
+            for pixel in pixel_chunks {
+                pixel[3] = 255;
+            }
+        }
+        pixels
+    }
 
     #[test]
     fn decodes_common_little_endian_bgrx_into_rgba() {
@@ -1481,6 +1910,161 @@ mod tests {
     fn rejects_truncated_server_frame() {
         let error = decode_zpixmap(&[0; 7], 2, 1, RGB888_LE).unwrap_err();
         assert_eq!(error.kind(), CaptureErrorKind::InvalidFrame);
+    }
+
+    #[test]
+    fn blends_premultiplied_xfixes_argb_over_opaque_rgba() {
+        let mut transparent_destination = [10, 20, 30, 255];
+        blend_premultiplied_argb_over_opaque_rgba(&mut transparent_destination, 0);
+        assert_eq!(transparent_destination, [10, 20, 30, 255]);
+
+        let mut opaque_destination = [10, 20, 30, 255];
+        blend_premultiplied_argb_over_opaque_rgba(&mut opaque_destination, 0xff11_2233);
+        assert_eq!(opaque_destination, [0x11, 0x22, 0x33, 255]);
+
+        let mut half_destination = [0, 0, 200, 255];
+        blend_premultiplied_argb_over_opaque_rgba(&mut half_destination, 0x8080_4000);
+        assert_eq!(half_destination, [128, 64, 100, 255]);
+    }
+
+    #[test]
+    fn hotspot_and_capture_origin_place_cursor_pixels_correctly() {
+        let region = PhysicalRect::new(100, 50, 3, 3).unwrap();
+        let cursor = cursor(
+            101,
+            51,
+            2,
+            2,
+            1,
+            1,
+            vec![0xffff_0000, 0xff00_ff00, 0xff00_00ff, 0xffff_ffff],
+        );
+        let mut frame = opaque_black_rgba(3, 3);
+
+        assert!(composite_cursor(&mut frame, 12, region, &cursor).unwrap());
+        assert_eq!(&frame[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&frame[4..8], &[0, 255, 0, 255]);
+        assert_eq!(&frame[12..16], &[0, 0, 255, 255]);
+        assert_eq!(&frame[16..20], &[255, 255, 255, 255]);
+        assert_eq!(&frame[32..36], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn cursor_image_is_cropped_at_capture_boundaries() {
+        let region = PhysicalRect::new(10, 20, 2, 2).unwrap();
+        let cursor = cursor(
+            10,
+            20,
+            3,
+            3,
+            1,
+            1,
+            vec![
+                0xff01_0000,
+                0xff02_0000,
+                0xff03_0000,
+                0xff04_0000,
+                0xff05_0000,
+                0xff06_0000,
+                0xff07_0000,
+                0xff08_0000,
+                0xff09_0000,
+            ],
+        );
+        let mut frame = opaque_black_rgba(2, 2);
+
+        assert!(composite_cursor(&mut frame, 8, region, &cursor).unwrap());
+        assert_eq!(&frame[0..4], &[5, 0, 0, 255]);
+        assert_eq!(&frame[4..8], &[6, 0, 0, 255]);
+        assert_eq!(&frame[8..12], &[8, 0, 0, 255]);
+        assert_eq!(&frame[12..16], &[9, 0, 0, 255]);
+    }
+
+    #[test]
+    fn cursor_is_not_drawn_when_hotspot_is_outside_capture_region() {
+        let region = PhysicalRect::new(10, 20, 2, 2).unwrap();
+        // The cursor image overlaps the region, but its pointer/hotspot is one
+        // pixel to the left and therefore must not appear in the capture.
+        let cursor = cursor(
+            9,
+            20,
+            3,
+            1,
+            0,
+            0,
+            vec![0xffff_0000, 0xffff_0000, 0xffff_0000],
+        );
+        let mut frame = opaque_black_rgba(2, 2);
+        let unchanged = frame.clone();
+
+        assert!(!composite_cursor(&mut frame, 8, region, &cursor).unwrap());
+        assert_eq!(frame, unchanged);
+    }
+
+    #[test]
+    fn metadata_uses_frame_coordinates_and_stable_shape_identity() {
+        let region = PhysicalRect::new(100, 50, 30, 30).unwrap();
+        let original = cursor(
+            115,
+            67,
+            3,
+            2,
+            2,
+            1,
+            [0; 5].into_iter().chain([0xffff_ffff]).collect(),
+        );
+        let moved = cursor(
+            120,
+            70,
+            3,
+            2,
+            2,
+            1,
+            [0; 5].into_iter().chain([0xffff_ffff]).collect(),
+        );
+
+        let metadata = original.metadata(region).unwrap();
+        let moved_metadata = moved.metadata(region).unwrap();
+        assert_eq!(metadata.position, PhysicalPosition { x: 15, y: 17 });
+        assert_eq!(metadata.hotspot, PhysicalPosition { x: 2, y: 1 });
+        assert!(metadata.visible);
+        assert_eq!(metadata.shape_id, moved_metadata.shape_id);
+        assert!(
+            metadata
+                .shape_id
+                .as_deref()
+                .is_some_and(|shape| shape.starts_with("x11-xfixes:1234abcd:"))
+        );
+
+        let outside = cursor(99, 67, 1, 1, 0, 0, vec![0xffff_ffff]);
+        let outside_metadata = outside.metadata(region).unwrap();
+        assert_eq!(outside_metadata.position, PhysicalPosition { x: -1, y: 17 });
+        assert!(!outside_metadata.visible);
+    }
+
+    #[test]
+    fn rejects_malformed_cursor_image_and_hotspot() {
+        let malformed_image = X11CursorSnapshot::new(
+            PhysicalPosition::default(),
+            2,
+            2,
+            PhysicalPosition::default(),
+            1,
+            vec![0; 3],
+        )
+        .unwrap_err();
+        assert_eq!(malformed_image.kind(), CaptureErrorKind::InvalidFrame);
+
+        let malformed_hotspot = X11CursorSnapshot::new(
+            PhysicalPosition::default(),
+            2,
+            2,
+            PhysicalPosition { x: 2, y: 0 },
+            1,
+            vec![0; 4],
+        )
+        .unwrap_err();
+        assert_eq!(malformed_hotspot.kind(), CaptureErrorKind::InvalidFrame);
     }
 
     #[test]
@@ -1637,6 +2221,32 @@ mod tests {
         assert_eq!(frame.size().width(), 2);
         assert_eq!(frame.size().height(), 2);
         assert_eq!(frame.pixels().len(), 16);
+
+        if backend.capabilities().cursor_metadata.is_ready() {
+            let mut request = CaptureRequest::new(target.clone(), CaptureCadence::Manual);
+            request.cursor = CursorCaptureMode::Automatic;
+            let mut session = backend.start_session(request).unwrap();
+            let FramePoll::Frame(frame) = session.poll_frame(Duration::ZERO).unwrap() else {
+                panic!("manual X11 session did not produce its first frame");
+            };
+            let cursor = frame
+                .cursor()
+                .expect("Automatic must prefer XFixes cursor metadata");
+            assert!(
+                cursor
+                    .shape_id
+                    .as_deref()
+                    .is_some_and(|shape| shape.starts_with("x11-xfixes:"))
+            );
+
+            let mut request = CaptureRequest::new(target.clone(), CaptureCadence::Manual);
+            request.cursor = CursorCaptureMode::Embedded;
+            let mut session = backend.start_session(request).unwrap();
+            let FramePoll::Frame(frame) = session.poll_frame(Duration::ZERO).unwrap() else {
+                panic!("embedded-cursor X11 session did not produce its first frame");
+            };
+            assert!(frame.cursor().is_none());
+        }
 
         let Some(window) = sources
             .into_iter()
