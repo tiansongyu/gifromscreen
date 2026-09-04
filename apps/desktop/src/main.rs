@@ -10,7 +10,8 @@ use std::{
 
 use eframe::egui;
 use gif_from_screen_capture::{
-    CaptureBackend, CaptureCadence, CaptureRequest, CaptureTarget, CursorCaptureMode, PhysicalRect,
+    CaptureBackend, CaptureCadence, CaptureRequest, CaptureSource, CaptureSourceId,
+    CaptureSourceKind, CaptureTarget, CursorCaptureMode, PhysicalRect,
 };
 use gif_from_screen_capture_linux::X11CaptureBackend;
 use gif_from_screen_gif::{CancellationFlag, EncodeOptions};
@@ -74,16 +75,24 @@ struct GifFromScreenApp {
     view: AppView,
     notice: Option<String>,
     settings: RecordingSettings,
+    sources: Vec<CaptureSource>,
+    selected_source: usize,
     job: Option<RecordingJob>,
     progress: Option<WorkflowProgress>,
 }
 
 impl Default for GifFromScreenApp {
     fn default() -> Self {
+        let (sources, notice) = match load_x11_sources() {
+            Ok(sources) => (sources, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
         Self {
             view: AppView::Landing,
-            notice: None,
+            notice,
             settings: RecordingSettings::default(),
+            sources,
+            selected_source: 0,
             job: None,
             progress: None,
         }
@@ -178,44 +187,7 @@ impl GifFromScreenApp {
         ui.heading("X11 screen recorder");
         ui.label("Capture and GIF encoding run on a background worker.");
         ui.add_space(12.0);
-
-        egui::Grid::new("recording_settings")
-            .num_columns(2)
-            .spacing([16.0, 8.0])
-            .show(ui, |ui| {
-                ui.label("Output GIF");
-                ui.text_edit_singleline(&mut self.settings.output);
-                ui.end_row();
-
-                ui.label("Duration (ms)");
-                ui.add(egui::DragValue::new(&mut self.settings.duration_ms).range(1..=60_000));
-                ui.end_row();
-
-                ui.label("Frames per second");
-                ui.add(egui::DragValue::new(&mut self.settings.fps).range(1..=60));
-                ui.end_row();
-
-                ui.label("Capture a region");
-                ui.checkbox(
-                    &mut self.settings.region_enabled,
-                    "Use physical-pixel rectangle",
-                );
-                ui.end_row();
-            });
-
-        if self.settings.region_enabled {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label("X");
-                ui.add(egui::DragValue::new(&mut self.settings.region_x));
-                ui.label("Y");
-                ui.add(egui::DragValue::new(&mut self.settings.region_y));
-                ui.label("Width");
-                ui.add(egui::DragValue::new(&mut self.settings.region_width).range(1..=65_535));
-                ui.label("Height");
-                ui.add(egui::DragValue::new(&mut self.settings.region_height).range(1..=65_535));
-            });
-        }
+        self.show_recording_settings(ui);
 
         ui.add_space(16.0);
         ui.horizontal(|ui| {
@@ -251,9 +223,87 @@ impl GifFromScreenApp {
         }
     }
 
+    fn show_recording_settings(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("recording_settings")
+            .num_columns(2)
+            .spacing([16.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Capture source");
+                ui.horizontal(|ui| {
+                    let selected_name = self
+                        .sources
+                        .get(self.selected_source)
+                        .map_or_else(|| "No X11 source".to_owned(), |source| source.name().into());
+                    egui::ComboBox::from_id_salt("capture_source")
+                        .selected_text(selected_name)
+                        .show_ui(ui, |ui| {
+                            for (index, source) in self.sources.iter().enumerate() {
+                                ui.selectable_value(
+                                    &mut self.selected_source,
+                                    index,
+                                    source.name(),
+                                );
+                            }
+                        });
+                    if ui.button("Refresh").clicked() {
+                        self.refresh_sources();
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Output GIF");
+                ui.text_edit_singleline(&mut self.settings.output);
+                ui.end_row();
+                ui.label("Duration (ms)");
+                ui.add(egui::DragValue::new(&mut self.settings.duration_ms).range(1..=60_000));
+                ui.end_row();
+                ui.label("Frames per second");
+                ui.add(egui::DragValue::new(&mut self.settings.fps).range(1..=60));
+                ui.end_row();
+                ui.label("Capture a region");
+                ui.checkbox(
+                    &mut self.settings.region_enabled,
+                    "Use physical-pixel rectangle",
+                );
+                ui.end_row();
+            });
+
+        if self.settings.region_enabled {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("X");
+                ui.add(egui::DragValue::new(&mut self.settings.region_x));
+                ui.label("Y");
+                ui.add(egui::DragValue::new(&mut self.settings.region_y));
+                ui.label("Width");
+                ui.add(egui::DragValue::new(&mut self.settings.region_width).range(1..=65_535));
+                ui.label("Height");
+                ui.add(egui::DragValue::new(&mut self.settings.region_height).range(1..=65_535));
+            });
+        }
+        if let Some(source) = self.sources.get(self.selected_source)
+            && let Some(rect) = source.geometry()
+        {
+            ui.weak(format!(
+                "Selected source: {}×{} at {},{} ({:?})",
+                rect.size().width(),
+                rect.size().height(),
+                rect.origin().x,
+                rect.origin().y,
+                source.kind()
+            ));
+        }
+    }
+
     fn start_recording(&mut self) -> Result<(), String> {
         validate_settings(&self.settings)?;
+        let selected = self
+            .sources
+            .get(self.selected_source)
+            .ok_or_else(|| "No X11 capture source is selected.".to_owned())?;
         let settings = self.settings.clone();
+        let source_id = selected.id().clone();
+        let source_kind = selected.kind();
         let cancellation = CancellationFlag::default();
         let worker_cancellation = cancellation.clone();
         let (sender, receiver) = mpsc::channel();
@@ -265,8 +315,14 @@ impl GifFromScreenApp {
                 let mut progress = move |snapshot| {
                     let _ = progress_sender.send(JobMessage::Progress(snapshot));
                 };
-                let result = run_x11_recording(&settings, &worker_cancellation, &mut progress)
-                    .map_err(|error| error.to_string());
+                let result = run_x11_recording(
+                    &settings,
+                    source_id,
+                    source_kind,
+                    &worker_cancellation,
+                    &mut progress,
+                )
+                .map_err(|error| error.to_string());
                 let _ = sender.send(JobMessage::Finished(result));
             })
             .map_err(|error| format!("could not start recording worker: {error}"))?;
@@ -278,6 +334,19 @@ impl GifFromScreenApp {
             cancellation,
         });
         Ok(())
+    }
+
+    fn refresh_sources(&mut self) {
+        match load_x11_sources() {
+            Ok(sources) => {
+                self.sources = sources;
+                self.selected_source = self
+                    .selected_source
+                    .min(self.sources.len().saturating_sub(1));
+                self.notice = Some(format!("Found {} X11 capture sources.", self.sources.len()));
+            }
+            Err(error) => self.notice = Some(error),
+        }
     }
 
     fn receive_job_messages(&mut self) {
@@ -332,18 +401,15 @@ fn validate_settings(settings: &RecordingSettings) -> Result<(), String> {
 
 fn run_x11_recording(
     settings: &RecordingSettings,
+    source_id: CaptureSourceId,
+    source_kind: CaptureSourceKind,
     cancellation: &CancellationFlag,
     progress: &mut dyn gif_from_screen_workflow::WorkflowProgressSink,
 ) -> Result<RecordToGifReport, Box<dyn std::error::Error + Send + Sync>> {
     let backend = X11CaptureBackend::connect(None)?;
-    let source = backend
-        .list_sources()?
-        .into_iter()
-        .next()
-        .ok_or("X11 backend returned no capture source")?;
     let target = if settings.region_enabled {
         CaptureTarget::Region {
-            source: source.id().clone(),
+            source: source_id,
             region: PhysicalRect::new(
                 settings.region_x,
                 settings.region_y,
@@ -352,7 +418,11 @@ fn run_x11_recording(
             )?,
         }
     } else {
-        CaptureTarget::Monitor(source.id().clone())
+        match source_kind {
+            CaptureSourceKind::Monitor => CaptureTarget::Monitor(source_id),
+            CaptureSourceKind::Window => CaptureTarget::Window(source_id),
+            _ => return Err("unsupported future X11 capture source kind".into()),
+        }
     };
     let mut request = CaptureRequest::new(target, CaptureCadence::fixed_fps(settings.fps)?);
     request.cursor = CursorCaptureMode::Hidden;
@@ -373,6 +443,19 @@ fn run_x11_recording(
         progress,
     )
     .map_err(Into::into)
+}
+
+fn load_x11_sources() -> Result<Vec<CaptureSource>, String> {
+    let backend = X11CaptureBackend::connect(None)
+        .map_err(|error| format!("Could not connect to X11: {error}"))?;
+    let sources = backend
+        .list_sources()
+        .map_err(|error| format!("Could not enumerate X11 sources: {error}"))?;
+    if sources.is_empty() {
+        Err("X11 did not report any capture sources.".into())
+    } else {
+        Ok(sources)
+    }
 }
 
 fn landing_action(ui: &mut egui::Ui, title: &str, description: &str, enabled: bool) -> bool {
