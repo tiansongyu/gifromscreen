@@ -1083,6 +1083,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gif-from-screen-workflow"
+version = "0.1.0"
+dependencies = [
+ "gif",
+ "gif-from-screen-capture",
+ "gif-from-screen-gif",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "gl_generator"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,19 @@
+[package]
+name = "gif-from-screen-workflow"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Synchronous capture-to-GIF workflows for GifFromScreen"
+
+[dependencies]
+gif-from-screen-capture = { path = "../capture" }
+gif-from-screen-gif = { path = "../gif" }
+thiserror.workspace = true
+
+[dev-dependencies]
+gif.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
