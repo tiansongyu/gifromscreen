@@ -2,6 +2,12 @@
 
 //! Application-level state machines and use-case orchestration.
 
+mod recording_project;
+
+pub use recording_project::{
+    PersistRecordingError, RecordingProjectOptions, persist_collected_recording,
+};
+
 use thiserror::Error;
 
 /// The lifecycle of a recording session.

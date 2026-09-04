@@ -6,8 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+gif-from-screen-domain = { path = "../domain" }
+gif-from-screen-project = { path = "../project" }
+gif-from-screen-workflow = { path = "../workflow" }
 thiserror.workspace = true
+
+[dev-dependencies]
+gif-from-screen-capture = { path = "../capture" }
+gif-from-screen-gif = { path = "../gif" }
+tempfile.workspace = true
 
 [lints]
 workspace = true
-
