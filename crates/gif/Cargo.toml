@@ -1,0 +1,14 @@
+[package]
+name = "gif-from-screen-gif"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "GIF encoding port and permissively licensed built-in encoder for GifFromScreen"
+
+[dependencies]
+gif.workspace = true
+thiserror.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
