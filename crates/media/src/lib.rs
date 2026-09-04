@@ -18,6 +18,8 @@ pub use model::{
     LoopBehavior, ZeroDelayPolicy,
 };
 pub use static_image::{
-    DecodedStaticImage, StaticImageDecodeError, StaticImageDecodeOptions, StaticImageFormat,
+    DecodedStaticImage, DecodedStaticImageSequence, StaticImageDecodeError,
+    StaticImageDecodeOptions, StaticImageFormat, StaticImageSequenceDurationPolicy,
+    StaticImageSequenceError, StaticImageSequenceOptions, assemble_static_image_sequence,
     decode_static_image, decode_static_image_with_format,
 };

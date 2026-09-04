@@ -12,6 +12,13 @@ use thiserror::Error;
 
 use crate::{DEFAULT_ZERO_DELAY_US, DecodeLimits, DecodedAnimation, DecodedFrame, LoopBehavior};
 
+mod sequence;
+
+pub use sequence::{
+    DecodedStaticImageSequence, StaticImageSequenceDurationPolicy, StaticImageSequenceError,
+    StaticImageSequenceOptions, assemble_static_image_sequence,
+};
+
 const RGBA_BYTES_PER_PIXEL: u64 = 4;
 
 /// Static raster formats intentionally accepted by [`decode_static_image`].
