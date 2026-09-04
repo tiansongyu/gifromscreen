@@ -265,10 +265,12 @@ fn composite_region(canvas: &mut [u8], canvas_width: u16, rgba: &[u8], frame: Fr
         let source_row = &rgba[source_start..source_start + source_row_bytes];
         let destination_row = &mut canvas[destination_start..destination_start + source_row_bytes];
 
-        for (source, destination) in source_row
-            .chunks_exact(RGBA_CHANNELS)
-            .zip(destination_row.chunks_exact_mut(RGBA_CHANNELS))
-        {
+        for (source, destination) in source_row.as_chunks::<RGBA_CHANNELS>().0.iter().zip(
+            destination_row
+                .as_chunks_mut::<RGBA_CHANNELS>()
+                .0
+                .iter_mut(),
+        ) {
             if source[3] != 0 {
                 destination.copy_from_slice(source);
             }
