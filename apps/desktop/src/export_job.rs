@@ -247,7 +247,9 @@ mod tests {
         ColorSpace, DurationUs, EditCommand, FrameClip, FrameId, PhysicalSize, ProjectId,
         ProjectManifest, RasterEncoding, UnixTimeMs,
     };
-    use gif_from_screen_gif::CancellationToken as _;
+    use gif_from_screen_gif::{
+        CancellationToken as _, DitherMode, EncodeOptions, PaletteMode, QuantizerStrategy,
+    };
     use gif_from_screen_project::ActiveProject;
     use tempfile::tempdir;
 
@@ -418,6 +420,30 @@ mod tests {
                 if matches!(&*source, ProjectGifExportError::ExistingOutput(path) if path == &output)
         ));
         assert_eq!(fs::read(&output).unwrap(), b"old GIF");
+    }
+
+    #[test]
+    fn predefined_palette_and_extended_dither_flow_through_background_export() {
+        let directory = tempdir().unwrap();
+        let snapshot = snapshot(&directory.path().join("project"), 2);
+        let output = directory.path().join("predefined.gif");
+        let options = ProjectGifExportOptions {
+            encoding: EncodeOptions {
+                max_colors: 17,
+                palette_mode: PaletteMode::Global,
+                quantizer: QuantizerStrategy::Windows16,
+                dither: DitherMode::Atkinson,
+                ..EncodeOptions::default()
+            },
+            ..ProjectGifExportOptions::default()
+        };
+        let mut job = ExportJob::default();
+        job.start(snapshot, output.clone(), options).unwrap();
+
+        drain_until_finished(&mut job);
+
+        assert!(output.is_file());
+        assert!(matches!(job.take_result(), Some(Ok(report)) if report.selected_frames == 2));
     }
 
     #[test]

@@ -141,6 +141,65 @@ fn neuquant_roundtrips_with_local_and_global_palettes() {
 }
 
 #[test]
+fn predefined_palette_strategies_encode_local_and_global_with_transparency() {
+    let frames = [
+        RgbaFrame::new(
+            3,
+            1,
+            vec![255, 0, 0, 255, 0, 0, 0, 0, 0, 255, 0, 255],
+            10_000,
+        )
+        .unwrap(),
+        RgbaFrame::new(
+            3,
+            1,
+            vec![0, 0, 255, 255, 255, 255, 255, 255, 12, 34, 56, 0],
+            20_000,
+        )
+        .unwrap(),
+    ];
+    for (strategy, required_colors) in [
+        (QuantizerStrategy::WebSafe216, 217),
+        (QuantizerStrategy::Monochrome, 3),
+        (QuantizerStrategy::Windows16, 17),
+    ] {
+        for palette_mode in [PaletteMode::LocalPerFrame, PaletteMode::Global] {
+            let options = EncodeOptions {
+                max_colors: required_colors,
+                merge_duplicate_frames: false,
+                transparency: Transparency::AlphaThreshold(1),
+                palette_mode,
+                quantizer: strategy,
+                dither: DitherMode::StevensonArce,
+                ..EncodeOptions::default()
+            };
+            let mut first = Vec::new();
+            let mut second = Vec::new();
+            BuiltinGifEncoder::default()
+                .encode_frames(frames.clone(), &mut first, &options)
+                .unwrap();
+            BuiltinGifEncoder::default()
+                .encode_frames(frames.clone(), &mut second, &options)
+                .unwrap();
+            assert_eq!(first, second);
+
+            let mut decoder = gif::DecodeOptions::new()
+                .read_info(Cursor::new(first))
+                .unwrap();
+            if palette_mode == PaletteMode::Global {
+                assert!(decoder.global_palette().is_some());
+            }
+            let mut decoded_frames = 0;
+            while let Some(frame) = decoder.read_next_frame().unwrap() {
+                assert!(frame.transparent.is_some());
+                decoded_frames += 1;
+            }
+            assert_eq!(decoded_frames, 2);
+        }
+    }
+}
+
+#[test]
 fn fixed_palette_roundtrips_local_global_bayer_and_floyd() {
     let mut first_pixels = [128, 128, 128, 255].repeat(64);
     first_pixels[3] = 0;

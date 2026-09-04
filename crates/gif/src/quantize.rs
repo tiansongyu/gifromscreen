@@ -62,7 +62,8 @@ pub enum DitherMode {
 /// default, [`Grayscale`](Self::Grayscale) deliberately removes hue, and
 /// [`MostUsed`](Self::MostUsed) favors the most frequent source colors, and
 /// [`Octree`](Self::Octree) prunes a bounded RGB octree. [`NeuQuant`](Self::NeuQuant)
-/// trains a bounded Kohonen network over a deterministic sample.
+/// trains a bounded Kohonen network over a deterministic sample. The remaining
+/// variants use immutable predefined palettes with a reserved transparency slot.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum QuantizerStrategy {
@@ -77,6 +78,12 @@ pub enum QuantizerStrategy {
     Octree,
     /// Bounded deterministic NeuQuant neural-network color reduction.
     NeuQuant,
+    /// Fixed 216-color web-safe cube plus a reserved transparent entry.
+    WebSafe216,
+    /// Fixed black-and-white palette plus a reserved transparent entry.
+    Monochrome,
+    /// Fixed classic Windows 16-color palette plus a reserved transparent entry.
+    Windows16,
 }
 
 /// RGB palette shared by every image descriptor in a GIF.
@@ -962,6 +969,12 @@ impl FrameQuantizer for QuantizerStrategy {
             Self::MostUsed => MostUsedQuantizer.quantize(frame, settings, cancellation),
             Self::Octree => OctreeQuantizer.quantize(frame, settings, cancellation),
             Self::NeuQuant => NeuQuantQuantizer.quantize(frame, settings, cancellation),
+            Self::WebSafe216 => predefined_strategy_quantizer(PredefinedPalette::WebSafe216)?
+                .quantize(frame, settings, cancellation),
+            Self::Monochrome => predefined_strategy_quantizer(PredefinedPalette::Monochrome)?
+                .quantize(frame, settings, cancellation),
+            Self::Windows16 => predefined_strategy_quantizer(PredefinedPalette::Windows16)?
+                .quantize(frame, settings, cancellation),
         }
     }
 
@@ -985,8 +998,20 @@ impl FrameQuantizer for QuantizerStrategy {
             Self::NeuQuant => {
                 NeuQuantQuantizer.build_global_palette(frames, settings, cancellation)
             }
+            Self::WebSafe216 => predefined_strategy_quantizer(PredefinedPalette::WebSafe216)?
+                .build_global_palette(frames, settings, cancellation),
+            Self::Monochrome => predefined_strategy_quantizer(PredefinedPalette::Monochrome)?
+                .build_global_palette(frames, settings, cancellation),
+            Self::Windows16 => predefined_strategy_quantizer(PredefinedPalette::Windows16)?
+                .build_global_palette(frames, settings, cancellation),
         }
     }
+}
+
+fn predefined_strategy_quantizer(
+    palette: PredefinedPalette,
+) -> Result<FixedPaletteQuantizer, QuantizationError> {
+    FixedPaletteQuantizer::from_predefined_with_transparency(palette, [0, 0, 0])
 }
 
 fn quantize_frame(

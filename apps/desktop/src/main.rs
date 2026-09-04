@@ -165,6 +165,10 @@ enum ExportQuantizerChoice {
     Octree,
     Grayscale,
     MostUsed,
+    NeuQuant,
+    WebSafe216,
+    Monochrome,
+    Windows16,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -173,7 +177,14 @@ enum ExportDitherChoice {
     None,
     Bayer,
     FloydSteinberg,
+    Atkinson,
+    Burkes,
     Sierra,
+    SierraLite,
+    TwoRowSierra,
+    JarvisJudiceNinke,
+    Stucki,
+    StevensonArce,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1924,22 +1935,33 @@ fn show_export_configuration(
             ui.end_row();
 
             ui.label("Quantizer");
-            egui::ComboBox::from_id_salt("editor_export_quantizer")
-                .selected_text(export_quantizer_label(settings.quantizer))
-                .show_ui(ui, |ui| {
-                    for choice in [
-                        ExportQuantizerChoice::MedianCut,
-                        ExportQuantizerChoice::Octree,
-                        ExportQuantizerChoice::Grayscale,
-                        ExportQuantizerChoice::MostUsed,
-                    ] {
-                        ui.selectable_value(
-                            &mut settings.quantizer,
-                            choice,
-                            export_quantizer_label(choice),
-                        );
-                    }
-                });
+            ui.vertical(|ui| {
+                egui::ComboBox::from_id_salt("editor_export_quantizer")
+                    .selected_text(export_quantizer_label(settings.quantizer))
+                    .show_ui(ui, |ui| {
+                        for choice in [
+                            ExportQuantizerChoice::MedianCut,
+                            ExportQuantizerChoice::Octree,
+                            ExportQuantizerChoice::Grayscale,
+                            ExportQuantizerChoice::MostUsed,
+                            ExportQuantizerChoice::NeuQuant,
+                            ExportQuantizerChoice::WebSafe216,
+                            ExportQuantizerChoice::Monochrome,
+                            ExportQuantizerChoice::Windows16,
+                        ] {
+                            ui.selectable_value(
+                                &mut settings.quantizer,
+                                choice,
+                                export_quantizer_label(choice),
+                            );
+                        }
+                    });
+                if let Some(required) = fixed_palette_required_colors(settings.quantizer) {
+                    ui.weak(format!(
+                        "Fixed palette · at least {required} colors including transparency"
+                    ));
+                }
+            });
             ui.end_row();
 
             ui.label("Dither");
@@ -1950,7 +1972,14 @@ fn show_export_configuration(
                         ExportDitherChoice::None,
                         ExportDitherChoice::Bayer,
                         ExportDitherChoice::FloydSteinberg,
+                        ExportDitherChoice::Atkinson,
+                        ExportDitherChoice::Burkes,
                         ExportDitherChoice::Sierra,
+                        ExportDitherChoice::SierraLite,
+                        ExportDitherChoice::TwoRowSierra,
+                        ExportDitherChoice::JarvisJudiceNinke,
+                        ExportDitherChoice::Stucki,
+                        ExportDitherChoice::StevensonArce,
                     ] {
                         ui.selectable_value(
                             &mut settings.dither,
@@ -2000,6 +2029,10 @@ const fn export_quantizer_label(choice: ExportQuantizerChoice) -> &'static str {
         ExportQuantizerChoice::Octree => "Octree",
         ExportQuantizerChoice::Grayscale => "Grayscale",
         ExportQuantizerChoice::MostUsed => "Most used",
+        ExportQuantizerChoice::NeuQuant => "NeuQuant",
+        ExportQuantizerChoice::WebSafe216 => "Web safe 216 (fixed)",
+        ExportQuantizerChoice::Monochrome => "Monochrome (fixed)",
+        ExportQuantizerChoice::Windows16 => "Windows 16 (fixed)",
     }
 }
 
@@ -2008,7 +2041,14 @@ const fn export_dither_label(choice: ExportDitherChoice) -> &'static str {
         ExportDitherChoice::None => "None",
         ExportDitherChoice::Bayer => "Bayer 4×4",
         ExportDitherChoice::FloydSteinberg => "Floyd–Steinberg",
+        ExportDitherChoice::Atkinson => "Atkinson",
+        ExportDitherChoice::Burkes => "Burkes",
         ExportDitherChoice::Sierra => "Sierra",
+        ExportDitherChoice::SierraLite => "Sierra Lite",
+        ExportDitherChoice::TwoRowSierra => "Two-row Sierra",
+        ExportDitherChoice::JarvisJudiceNinke => "Jarvis–Judice–Ninke",
+        ExportDitherChoice::Stucki => "Stucki",
+        ExportDitherChoice::StevensonArce => "Stevenson–Arce",
     }
 }
 
@@ -2636,6 +2676,13 @@ fn build_project_export_options(
     if !(2..=256).contains(&settings.max_colors) {
         return Err("Maximum colors must be between 2 and 256.".to_owned());
     }
+    if let Some(required) = fixed_palette_required_colors(settings.quantizer)
+        && settings.max_colors < required
+    {
+        return Err(format!(
+            "The selected fixed palette requires at least {required} colors including transparency."
+        ));
+    }
     if settings.loop_choice == ExportLoopChoice::Finite && settings.finite_loop_count == 0 {
         return Err("Finite loop count must be at least one.".to_owned());
     }
@@ -2648,12 +2695,23 @@ fn build_project_export_options(
         ExportQuantizerChoice::Octree => QuantizerStrategy::Octree,
         ExportQuantizerChoice::Grayscale => QuantizerStrategy::Grayscale,
         ExportQuantizerChoice::MostUsed => QuantizerStrategy::MostUsed,
+        ExportQuantizerChoice::NeuQuant => QuantizerStrategy::NeuQuant,
+        ExportQuantizerChoice::WebSafe216 => QuantizerStrategy::WebSafe216,
+        ExportQuantizerChoice::Monochrome => QuantizerStrategy::Monochrome,
+        ExportQuantizerChoice::Windows16 => QuantizerStrategy::Windows16,
     };
     let dither = match settings.dither {
         ExportDitherChoice::None => DitherMode::None,
         ExportDitherChoice::Bayer => DitherMode::Bayer4x4,
         ExportDitherChoice::FloydSteinberg => DitherMode::FloydSteinberg,
+        ExportDitherChoice::Atkinson => DitherMode::Atkinson,
+        ExportDitherChoice::Burkes => DitherMode::Burkes,
         ExportDitherChoice::Sierra => DitherMode::Sierra,
+        ExportDitherChoice::SierraLite => DitherMode::SierraLite,
+        ExportDitherChoice::TwoRowSierra => DitherMode::TwoRowSierra,
+        ExportDitherChoice::JarvisJudiceNinke => DitherMode::JarvisJudiceNinke,
+        ExportDitherChoice::Stucki => DitherMode::Stucki,
+        ExportDitherChoice::StevensonArce => DitherMode::StevensonArce,
     };
     let loop_behavior = match settings.loop_choice {
         ExportLoopChoice::Infinite => LoopBehavior::Infinite,
@@ -2678,6 +2736,19 @@ fn build_project_export_options(
         overwrite_existing: settings.overwrite,
         ..ProjectGifExportOptions::default()
     })
+}
+
+const fn fixed_palette_required_colors(choice: ExportQuantizerChoice) -> Option<u16> {
+    match choice {
+        ExportQuantizerChoice::WebSafe216 => Some(217),
+        ExportQuantizerChoice::Monochrome => Some(3),
+        ExportQuantizerChoice::Windows16 => Some(17),
+        ExportQuantizerChoice::MedianCut
+        | ExportQuantizerChoice::Octree
+        | ExportQuantizerChoice::Grayscale
+        | ExportQuantizerChoice::MostUsed
+        | ExportQuantizerChoice::NeuQuant => None,
+    }
 }
 
 fn validate_export_output(output: &str) -> Result<PathBuf, String> {
@@ -3360,6 +3431,19 @@ mod tests {
                 QuantizerStrategy::Grayscale,
             ),
             (ExportQuantizerChoice::MostUsed, QuantizerStrategy::MostUsed),
+            (ExportQuantizerChoice::NeuQuant, QuantizerStrategy::NeuQuant),
+            (
+                ExportQuantizerChoice::WebSafe216,
+                QuantizerStrategy::WebSafe216,
+            ),
+            (
+                ExportQuantizerChoice::Monochrome,
+                QuantizerStrategy::Monochrome,
+            ),
+            (
+                ExportQuantizerChoice::Windows16,
+                QuantizerStrategy::Windows16,
+            ),
         ] {
             let mapped = build_project_export_options(
                 &EditorExportSettings {
@@ -3378,6 +3462,16 @@ mod tests {
                 ExportDitherChoice::FloydSteinberg,
                 DitherMode::FloydSteinberg,
             ),
+            (ExportDitherChoice::Atkinson, DitherMode::Atkinson),
+            (ExportDitherChoice::Burkes, DitherMode::Burkes),
+            (ExportDitherChoice::SierraLite, DitherMode::SierraLite),
+            (ExportDitherChoice::TwoRowSierra, DitherMode::TwoRowSierra),
+            (
+                ExportDitherChoice::JarvisJudiceNinke,
+                DitherMode::JarvisJudiceNinke,
+            ),
+            (ExportDitherChoice::Stucki, DitherMode::Stucki),
+            (ExportDitherChoice::StevensonArce, DitherMode::StevensonArce),
         ] {
             let mapped = build_project_export_options(
                 &EditorExportSettings {
@@ -3389,6 +3483,16 @@ mod tests {
             .unwrap();
             assert_eq!(mapped.encoding.dither, expected);
         }
+        let fixed_limit_error = build_project_export_options(
+            &EditorExportSettings {
+                max_colors: 216,
+                quantizer: ExportQuantizerChoice::WebSafe216,
+                ..EditorExportSettings::default()
+            },
+            ProjectFrameSelection::All,
+        )
+        .unwrap_err();
+        assert!(fixed_limit_error.contains("at least 217 colors"));
     }
 
     #[test]
