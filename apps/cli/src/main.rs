@@ -2,8 +2,13 @@
 
 //! Diagnostics and headless tooling for `GifFromScreen` projects and encoders.
 
-use std::{env, fs, io, path::Path};
+use std::{env, fs, io, path::Path, time::Duration};
 
+use gif_from_screen_capture::{
+    CaptureBackend, CaptureCadence, CaptureRequest, CaptureTarget, CursorCaptureMode, FramePoll,
+    PhysicalRect as CaptureRect, PixelFormat,
+};
+use gif_from_screen_capture_linux::X11CaptureBackend;
 use gif_from_screen_domain::{
     AssetDescriptor, AssetKind, Canvas, CanvasBackground, CaptureMetadata, ClipTransform,
     ColorSpace, DurationUs, EditCommand, FrameClip, FrameId, PhysicalSize, ProjectId,
@@ -40,6 +45,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let output = arguments.next().ok_or("missing OUTPUT.gif")?;
             export_project(Path::new(&project), Path::new(&output))?;
         }
+        "sources-x11" => list_x11_sources()?,
+        "record-x11" => {
+            let output = arguments.next().ok_or("missing OUTPUT.gif")?;
+            let duration_ms = parse_optional(&mut arguments, 3_000_u64, "duration milliseconds")?;
+            let fps = parse_optional(&mut arguments, 10_u32, "FPS")?;
+            let region = parse_optional_region(&mut arguments)?;
+            record_x11(Path::new(&output), duration_ms, fps, region)?;
+        }
         "help" | "--help" | "-h" => help(),
         other => {
             eprintln!("unknown command: {other}");
@@ -52,7 +65,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn help() {
     println!(
-        "GifFromScreen CLI\n\nUSAGE:\n  gif-from-screen-cli doctor\n  gif-from-screen-cli demo [OUTPUT.gif]\n  gif-from-screen-cli demo-project PROJECT_DIRECTORY OUTPUT.gif\n  gif-from-screen-cli export PROJECT_DIRECTORY OUTPUT.gif\n  gif-from-screen-cli version"
+        "GifFromScreen CLI\n\nUSAGE:\n  gif-from-screen-cli doctor\n  gif-from-screen-cli demo [OUTPUT.gif]\n  gif-from-screen-cli demo-project PROJECT_DIRECTORY OUTPUT.gif\n  gif-from-screen-cli export PROJECT_DIRECTORY OUTPUT.gif\n  gif-from-screen-cli sources-x11\n  gif-from-screen-cli record-x11 OUTPUT.gif [DURATION_MS] [FPS] [X Y WIDTH HEIGHT]\n  gif-from-screen-cli version"
     );
 }
 
@@ -60,28 +73,8 @@ fn write_demo(output: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if output.exists() {
         return Err(format!("refusing to overwrite {}", output.display()).into());
     }
-    let file_name = output
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid output filename"))?;
-    let partial = output.with_file_name(format!(".{file_name}.partial"));
     let frames = (0..36).map(demo_frame).collect::<Result<Vec<_>, _>>()?;
-    let result = (|| -> Result<_, Box<dyn std::error::Error>> {
-        let mut file = fs::File::create(&partial)?;
-        let report = BuiltinGifEncoder::default().encode_frames(
-            frames,
-            &mut file,
-            &EncodeOptions::default(),
-        )?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&partial, output)?;
-        Ok(report)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&partial);
-    }
-    let report = result?;
+    let report = write_gif_frames(output, frames)?;
     println!(
         "wrote {} frames ({} GIF frames, {} ticks) to {}",
         report.input_frames,
@@ -185,6 +178,23 @@ fn export_project(project_root: &Path, output: &Path) -> Result<(), Box<dyn std:
         })
         .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
 
+    let report = write_gif_frames(output, frames)?;
+    println!(
+        "exported revision {} as {} GIF frames to {}",
+        opened.project.manifest().revision,
+        report.encoded_frames,
+        output.display()
+    );
+    Ok(())
+}
+
+fn write_gif_frames(
+    output: &Path,
+    frames: Vec<RgbaFrame>,
+) -> Result<gif_from_screen_gif::EncodeReport, Box<dyn std::error::Error>> {
+    if output.exists() {
+        return Err(format!("refusing to overwrite {}", output.display()).into());
+    }
     let file_name = output
         .file_name()
         .and_then(|name| name.to_str())
@@ -205,14 +215,159 @@ fn export_project(project_root: &Path, output: &Path) -> Result<(), Box<dyn std:
     if result.is_err() {
         let _ = fs::remove_file(&partial);
     }
-    let report = result?;
+    result
+}
+
+fn list_x11_sources() -> Result<(), Box<dyn std::error::Error>> {
+    let backend = X11CaptureBackend::connect(None)?;
+    for source in backend.list_sources()? {
+        let geometry = source.geometry().map_or_else(
+            || "unknown geometry".to_owned(),
+            |rect| {
+                format!(
+                    "{}x{} at {},{}",
+                    rect.size().width(),
+                    rect.size().height(),
+                    rect.origin().x,
+                    rect.origin().y
+                )
+            },
+        );
+        println!("{}\t{}\t{geometry}", source.id(), source.name());
+    }
+    Ok(())
+}
+
+fn record_x11(
+    output: &Path,
+    duration_ms: u64,
+    fps: u32,
+    region: Option<CaptureRect>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if duration_ms == 0 || duration_ms > 60_000 {
+        return Err("duration must be between 1 and 60000 milliseconds".into());
+    }
+    if !(1..=60).contains(&fps) {
+        return Err("FPS must be between 1 and 60".into());
+    }
+    let backend = X11CaptureBackend::connect(None)?;
+    let source = backend
+        .list_sources()?
+        .into_iter()
+        .next()
+        .ok_or("X11 backend returned no capture sources")?;
+    let target = region.map_or_else(
+        || CaptureTarget::Monitor(source.id().clone()),
+        |region| CaptureTarget::Region {
+            source: source.id().clone(),
+            region,
+        },
+    );
+    let mut request = CaptureRequest::new(target, CaptureCadence::fixed_fps(fps)?);
+    request.cursor = CursorCaptureMode::Hidden;
+    let mut session = backend.start_session(request)?;
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_millis(duration_ms))
+        .ok_or("capture deadline overflow")?;
+    let mut captured = Vec::new();
+    while std::time::Instant::now() < deadline {
+        match session.poll_frame(Duration::from_millis(250))? {
+            FramePoll::Frame(frame) => captured.push(frame),
+            FramePoll::Pending => {}
+            FramePoll::EndOfStream => break,
+        }
+    }
+    session.stop()?;
+    if captured.is_empty() {
+        return Err("capture finished without any frames".into());
+    }
+
+    let fallback_duration = 1_000_000_u64 / u64::from(fps);
+    let mut frames = Vec::with_capacity(captured.len());
+    for (index, frame) in captured.iter().enumerate() {
+        let frame_delay_us = captured
+            .get(index + 1)
+            .map(|next| {
+                next.captured_at()
+                    .as_micros()
+                    .saturating_sub(frame.captured_at().as_micros())
+            })
+            .filter(|duration| *duration > 0)
+            .unwrap_or(fallback_duration);
+        frames.push(captured_frame_to_gif(frame, frame_delay_us)?);
+    }
+    let report = write_gif_frames(output, frames)?;
     println!(
-        "exported revision {} as {} GIF frames to {}",
-        opened.project.manifest().revision,
+        "captured {} X11 frames and wrote {} GIF frames to {}",
+        captured.len(),
         report.encoded_frames,
         output.display()
     );
     Ok(())
+}
+
+fn captured_frame_to_gif(
+    frame: &gif_from_screen_capture::CapturedFrame,
+    duration_us: u64,
+) -> Result<RgbaFrame, Box<dyn std::error::Error>> {
+    let width = usize::try_from(frame.size().width())?;
+    let height = usize::try_from(frame.size().height())?;
+    let tight_stride = width.checked_mul(4).ok_or("RGBA row size overflow")?;
+    let tight_len = tight_stride
+        .checked_mul(height)
+        .ok_or("RGBA frame size overflow")?;
+    let mut pixels = Vec::with_capacity(tight_len);
+    for row in frame.pixels().chunks(frame.stride()).take(height) {
+        let row = row.get(..tight_stride).ok_or("captured row is truncated")?;
+        match frame.format() {
+            PixelFormat::Rgba8 => pixels.extend_from_slice(row),
+            PixelFormat::Bgra8 => {
+                for pixel in row.chunks_exact(4) {
+                    pixels.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+                }
+            }
+            _ => return Err("unsupported captured pixel format".into()),
+        }
+    }
+    if pixels.len() != tight_len {
+        return Err("captured frame has too few rows".into());
+    }
+    RgbaFrame::new(
+        u16::try_from(width)?,
+        u16::try_from(height)?,
+        pixels,
+        duration_us,
+    )
+    .map_err(Into::into)
+}
+
+fn parse_optional<T: std::str::FromStr>(
+    arguments: &mut impl Iterator<Item = String>,
+    default: T,
+    label: &str,
+) -> Result<T, Box<dyn std::error::Error>> {
+    arguments.next().map_or(Ok(default), |value| {
+        value
+            .parse()
+            .map_err(|_| format!("invalid {label}: {value}").into())
+    })
+}
+
+fn parse_optional_region(
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<Option<CaptureRect>, Box<dyn std::error::Error>> {
+    let Some(x) = arguments.next() else {
+        return Ok(None);
+    };
+    let y = arguments.next().ok_or("region requires Y WIDTH HEIGHT")?;
+    let width = arguments.next().ok_or("region requires WIDTH HEIGHT")?;
+    let height = arguments.next().ok_or("region requires HEIGHT")?;
+    Ok(Some(CaptureRect::new(
+        x.parse().map_err(|_| "invalid region X")?,
+        y.parse().map_err(|_| "invalid region Y")?,
+        width.parse().map_err(|_| "invalid region WIDTH")?,
+        height.parse().map_err(|_| "invalid region HEIGHT")?,
+    )?))
 }
 
 fn unique_u128() -> u128 {

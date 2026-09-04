@@ -1031,6 +1031,8 @@ dependencies = [
 name = "gif-from-screen-cli"
 version = "0.1.0"
 dependencies = [
+ "gif-from-screen-capture",
+ "gif-from-screen-capture-linux",
  "gif-from-screen-domain",
  "gif-from-screen-gif",
  "gif-from-screen-project",

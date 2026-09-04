@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+gif-from-screen-capture = { path = "../../crates/capture" }
+gif-from-screen-capture-linux = { path = "../../crates/capture-linux", features = ["native-x11"] }
 gif-from-screen-domain = { path = "../../crates/domain" }
 gif-from-screen-gif = { path = "../../crates/gif" }
 gif-from-screen-project = { path = "../../crates/project" }
