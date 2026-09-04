@@ -1,8 +1,11 @@
 use std::{collections::BTreeMap, path::Path};
 
 use gif_from_screen_domain::{
-    DomainError, FrameId, ProjectId, SourceProvenance, UnitError, UnixTimeMs,
+    AssetDescriptor, AssetKind, Canvas, CanvasBackground, CaptureMetadata, ClipTransform,
+    DomainError, DurationUs, EditCommand, FrameClip, FrameDurationChange, FrameId, PhysicalSize,
+    ProjectId, ProjectManifest, RasterEncoding, SourceProvenance, UnitError, UnixTimeMs,
 };
+use gif_from_screen_gif::RgbaFrame;
 use gif_from_screen_project::{ActiveProject, ProjectError};
 use gif_from_screen_workflow::CollectedRecording;
 use thiserror::Error;
@@ -24,6 +27,349 @@ pub struct RecordingProjectOptions {
     pub created_at: UnixTimeMs,
     /// Optional display label for the captured screen/window source.
     pub source_label: Option<String>,
+}
+
+/// Metadata required before the first frame of an incrementally persisted recording arrives.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncrementalRecordingProjectOptions {
+    /// Stable identifier assigned to the new project.
+    pub project_id: ProjectId,
+    /// Application version persisted in the project manifest.
+    pub app_version: String,
+    /// Wall-clock project creation timestamp.
+    pub created_at: UnixTimeMs,
+    /// Optional display label for the captured screen/window source.
+    pub source_label: Option<String>,
+}
+
+/// Summary of frames durably journaled while capture is still active.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IncrementalRecordingSummary {
+    /// Number of frames represented by the recoverable project journal.
+    pub frames: usize,
+    /// Total presentation duration represented by those frames.
+    pub duration_us: u64,
+}
+
+/// Failure while creating, appending to, or finalizing an incremental recording project.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum IncrementalRecordingProjectError {
+    /// The caller attempted to finalize a recording before any frame was persisted.
+    #[error("cannot finalize an empty incremental recording")]
+    EmptyRecording,
+
+    /// A frame identity may never use the reserved nil value.
+    #[error("frame {frame_index} has the reserved nil identity")]
+    NilFrameId {
+        /// Zero-based position that the frame would have occupied.
+        frame_index: usize,
+    },
+
+    /// A frame identity must be unique for the lifetime of the project.
+    #[error("frame {frame_id} already exists in the incremental recording")]
+    DuplicateFrameId {
+        /// Repeated stable identity.
+        frame_id: FrameId,
+    },
+
+    /// Every recording frame must match the fixed project canvas.
+    #[error(
+        "frame {frame_index} dimensions {actual_width}x{actual_height} do not match recording canvas {expected_width}x{expected_height}"
+    )]
+    DimensionMismatch {
+        /// Zero-based position rejected by the writer.
+        frame_index: usize,
+        /// Canvas width established before recording.
+        expected_width: u32,
+        /// Canvas height established before recording.
+        expected_height: u32,
+        /// Supplied frame width.
+        actual_width: u16,
+        /// Supplied frame height.
+        actual_height: u16,
+    },
+
+    /// A frame's byte count cannot be represented by the persisted descriptor.
+    #[error("frame {frame_index} byte length cannot be represented as u64")]
+    AssetLengthOutOfRange {
+        /// Zero-based position rejected by the writer.
+        frame_index: usize,
+    },
+
+    /// The supplied frame duration could not be represented by the project model.
+    #[error("frame {frame_index} has invalid duration {duration_us} microseconds")]
+    InvalidFrameDuration {
+        /// Zero-based position rejected by the writer.
+        frame_index: usize,
+        /// Rejected duration.
+        duration_us: u64,
+    },
+
+    /// A duration update referred to a frame that has not been persisted.
+    #[error("cannot update unknown recording frame {frame_id}")]
+    UnknownFrame {
+        /// Stable identity requested by the caller.
+        frame_id: FrameId,
+    },
+
+    /// Creating the empty, recoverable project failed.
+    #[error("could not create incremental recording project: {source}")]
+    CreateProject {
+        /// Project storage or domain failure.
+        #[source]
+        source: ProjectError,
+    },
+
+    /// Storing one immutable RGBA asset failed.
+    #[error("could not store incremental recording frame {frame_index}: {source}")]
+    StoreAsset {
+        /// Zero-based frame position.
+        frame_index: usize,
+        /// Content-addressed storage failure.
+        #[source]
+        source: ProjectError,
+    },
+
+    /// Appending a frame or duration update to the durable journal failed.
+    #[error("could not journal incremental recording edit: {source}")]
+    Commit {
+        /// Project storage or domain failure.
+        #[source]
+        source: ProjectError,
+    },
+
+    /// Writing an explicit manifest checkpoint failed.
+    #[error("could not checkpoint incremental recording project: {source}")]
+    Checkpoint {
+        /// Project storage failure.
+        #[source]
+        source: ProjectError,
+    },
+
+    /// Final snapshot or journal compaction failed. The journal remains the recovery source.
+    #[error("could not finalize incremental recording project: {source}")]
+    Finalize {
+        /// Project storage failure.
+        #[source]
+        source: ProjectError,
+    },
+}
+
+/// A project writer that durably appends captured frames before recording stops.
+///
+/// Creation writes an empty manifest immediately. Each successful [`Self::append_frame`] stores
+/// immutable pixels and synchronously appends a checksummed journal record, so dropping the writer
+/// without calling [`Self::finish`] intentionally leaves a project that can be recovered by
+/// [`ActiveProject::open`]. At most the caller's not-yet-appended frame can be lost in a process
+/// crash.
+#[derive(Debug)]
+pub struct IncrementalRecordingProject {
+    project: ActiveProject,
+    canvas: PhysicalSize,
+}
+
+impl IncrementalRecordingProject {
+    /// Creates the empty snapshot used as the recovery anchor for an active recording.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid metadata/canvas values, an existing project, a lock conflict,
+    /// or an I/O failure. Existing project contents are never replaced.
+    pub fn create(
+        root: impl AsRef<Path>,
+        canvas: PhysicalSize,
+        options: IncrementalRecordingProjectOptions,
+    ) -> Result<Self, IncrementalRecordingProjectError> {
+        let mut manifest = ProjectManifest::new(
+            options.project_id,
+            options.app_version,
+            options.created_at,
+            Canvas {
+                size: canvas,
+                color_space: gif_from_screen_domain::ColorSpace::Srgb,
+                background: CanvasBackground::Transparent,
+            },
+        )
+        .map_err(ProjectError::from)
+        .map_err(|source| IncrementalRecordingProjectError::CreateProject { source })?;
+        manifest.source_provenance = vec![SourceProvenance::Screen {
+            source_label: options.source_label,
+        }];
+        manifest
+            .validate()
+            .map_err(ProjectError::from)
+            .map_err(|source| IncrementalRecordingProjectError::CreateProject { source })?;
+        let project = ActiveProject::create(root, manifest)
+            .map_err(|source| IncrementalRecordingProjectError::CreateProject { source })?;
+        Ok(Self { project, canvas })
+    }
+
+    /// Stores and journals one complete frame at the end of the active timeline.
+    ///
+    /// If the pixels already exist, their content-addressed asset is reused. Input validation is
+    /// performed before writing an asset, and a failed journal append never mutates the in-memory
+    /// manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for nil/duplicate frame identities, a canvas mismatch, an unrepresentable
+    /// asset length, or a storage/journal failure.
+    pub fn append_frame(
+        &mut self,
+        frame_id: FrameId,
+        frame: &RgbaFrame,
+    ) -> Result<(), IncrementalRecordingProjectError> {
+        let frame_index = self.project.manifest().timeline.frames.len();
+        if frame_id.is_nil() {
+            return Err(IncrementalRecordingProjectError::NilFrameId { frame_index });
+        }
+        if self
+            .project
+            .manifest()
+            .timeline
+            .frames
+            .iter()
+            .any(|existing| existing.id == frame_id)
+        {
+            return Err(IncrementalRecordingProjectError::DuplicateFrameId { frame_id });
+        }
+        if u32::from(frame.width()) != self.canvas.width.get()
+            || u32::from(frame.height()) != self.canvas.height.get()
+        {
+            return Err(IncrementalRecordingProjectError::DimensionMismatch {
+                frame_index,
+                expected_width: self.canvas.width.get(),
+                expected_height: self.canvas.height.get(),
+                actual_width: frame.width(),
+                actual_height: frame.height(),
+            });
+        }
+        let duration = DurationUs::new(frame.duration_us()).ok_or(
+            IncrementalRecordingProjectError::InvalidFrameDuration {
+                frame_index,
+                duration_us: frame.duration_us(),
+            },
+        )?;
+        let byte_len = u64::try_from(frame.pixels().len())
+            .map_err(|_| IncrementalRecordingProjectError::AssetLengthOutOfRange { frame_index })?;
+        let asset_id = self
+            .project
+            .assets()
+            .put(frame.pixels())
+            .map_err(|source| IncrementalRecordingProjectError::StoreAsset {
+                frame_index,
+                source,
+            })?;
+        let clip = FrameClip {
+            id: frame_id,
+            asset_id,
+            duration,
+            transform: ClipTransform::default(),
+            capture_metadata: CaptureMetadata::default(),
+            effects: Vec::new(),
+        };
+        let mut commands = Vec::with_capacity(2);
+        if !self.project.manifest().assets.contains_key(&asset_id) {
+            commands.push(EditCommand::RegisterAsset {
+                asset: AssetDescriptor {
+                    id: asset_id,
+                    byte_len,
+                    kind: AssetKind::Frame {
+                        size: self.canvas,
+                        encoding: RasterEncoding::Rgba8,
+                    },
+                },
+            });
+        }
+        commands.push(EditCommand::InsertFrames {
+            index: frame_index,
+            frames: vec![clip],
+        });
+        self.project
+            .commit(EditCommand::Compound { commands })
+            .map_err(|source| IncrementalRecordingProjectError::Commit { source })?;
+        Ok(())
+    }
+
+    /// Replaces the duration of a previously journaled frame.
+    ///
+    /// This supports capture pipelines that append the newest frame with a safe provisional tail
+    /// duration and finalize it once the next capture timestamp is known.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the frame is unknown or the journal update fails.
+    pub fn set_frame_duration(
+        &mut self,
+        frame_id: FrameId,
+        duration: DurationUs,
+    ) -> Result<bool, IncrementalRecordingProjectError> {
+        let Some(frame) = self
+            .project
+            .manifest()
+            .timeline
+            .frames
+            .iter()
+            .find(|frame| frame.id == frame_id)
+        else {
+            return Err(IncrementalRecordingProjectError::UnknownFrame { frame_id });
+        };
+        if frame.duration == duration {
+            return Ok(false);
+        }
+        self.project
+            .commit(EditCommand::SetFrameDurations {
+                changes: vec![FrameDurationChange { frame_id, duration }],
+            })
+            .map_err(|source| IncrementalRecordingProjectError::Commit { source })?;
+        Ok(true)
+    }
+
+    /// Returns the number and total duration currently protected by the journal.
+    pub fn summary(&self) -> IncrementalRecordingSummary {
+        IncrementalRecordingSummary {
+            frames: self.project.manifest().timeline.frames.len(),
+            duration_us: self
+                .project
+                .manifest()
+                .timeline
+                .total_duration()
+                .map_or(u64::MAX, gif_from_screen_domain::TimeUs::get),
+        }
+    }
+
+    /// Atomically checkpoints the current revision without truncating the recovery journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the manifest cannot be validated or durably replaced.
+    pub fn checkpoint(&self) -> Result<(), IncrementalRecordingProjectError> {
+        self.project
+            .checkpoint()
+            .map_err(|source| IncrementalRecordingProjectError::Checkpoint { source })
+    }
+
+    /// Writes the final snapshot, compacts the represented journal, and yields the editor project.
+    ///
+    /// # Errors
+    ///
+    /// Empty recordings are rejected. If finalization fails, already-journaled frames remain
+    /// recoverable on disk.
+    pub fn finish(mut self) -> Result<ActiveProject, IncrementalRecordingProjectError> {
+        if self.project.manifest().timeline.frames.is_empty() {
+            return Err(IncrementalRecordingProjectError::EmptyRecording);
+        }
+        self.project
+            .checkpoint_and_compact()
+            .map_err(|source| IncrementalRecordingProjectError::Finalize { source })?;
+        Ok(self.project)
+    }
+
+    /// Path layout of the live project, useful for user-facing recovery messages.
+    pub fn root(&self) -> &Path {
+        &self.project.layout().root
+    }
 }
 
 /// Failure while converting an in-memory recording into an editable project.
@@ -325,6 +671,15 @@ mod tests {
         RecordingProjectOptions {
             project_id: ProjectId::from_u128(project_id),
             frame_ids: frame_ids.iter().copied().map(FrameId::from_u128).collect(),
+            app_version: "test-1.0".to_owned(),
+            created_at: UnixTimeMs::new(1_234),
+            source_label: Some("Synthetic display".to_owned()),
+        }
+    }
+
+    fn incremental_options(project_id: u128) -> IncrementalRecordingProjectOptions {
+        IncrementalRecordingProjectOptions {
+            project_id: ProjectId::from_u128(project_id),
             app_version: "test-1.0".to_owned(),
             created_at: UnixTimeMs::new(1_234),
             source_label: Some("Synthetic display".to_owned()),
@@ -644,5 +999,160 @@ mod tests {
         assert_eq!(reopened.project.manifest().revision, ProjectRevision::ZERO);
         assert!(reopened.project.manifest().timeline.frames.is_empty());
         assert!(reopened.project.manifest().assets.is_empty());
+    }
+
+    #[test]
+    fn incremental_frames_survive_drop_through_journal_recovery() {
+        let directory = tempdir().unwrap();
+        let canvas = PhysicalSize::new(2, 1).unwrap();
+        let pixels = vec![10, 20, 30, 255, 40, 50, 60, 255];
+        let first = RgbaFrame::new(2, 1, pixels.clone(), 100).unwrap();
+        let second = RgbaFrame::new(2, 1, pixels.clone(), 200).unwrap();
+        let mut writer =
+            IncrementalRecordingProject::create(directory.path(), canvas, incremental_options(77))
+                .unwrap();
+
+        writer.append_frame(FrameId::from_u128(10), &first).unwrap();
+        writer
+            .append_frame(FrameId::from_u128(20), &second)
+            .unwrap();
+        assert!(
+            writer
+                .set_frame_duration(FrameId::from_u128(10), DurationUs::new(150).unwrap())
+                .unwrap()
+        );
+        assert!(
+            !writer
+                .set_frame_duration(FrameId::from_u128(10), DurationUs::new(150).unwrap())
+                .unwrap()
+        );
+        assert_eq!(
+            writer.summary(),
+            IncrementalRecordingSummary {
+                frames: 2,
+                duration_us: 350
+            }
+        );
+        assert_eq!(writer.root(), directory.path());
+        drop(writer);
+
+        let opened = ActiveProject::open(directory.path(), LockPolicy::FailIfPresent).unwrap();
+        assert!(opened.journal_recovery.is_clean());
+        assert_eq!(opened.journal_recovery.replayed_records, 3);
+        assert!(opened.asset_issues.is_empty());
+        assert_eq!(opened.project.manifest().revision, ProjectRevision::new(3));
+        assert_eq!(opened.project.manifest().timeline.frames.len(), 2);
+        assert_eq!(opened.project.manifest().assets.len(), 1);
+        assert_eq!(
+            opened
+                .project
+                .manifest()
+                .timeline
+                .frames
+                .iter()
+                .map(|frame| frame.duration.get())
+                .collect::<Vec<_>>(),
+            [150, 200]
+        );
+        assert_eq!(
+            opened.project.manifest().source_provenance,
+            [SourceProvenance::Screen {
+                source_label: Some("Synthetic display".to_owned())
+            }]
+        );
+        assert_eq!(
+            fs::read_dir(opened.project.assets().directory())
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn incremental_finish_compacts_only_after_a_nonempty_recording() {
+        let directory = tempdir().unwrap();
+        let empty_root = directory.path().join("empty");
+        let writer = IncrementalRecordingProject::create(
+            &empty_root,
+            PhysicalSize::new(1, 1).unwrap(),
+            incremental_options(1),
+        )
+        .unwrap();
+        assert!(matches!(
+            writer.finish(),
+            Err(IncrementalRecordingProjectError::EmptyRecording)
+        ));
+        let reopened = ActiveProject::open(&empty_root, LockPolicy::FailIfPresent).unwrap();
+        assert!(reopened.project.manifest().timeline.frames.is_empty());
+        drop(reopened);
+
+        let completed_root = directory.path().join("completed");
+        let mut writer = IncrementalRecordingProject::create(
+            &completed_root,
+            PhysicalSize::new(1, 1).unwrap(),
+            incremental_options(2),
+        )
+        .unwrap();
+        writer
+            .append_frame(
+                FrameId::from_u128(1),
+                &RgbaFrame::new(1, 1, vec![1, 2, 3, 255], 10_000).unwrap(),
+            )
+            .unwrap();
+        writer.checkpoint().unwrap();
+        let project = writer.finish().unwrap();
+        assert_eq!(project.manifest().timeline.frames.len(), 1);
+        assert!(fs::read(&project.layout().journal).unwrap().is_empty());
+        drop(project);
+
+        let reopened = ActiveProject::open(&completed_root, LockPolicy::FailIfPresent).unwrap();
+        assert_eq!(reopened.journal_recovery.replayed_records, 0);
+        assert_eq!(
+            reopened.project.manifest().revision,
+            ProjectRevision::new(1)
+        );
+    }
+
+    #[test]
+    fn incremental_validation_never_mutates_the_project() {
+        let directory = tempdir().unwrap();
+        let mut writer = IncrementalRecordingProject::create(
+            directory.path(),
+            PhysicalSize::new(1, 1).unwrap(),
+            incremental_options(8),
+        )
+        .unwrap();
+        let valid = RgbaFrame::new(1, 1, vec![9, 8, 7, 255], 100).unwrap();
+        let wrong_size = RgbaFrame::new(2, 1, vec![0; 8], 100).unwrap();
+
+        assert!(matches!(
+            writer.append_frame(FrameId::NIL, &valid),
+            Err(IncrementalRecordingProjectError::NilFrameId { frame_index: 0 })
+        ));
+        assert!(matches!(
+            writer.append_frame(FrameId::from_u128(1), &wrong_size),
+            Err(IncrementalRecordingProjectError::DimensionMismatch { frame_index: 0, .. })
+        ));
+        assert_eq!(writer.summary(), IncrementalRecordingSummary::default());
+        assert_eq!(writer.project.manifest().revision, ProjectRevision::ZERO);
+        assert_eq!(
+            fs::read_dir(writer.project.assets().directory())
+                .unwrap()
+                .count(),
+            0
+        );
+
+        writer.append_frame(FrameId::from_u128(1), &valid).unwrap();
+        let revision = writer.project.manifest().revision;
+        assert!(matches!(
+            writer.append_frame(FrameId::from_u128(1), &valid),
+            Err(IncrementalRecordingProjectError::DuplicateFrameId { .. })
+        ));
+        assert!(matches!(
+            writer.set_frame_duration(FrameId::from_u128(99), DurationUs::new(1).unwrap()),
+            Err(IncrementalRecordingProjectError::UnknownFrame { .. })
+        ));
+        assert_eq!(writer.project.manifest().revision, revision);
+        assert_eq!(writer.summary().frames, 1);
     }
 }

@@ -19,7 +19,9 @@ pub use project_export::{
     ProjectGifExportOptions, ProjectGifExportReport, export_project_snapshot_to_gif,
 };
 pub use recording_project::{
-    PersistRecordingError, RecordingProjectOptions, persist_collected_recording,
+    IncrementalRecordingProject, IncrementalRecordingProjectError,
+    IncrementalRecordingProjectOptions, IncrementalRecordingSummary, PersistRecordingError,
+    RecordingProjectOptions, persist_collected_recording,
 };
 pub use static_image_project::{
     IMPORTED_STATIC_IMAGE_PRESET_NAME, PersistStaticImageError, StaticImageProjectOptions,
