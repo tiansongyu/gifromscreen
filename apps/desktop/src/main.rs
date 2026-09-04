@@ -2,12 +2,15 @@
 
 //! Desktop entry point for the Linux-first `GifFromScreen` application.
 
+mod countdown;
+
 use std::{
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+use countdown::{CountdownStart, CountdownTick, MAX_COUNTDOWN_SECONDS, RecordingCountdown};
 use eframe::egui;
 use gif_from_screen_capture::{
     CaptureBackend, CaptureCadence, CaptureRequest, CaptureSource, CaptureSourceId,
@@ -40,6 +43,7 @@ struct RecordingSettings {
     output: String,
     duration_ms: u64,
     fps: u32,
+    countdown_seconds: u8,
     region_enabled: bool,
     region_x: i32,
     region_y: i32,
@@ -58,6 +62,7 @@ impl Default for RecordingSettings {
             output,
             duration_ms: 3_000,
             fps: 10,
+            countdown_seconds: 3,
             region_enabled: true,
             region_x: 0,
             region_y: 0,
@@ -106,6 +111,7 @@ enum RecorderOverlayAction {
     #[default]
     None,
     Start,
+    CancelCountdown,
     Pause,
     Resume,
     Stop,
@@ -117,6 +123,7 @@ enum RecorderOverlayAction {
 enum RecorderStage {
     #[default]
     Ready,
+    Countdown(u8),
     Recording,
     Paused,
     Finalizing,
@@ -138,6 +145,7 @@ struct GifFromScreenApp {
     recorder_overlay: Option<RecorderOverlay>,
     main_window_snapshot: Option<MainWindowSnapshot>,
     restore_main_window: bool,
+    recording_countdown: RecordingCountdown,
     job: Option<RecordingJob>,
     progress: Option<WorkflowProgress>,
 }
@@ -162,6 +170,7 @@ impl Default for GifFromScreenApp {
             recorder_overlay: None,
             main_window_snapshot: None,
             restore_main_window: false,
+            recording_countdown: RecordingCountdown::default(),
             job: None,
             progress: None,
         }
@@ -180,6 +189,7 @@ impl Drop for GifFromScreenApp {
 impl eframe::App for GifFromScreenApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_job_messages();
+        self.advance_recording_countdown(context);
         if self.restore_main_window {
             if let Some(snapshot) = self.main_window_snapshot.take() {
                 context.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
@@ -195,7 +205,10 @@ impl eframe::App for GifFromScreenApp {
         if self.recorder_overlay.is_some() {
             self.show_recorder_overlay(context);
         }
-        if self.job.is_some() || self.recorder_overlay.is_some() {
+        if self.job.is_some()
+            || self.recorder_overlay.is_some()
+            || self.recording_countdown.is_active()
+        {
             context.request_repaint_after(Duration::from_millis(33));
         }
 
@@ -347,6 +360,12 @@ impl GifFromScreenApp {
                 ui.end_row();
                 ui.label("Frames per second");
                 ui.add(egui::DragValue::new(&mut self.settings.fps).range(1..=60));
+                ui.end_row();
+                ui.label("Start countdown (seconds)");
+                ui.add(
+                    egui::DragValue::new(&mut self.settings.countdown_seconds)
+                        .range(0..=MAX_COUNTDOWN_SECONDS),
+                );
                 ui.end_row();
                 ui.label("Capture a region");
                 ui.checkbox(
@@ -603,12 +622,13 @@ impl GifFromScreenApp {
             return;
         };
         let stage = self.recorder_stage();
+        let ready = stage == RecorderStage::Ready;
         let mut builder = egui::ViewportBuilder::default()
             .with_title("GifFromScreen recorder")
             .with_transparent(true)
             .with_decorations(false)
-            .with_resizable(stage == RecorderStage::Ready)
-            .with_movable_by_background(stage == RecorderStage::Ready)
+            .with_resizable(ready)
+            .with_movable_by_background(ready)
             .with_min_inner_size([180.0, 130.0])
             .with_always_on_top()
             .with_has_shadow(false)
@@ -638,10 +658,13 @@ impl GifFromScreenApp {
             self.settings.region_width = region.size().width();
             self.settings.region_height = region.size().height();
         }
-        self.handle_recorder_overlay_action(frame.action);
+        self.handle_recorder_overlay_action(context, frame.action);
     }
 
     fn recorder_stage(&self) -> RecorderStage {
+        if let Some(remaining) = self.recording_countdown.remaining_seconds() {
+            return RecorderStage::Countdown(remaining);
+        }
         let Some(job) = &self.job else {
             return RecorderStage::Ready;
         };
@@ -657,12 +680,22 @@ impl GifFromScreenApp {
         }
     }
 
-    fn handle_recorder_overlay_action(&mut self, action: RecorderOverlayAction) {
+    fn handle_recorder_overlay_action(
+        &mut self,
+        context: &egui::Context,
+        action: RecorderOverlayAction,
+    ) {
         match action {
             RecorderOverlayAction::None => {}
             RecorderOverlayAction::Start => {
-                if let Err(error) = self.start_recording() {
+                if let Err(error) = self.begin_recording(context) {
                     self.notice = Some(error);
+                }
+            }
+            RecorderOverlayAction::CancelCountdown => {
+                if self.recording_countdown.cancel() {
+                    self.notice = Some("Recording countdown cancelled.".into());
+                    context.request_repaint();
                 }
             }
             RecorderOverlayAction::Pause => {
@@ -698,8 +731,52 @@ impl GifFromScreenApp {
     }
 
     fn close_recorder_overlay(&mut self) {
+        self.recording_countdown.cancel();
         self.recorder_overlay = None;
         self.restore_main_window = true;
+    }
+
+    fn begin_recording(&mut self, context: &egui::Context) -> Result<(), String> {
+        validate_settings(&self.settings)?;
+        if self.job.is_some() {
+            return Ok(());
+        }
+        match self
+            .recording_countdown
+            .start(Instant::now(), self.settings.countdown_seconds)
+        {
+            CountdownStart::Immediate => self.start_recording(),
+            CountdownStart::Started => {
+                self.notice = Some(format!(
+                    "Recording starts in {} seconds…",
+                    self.settings.countdown_seconds
+                ));
+                context.request_repaint();
+                Ok(())
+            }
+            CountdownStart::AlreadyRunning => Ok(()),
+            CountdownStart::OutOfRange => Err(format!(
+                "Countdown must be between 0 and {MAX_COUNTDOWN_SECONDS} seconds."
+            )),
+        }
+    }
+
+    fn advance_recording_countdown(&mut self, context: &egui::Context) {
+        match self.recording_countdown.tick(Instant::now()) {
+            CountdownTick::Idle => {}
+            CountdownTick::Waiting(_) => {
+                context.request_repaint_after(Duration::from_millis(16));
+            }
+            CountdownTick::Finished => {
+                context.request_repaint();
+                if self.recorder_overlay.is_some()
+                    && self.job.is_none()
+                    && let Err(error) = self.start_recording()
+                {
+                    self.notice = Some(error);
+                }
+            }
+        }
     }
 
     fn start_recording(&mut self) -> Result<(), String> {
@@ -857,6 +934,12 @@ fn draw_recorder_toolbar(
             ui.horizontal_centered(|ui| match stage {
                 RecorderStage::Ready => {
                     action = show_ready_recorder_controls(ui, context);
+                }
+                RecorderStage::Countdown(remaining) => {
+                    ui.strong(format!("Recording starts in {remaining}s"));
+                    if ui.button("Cancel").clicked() {
+                        action = RecorderOverlayAction::CancelCountdown;
+                    }
                 }
                 RecorderStage::Recording => {
                     show_overlay_progress(ui, progress);
@@ -1318,6 +1401,11 @@ fn validate_settings(settings: &RecordingSettings) -> Result<(), String> {
     if !(1..=60).contains(&settings.fps) {
         return Err("FPS must be between 1 and 60.".into());
     }
+    if settings.countdown_seconds > MAX_COUNTDOWN_SECONDS {
+        return Err(format!(
+            "Countdown must be between 0 and {MAX_COUNTDOWN_SECONDS} seconds."
+        ));
+    }
     let output = Path::new(settings.output.trim());
     if output.file_name().is_none() {
         return Err("Output must identify a GIF file.".into());
@@ -1432,8 +1520,8 @@ mod tests {
     use eframe::egui;
 
     use super::{
-        RecordingSettings, fit_dimensions, map_preview_selection, resize_nearest_rgba,
-        validate_settings,
+        MAX_COUNTDOWN_SECONDS, RecordingSettings, fit_dimensions, map_preview_selection,
+        resize_nearest_rgba, validate_settings,
     };
 
     #[test]
@@ -1442,6 +1530,12 @@ mod tests {
             output: "/tmp/gfs-ui-validation.gif".into(),
             ..RecordingSettings::default()
         };
+        assert!(validate_settings(&settings).is_ok());
+        settings.countdown_seconds = MAX_COUNTDOWN_SECONDS;
+        assert!(validate_settings(&settings).is_ok());
+        settings.countdown_seconds = MAX_COUNTDOWN_SECONDS + 1;
+        assert!(validate_settings(&settings).is_err());
+        settings.countdown_seconds = 0;
         assert!(validate_settings(&settings).is_ok());
         settings.fps = 0;
         assert!(validate_settings(&settings).is_err());
