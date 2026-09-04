@@ -11,7 +11,7 @@ use std::{
 };
 
 use eframe::egui;
-use gif_from_screen_domain::{DurationUs, FrameId, TimeUs};
+use gif_from_screen_domain::{DurationUs, FrameId, PhysicalRect, PhysicalSize, TimeUs};
 use gif_from_screen_editor::{
     VirtualFilmstripError, VirtualFilmstripLayout, parse_frame_expression,
 };
@@ -36,6 +36,18 @@ pub(crate) struct EditorUiState {
     pub(crate) percentage_input: String,
     /// Comma/range expression used to replace the current frame selection.
     pub(crate) frame_expression: String,
+    /// Source-coordinate crop X input in physical pixels.
+    pub(crate) crop_x_input: String,
+    /// Source-coordinate crop Y input in physical pixels.
+    pub(crate) crop_y_input: String,
+    /// Crop width input in physical pixels.
+    pub(crate) crop_width_input: String,
+    /// Crop height input in physical pixels.
+    pub(crate) crop_height_input: String,
+    /// Pre-rotation resize width input in physical pixels.
+    pub(crate) resize_width_input: String,
+    /// Pre-rotation resize height input in physical pixels.
+    pub(crate) resize_height_input: String,
     /// Monotonic playback clock when playback is active.
     pub(crate) playback: Option<PlaybackClock>,
     filmstrip_scroll_offset: f64,
@@ -50,6 +62,12 @@ impl Default for EditorUiState {
             duration_us_input: "100000".into(),
             percentage_input: "100".into(),
             frame_expression: "1".into(),
+            crop_x_input: "0".into(),
+            crop_y_input: "0".into(),
+            crop_width_input: "1".into(),
+            crop_height_input: "1".into(),
+            resize_width_input: "1".into(),
+            resize_height_input: "1".into(),
             playback: None,
             filmstrip_scroll_offset: 0.0,
             reveal_current_frame: false,
@@ -113,6 +131,14 @@ pub(crate) enum EditorUiOperation {
     OverrideDuration,
     AdjustDuration,
     ScaleDuration,
+    ApplyCrop,
+    ClearCrop,
+    Resize,
+    ClearOutputSize,
+    RotateLeft,
+    RotateRight,
+    FlipHorizontal,
+    FlipVertical,
     FilmstripLayout,
 }
 
@@ -153,6 +179,7 @@ pub(crate) fn show_editor_ui(
     show_navigation_toolbar(ui, workspace, state, now, &mut results);
     show_selection_toolbar(ui, workspace, state, now, &mut results);
     show_edit_toolbar(ui, workspace, state, now, &mut results);
+    show_transform_toolbar(ui, workspace, state, now, &mut results);
     ui.separator();
     show_virtual_filmstrip(ui, workspace, state, now, &mut results);
 
@@ -512,6 +539,172 @@ fn show_edit_toolbar(
             }
         }
     });
+}
+
+fn show_transform_toolbar(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    now: Instant,
+    results: &mut Vec<EditorUiResult>,
+) {
+    ui.group(|ui| {
+        ui.strong("Transform selected frames");
+        show_crop_resize_controls(ui, workspace, state, now, results);
+        show_orientation_controls(ui, workspace, state, now, results);
+    });
+}
+
+fn show_crop_resize_controls(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    now: Instant,
+    results: &mut Vec<EditorUiResult>,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Crop");
+        ui.label("X");
+        compact_input(ui, &mut state.crop_x_input);
+        ui.label("Y");
+        compact_input(ui, &mut state.crop_y_input);
+        ui.label("W");
+        compact_input(ui, &mut state.crop_width_input);
+        ui.label("H");
+        compact_input(ui, &mut state.crop_height_input);
+        if ui.button("Apply crop").clicked() {
+            match parse_crop(state) {
+                Ok(crop) => {
+                    let result = workspace.set_selection_crop(crop);
+                    record_project_result(
+                        workspace,
+                        state,
+                        now,
+                        results,
+                        EditorUiOperation::ApplyCrop,
+                        result,
+                    );
+                }
+                Err(message) => push_failure(results, EditorUiOperation::ApplyCrop, message),
+            }
+        }
+        if ui.button("Clear crop").clicked() {
+            let result = workspace.clear_selection_crop();
+            record_project_result(
+                workspace,
+                state,
+                now,
+                results,
+                EditorUiOperation::ClearCrop,
+                result,
+            );
+        }
+    });
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Resize before rotation");
+        ui.label("W");
+        compact_input(ui, &mut state.resize_width_input);
+        ui.label("H");
+        compact_input(ui, &mut state.resize_height_input);
+        if ui.button("Resize").clicked() {
+            match parse_output_size(state) {
+                Ok(size) => {
+                    let result = workspace.set_selection_output_size(size);
+                    record_project_result(
+                        workspace,
+                        state,
+                        now,
+                        results,
+                        EditorUiOperation::Resize,
+                        result,
+                    );
+                }
+                Err(message) => push_failure(results, EditorUiOperation::Resize, message),
+            }
+        }
+        if ui.button("Clear resize").clicked() {
+            let result = workspace.clear_selection_output_size();
+            record_project_result(
+                workspace,
+                state,
+                now,
+                results,
+                EditorUiOperation::ClearOutputSize,
+                result,
+            );
+        }
+    });
+}
+
+fn show_orientation_controls(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    now: Instant,
+    results: &mut Vec<EditorUiResult>,
+) {
+    ui.horizontal_wrapped(|ui| {
+        for (label, control) in [
+            ("Rotate left", OrientationControl::RotateLeft),
+            ("Rotate right", OrientationControl::RotateRight),
+            ("Flip H", OrientationControl::FlipHorizontal),
+            ("Flip V", OrientationControl::FlipVertical),
+        ] {
+            if ui.button(label).clicked() {
+                let operation = orientation_operation(control);
+                let result = apply_orientation_control(workspace, control);
+                record_project_result(workspace, state, now, results, operation, result);
+            }
+        }
+    });
+}
+
+fn compact_input(ui: &mut egui::Ui, value: &mut String) {
+    ui.add(egui::TextEdit::singleline(value).desired_width(54.0));
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrientationControl {
+    RotateLeft,
+    RotateRight,
+    FlipHorizontal,
+    FlipVertical,
+}
+
+const fn orientation_operation(control: OrientationControl) -> EditorUiOperation {
+    match control {
+        OrientationControl::RotateLeft => EditorUiOperation::RotateLeft,
+        OrientationControl::RotateRight => EditorUiOperation::RotateRight,
+        OrientationControl::FlipHorizontal => EditorUiOperation::FlipHorizontal,
+        OrientationControl::FlipVertical => EditorUiOperation::FlipVertical,
+    }
+}
+
+fn apply_orientation_control(
+    workspace: &mut EditorWorkspace,
+    control: OrientationControl,
+) -> Result<(), EditorWorkspaceError> {
+    match control {
+        OrientationControl::RotateLeft => workspace.rotate_selection_counterclockwise(),
+        OrientationControl::RotateRight => workspace.rotate_selection_clockwise(),
+        OrientationControl::FlipHorizontal => workspace.toggle_selection_horizontal_flip(),
+        OrientationControl::FlipVertical => workspace.toggle_selection_vertical_flip(),
+    }
+}
+
+fn parse_crop(state: &EditorUiState) -> Result<PhysicalRect, String> {
+    let x = parse_input::<u32>(&state.crop_x_input, "crop X")?;
+    let y = parse_input::<u32>(&state.crop_y_input, "crop Y")?;
+    let width = parse_input::<u32>(&state.crop_width_input, "crop width")?;
+    let height = parse_input::<u32>(&state.crop_height_input, "crop height")?;
+    PhysicalRect::new(x, y, width, height).map_err(|error| format!("invalid crop: {error}"))
+}
+
+fn parse_output_size(state: &EditorUiState) -> Result<PhysicalSize, String> {
+    let width = parse_input::<u32>(&state.resize_width_input, "resize width")?;
+    let height = parse_input::<u32>(&state.resize_height_input, "resize height")?;
+    PhysicalSize::new(width, height).map_err(|error| format!("invalid resize: {error}"))
 }
 
 #[allow(
@@ -958,12 +1151,12 @@ fn schedule_playback_repaint(context: &egui::Context, state: &EditorUiState, now
 mod tests {
     use std::time::{Duration, Instant};
 
-    use gif_from_screen_domain::{DurationUs, FrameId, TimeUs};
+    use gif_from_screen_domain::{DurationUs, FrameId, PhysicalRect, PhysicalSize, TimeUs};
 
     use super::{
-        EditorUiOperation, EditorUiState, FILMSTRIP_ITEM_WIDTH, PlaybackClock,
-        frame_click_operation, parse_duration_us, parse_time_ms, to_ui_points,
-        visible_widget_range,
+        EditorUiOperation, EditorUiState, FILMSTRIP_ITEM_WIDTH, OrientationControl, PlaybackClock,
+        frame_click_operation, orientation_operation, parse_crop, parse_duration_us,
+        parse_output_size, parse_time_ms, to_ui_points, visible_widget_range,
     };
 
     #[test]
@@ -974,6 +1167,12 @@ mod tests {
         assert_eq!(state.duration_us_input, "100000");
         assert_eq!(state.percentage_input, "100");
         assert_eq!(state.frame_expression, "1");
+        assert_eq!(state.crop_x_input, "0");
+        assert_eq!(state.crop_y_input, "0");
+        assert_eq!(state.crop_width_input, "1");
+        assert_eq!(state.crop_height_input, "1");
+        assert_eq!(state.resize_width_input, "1");
+        assert_eq!(state.resize_height_input, "1");
         assert!(state.playback.is_none());
     }
 
@@ -1004,6 +1203,64 @@ mod tests {
         assert_eq!(parse_duration_us("1").unwrap(), DurationUs::new(1).unwrap());
         assert!(parse_duration_us("0").is_err());
         assert!(parse_duration_us("not a number").is_err());
+    }
+
+    #[test]
+    fn crop_and_resize_inputs_validate_zero_overflow_and_u32_boundaries() {
+        let mut state = EditorUiState {
+            crop_x_input: "2".to_owned(),
+            crop_y_input: "3".to_owned(),
+            crop_width_input: "4".to_owned(),
+            crop_height_input: "5".to_owned(),
+            ..EditorUiState::default()
+        };
+        assert_eq!(
+            parse_crop(&state).unwrap(),
+            PhysicalRect::new(2, 3, 4, 5).unwrap()
+        );
+
+        state.crop_width_input = "0".to_owned();
+        assert!(parse_crop(&state).is_err());
+        state.crop_x_input = u32::MAX.to_string();
+        state.crop_width_input = "1".to_owned();
+        assert!(parse_crop(&state).is_err());
+        state.crop_x_input = "not-a-number".to_owned();
+        assert!(parse_crop(&state).is_err());
+
+        state.resize_width_input = u32::MAX.to_string();
+        state.resize_height_input = u32::MAX.to_string();
+        assert_eq!(
+            parse_output_size(&state).unwrap(),
+            PhysicalSize::new(u32::MAX, u32::MAX).unwrap()
+        );
+        state.resize_height_input = "0".to_owned();
+        assert!(parse_output_size(&state).is_err());
+        state.resize_height_input = "4294967296".to_owned();
+        assert!(parse_output_size(&state).is_err());
+    }
+
+    #[test]
+    fn orientation_controls_map_to_their_project_operations() {
+        for (control, expected) in [
+            (
+                OrientationControl::RotateLeft,
+                EditorUiOperation::RotateLeft,
+            ),
+            (
+                OrientationControl::RotateRight,
+                EditorUiOperation::RotateRight,
+            ),
+            (
+                OrientationControl::FlipHorizontal,
+                EditorUiOperation::FlipHorizontal,
+            ),
+            (
+                OrientationControl::FlipVertical,
+                EditorUiOperation::FlipVertical,
+            ),
+        ] {
+            assert_eq!(orientation_operation(control), expected);
+        }
     }
 
     #[test]

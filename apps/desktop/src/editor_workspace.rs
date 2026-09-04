@@ -5,11 +5,13 @@
 
 use std::{collections::BTreeSet, path::Path};
 
-use gif_from_screen_domain::{DurationUs, EditCommand, FrameId, ProjectManifest, TimeUs};
+use gif_from_screen_domain::{
+    DurationUs, EditCommand, FrameId, PhysicalRect, PhysicalSize, ProjectManifest, TimeUs,
+};
 use gif_from_screen_editor::{
-    EditorError, TimelineSelection, TimelineSelectionError, adjust_duration, delete_frames,
-    delete_frames_after, delete_frames_before, move_selected_left, move_selected_right,
-    override_duration, reverse_selected, scale_duration,
+    ClipTransformEdit, EditorError, TimelineSelection, TimelineSelectionError, adjust_duration,
+    delete_frames, delete_frames_after, delete_frames_before, edit_clip_transforms,
+    move_selected_left, move_selected_right, override_duration, reverse_selected, scale_duration,
 };
 use gif_from_screen_project::{
     ActiveProject, AssetIssue, JournalRecoveryReport, LockPolicy, OpenedProject, ProjectError,
@@ -328,6 +330,52 @@ impl EditorWorkspace {
         self.execute(command)
     }
 
+    /// Sets one source-coordinate crop on every selected frame.
+    pub(crate) fn set_selection_crop(
+        &mut self,
+        crop: PhysicalRect,
+    ) -> Result<(), EditorWorkspaceError> {
+        self.execute_selection_transform(ClipTransformEdit::SetCrop(crop))
+    }
+
+    /// Clears cropping from every selected frame.
+    pub(crate) fn clear_selection_crop(&mut self) -> Result<(), EditorWorkspaceError> {
+        self.execute_selection_transform(ClipTransformEdit::ClearCrop)
+    }
+
+    /// Sets the pre-rotation output dimensions on every selected frame.
+    pub(crate) fn set_selection_output_size(
+        &mut self,
+        size: PhysicalSize,
+    ) -> Result<(), EditorWorkspaceError> {
+        self.execute_selection_transform(ClipTransformEdit::SetOutputSize(size))
+    }
+
+    /// Clears explicit output dimensions from every selected frame.
+    pub(crate) fn clear_selection_output_size(&mut self) -> Result<(), EditorWorkspaceError> {
+        self.execute_selection_transform(ClipTransformEdit::ClearOutputSize)
+    }
+
+    /// Rotates every selected frame 90 degrees clockwise relative to its current transform.
+    pub(crate) fn rotate_selection_clockwise(&mut self) -> Result<(), EditorWorkspaceError> {
+        self.execute_selection_transform(ClipTransformEdit::RotateClockwise)
+    }
+
+    /// Rotates every selected frame 90 degrees counterclockwise relative to its current transform.
+    pub(crate) fn rotate_selection_counterclockwise(&mut self) -> Result<(), EditorWorkspaceError> {
+        self.execute_selection_transform(ClipTransformEdit::RotateCounterclockwise)
+    }
+
+    /// Toggles horizontal flipping on every selected frame.
+    pub(crate) fn toggle_selection_horizontal_flip(&mut self) -> Result<(), EditorWorkspaceError> {
+        self.execute_selection_transform(ClipTransformEdit::ToggleHorizontalFlip)
+    }
+
+    /// Toggles vertical flipping on every selected frame.
+    pub(crate) fn toggle_selection_vertical_flip(&mut self) -> Result<(), EditorWorkspaceError> {
+        self.execute_selection_transform(ClipTransformEdit::ToggleVerticalFlip)
+    }
+
     /// Commits the newest inverse command through the project journal.
     ///
     /// Returns `false` without writing when no undo entry exists. A failed commit preserves the
@@ -382,6 +430,15 @@ impl EditorWorkspace {
             return Err(EditorError::EmptySelection.into());
         }
         Ok(self.selection.selected().iter().copied().collect())
+    }
+
+    fn execute_selection_transform(
+        &mut self,
+        edit: ClipTransformEdit,
+    ) -> Result<(), EditorWorkspaceError> {
+        let selected = self.selected_frame_ids()?;
+        let command = edit_clip_transforms(self.project.manifest(), selected, edit)?;
+        self.execute(command)
     }
 }
 
@@ -438,7 +495,7 @@ mod tests {
     use gif_from_screen_domain::{
         AssetDescriptor, AssetId, AssetKind, Canvas, CanvasBackground, CaptureMetadata,
         ClipTransform, ColorSpace, FrameClip, PhysicalSize, ProjectId, ProjectManifest,
-        ProjectRevision, RasterEncoding, Timeline, UnixTimeMs,
+        ProjectRevision, QuarterTurn, RasterEncoding, Timeline, UnixTimeMs,
     };
     use tempfile::TempDir;
 
@@ -799,5 +856,59 @@ mod tests {
         assert!(workspace.is_dirty());
         workspace.checkpoint_and_compact().unwrap();
         assert!(!workspace.is_dirty());
+    }
+
+    #[test]
+    fn transform_helpers_persist_and_undo_as_workspace_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let crop = PhysicalRect::new(1, 1, 2, 2).unwrap();
+        let output_size = PhysicalSize::new(8, 6).unwrap();
+        let mut workspace = create_workspace(&directory, &[10, 20], 16);
+        workspace.select_only(frame_id(1)).unwrap();
+
+        workspace.set_selection_crop(crop).unwrap();
+        workspace.set_selection_output_size(output_size).unwrap();
+        workspace.rotate_selection_clockwise().unwrap();
+        workspace.toggle_selection_horizontal_flip().unwrap();
+        workspace.toggle_selection_vertical_flip().unwrap();
+        workspace.clear_selection_crop().unwrap();
+        workspace.clear_selection_output_size().unwrap();
+        workspace.rotate_selection_counterclockwise().unwrap();
+        let transform = workspace.manifest().timeline.frames[0].transform;
+        assert_eq!(transform.crop, None);
+        assert_eq!(transform.output_size, None);
+        assert_eq!(transform.rotation, QuarterTurn::Zero);
+        assert!(transform.flip_horizontal);
+        assert!(transform.flip_vertical);
+
+        assert!(workspace.undo().unwrap());
+        assert!(workspace.undo().unwrap());
+        assert!(workspace.undo().unwrap());
+        let restored = workspace.manifest().timeline.frames[0].transform;
+        assert_eq!(restored.crop, Some(crop));
+        assert_eq!(restored.output_size, Some(output_size));
+        assert_eq!(restored.rotation, QuarterTurn::Clockwise90);
+        drop(workspace);
+
+        let reopened =
+            EditorWorkspace::open(directory.path(), LockPolicy::FailIfPresent, 16).unwrap();
+        assert_eq!(reopened.manifest().timeline.frames[0].transform, restored);
+        assert!(reopened.is_dirty());
+    }
+
+    #[test]
+    fn transform_helper_without_selection_is_a_friendly_editor_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = create_workspace(&directory, &[10], 4);
+
+        let error = workspace.rotate_selection_clockwise().unwrap_err();
+
+        assert!(matches!(
+            &error,
+            EditorWorkspaceError::Editor(EditorError::EmptySelection)
+        ));
+        assert!(error.to_string().contains("at least one frame"));
+        assert!(!workspace.is_dirty());
+        assert!(!workspace.can_undo());
     }
 }
