@@ -31,11 +31,27 @@ pub enum CollectionLimit {
     MaxFrames(u64),
 }
 
+/// Controls whether unchanged native samples occupy their own stored frame.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FrameRetention {
+    /// Retain every normalized native frame.
+    #[default]
+    All,
+    /// Retain the first frame and frames whose normalized RGBA pixels differ
+    /// from the preceding retained frame.
+    ///
+    /// Skipped samples still extend presentation time. This reduces project
+    /// memory without changing the animation observed at any timestamp.
+    ChangesOnly,
+}
+
 /// Bounds and timing policy for frame collection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollectOptions {
     /// Normal completion condition.
     pub limit: CollectionLimit,
+    /// Pixel-change filtering applied after native format normalization.
+    pub frame_retention: FrameRetention,
     /// Maximum normalized RGBA bytes retained before returning an error.
     pub frame_buffer_limit_bytes: u64,
     /// Maximum duration of an individual blocking capture poll.
@@ -49,6 +65,7 @@ impl Default for CollectOptions {
     fn default() -> Self {
         Self {
             limit: CollectionLimit::Duration(Duration::from_secs(5)),
+            frame_retention: FrameRetention::default(),
             frame_buffer_limit_bytes: DEFAULT_FRAME_BUFFER_LIMIT_BYTES,
             poll_interval: DEFAULT_POLL_INTERVAL,
             tail_frame_duration: DEFAULT_TAIL_FRAME_DURATION,
@@ -110,6 +127,7 @@ enum StopReason {
 #[derive(Clone, Copy, Debug)]
 struct ValidatedOptions {
     limit: ValidatedLimit,
+    frame_retention: FrameRetention,
     poll_interval: Duration,
     tail_duration_us: u64,
     frame_buffer_limit_bytes: u64,
@@ -237,6 +255,7 @@ fn validate_options(options: &CollectOptions) -> Result<ValidatedOptions, Workfl
     };
     Ok(ValidatedOptions {
         limit,
+        frame_retention: options.frame_retention,
         poll_interval: options.poll_interval,
         tail_duration_us,
         frame_buffer_limit_bytes: options.frame_buffer_limit_bytes,
@@ -269,6 +288,7 @@ fn collect_session(
     let mut previous_timestamp = None;
     let mut previous_sequence = None;
     let mut first_timestamp = None;
+    let mut last_observed_timestamp = None;
     let mut stream_index = 0_u64;
 
     let stop_reason = loop {
@@ -287,7 +307,10 @@ fn collect_session(
             progress.report(WorkflowProgress::capture(
                 WorkflowPhase::Paused,
                 u64::try_from(captures.len()).unwrap_or(u64::MAX),
-                Duration::from_micros(current_timestamp_span(&captures)),
+                Duration::from_micros(current_timestamp_span(
+                    first_timestamp,
+                    last_observed_timestamp,
+                )),
             ));
             std::thread::sleep(bounded_poll_interval(options.limit, options.poll_interval));
             continue;
@@ -305,21 +328,29 @@ fn collect_session(
                 if duration_span_reached(options.limit, capture_start, timestamp_us) {
                     break StopReason::DurationReached;
                 }
+                last_observed_timestamp = Some(timestamp_us);
 
                 let normalized = normalize_frame(&frame, stream_index, captures.first())?;
-                let frame_bytes = u64::try_from(normalized.pixels.len()).unwrap_or(u64::MAX);
-                let required_bytes = rgba_bytes.saturating_add(frame_bytes);
-                if required_bytes > options.frame_buffer_limit_bytes {
-                    return Err(WorkflowError::FrameBufferLimitExceeded {
-                        required_bytes,
-                        limit_bytes: options.frame_buffer_limit_bytes,
-                    });
+                let retain = options.frame_retention == FrameRetention::All
+                    || captures
+                        .last()
+                        .is_none_or(|previous| previous.pixels != normalized.pixels);
+                if retain {
+                    let frame_bytes = u64::try_from(normalized.pixels.len()).unwrap_or(u64::MAX);
+                    let required_bytes = rgba_bytes.saturating_add(frame_bytes);
+                    if required_bytes > options.frame_buffer_limit_bytes {
+                        return Err(WorkflowError::FrameBufferLimitExceeded {
+                            required_bytes,
+                            limit_bytes: options.frame_buffer_limit_bytes,
+                        });
+                    }
+                    rgba_bytes = required_bytes;
+                    captures.push(normalized);
                 }
-                rgba_bytes = required_bytes;
-                captures.push(normalized);
                 stream_index = stream_index.saturating_add(1);
 
-                let captured_duration = current_timestamp_span(&captures);
+                let captured_duration =
+                    current_timestamp_span(first_timestamp, last_observed_timestamp);
                 progress.report(WorkflowProgress::capture(
                     WorkflowPhase::Capturing,
                     u64::try_from(captures.len()).unwrap_or(u64::MAX),
@@ -337,10 +368,19 @@ fn collect_session(
     progress.report(WorkflowProgress::capture(
         WorkflowPhase::StoppingCapture,
         u64::try_from(captures.len()).unwrap_or(u64::MAX),
-        Duration::from_micros(current_timestamp_span(&captures)),
+        Duration::from_micros(current_timestamp_span(
+            first_timestamp,
+            last_observed_timestamp,
+        )),
     ));
     stop_session_if_live(session)?;
-    finish_collection(captures, rgba_bytes, stop_reason, options)
+    finish_collection(
+        captures,
+        rgba_bytes,
+        last_observed_timestamp,
+        stop_reason,
+        options,
+    )
 }
 
 fn duration_deadline_reached(limit: ValidatedLimit) -> bool {
@@ -517,6 +557,7 @@ fn validate_dimensions(
 fn finish_collection(
     captures: Vec<NormalizedCapture>,
     rgba_bytes: u64,
+    last_observed_timestamp: Option<u64>,
     stop_reason: StopReason,
     options: ValidatedOptions,
 ) -> Result<CollectedRecording, WorkflowError> {
@@ -524,17 +565,38 @@ fn finish_collection(
         return Err(WorkflowError::EmptyCapture);
     };
     let first_timestamp_us = first.timestamp_us;
-    let last_duration_us = match (stop_reason, options.limit) {
-        (StopReason::DurationReached, ValidatedLimit::Duration { duration_us, .. }) => {
+    let last_duration_us =
+        if let (StopReason::DurationReached, ValidatedLimit::Duration { duration_us, .. }) =
+            (stop_reason, options.limit)
+        {
             let elapsed = captures
                 .last()
                 .expect("non-empty collection has a final frame")
                 .timestamp_us
                 - first_timestamp_us;
             duration_us - elapsed
-        }
-        _ => options.tail_duration_us,
-    };
+        } else {
+            let last_retained_timestamp = captures
+                .last()
+                .expect("non-empty collection has a final frame")
+                .timestamp_us;
+            let skipped_span = last_observed_timestamp
+                .unwrap_or(last_retained_timestamp)
+                .checked_sub(last_retained_timestamp)
+                .ok_or_else(|| {
+                    WorkflowError::InvalidCollectionOption(
+                        "last observed timestamp precedes the retained frame".to_owned(),
+                    )
+                })?;
+            options
+                .tail_duration_us
+                .checked_add(skipped_span)
+                .ok_or_else(|| {
+                    WorkflowError::InvalidCollectionOption(
+                        "final presentation duration overflowed u64 microseconds".to_owned(),
+                    )
+                })?
+        };
 
     let mut frames = Vec::with_capacity(captures.len());
     let mut duration_us = 0_u64;
@@ -563,14 +625,10 @@ fn finish_collection(
     Ok(CollectedRecording { frames, summary })
 }
 
-fn current_timestamp_span(captures: &[NormalizedCapture]) -> u64 {
-    captures.first().map_or(0, |first| {
-        captures
-            .last()
-            .expect("a first frame implies a last frame")
-            .timestamp_us
-            - first.timestamp_us
-    })
+fn current_timestamp_span(first: Option<u64>, last: Option<u64>) -> u64 {
+    first
+        .zip(last)
+        .map_or(0, |(first, last)| last.saturating_sub(first))
 }
 
 fn stop_session_if_live(session: &mut dyn CaptureSession) -> Result<(), WorkflowError> {

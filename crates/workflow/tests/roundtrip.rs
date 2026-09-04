@@ -10,9 +10,9 @@ use gif_from_screen_capture::{
 };
 use gif_from_screen_gif::{CancellationFlag, NeverCancel};
 use gif_from_screen_workflow::{
-    CollectOptions, CollectionLimit, NoopWorkflowProgress, RecordToGifOptions, RecordingController,
-    WorkflowError, WorkflowPhase, WorkflowProgress, collect, partial_output_path, record_to_gif,
-    record_to_gif_controlled,
+    CollectOptions, CollectionLimit, FrameRetention, NoopWorkflowProgress, RecordToGifOptions,
+    RecordingController, WorkflowError, WorkflowPhase, WorkflowProgress, collect,
+    partial_output_path, record_to_gif, record_to_gif_controlled,
 };
 
 fn request() -> CaptureRequest {
@@ -138,6 +138,66 @@ fn duration_limit_uses_boundary_as_exact_tail_timestamp() {
     assert_eq!(recording.frames()[0].duration_us(), 20_000);
     assert_eq!(recording.frames()[1].duration_us(), 30_000);
     assert_eq!(recording.summary().duration_us, 50_000);
+}
+
+#[test]
+fn changes_only_merges_equal_pixels_without_losing_elapsed_time() {
+    let red = vec![255, 0, 0, 255];
+    let green = vec![0, 255, 0, 255];
+    let backend = SyntheticCaptureBackend::new(vec![
+        frame(1, 0, 1, 1, 4, PixelFormat::Rgba8, red.clone()),
+        frame(2, 10_000, 1, 1, 4, PixelFormat::Rgba8, red),
+        frame(3, 30_000, 1, 1, 4, PixelFormat::Rgba8, green.clone()),
+        frame(4, 50_000, 1, 1, 4, PixelFormat::Rgba8, green),
+    ]);
+    let recording = collect(
+        &backend,
+        request(),
+        &CollectOptions {
+            limit: CollectionLimit::UntilStopped,
+            frame_retention: FrameRetention::ChangesOnly,
+            tail_frame_duration: Duration::from_millis(20),
+            ..CollectOptions::default()
+        },
+        &NeverCancel,
+        &mut NoopWorkflowProgress,
+    )
+    .unwrap();
+
+    assert_eq!(recording.frames().len(), 2);
+    assert_eq!(recording.frames()[0].duration_us(), 30_000);
+    assert_eq!(recording.frames()[1].duration_us(), 40_000);
+    assert_eq!(recording.summary().duration_us, 70_000);
+    assert_eq!(recording.summary().rgba_bytes, 8);
+}
+
+#[test]
+fn changes_only_frame_limit_counts_retained_changes() {
+    let red = vec![255, 0, 0, 255];
+    let green = vec![0, 255, 0, 255];
+    let blue = vec![0, 0, 255, 255];
+    let backend = SyntheticCaptureBackend::new(vec![
+        frame(1, 0, 1, 1, 4, PixelFormat::Rgba8, red.clone()),
+        frame(2, 10_000, 1, 1, 4, PixelFormat::Rgba8, red),
+        frame(3, 20_000, 1, 1, 4, PixelFormat::Rgba8, green),
+        frame(4, 30_000, 1, 1, 4, PixelFormat::Rgba8, blue),
+    ]);
+    let recording = collect(
+        &backend,
+        request(),
+        &CollectOptions {
+            frame_retention: FrameRetention::ChangesOnly,
+            ..max_frames_options(2, 10_000)
+        },
+        &NeverCancel,
+        &mut NoopWorkflowProgress,
+    )
+    .unwrap();
+
+    assert_eq!(recording.frames().len(), 2);
+    assert_eq!(recording.frames()[0].duration_us(), 20_000);
+    assert_eq!(recording.frames()[1].duration_us(), 10_000);
+    assert_eq!(recording.summary().duration_us, 30_000);
 }
 
 #[test]

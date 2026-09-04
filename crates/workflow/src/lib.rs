@@ -14,8 +14,8 @@ mod output;
 mod progress;
 
 pub use collect::{
-    CollectOptions, CollectedRecording, CollectionLimit, CollectionSummary, collect,
-    collect_controlled,
+    CollectOptions, CollectedRecording, CollectionLimit, CollectionSummary, FrameRetention,
+    collect, collect_controlled,
 };
 pub use control::{RecordingControl, RecordingController, TargetUpdateRequest, TargetUpdateStatus};
 pub use error::WorkflowError;
