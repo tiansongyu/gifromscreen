@@ -402,6 +402,20 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_is_one_shot_but_synchronous_start_failure_can_retry() {
+        let mut lifecycle = ImportGifLifecycle::default();
+        lifecycle.begin().unwrap();
+        assert_eq!(lifecycle.begin(), Err(ImportGifJobState::Running));
+        lifecycle.start_failed();
+        assert_eq!(lifecycle.state, ImportGifJobState::Idle);
+        lifecycle.begin().unwrap();
+        lifecycle.finish();
+        assert_eq!(lifecycle.state, ImportGifJobState::Finished);
+        assert_eq!(lifecycle.begin(), Err(ImportGifJobState::Finished));
+        assert!(!ImportGifJob::cancellation_supported());
+    }
+
+    #[test]
     fn imports_transparency_and_disposal_as_full_canvas_project_frames() {
         let directory = tempdir().unwrap();
         let input = directory.path().join("animated.gif");
