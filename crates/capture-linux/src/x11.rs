@@ -4,7 +4,7 @@ use gif_from_screen_capture::{
     RecoveryHint,
 };
 #[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
-use gif_from_screen_capture::{CursorMetadata, PhysicalPosition, PhysicalRect};
+use gif_from_screen_capture::{CursorMetadata, PhysicalPosition, PhysicalRect, PhysicalSize};
 
 #[cfg(all(target_os = "linux", feature = "native-x11"))]
 mod native {
@@ -32,10 +32,10 @@ mod native {
     use super::{
         BackendDescriptor, BackendStatus, CaptureBackend, CaptureCapabilities, CaptureError,
         CaptureErrorKind, CaptureRequest, CaptureSession, CaptureSource, CaptureTarget,
-        CapturedFrame, PhysicalPosition, PhysicalRect, RecoveryHint, WindowFilterFacts,
-        X11CursorSnapshot, composite_cursor, decode_text_property, decode_u32_property,
-        decode_zpixmap, format_window_source_id, intersect_rect, parse_window_source_id,
-        should_list_window, translate_region,
+        CapturedFrame, PhysicalPosition, PhysicalRect, PhysicalSize, RecoveryHint,
+        WindowFilterFacts, X11CursorSnapshot, composite_cursor, decode_text_property,
+        decode_u32_property, decode_zpixmap, ensure_fixed_canvas, format_window_source_id,
+        intersect_rect, parse_window_source_id, should_list_window, translate_region,
     };
     use crate::x11::{ByteOrder, PixelLayout};
 
@@ -160,7 +160,7 @@ mod native {
             let elapsed = self.inner.connected_at.elapsed().as_micros();
             let timestamp =
                 CaptureTimestamp::from_micros(u64::try_from(elapsed).unwrap_or(u64::MAX));
-            self.capture_target(target, CursorCaptureMode::Hidden, sequence, timestamp)
+            self.capture_target(target, CursorCaptureMode::Hidden, sequence, timestamp, None)
         }
 
         fn capture_target(
@@ -169,10 +169,14 @@ mod native {
             cursor_mode: CursorCaptureMode,
             sequence: u64,
             timestamp: CaptureTimestamp,
+            expected_size: Option<PhysicalSize>,
         ) -> Result<CapturedFrame, CaptureError> {
             let cursor_mode = self.effective_cursor_mode(cursor_mode);
             for attempt in 0..Self::WINDOW_CAPTURE_ATTEMPTS {
                 let resolved = self.resolve_target(target)?;
+                if let Some(expected_size) = expected_size {
+                    ensure_fixed_canvas(expected_size, resolved.root_region.size())?;
+                }
                 let mut rgba = self.capture_root_pixels(resolved.root_region)?;
                 let cursor = match cursor_mode {
                     CursorCaptureMode::Hidden => None,
@@ -469,8 +473,8 @@ mod native {
             )
         }
 
-        fn validate_request(&self, request: &CaptureRequest) -> Result<(), CaptureError> {
-            self.resolve_target(&request.target)?;
+        fn validate_request(&self, request: &CaptureRequest) -> Result<PhysicalSize, CaptureError> {
+            let target_size = self.resolve_target(&request.target)?.root_region.size();
             match request.cursor {
                 CursorCaptureMode::Hidden | CursorCaptureMode::Automatic => {}
                 CursorCaptureMode::Embedded | CursorCaptureMode::Metadata => {
@@ -487,7 +491,7 @@ mod native {
                     RecoveryHint::ChangeRequest,
                 ));
             }
-            Ok(())
+            Ok(target_size)
         }
     }
 
@@ -528,10 +532,11 @@ mod native {
             &self,
             request: CaptureRequest,
         ) -> Result<Box<dyn CaptureSession>, CaptureError> {
-            self.validate_request(&request)?;
+            let canvas_size = self.validate_request(&request)?;
             Ok(Box::new(X11CaptureSession {
                 backend: self.clone(),
                 request,
+                canvas_size,
                 state: CaptureSessionState::Recording,
                 sequence: 0,
                 started_at: Instant::now(),
@@ -543,6 +548,7 @@ mod native {
     struct X11CaptureSession {
         backend: X11CaptureBackend,
         request: CaptureRequest,
+        canvas_size: PhysicalSize,
         state: CaptureSessionState,
         sequence: u64,
         started_at: Instant,
@@ -576,6 +582,25 @@ mod native {
 
         fn request(&self) -> &CaptureRequest {
             &self.request
+        }
+
+        fn update_target(&mut self, target: CaptureTarget) -> Result<(), CaptureError> {
+            if !matches!(
+                self.state,
+                CaptureSessionState::Recording | CaptureSessionState::Paused
+            ) {
+                return Err(self.invalid_transition("update the target of"));
+            }
+            if target == self.request.target {
+                return Ok(());
+            }
+
+            let mut updated_request = self.request.clone();
+            updated_request.target = target.clone();
+            let updated_size = self.backend.validate_request(&updated_request)?;
+            ensure_fixed_canvas(self.canvas_size, updated_size)?;
+            self.request.target = target;
+            Ok(())
         }
 
         fn pause(&mut self) -> Result<(), CaptureError> {
@@ -653,6 +678,7 @@ mod native {
                 self.request.cursor,
                 self.sequence,
                 timestamp,
+                Some(self.canvas_size),
             ) {
                 Ok(frame) => {
                     self.sequence = self.sequence.checked_add(1).ok_or_else(|| {
@@ -1280,6 +1306,20 @@ mod native {
 }
 
 pub use native::X11CaptureBackend;
+
+#[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
+fn ensure_fixed_canvas(expected: PhysicalSize, actual: PhysicalSize) -> Result<(), CaptureError> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(CaptureError::invalid_request(format!(
+        "updated X11 target dimensions {}x{} do not match the fixed session canvas {}x{}; start a new recording to change size",
+        actual.width(),
+        actual.height(),
+        expected.width(),
+        expected.height()
+    )))
+}
 
 #[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
 #[allow(clippy::struct_excessive_bools)]
@@ -2078,6 +2118,17 @@ mod tests {
     }
 
     #[test]
+    fn fixed_canvas_accepts_movement_but_rejects_resizing() {
+        let canvas = PhysicalSize::new(640, 480).unwrap();
+        ensure_fixed_canvas(canvas, PhysicalSize::new(640, 480).unwrap()).unwrap();
+
+        let error = ensure_fixed_canvas(canvas, PhysicalSize::new(641, 480).unwrap()).unwrap_err();
+        assert_eq!(error.kind(), CaptureErrorKind::InvalidRequest);
+        assert!(error.message().contains("fixed session canvas 640x480"));
+        assert!(error.message().contains("start a new recording"));
+    }
+
+    #[test]
     fn parses_native_u32_properties_and_rejects_wrong_formats() {
         let expected = [0x0123_4567_u32, 0x89ab_cdef];
         let bytes: Vec<_> = expected
@@ -2196,6 +2247,70 @@ mod tests {
     }
 
     #[cfg(all(target_os = "linux", feature = "native-x11"))]
+    fn exercise_live_region_retarget(
+        backend: &X11CaptureBackend,
+        root: &gif_from_screen_capture::CaptureSource,
+        initial_target: &CaptureTarget,
+    ) {
+        let moved_x = root
+            .geometry()
+            .filter(|geometry| geometry.size().width() > 2)
+            .map_or(0, |_| 1);
+        let moved_target = CaptureTarget::Region {
+            source: root.id().clone(),
+            region: PhysicalRect::new(moved_x, 0, 2, 2).unwrap(),
+        };
+        let mut session = backend
+            .start_session(CaptureRequest::new(
+                initial_target.clone(),
+                CaptureCadence::Manual,
+            ))
+            .unwrap();
+        session.update_target(moved_target.clone()).unwrap();
+        assert_eq!(session.request().target, moved_target);
+        let FramePoll::Frame(moved_frame) = session
+            .poll_frame(Duration::ZERO)
+            .expect("moved X11 region should remain capturable")
+        else {
+            panic!("manual X11 session did not produce a frame after moving");
+        };
+        assert_eq!(moved_frame.size(), PhysicalSize::new(2, 2).unwrap());
+
+        let resized_target = CaptureTarget::Region {
+            source: root.id().clone(),
+            region: PhysicalRect::new(0, 0, 1, 2).unwrap(),
+        };
+        let resize_error = session.update_target(resized_target).unwrap_err();
+        assert_eq!(resize_error.kind(), CaptureErrorKind::InvalidRequest);
+        assert_eq!(session.request().target, moved_target);
+
+        let missing_target = CaptureTarget::Region {
+            source: CaptureSourceId::new("x11:missing").unwrap(),
+            region: PhysicalRect::new(0, 0, 2, 2).unwrap(),
+        };
+        assert_eq!(
+            session.update_target(missing_target).unwrap_err().kind(),
+            CaptureErrorKind::SourceNotFound
+        );
+        let source_size = root.geometry().expect("X11 monitor geometry").size();
+        let outside_target = CaptureTarget::Region {
+            source: root.id().clone(),
+            region: PhysicalRect::new(
+                i32::try_from(source_size.width()).unwrap_or(i32::MAX),
+                0,
+                2,
+                2,
+            )
+            .unwrap(),
+        };
+        assert_eq!(
+            session.update_target(outside_target).unwrap_err().kind(),
+            CaptureErrorKind::InvalidRequest
+        );
+        assert_eq!(session.request().target, moved_target);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-x11"))]
     #[test]
     fn real_x11_smoke_test_when_display_is_available() {
         let Some(display) = std::env::var("DISPLAY")
@@ -2248,6 +2363,8 @@ mod tests {
             };
             assert!(frame.cursor().is_none());
         }
+
+        exercise_live_region_retarget(&backend, root, &target);
 
         let Some(window) = sources
             .into_iter()

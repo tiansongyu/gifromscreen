@@ -140,6 +140,18 @@ impl SyntheticCaptureBackend {
         }
         Ok(())
     }
+
+    fn target_size(&self, target: &CaptureTarget) -> Option<crate::PhysicalSize> {
+        match target {
+            CaptureTarget::Region { region, .. } => Some(region.size()),
+            CaptureTarget::Monitor(source_id) | CaptureTarget::Window(source_id) => self
+                .sources
+                .iter()
+                .find(|source| source.id() == source_id)
+                .and_then(CaptureSource::geometry)
+                .map(PhysicalRect::size),
+        }
+    }
 }
 
 impl CaptureBackend for SyntheticCaptureBackend {
@@ -168,10 +180,15 @@ impl CaptureBackend for SyntheticCaptureBackend {
     ) -> Result<Box<dyn CaptureSession>, CaptureError> {
         self.validate_request(&request)?;
         validate_frame_order(&self.frames)?;
+        let canvas_size = self
+            .target_size(&request.target)
+            .or_else(|| self.frames.first().map(CapturedFrame::size));
         Ok(Box::new(SyntheticCaptureSession {
             request,
             state: CaptureSessionState::Recording,
             frames: self.frames.clone().into(),
+            validator: self.clone(),
+            canvas_size,
         }))
     }
 }
@@ -198,6 +215,8 @@ pub struct SyntheticCaptureSession {
     request: CaptureRequest,
     state: CaptureSessionState,
     frames: VecDeque<CapturedFrame>,
+    validator: SyntheticCaptureBackend,
+    canvas_size: Option<crate::PhysicalSize>,
 }
 
 impl SyntheticCaptureSession {
@@ -220,6 +239,44 @@ impl CaptureSession for SyntheticCaptureSession {
 
     fn request(&self) -> &CaptureRequest {
         &self.request
+    }
+
+    fn update_target(&mut self, target: CaptureTarget) -> Result<(), CaptureError> {
+        if !matches!(
+            self.state,
+            CaptureSessionState::Recording | CaptureSessionState::Paused
+        ) {
+            return Err(self.invalid_transition("update the target of"));
+        }
+        if target == self.request.target {
+            return Ok(());
+        }
+
+        let mut updated_request = self.request.clone();
+        updated_request.target = target.clone();
+        self.validator.validate_request(&updated_request)?;
+        let updated_size = self.validator.target_size(&target).ok_or_else(|| {
+            CaptureError::invalid_request(
+                "cannot verify that the updated synthetic target preserves the capture canvas",
+            )
+        })?;
+        let canvas_size = self.canvas_size.ok_or_else(|| {
+            CaptureError::invalid_request(
+                "cannot update a synthetic target whose initial canvas dimensions are unknown",
+            )
+        })?;
+        if updated_size != canvas_size {
+            return Err(CaptureError::invalid_request(format!(
+                "updated capture target dimensions {}x{} do not match the fixed session canvas {}x{}",
+                updated_size.width(),
+                updated_size.height(),
+                canvas_size.width(),
+                canvas_size.height()
+            )));
+        }
+
+        self.request.target = target;
+        Ok(())
     }
 
     fn pause(&mut self) -> Result<(), CaptureError> {
@@ -376,5 +433,121 @@ mod tests {
             .err()
             .expect("missing source must fail");
         assert_eq!(error.kind(), CaptureErrorKind::SourceNotFound);
+    }
+
+    #[test]
+    fn moves_a_region_between_frames_without_changing_the_canvas() {
+        let backend = SyntheticCaptureBackend::new(vec![frame(0, 0), frame(1, 100_000)]);
+        let source = CaptureSourceId::new(SYNTHETIC_SOURCE_ID).unwrap();
+        let initial = CaptureTarget::Region {
+            source: source.clone(),
+            region: PhysicalRect::new(10, 20, 1, 1).unwrap(),
+        };
+        let moved = CaptureTarget::Region {
+            source,
+            region: PhysicalRect::new(100, 200, 1, 1).unwrap(),
+        };
+        let mut session = backend
+            .start_session(CaptureRequest::new(initial, CaptureCadence::Manual))
+            .unwrap();
+
+        assert!(matches!(
+            session.poll_frame(Duration::ZERO).unwrap(),
+            FramePoll::Frame(frame) if frame.sequence() == 0
+        ));
+        session.update_target(moved.clone()).unwrap();
+        assert_eq!(session.request().target, moved);
+        assert!(matches!(
+            session.poll_frame(Duration::ZERO).unwrap(),
+            FramePoll::Frame(frame) if frame.sequence() == 1
+        ));
+    }
+
+    #[test]
+    fn rejects_dimension_changes_without_replacing_the_active_target() {
+        let backend = SyntheticCaptureBackend::new(vec![frame(0, 0)]);
+        let source = CaptureSourceId::new(SYNTHETIC_SOURCE_ID).unwrap();
+        let initial = CaptureTarget::Region {
+            source: source.clone(),
+            region: PhysicalRect::new(10, 20, 1, 1).unwrap(),
+        };
+        let resized = CaptureTarget::Region {
+            source,
+            region: PhysicalRect::new(10, 20, 2, 1).unwrap(),
+        };
+        let mut session = backend
+            .start_session(CaptureRequest::new(initial.clone(), CaptureCadence::Manual))
+            .unwrap();
+
+        let error = session.update_target(resized).unwrap_err();
+        assert_eq!(error.kind(), CaptureErrorKind::InvalidRequest);
+        assert!(error.message().contains("fixed session canvas 1x1"));
+        assert_eq!(session.request().target, initial);
+        assert!(matches!(
+            session.poll_frame(Duration::ZERO).unwrap(),
+            FramePoll::Frame(_)
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_and_out_of_bounds_retargets_without_mutating_the_request() {
+        let backend = SyntheticCaptureBackend::new(vec![frame(0, 0)]);
+        let source = CaptureSourceId::new(SYNTHETIC_SOURCE_ID).unwrap();
+        let initial = CaptureTarget::Region {
+            source: source.clone(),
+            region: PhysicalRect::new(0, 0, 1, 1).unwrap(),
+        };
+        let mut session = backend
+            .start_session(CaptureRequest::new(initial.clone(), CaptureCadence::Manual))
+            .unwrap();
+
+        let missing = CaptureTarget::Region {
+            source: CaptureSourceId::new("synthetic:missing").unwrap(),
+            region: PhysicalRect::new(0, 0, 1, 1).unwrap(),
+        };
+        assert_eq!(
+            session.update_target(missing).unwrap_err().kind(),
+            CaptureErrorKind::SourceNotFound
+        );
+        let outside = CaptureTarget::Region {
+            source,
+            region: PhysicalRect::new(1_920, 0, 1, 1).unwrap(),
+        };
+        assert_eq!(
+            session.update_target(outside).unwrap_err().kind(),
+            CaptureErrorKind::InvalidRequest
+        );
+        assert_eq!(session.request().target, initial);
+    }
+
+    #[test]
+    fn rejects_retargets_after_stop_or_discard() {
+        let backend = SyntheticCaptureBackend::new(Vec::new());
+        let target = CaptureTarget::Region {
+            source: CaptureSourceId::new(SYNTHETIC_SOURCE_ID).unwrap(),
+            region: PhysicalRect::new(0, 0, 1, 1).unwrap(),
+        };
+        let moved = CaptureTarget::Region {
+            source: CaptureSourceId::new(SYNTHETIC_SOURCE_ID).unwrap(),
+            region: PhysicalRect::new(1, 0, 1, 1).unwrap(),
+        };
+
+        let mut stopped = backend
+            .start_session(CaptureRequest::new(target.clone(), CaptureCadence::Manual))
+            .unwrap();
+        stopped.stop().unwrap();
+        assert_eq!(
+            stopped.update_target(moved.clone()).unwrap_err().kind(),
+            CaptureErrorKind::InvalidStateTransition
+        );
+
+        let mut discarded = backend
+            .start_session(CaptureRequest::new(target, CaptureCadence::Manual))
+            .unwrap();
+        discarded.discard().unwrap();
+        assert_eq!(
+            discarded.update_target(moved).unwrap_err().kind(),
+            CaptureErrorKind::InvalidStateTransition
+        );
     }
 }

@@ -320,8 +320,25 @@ pub trait CaptureSession: Send {
     /// Current session state.
     fn state(&self) -> CaptureSessionState;
 
-    /// Original request used to create the session.
+    /// Current request used by the session.
+    ///
+    /// The returned request contains the most recently accepted target after
+    /// a successful [`CaptureSession::update_target`] call.
     fn request(&self) -> &CaptureRequest;
+
+    /// Changes the source or source-local rectangle used by subsequent frames.
+    ///
+    /// Capture sessions have a fixed output canvas. Implementations must reject
+    /// a target whose resolved dimensions differ from the dimensions selected
+    /// when the session started. A rejected update leaves the previous target
+    /// active. Updates are also rejected after the session becomes terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaptureError`] if the target is unknown, outside its parent
+    /// source, changes the output dimensions, is unsupported by the backend, or
+    /// cannot be applied in the current state.
+    fn update_target(&mut self, target: CaptureTarget) -> Result<(), CaptureError>;
 
     /// Pauses frame production.
     ///

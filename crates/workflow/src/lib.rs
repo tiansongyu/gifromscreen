@@ -17,7 +17,7 @@ pub use collect::{
     CollectOptions, CollectedRecording, CollectionLimit, CollectionSummary, collect,
     collect_controlled,
 };
-pub use control::{RecordingControl, RecordingController};
+pub use control::{RecordingControl, RecordingController, TargetUpdateRequest, TargetUpdateStatus};
 pub use error::WorkflowError;
 pub use output::{
     RecordToGifOptions, RecordToGifReport, partial_output_path, record_to_gif,
