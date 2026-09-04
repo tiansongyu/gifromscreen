@@ -1,6 +1,7 @@
 //! End-to-end tests spanning synthetic capture, workflow normalization, and GIF decoding.
 
 use std::fs;
+use std::io;
 use std::io::Cursor;
 use std::time::Duration;
 
@@ -11,9 +12,72 @@ use gif_from_screen_capture::{
 use gif_from_screen_gif::{CancellationFlag, NeverCancel};
 use gif_from_screen_workflow::{
     CollectOptions, CollectionLimit, FrameRetention, NoopWorkflowProgress, RecordToGifOptions,
-    RecordingController, WorkflowError, WorkflowPhase, WorkflowProgress, collect,
-    partial_output_path, record_to_gif, record_to_gif_controlled,
+    RecordingController, RecordingFrameSink, RecordingFrameSinkError, RecordingFrameSinkOperation,
+    WorkflowError, WorkflowPhase, WorkflowProgress, collect, collect_controlled_to_sink,
+    collect_controlled_with_sink, partial_output_path, record_to_gif, record_to_gif_controlled,
 };
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SinkEvent {
+    Append {
+        frame_index: u64,
+        duration_us: u64,
+        pixels: Vec<u8>,
+    },
+    Update {
+        frame_index: u64,
+        duration_us: u64,
+    },
+}
+
+#[derive(Default)]
+struct TestFrameSink {
+    events: Vec<SinkEvent>,
+    fail: Option<(RecordingFrameSinkOperation, u64)>,
+}
+
+impl RecordingFrameSink for TestFrameSink {
+    fn append_provisional_frame(
+        &mut self,
+        frame_index: u64,
+        frame: &gif_from_screen_gif::RgbaFrame,
+    ) -> Result<(), RecordingFrameSinkError> {
+        if self.fail
+            == Some((
+                RecordingFrameSinkOperation::AppendProvisionalFrame,
+                frame_index,
+            ))
+        {
+            return Err(io::Error::other("injected append failure").into());
+        }
+        self.events.push(SinkEvent::Append {
+            frame_index,
+            duration_us: frame.duration_us(),
+            pixels: frame.pixels().to_vec(),
+        });
+        Ok(())
+    }
+
+    fn update_frame_duration(
+        &mut self,
+        frame_index: u64,
+        duration_us: u64,
+    ) -> Result<(), RecordingFrameSinkError> {
+        if self.fail
+            == Some((
+                RecordingFrameSinkOperation::UpdateFrameDuration,
+                frame_index,
+            ))
+        {
+            return Err(io::Error::other("injected duration failure").into());
+        }
+        self.events.push(SinkEvent::Update {
+            frame_index,
+            duration_us,
+        });
+        Ok(())
+    }
+}
 
 fn request() -> CaptureRequest {
     CaptureRequest::new(
@@ -198,6 +262,202 @@ fn changes_only_frame_limit_counts_retained_changes() {
     assert_eq!(recording.frames()[0].duration_us(), 20_000);
     assert_eq!(recording.frames()[1].duration_us(), 10_000);
     assert_eq!(recording.summary().duration_us, 30_000);
+}
+
+#[test]
+fn incremental_sink_journals_provisional_frames_and_corrects_all_durations() {
+    let backend = SyntheticCaptureBackend::new(vec![
+        frame(1, 0, 1, 1, 4, PixelFormat::Rgba8, vec![255, 0, 0, 255]),
+        frame(2, 10_000, 1, 1, 4, PixelFormat::Rgba8, vec![0, 255, 0, 255]),
+        frame(3, 30_000, 1, 1, 4, PixelFormat::Rgba8, vec![0, 0, 255, 255]),
+    ]);
+    let (controller, mut control) = RecordingController::channel();
+    drop(controller);
+    let mut sink = TestFrameSink::default();
+
+    let recording = collect_controlled_with_sink(
+        &backend,
+        request(),
+        &CollectOptions {
+            limit: CollectionLimit::UntilStopped,
+            tail_frame_duration: Duration::from_millis(5),
+            ..CollectOptions::default()
+        },
+        &mut control,
+        &mut sink,
+        &NeverCancel,
+        &mut NoopWorkflowProgress,
+    )
+    .unwrap();
+
+    assert_eq!(
+        sink.events,
+        [
+            SinkEvent::Append {
+                frame_index: 0,
+                duration_us: 5_000,
+                pixels: vec![255, 0, 0, 255]
+            },
+            SinkEvent::Update {
+                frame_index: 0,
+                duration_us: 10_000
+            },
+            SinkEvent::Append {
+                frame_index: 1,
+                duration_us: 5_000,
+                pixels: vec![0, 255, 0, 255]
+            },
+            SinkEvent::Update {
+                frame_index: 1,
+                duration_us: 20_000
+            },
+            SinkEvent::Append {
+                frame_index: 2,
+                duration_us: 5_000,
+                pixels: vec![0, 0, 255, 255]
+            },
+            SinkEvent::Update {
+                frame_index: 2,
+                duration_us: 5_000
+            },
+        ]
+    );
+    assert_eq!(
+        recording
+            .frames()
+            .iter()
+            .map(gif_from_screen_gif::RgbaFrame::duration_us)
+            .collect::<Vec<_>>(),
+        [10_000, 20_000, 5_000]
+    );
+}
+
+#[test]
+fn changes_only_persists_first_static_frame_before_final_duration_is_known() {
+    let red = vec![255, 0, 0, 255];
+    let backend = SyntheticCaptureBackend::new(vec![
+        frame(1, 0, 1, 1, 4, PixelFormat::Rgba8, red.clone()),
+        frame(2, 10_000, 1, 1, 4, PixelFormat::Rgba8, red.clone()),
+        frame(3, 20_000, 1, 1, 4, PixelFormat::Rgba8, red),
+    ]);
+    let (controller, mut control) = RecordingController::channel();
+    drop(controller);
+    let mut sink = TestFrameSink {
+        fail: Some((RecordingFrameSinkOperation::UpdateFrameDuration, 0)),
+        ..TestFrameSink::default()
+    };
+
+    let error = collect_controlled_to_sink(
+        &backend,
+        request(),
+        &CollectOptions {
+            limit: CollectionLimit::UntilStopped,
+            frame_retention: FrameRetention::ChangesOnly,
+            tail_frame_duration: Duration::from_millis(5),
+            ..CollectOptions::default()
+        },
+        &mut control,
+        &mut sink,
+        &NeverCancel,
+        &mut NoopWorkflowProgress,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        WorkflowError::FrameSink {
+            operation: RecordingFrameSinkOperation::UpdateFrameDuration,
+            frame_index: 0,
+            ..
+        }
+    ));
+    assert_eq!(
+        sink.events,
+        [SinkEvent::Append {
+            frame_index: 0,
+            duration_us: 5_000,
+            pixels: vec![255, 0, 0, 255]
+        }]
+    );
+}
+
+#[test]
+fn sink_append_failure_is_typed_and_stops_before_later_frames() {
+    let backend = SyntheticCaptureBackend::new(vec![
+        frame(1, 0, 1, 1, 4, PixelFormat::Rgba8, vec![255, 0, 0, 255]),
+        frame(2, 10_000, 1, 1, 4, PixelFormat::Rgba8, vec![0, 255, 0, 255]),
+        frame(3, 20_000, 1, 1, 4, PixelFormat::Rgba8, vec![0, 0, 255, 255]),
+    ]);
+    let (controller, mut control) = RecordingController::channel();
+    drop(controller);
+    let mut sink = TestFrameSink {
+        fail: Some((RecordingFrameSinkOperation::AppendProvisionalFrame, 1)),
+        ..TestFrameSink::default()
+    };
+
+    let error = collect_controlled_to_sink(
+        &backend,
+        request(),
+        &max_frames_options(3, 5_000),
+        &mut control,
+        &mut sink,
+        &NeverCancel,
+        &mut NoopWorkflowProgress,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        WorkflowError::FrameSink {
+            operation: RecordingFrameSinkOperation::AppendProvisionalFrame,
+            frame_index: 1,
+            ..
+        }
+    ));
+    assert_eq!(
+        sink.events,
+        [
+            SinkEvent::Append {
+                frame_index: 0,
+                duration_us: 5_000,
+                pixels: vec![255, 0, 0, 255]
+            },
+            SinkEvent::Update {
+                frame_index: 0,
+                duration_us: 10_000
+            },
+        ]
+    );
+}
+
+#[test]
+fn sink_only_collection_bounds_resident_frame_instead_of_total_recording() {
+    let backend = SyntheticCaptureBackend::new(vec![
+        frame(1, 0, 1, 1, 4, PixelFormat::Rgba8, vec![255, 0, 0, 255]),
+        frame(2, 10_000, 1, 1, 4, PixelFormat::Rgba8, vec![0, 255, 0, 255]),
+        frame(3, 20_000, 1, 1, 4, PixelFormat::Rgba8, vec![0, 0, 255, 255]),
+    ]);
+    let (controller, mut control) = RecordingController::channel();
+    drop(controller);
+    let mut sink = TestFrameSink::default();
+
+    let summary = collect_controlled_to_sink(
+        &backend,
+        request(),
+        &CollectOptions {
+            frame_buffer_limit_bytes: 4,
+            ..max_frames_options(3, 5_000)
+        },
+        &mut control,
+        &mut sink,
+        &NeverCancel,
+        &mut NoopWorkflowProgress,
+    )
+    .unwrap();
+
+    assert_eq!(summary.frames, 3);
+    assert_eq!(summary.rgba_bytes, 12);
+    assert_eq!(summary.duration_us, 25_000);
 }
 
 #[test]
@@ -391,6 +651,46 @@ fn controlled_stop_encodes_frames_collected_so_far() {
 }
 
 #[test]
+fn controlled_stop_finalizes_incremental_sink_tail() {
+    let backend = SyntheticCaptureBackend::new(vec![
+        frame(1, 0, 1, 1, 4, PixelFormat::Rgba8, vec![255, 0, 0, 255]),
+        frame(2, 20_000, 1, 1, 4, PixelFormat::Rgba8, vec![0, 255, 0, 255]),
+        frame(3, 40_000, 1, 1, 4, PixelFormat::Rgba8, vec![0, 0, 255, 255]),
+    ]);
+    let (controller, mut control) = RecordingController::channel();
+    let stop_controller = controller.clone();
+    let mut sink = TestFrameSink::default();
+
+    let summary = collect_controlled_to_sink(
+        &backend,
+        request(),
+        &CollectOptions {
+            limit: CollectionLimit::UntilStopped,
+            tail_frame_duration: Duration::from_millis(15),
+            ..CollectOptions::default()
+        },
+        &mut control,
+        &mut sink,
+        &NeverCancel,
+        &mut move |progress: WorkflowProgress| {
+            if progress.phase == WorkflowPhase::Capturing && progress.frames_captured == 2 {
+                assert!(stop_controller.stop());
+            }
+        },
+    )
+    .unwrap();
+
+    assert_eq!(summary.duration_us, 35_000);
+    assert_eq!(
+        sink.events.last(),
+        Some(&SinkEvent::Update {
+            frame_index: 1,
+            duration_us: 15_000
+        })
+    );
+}
+
+#[test]
 fn duration_limit_excludes_time_spent_paused() {
     let backend = SyntheticCaptureBackend::new(vec![
         frame(1, 0, 1, 1, 4, PixelFormat::Rgba8, vec![255, 0, 0, 255]),
@@ -466,4 +766,40 @@ fn controlled_discard_never_creates_an_output() {
     assert!(matches!(error, WorkflowError::Discarded));
     assert!(!target.exists());
     assert!(!partial_output_path(&target).unwrap().exists());
+}
+
+#[test]
+fn controlled_discard_does_not_finalize_incremental_sink() {
+    let backend = SyntheticCaptureBackend::new(vec![
+        frame(1, 0, 1, 1, 4, PixelFormat::Rgba8, vec![255, 0, 0, 255]),
+        frame(2, 20_000, 1, 1, 4, PixelFormat::Rgba8, vec![0, 255, 0, 255]),
+    ]);
+    let (controller, mut control) = RecordingController::channel();
+    let discard_controller = controller.clone();
+    let mut sink = TestFrameSink::default();
+
+    let error = collect_controlled_to_sink(
+        &backend,
+        request(),
+        &max_frames_options(2, 10_000),
+        &mut control,
+        &mut sink,
+        &NeverCancel,
+        &mut move |progress: WorkflowProgress| {
+            if progress.phase == WorkflowPhase::Capturing && progress.frames_captured == 1 {
+                assert!(discard_controller.discard());
+            }
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, WorkflowError::Discarded));
+    assert_eq!(
+        sink.events,
+        [SinkEvent::Append {
+            frame_index: 0,
+            duration_us: 10_000,
+            pixels: vec![255, 0, 0, 255]
+        }]
+    );
 }

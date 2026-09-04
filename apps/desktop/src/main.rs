@@ -23,29 +23,31 @@ use std::{
 
 use countdown::{CountdownStart, CountdownTick, MAX_COUNTDOWN_SECONDS, RecordingCountdown};
 use editor_preview::EditorPreviewCache;
-use editor_ui::{EditorUiState, show_editor_ui};
+use editor_ui::{EditorUiAction, EditorUiResult, EditorUiState, show_editor_ui};
 use editor_workspace::EditorWorkspace;
 use eframe::egui;
 use export_job::{ExportJob, ExportJobError, ExportJobEvent, ExportJobState};
 use gif_from_screen_application::{
-    ProjectExportSnapshot, ProjectFrameSelection, ProjectGifExportOptions, ProjectGifExportReport,
-    RecordingProjectOptions, persist_collected_recording,
+    IncrementalRecordingProject, IncrementalRecordingProjectOptions, ProjectExportSnapshot,
+    ProjectFrameSelection, ProjectGifExportOptions, ProjectGifExportReport,
 };
 use gif_from_screen_capture::{
     CaptureBackend, CaptureCadence, CaptureRequest, CaptureSource, CaptureSourceId,
     CaptureSourceKind, CaptureTarget, CapturedFrame, CursorCaptureMode, PhysicalRect, PixelFormat,
 };
 use gif_from_screen_capture_linux::X11CaptureBackend;
-use gif_from_screen_domain::{FrameId, ProjectId, UnixTimeMs};
+use gif_from_screen_domain::{
+    DurationUs, FrameId, PhysicalSize as ProjectPhysicalSize, ProjectId, UnixTimeMs,
+};
 use gif_from_screen_gif::{
     CancellationFlag, CancellationToken as _, DeltaMode, DitherMode, EncodeOptions, LoopBehavior,
     PaletteMode, QuantizerStrategy, Transparency,
 };
 use gif_from_screen_project::{ActiveProject, LockPolicy, OpenedProject};
 use gif_from_screen_workflow::{
-    CollectOptions, CollectedRecording, CollectionLimit, FrameRetention, RecordingControl,
-    RecordingController, TargetUpdateRequest, TargetUpdateStatus, WorkflowProgress,
-    collect_controlled,
+    CollectOptions, CollectionLimit, FrameRetention, RecordingControl, RecordingController,
+    RecordingFrameSink, RecordingFrameSinkError, TargetUpdateRequest, TargetUpdateStatus,
+    WorkflowError, WorkflowProgress, collect_controlled_to_sink,
 };
 use import_gif_job::{ImportGifJob, ImportGifJobEvent, ImportGifJobState};
 use import_static_image_job::{
@@ -127,7 +129,18 @@ impl Default for RecordingSettings {
 enum JobMessage {
     Progress(WorkflowProgress),
     Persisting,
-    Finished(Result<Box<ActiveProject>, String>),
+    Finished(RecordingCompletion),
+}
+
+enum RecordingCompletion {
+    Completed(Box<ActiveProject>),
+    Discarded {
+        cleanup_error: Option<String>,
+    },
+    Failed {
+        error: String,
+        recovery_path: Option<PathBuf>,
+    },
 }
 
 struct RecordingWorkerRequest {
@@ -136,6 +149,67 @@ struct RecordingWorkerRequest {
     source_kind: CaptureSourceKind,
     source_label: String,
     project_path: PathBuf,
+    canvas: ProjectPhysicalSize,
+}
+
+struct IncrementalProjectFrameSink {
+    project: IncrementalRecordingProject,
+    frame_ids: Vec<FrameId>,
+}
+
+impl IncrementalProjectFrameSink {
+    fn new(project: IncrementalRecordingProject) -> Self {
+        Self {
+            project,
+            frame_ids: Vec::new(),
+        }
+    }
+
+    fn root(&self) -> &Path {
+        self.project.root()
+    }
+
+    fn finish(
+        self,
+    ) -> Result<ActiveProject, gif_from_screen_application::IncrementalRecordingProjectError> {
+        self.project.finish()
+    }
+}
+
+impl RecordingFrameSink for IncrementalProjectFrameSink {
+    fn append_provisional_frame(
+        &mut self,
+        frame_index: u64,
+        frame: &gif_from_screen_gif::RgbaFrame,
+    ) -> Result<(), RecordingFrameSinkError> {
+        let expected = u64::try_from(self.frame_ids.len()).unwrap_or(u64::MAX);
+        if frame_index != expected {
+            return Err(io::Error::other(format!(
+                "incremental frame index {frame_index} does not follow {expected}"
+            ))
+            .into());
+        }
+        let frame_id = FrameId::from_u128(Uuid::new_v4().as_u128());
+        self.project.append_frame(frame_id, frame)?;
+        self.frame_ids.push(frame_id);
+        Ok(())
+    }
+
+    fn update_frame_duration(
+        &mut self,
+        frame_index: u64,
+        duration_us: u64,
+    ) -> Result<(), RecordingFrameSinkError> {
+        let index = usize::try_from(frame_index)
+            .map_err(|_| io::Error::other("incremental frame index exceeds usize"))?;
+        let frame_id = self.frame_ids.get(index).copied().ok_or_else(|| {
+            io::Error::other(format!("incremental frame {frame_index} was not appended"))
+        })?;
+        let duration = DurationUs::new(duration_us)
+            .ok_or_else(|| io::Error::other("incremental frame duration must be positive"))?;
+        self.project.set_frame_duration(frame_id, duration)?;
+        Ok(())
+    }
 }
 
 struct CompletedProjectSummary {
@@ -882,11 +956,10 @@ impl GifFromScreenApp {
             return;
         };
         let results = show_editor_ui(ui, workspace, &mut self.editor_ui_state);
-        for failure in results.into_iter().filter_map(Result::err) {
-            self.notice = Some(format!(
-                "Editor {:?} failed: {}",
-                failure.operation, failure.message
-            ));
+        for result in results {
+            if let Some(notice) = editor_result_notice(result) {
+                self.notice = Some(notice);
+            }
         }
 
         ui.separator();
@@ -1337,7 +1410,7 @@ impl GifFromScreenApp {
                 if let Some(job) = &mut self.job {
                     job.stop_retargeting();
                     let _ = job.controller.stop();
-                    self.notice = Some("Stopping and encoding…".into());
+                    self.notice = Some("Stopping and finalizing recoverable project…".into());
                 }
             }
             RecorderOverlayAction::Discard | RecorderOverlayAction::Close => {
@@ -1412,6 +1485,7 @@ impl GifFromScreenApp {
         let source_id = selected.id().clone();
         let source_kind = selected.kind();
         let project_path = project_path_for_output(Path::new(settings.output.trim()))?;
+        let canvas = recording_project_canvas(&settings, selected.geometry())?;
         let retarget = if settings.region_enabled {
             let initial = PhysicalRect::new(
                 settings.region_x,
@@ -1434,6 +1508,7 @@ impl GifFromScreenApp {
             source_kind,
             source_label: selected.name().to_owned(),
             project_path,
+            canvas,
         };
 
         std::thread::Builder::new()
@@ -1443,22 +1518,18 @@ impl GifFromScreenApp {
                 let mut progress = move |snapshot| {
                     let _ = progress_sender.send(JobMessage::Progress(snapshot));
                 };
-                let result = collect_x11_recording(
+                let completion = run_incremental_x11_recording(
                     &worker_request,
                     &mut control,
                     &worker_cancellation,
                     &mut progress,
-                )
-                .and_then(|recording| {
-                    ensure_recording_not_cancelled(&worker_cancellation)?;
-                    let _ = sender.send(JobMessage::Persisting);
-                    persist_recording_project(&worker_request, recording, &worker_cancellation)
-                })
-                .map(Box::new)
-                .map_err(|error| error.to_string());
-                if let Err(error) = sender.send(JobMessage::Finished(result))
+                    || {
+                        let _ = sender.send(JobMessage::Persisting);
+                    },
+                );
+                if let Err(error) = sender.send(JobMessage::Finished(completion))
                     && worker_cancellation.is_cancelled()
-                    && let JobMessage::Finished(Ok(project)) = error.0
+                    && let JobMessage::Finished(RecordingCompletion::Completed(project)) = error.0
                 {
                     let _ = remove_completed_project(*project);
                 }
@@ -1503,9 +1574,9 @@ impl GifFromScreenApp {
                     if let Some(job) = &mut self.job {
                         job.stop_retargeting();
                     }
-                    self.notice = Some("Saving editable project…".to_owned());
+                    self.notice = Some("Finalizing recoverable project…".to_owned());
                 }
-                JobMessage::Finished(Ok(project)) => {
+                JobMessage::Finished(RecordingCompletion::Completed(project)) => {
                     let discarded = self
                         .job
                         .as_ref()
@@ -1539,16 +1610,26 @@ impl GifFromScreenApp {
                     }
                     self.finish_recording_job();
                 }
-                JobMessage::Finished(Err(error)) => {
-                    let discarded = self
-                        .job
-                        .as_ref()
-                        .is_some_and(|job| job.cancellation.is_cancelled());
-                    self.notice = Some(if discarded {
-                        "Recording discarded.".to_owned()
-                    } else {
-                        format!("Recording failed: {error}")
-                    });
+                JobMessage::Finished(RecordingCompletion::Discarded { cleanup_error }) => {
+                    self.notice = Some(cleanup_error.map_or_else(
+                        || "Recording discarded; its autosave project was removed.".to_owned(),
+                        |error| format!("Recording discarded, but {error}"),
+                    ));
+                    self.finish_recording_job();
+                }
+                JobMessage::Finished(RecordingCompletion::Failed {
+                    error,
+                    recovery_path,
+                }) => {
+                    self.notice = Some(recovery_path.map_or_else(
+                        || format!("Recording failed before autosave project creation: {error}"),
+                        |path| {
+                            format!(
+                                "Recording failed: {error}. Recoverable autosave retained at {}",
+                                path.display()
+                            )
+                        },
+                    ));
                     self.finish_recording_job();
                 }
             }
@@ -1744,6 +1825,21 @@ enum EditorExportAction {
     None,
     Start,
     Cancel,
+}
+
+fn editor_result_notice(result: EditorUiResult) -> Option<String> {
+    match result {
+        Ok(EditorUiAction::Notice { message, .. }) => Some(message),
+        Err(failure) => Some(format!(
+            "Editor {:?} failed: {}",
+            failure.operation, failure.message
+        )),
+        Ok(
+            EditorUiAction::Selection(_)
+            | EditorUiAction::Project(_)
+            | EditorUiAction::Playback { .. },
+        ) => None,
+    }
 }
 
 fn show_editor_scroll_area<R>(
@@ -2165,7 +2261,7 @@ fn draw_recorder_toolbar(
             RecorderStage::Finalizing => {
                 ui.horizontal_centered(|ui| {
                     ui.spinner();
-                    ui.label("Encoding GIF…");
+                    ui.label("Finalizing recoverable project…");
                     if ui.button("Cancel").clicked() {
                         action = RecorderOverlayAction::Discard;
                     }
@@ -2643,6 +2739,20 @@ fn project_path_for_output(output: &Path) -> Result<PathBuf, String> {
     Ok(output.with_extension("gfsproj"))
 }
 
+fn recording_project_canvas(
+    settings: &RecordingSettings,
+    source_geometry: Option<PhysicalRect>,
+) -> Result<ProjectPhysicalSize, String> {
+    let (width, height) = if settings.region_enabled {
+        (settings.region_width, settings.region_height)
+    } else {
+        let geometry = source_geometry
+            .ok_or_else(|| "The selected source has no known project canvas size.".to_owned())?;
+        (geometry.size().width(), geometry.size().height())
+    };
+    ProjectPhysicalSize::new(width, height).map_err(|error| error.to_string())
+}
+
 fn resolve_export_selection(
     scope: ExportFrameScope,
     timeline_order: &[FrameId],
@@ -2880,6 +2990,11 @@ fn activate_editor(
 
 fn remove_completed_project(project: ActiveProject) -> Result<(), String> {
     let project_path = project.layout().root.clone();
+    drop(project);
+    remove_recording_project_path(&project_path)
+}
+
+fn remove_recording_project_path(project_path: &Path) -> Result<(), String> {
     if project_path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -2890,8 +3005,7 @@ fn remove_completed_project(project: ActiveProject) -> Result<(), String> {
             project_path.display()
         ));
     }
-    drop(project);
-    fs::remove_dir_all(&project_path).map_err(|error| {
+    fs::remove_dir_all(project_path).map_err(|error| {
         format!(
             "could not remove discarded project {}: {error}",
             project_path.display()
@@ -2940,12 +3054,98 @@ fn validate_settings(settings: &RecordingSettings) -> Result<(), String> {
     Ok(())
 }
 
-fn collect_x11_recording(
+fn run_incremental_x11_recording(
     worker: &RecordingWorkerRequest,
     control: &mut RecordingControl,
     cancellation: &CancellationFlag,
     progress: &mut dyn gif_from_screen_workflow::WorkflowProgressSink,
-) -> Result<CollectedRecording, Box<dyn std::error::Error + Send + Sync>> {
+    on_finalizing: impl FnOnce(),
+) -> RecordingCompletion {
+    if cancellation.is_cancelled() {
+        return RecordingCompletion::Discarded {
+            cleanup_error: None,
+        };
+    }
+    let project = match create_incremental_recording_project(worker) {
+        Ok(project) => project,
+        Err(error) => {
+            return RecordingCompletion::Failed {
+                error: error.to_string(),
+                recovery_path: None,
+            };
+        }
+    };
+    let mut sink = IncrementalProjectFrameSink::new(project);
+    match collect_x11_recording(worker, control, &mut sink, cancellation, progress) {
+        Ok(()) => {
+            on_finalizing();
+            let recovery_path = sink.root().to_path_buf();
+            match sink.finish() {
+                Ok(project) => RecordingCompletion::Completed(Box::new(project)),
+                Err(error) => RecordingCompletion::Failed {
+                    error: error.to_string(),
+                    recovery_path: Some(recovery_path),
+                },
+            }
+        }
+        Err(WorkflowError::Discarded | WorkflowError::Cancelled) => {
+            let project_path = sink.root().to_path_buf();
+            drop(sink);
+            RecordingCompletion::Discarded {
+                cleanup_error: remove_recording_project_path(&project_path).err(),
+            }
+        }
+        Err(error) => {
+            let recovery_path = sink.root().to_path_buf();
+            drop(sink);
+            RecordingCompletion::Failed {
+                error: error.to_string(),
+                recovery_path: Some(recovery_path),
+            }
+        }
+    }
+}
+
+fn create_incremental_recording_project(
+    worker: &RecordingWorkerRequest,
+) -> Result<IncrementalRecordingProject, Box<dyn std::error::Error + Send + Sync>> {
+    if Path::new(worker.settings.output.trim()).try_exists()? {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "final GIF target appeared before recording started",
+        )
+        .into());
+    }
+    if worker.project_path.try_exists()? {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "project directory appeared before recording started",
+        )
+        .into());
+    }
+    let created_millis = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    let created_millis = i64::try_from(created_millis)
+        .map_err(|_| io::Error::other("current time does not fit the project timestamp"))?;
+    IncrementalRecordingProject::create(
+        &worker.project_path,
+        worker.canvas,
+        IncrementalRecordingProjectOptions {
+            project_id: ProjectId::from_u128(Uuid::new_v4().as_u128()),
+            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            created_at: UnixTimeMs::new(created_millis),
+            source_label: Some(worker.source_label.clone()),
+        },
+    )
+    .map_err(Into::into)
+}
+
+fn collect_x11_recording(
+    worker: &RecordingWorkerRequest,
+    control: &mut RecordingControl,
+    sink: &mut dyn RecordingFrameSink,
+    cancellation: &CancellationFlag,
+    progress: &mut dyn gif_from_screen_workflow::WorkflowProgressSink,
+) -> Result<(), WorkflowError> {
     let backend = X11CaptureBackend::connect(None)?;
     let target = if worker.settings.region_enabled {
         CaptureTarget::Region {
@@ -2961,70 +3161,26 @@ fn collect_x11_recording(
         match worker.source_kind {
             CaptureSourceKind::Monitor => CaptureTarget::Monitor(worker.source_id.clone()),
             CaptureSourceKind::Window => CaptureTarget::Window(worker.source_id.clone()),
-            _ => return Err("unsupported future X11 capture source kind".into()),
+            _ => {
+                return Err(gif_from_screen_capture::CaptureError::invalid_request(
+                    "unsupported future X11 capture source kind",
+                )
+                .into());
+            }
         }
     };
     let mut request = CaptureRequest::new(target, CaptureCadence::fixed_fps(worker.settings.fps)?);
     request.cursor = CursorCaptureMode::Embedded;
-    collect_controlled(
+    collect_controlled_to_sink(
         &backend,
         request,
         &collection_options(&worker.settings),
         control,
+        sink,
         cancellation,
         progress,
     )
-    .map_err(Into::into)
-}
-
-fn persist_recording_project(
-    worker: &RecordingWorkerRequest,
-    recording: CollectedRecording,
-    cancellation: &CancellationFlag,
-) -> Result<ActiveProject, Box<dyn std::error::Error + Send + Sync>> {
-    ensure_recording_not_cancelled(cancellation)?;
-    if Path::new(worker.settings.output.trim()).try_exists()? {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "final GIF target appeared while recording",
-        )
-        .into());
-    }
-    if worker.project_path.try_exists()? {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "project directory appeared while recording",
-        )
-        .into());
-    }
-    let frame_ids = (0..recording.frames().len())
-        .map(|_| FrameId::from_u128(Uuid::new_v4().as_u128()))
-        .collect();
-    let created_millis = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-    let created_millis = i64::try_from(created_millis)
-        .map_err(|_| io::Error::other("current time does not fit the project timestamp"))?;
-    let project = persist_collected_recording(
-        &worker.project_path,
-        recording,
-        RecordingProjectOptions {
-            project_id: ProjectId::from_u128(Uuid::new_v4().as_u128()),
-            frame_ids,
-            app_version: env!("CARGO_PKG_VERSION").to_owned(),
-            created_at: UnixTimeMs::new(created_millis),
-            source_label: Some(worker.source_label.clone()),
-        },
-    )?;
-    Ok(project)
-}
-
-fn ensure_recording_not_cancelled(
-    cancellation: &CancellationFlag,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if cancellation.is_cancelled() {
-        Err(io::Error::new(io::ErrorKind::Interrupted, "recording was discarded").into())
-    } else {
-        Ok(())
-    }
+    .map(|_| ())
 }
 
 fn collection_options(settings: &RecordingSettings) -> CollectOptions {
@@ -3189,7 +3345,11 @@ mod tests {
     };
 
     use eframe::egui;
-    use gif_from_screen_application::{ProjectFrameSelection, ProjectGifExportReport};
+    use gif_from_screen_application::{
+        IncrementalRecordingProject, IncrementalRecordingProjectOptions, ProjectFrameSelection,
+        ProjectGifExportReport,
+    };
+    use gif_from_screen_capture::{CaptureSourceId, CaptureSourceKind, PhysicalRect};
     use gif_from_screen_domain::{
         AssetDescriptor, AssetKind, Canvas, CanvasBackground, CaptureMetadata, ClipTransform,
         ColorSpace, DurationUs, EditCommand, FrameClip, FrameId, PhysicalSize as DomainSize,
@@ -3199,21 +3359,26 @@ mod tests {
         BuiltinGifEncoder, DeltaMode, DitherMode, EncodeOptions, EncodeReport, LoopBehavior,
         PaletteMode, QuantizerStrategy, RgbaFrame, Transparency,
     };
-    use gif_from_screen_project::ActiveProject;
+    use gif_from_screen_project::{ActiveProject, LockPolicy};
+    use gif_from_screen_workflow::RecordingFrameSink;
     use tempfile::tempdir;
 
     use super::{
         AppView, EDITOR_PREVIEW_MAX_SIZE, EditorExportSettings, ExportDitherChoice,
         ExportFrameScope, ExportLoopChoice, ExportPaletteChoice, ExportQuantizerChoice,
-        GifFromScreenApp, MAX_COUNTDOWN_SECONDS, MAX_RECORDING_DURATION_MS, RecorderOverlayAction,
-        RecorderStage, RecordingSettings, StartupIntent, activate_editor, apply_overlay_region,
+        GifFromScreenApp, IncrementalProjectFrameSink, MAX_COUNTDOWN_SECONDS,
+        MAX_RECORDING_DURATION_MS, RecorderOverlayAction, RecorderStage, RecordingSettings,
+        RecordingWorkerRequest, StartupIntent, activate_editor, apply_overlay_region,
         build_project_export_options, can_navigate_back, collection_limit, collection_options,
-        default_gif_path_for_project, edited_gif_path_for_import, export_job_is_active,
+        create_incremental_recording_project, default_gif_path_for_project,
+        edited_gif_path_for_import, editor_result_notice, export_job_is_active,
         export_result_notice, fit_dimensions, frame_retention, has_static_image_extension,
         landing_cards_fit, map_preview_selection, parse_startup_intent, project_path_for_output,
-        remove_completed_project, resize_nearest_rgba, resolve_export_selection,
-        should_sync_retarget, show_editor_scroll_area, validate_export_output, validate_settings,
+        recording_project_canvas, remove_completed_project, remove_recording_project_path,
+        resize_nearest_rgba, resolve_export_selection, should_sync_retarget,
+        show_editor_scroll_area, validate_export_output, validate_settings,
     };
+    use crate::editor_ui::{EditorUiAction, EditorUiFailure, EditorUiOperation};
     use crate::editor_workspace::EditorWorkspace;
     use crate::export_job::{ExportJobError, ExportJobState};
     use crate::import_gif_job::ImportGifJobState;
@@ -3523,6 +3688,37 @@ mod tests {
         assert!(success.contains(output.to_string_lossy().as_ref()));
         assert_eq!(validate_export_output(" finished.gif ").unwrap(), output);
         assert!(validate_export_output("finished.mp4").is_err());
+    }
+
+    #[test]
+    fn editor_shell_surfaces_notices_and_failures_without_noisy_success_messages() {
+        let operation = EditorUiOperation::RepairJournal;
+        assert_eq!(
+            editor_result_notice(Ok(EditorUiAction::Notice {
+                operation,
+                message: "Preserved journal at /tmp/rejected".to_owned(),
+            })),
+            Some("Preserved journal at /tmp/rejected".to_owned())
+        );
+        assert_eq!(
+            editor_result_notice(Err(EditorUiFailure {
+                operation,
+                message: "repair failed".to_owned(),
+            })),
+            Some("Editor RepairJournal failed: repair failed".to_owned())
+        );
+        assert_eq!(
+            editor_result_notice(Ok(EditorUiAction::Selection(operation))),
+            None
+        );
+        assert_eq!(
+            editor_result_notice(Ok(EditorUiAction::Project(operation))),
+            None
+        );
+        assert_eq!(
+            editor_result_notice(Ok(EditorUiAction::Playback { playing: true })),
+            None
+        );
     }
 
     #[test]
@@ -3987,6 +4183,96 @@ mod tests {
     }
 
     #[test]
+    fn recording_canvas_is_fixed_from_region_or_selected_source_geometry() {
+        let mut settings = RecordingSettings {
+            region_width: 800,
+            region_height: 450,
+            ..RecordingSettings::default()
+        };
+        let source_geometry = PhysicalRect::new(-100, 20, 1_920, 1_080).unwrap();
+
+        assert_eq!(
+            recording_project_canvas(&settings, Some(source_geometry)).unwrap(),
+            DomainSize::new(800, 450).unwrap()
+        );
+        settings.region_enabled = false;
+        assert_eq!(
+            recording_project_canvas(&settings, Some(source_geometry)).unwrap(),
+            DomainSize::new(1_920, 1_080).unwrap()
+        );
+        assert!(recording_project_canvas(&settings, None).is_err());
+    }
+
+    #[test]
+    fn recording_start_rechecks_output_and_project_path_after_countdown() {
+        let directory = tempdir().unwrap();
+        let output = directory.path().join("race.gif");
+        let project_path = directory.path().join("race.gfsproj");
+        let worker = RecordingWorkerRequest {
+            settings: RecordingSettings {
+                output: output.to_string_lossy().into_owned(),
+                ..RecordingSettings::default()
+            },
+            source_id: CaptureSourceId::new("test:source").unwrap(),
+            source_kind: CaptureSourceKind::Monitor,
+            source_label: "Test monitor".to_owned(),
+            project_path: project_path.clone(),
+            canvas: DomainSize::new(640, 480).unwrap(),
+        };
+
+        fs::write(&output, b"appeared during countdown").unwrap();
+        let output_error = create_incremental_recording_project(&worker).unwrap_err();
+        assert!(
+            output_error
+                .to_string()
+                .contains("final GIF target appeared")
+        );
+        assert!(!project_path.exists());
+
+        fs::remove_file(&output).unwrap();
+        fs::create_dir(&project_path).unwrap();
+        fs::write(project_path.join("sentinel"), b"keep").unwrap();
+        let project_error = create_incremental_recording_project(&worker).unwrap_err();
+        assert!(
+            project_error
+                .to_string()
+                .contains("project directory appeared")
+        );
+        assert_eq!(fs::read(project_path.join("sentinel")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn desktop_incremental_sink_first_frame_survives_an_unfinalized_drop() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("autosave.gfsproj");
+        let writer = IncrementalRecordingProject::create(
+            &root,
+            DomainSize::new(1, 1).unwrap(),
+            IncrementalRecordingProjectOptions {
+                project_id: ProjectId::from_u128(55),
+                app_version: "desktop-test".to_owned(),
+                created_at: UnixTimeMs::new(1),
+                source_label: Some("Test monitor".to_owned()),
+            },
+        )
+        .unwrap();
+        let mut sink = IncrementalProjectFrameSink::new(writer);
+        let frame = RgbaFrame::new(1, 1, vec![12, 34, 56, 255], 100_000).unwrap();
+
+        sink.append_provisional_frame(0, &frame).unwrap();
+        drop(sink);
+
+        let opened = ActiveProject::open(&root, LockPolicy::FailIfPresent).unwrap();
+        assert!(opened.journal_recovery.is_clean());
+        assert_eq!(opened.journal_recovery.replayed_records, 1);
+        assert_eq!(opened.project.manifest().timeline.frames.len(), 1);
+        assert_eq!(
+            opened.project.manifest().timeline.frames[0].duration.get(),
+            100_000
+        );
+    }
+
+    #[test]
     fn discarded_completed_project_is_removed_after_releasing_its_lock() {
         let directory = tempdir().unwrap();
         let root = directory.path().join("discarded.gfsproj");
@@ -3997,6 +4283,12 @@ mod tests {
 
         assert!(!root.exists());
         assert!(!gif_output.exists());
+
+        let unexpected = directory.path().join("do-not-delete.txt");
+        fs::create_dir(&unexpected).unwrap();
+        fs::write(unexpected.join("sentinel"), b"keep").unwrap();
+        assert!(remove_recording_project_path(&unexpected).is_err());
+        assert!(unexpected.join("sentinel").is_file());
     }
 
     #[test]

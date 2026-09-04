@@ -10,15 +10,17 @@
 mod collect;
 mod control;
 mod error;
+mod frame_sink;
 mod output;
 mod progress;
 
 pub use collect::{
     CollectOptions, CollectedRecording, CollectionLimit, CollectionSummary, FrameRetention,
-    collect, collect_controlled,
+    collect, collect_controlled, collect_controlled_to_sink, collect_controlled_with_sink,
 };
 pub use control::{RecordingControl, RecordingController, TargetUpdateRequest, TargetUpdateStatus};
 pub use error::WorkflowError;
+pub use frame_sink::{RecordingFrameSink, RecordingFrameSinkError, RecordingFrameSinkOperation};
 pub use output::{
     RecordToGifOptions, RecordToGifReport, partial_output_path, record_to_gif,
     record_to_gif_controlled, record_to_gif_with_encoder,

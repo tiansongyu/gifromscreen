@@ -5,6 +5,8 @@ use gif_from_screen_capture::CaptureError;
 use gif_from_screen_gif::{FrameError, GifEncodeError};
 use thiserror::Error;
 
+use crate::{RecordingFrameSinkError, RecordingFrameSinkOperation};
+
 /// A typed failure from capture collection or atomic GIF export.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -127,6 +129,27 @@ pub enum WorkflowError {
         required_bytes: u64,
         /// Configured collection bound.
         limit_bytes: u64,
+    },
+
+    /// A collection counter exceeded the integer range exposed by the workflow API.
+    #[error("collected {counter} exceeded its supported integer range")]
+    CollectionCounterOverflow {
+        /// Counter that could not be represented.
+        counter: &'static str,
+    },
+
+    /// Incremental frame persistence failed while capture was active.
+    #[error(
+        "recording frame sink failed to {operation:?} for retained frame {frame_index}: {source}"
+    )]
+    FrameSink {
+        /// Durable sink operation that failed.
+        operation: RecordingFrameSinkOperation,
+        /// Zero-based retained-frame index involved in the operation.
+        frame_index: u64,
+        /// Application/project persistence failure.
+        #[source]
+        source: RecordingFrameSinkError,
     },
 
     /// Building an encoder frame failed after capture validation.
