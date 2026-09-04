@@ -9,7 +9,7 @@ Implemented now:
 - exact duplicate-frame merging;
 - once, finite, and infinite loop behavior;
 - deterministic local or memory-bounded global palettes with 2–256 entries;
-- selectable Median Cut, Grayscale, and Most Used built-in quantizers;
+- selectable Median Cut, Grayscale, Most Used, and Octree built-in quantizers;
 - no dithering, ordered Bayer 4x4, Floyd-Steinberg, Atkinson, Burkes,
   Sierra Lite, Two-row Sierra, full three-row Sierra, Jarvis–Judice–Ninke,
   Stucki, and Stevenson–Arce strategies;
@@ -53,8 +53,12 @@ cancellation token while it works.
 
 `MedianCut` is the balanced general-purpose choice. `Grayscale` converts source
 colors to deterministic BT.601 luma values before palette reduction. `MostUsed`
-prioritizes frequent colors and resolves ties lexicographically. All three work
-with `PaletteMode::LocalPerFrame` and `PaletteMode::Global`, reserve transparency
+prioritizes frequent colors and resolves ties lexicographically. `Octree` builds
+a fixed-depth RGB tree from the bounded 5-bit/channel histogram, collapses the
+least-populated deepest nodes with Morton-path tie-breaking, and emits frontier
+leaves in Morton order. A complete tree is capped at 37,449 nodes, independent
+of input dimensions or frame count. All four strategies work with
+`PaletteMode::LocalPerFrame` and `PaletteMode::Global`, reserve transparency
 inside the requested color count, and honor cooperative cancellation. Supplying
 a custom `FrameQuantizer` through `BuiltinGifEncoder::new` overrides the option.
 
@@ -63,7 +67,7 @@ replaceable. Additional palette/optimization implementations can therefore be
 added behind the same application port:
 
 - fixed and custom palette planners;
-- NeuQuant/Octree/Wu quantizers;
+- NeuQuant/Wu quantizers;
 - more aggressive transparent-rectangle and disposal optimization;
 - lossy similar-frame merging.
 

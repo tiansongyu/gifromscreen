@@ -125,6 +125,11 @@ fn most_used_roundtrips_with_local_and_global_palettes() {
 }
 
 #[test]
+fn octree_roundtrips_with_local_and_global_palettes() {
+    quantizer_roundtrip(QuantizerStrategy::Octree);
+}
+
+#[test]
 fn roundtrip_merges_duplicates_and_preserves_total_duration() {
     let red = solid_frame([255, 0, 0, 255], 15_000);
     let same_red = solid_frame([255, 0, 0, 255], 25_000);

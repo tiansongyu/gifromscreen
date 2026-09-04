@@ -58,7 +58,8 @@ pub enum DitherMode {
 /// The selected strategy is used for both local per-frame palettes and a
 /// shared global palette. [`MedianCut`](Self::MedianCut) is the general-purpose
 /// default, [`Grayscale`](Self::Grayscale) deliberately removes hue, and
-/// [`MostUsed`](Self::MostUsed) favors the most frequent source colors.
+/// [`MostUsed`](Self::MostUsed) favors the most frequent source colors, and
+/// [`Octree`](Self::Octree) prunes a bounded RGB octree.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum QuantizerStrategy {
@@ -69,6 +70,8 @@ pub enum QuantizerStrategy {
     Grayscale,
     /// The most frequent colors in a bounded RGB histogram.
     MostUsed,
+    /// A deterministic, population-pruned RGB octree.
+    Octree,
 }
 
 /// RGB palette shared by every image descriptor in a GIF.
@@ -199,6 +202,19 @@ pub struct GrayscaleQuantizer;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MostUsedQuantizer;
 
+/// Deterministic, bounded-memory RGB octree quantizer.
+///
+/// Input first enters the crate's fixed 5-bit/channel histogram. Its occupied
+/// bins populate a depth-5 octree, whose complete shape is bounded by 37,449
+/// nodes (`1 + 8 + … + 8^5`) regardless of frame dimensions or count. Starting
+/// at depth 4 and moving toward the root, reduction collapses sibling leaves
+/// into their population-weighted parent centroid. At a given depth, the least
+/// populated parent is collapsed first; equal populations use the node's RGB
+/// Morton path as a stable tie-break. The final frontier is ordered by its
+/// left-aligned Morton prefix, so palette indices are reproducible as well.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OctreeQuantizer;
+
 #[derive(Clone, Copy, Debug, Default)]
 struct HistogramBin {
     red_sum: u64,
@@ -229,6 +245,213 @@ impl HistogramBin {
 struct ColorPoint {
     rgb: [u8; 3],
     count: u64,
+}
+
+const OCTREE_DEPTH: u8 = HISTOGRAM_CHANNEL_BITS as u8;
+// A complete 8-way tree through depth five has
+// (8^(5 + 1) - 1) / (8 - 1) nodes.
+const OCTREE_MAX_NODES: usize = 37_449;
+const OCTREE_REDUCTION_CANCELLATION_INTERVAL: usize = 256;
+
+#[derive(Clone, Debug)]
+struct OctreeNode {
+    children: [Option<usize>; 8],
+    red_sum: u64,
+    green_sum: u64,
+    blue_sum: u64,
+    count: u64,
+    depth: u8,
+    path: u32,
+}
+
+impl OctreeNode {
+    const fn new(depth: u8, path: u32) -> Self {
+        Self {
+            children: [None; 8],
+            red_sum: 0,
+            green_sum: 0,
+            blue_sum: 0,
+            count: 0,
+            depth,
+            path,
+        }
+    }
+
+    fn add_bin(&mut self, bin: HistogramBin) {
+        self.red_sum += bin.red_sum;
+        self.green_sum += bin.green_sum;
+        self.blue_sum += bin.blue_sum;
+        self.count += bin.count;
+    }
+
+    fn centroid(&self) -> [u8; 3] {
+        debug_assert_ne!(self.count, 0);
+        [
+            (self.red_sum / self.count) as u8,
+            (self.green_sum / self.count) as u8,
+            (self.blue_sum / self.count) as u8,
+        ]
+    }
+
+    fn palette_order_key(&self) -> u32 {
+        self.path << (3 * u32::from(OCTREE_DEPTH - self.depth))
+    }
+}
+
+fn build_octree(
+    histogram: &[HistogramBin],
+    cancellation: &dyn CancellationToken,
+) -> Result<Vec<OctreeNode>, QuantizationError> {
+    debug_assert_eq!(histogram.len(), HISTOGRAM_LEN);
+    check_now(cancellation)?;
+
+    let mut nodes = Vec::with_capacity(OCTREE_MAX_NODES);
+    nodes.push(OctreeNode::new(0, 0));
+
+    for (histogram_index, &bin) in histogram.iter().enumerate() {
+        check_cancellation(histogram_index, cancellation)?;
+        if bin.count == 0 {
+            continue;
+        }
+
+        nodes[0].add_bin(bin);
+        let color = bin.average();
+        let mut node_index = 0;
+        for depth in 1..=OCTREE_DEPTH {
+            let branch = octree_branch(color, depth);
+            let child_index = match nodes[node_index].children[branch] {
+                Some(index) => index,
+                None => {
+                    if nodes.len() >= OCTREE_MAX_NODES {
+                        return Err(QuantizationError::InvalidPalette(
+                            "octree exceeded its fixed node bound".to_owned(),
+                        ));
+                    }
+                    let index = nodes.len();
+                    let path = (nodes[node_index].path << 3) | branch as u32;
+                    nodes.push(OctreeNode::new(depth, path));
+                    nodes[node_index].children[branch] = Some(index);
+                    index
+                }
+            };
+            nodes[child_index].add_bin(bin);
+            node_index = child_index;
+        }
+    }
+
+    debug_assert!(nodes.len() <= OCTREE_MAX_NODES);
+    Ok(nodes)
+}
+
+fn reduce_octree(
+    nodes: &[OctreeNode],
+    color_limit: usize,
+    cancellation: &dyn CancellationToken,
+) -> Result<Vec<[u8; 3]>, QuantizationError> {
+    let palette_nodes = reduce_octree_frontier(nodes, color_limit, cancellation)?;
+    Ok(palette_nodes
+        .into_iter()
+        .map(|index| nodes[index].centroid())
+        .collect())
+}
+
+fn reduce_octree_frontier(
+    nodes: &[OctreeNode],
+    color_limit: usize,
+    cancellation: &dyn CancellationToken,
+) -> Result<Vec<usize>, QuantizationError> {
+    check_now(cancellation)?;
+    if nodes[0].count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut active = vec![false; nodes.len()];
+    let mut active_count = 0_usize;
+    for (index, node) in nodes.iter().enumerate() {
+        if node.depth == OCTREE_DEPTH {
+            active[index] = true;
+            active_count += 1;
+        }
+    }
+
+    let mut visited_candidates = 0_usize;
+    'depths: for depth in (0..OCTREE_DEPTH).rev() {
+        if active_count <= color_limit {
+            break;
+        }
+        check_now(cancellation)?;
+        let mut candidates = nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.depth == depth)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|&index| (nodes[index].count, nodes[index].path));
+
+        for parent_index in candidates {
+            if visited_candidates.is_multiple_of(OCTREE_REDUCTION_CANCELLATION_INTERVAL) {
+                check_now(cancellation)?;
+            }
+            visited_candidates = visited_candidates.wrapping_add(1);
+            let active_children = nodes[parent_index]
+                .children
+                .iter()
+                .flatten()
+                .copied()
+                .filter(|&child_index| active[child_index])
+                .collect::<Vec<_>>();
+            if active_children.is_empty() {
+                continue;
+            }
+            debug_assert!(!active[parent_index]);
+            debug_assert!(
+                nodes[parent_index]
+                    .children
+                    .iter()
+                    .flatten()
+                    .all(|&child_index| active[child_index])
+            );
+            debug_assert_eq!(
+                active_children
+                    .iter()
+                    .map(|&child_index| nodes[child_index].count)
+                    .sum::<u64>(),
+                nodes[parent_index].count
+            );
+
+            for child_index in &active_children {
+                active[*child_index] = false;
+            }
+            active[parent_index] = true;
+            active_count = active_count + 1 - active_children.len();
+            if active_count <= color_limit {
+                break 'depths;
+            }
+        }
+    }
+
+    check_now(cancellation)?;
+    let mut palette_nodes = active
+        .iter()
+        .enumerate()
+        .filter(|(_, is_active)| **is_active)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    palette_nodes.sort_unstable_by_key(|&index| {
+        let node = &nodes[index];
+        (node.palette_order_key(), node.depth, node.path)
+    });
+    debug_assert!(palette_nodes.len() <= color_limit);
+
+    Ok(palette_nodes)
+}
+
+fn octree_branch(color: [u8; 3], depth: u8) -> usize {
+    debug_assert!((1..=OCTREE_DEPTH).contains(&depth));
+    let shift = 8 - depth;
+    usize::from((color[0] >> shift) & 1) << 2
+        | usize::from((color[1] >> shift) & 1) << 1
+        | usize::from((color[2] >> shift) & 1)
 }
 
 impl FrameQuantizer for MedianCutQuantizer {
@@ -322,6 +545,31 @@ impl FrameQuantizer for MostUsedQuantizer {
     }
 }
 
+impl FrameQuantizer for OctreeQuantizer {
+    fn quantize(
+        &self,
+        frame: &RgbaFrame,
+        settings: QuantizationSettings,
+        cancellation: &dyn CancellationToken,
+    ) -> Result<IndexedFrame, QuantizationError> {
+        quantize_frame(self, frame, settings, cancellation)
+    }
+
+    fn build_global_palette(
+        &self,
+        frames: &[RgbaFrame],
+        settings: QuantizationSettings,
+        cancellation: &dyn CancellationToken,
+    ) -> Result<ColorPalette, QuantizationError> {
+        let (histogram, has_transparency) = build_rgb_histogram(frames, settings, cancellation)?;
+        let opaque_limit = opaque_color_limit(settings.max_colors, has_transparency);
+        let nodes = build_octree(&histogram, cancellation)?;
+        let opaque_palette = reduce_octree(&nodes, opaque_limit, cancellation)?;
+
+        finish_palette(opaque_palette, has_transparency)
+    }
+}
+
 impl FrameQuantizer for QuantizerStrategy {
     fn quantize(
         &self,
@@ -333,6 +581,7 @@ impl FrameQuantizer for QuantizerStrategy {
             Self::MedianCut => MedianCutQuantizer.quantize(frame, settings, cancellation),
             Self::Grayscale => GrayscaleQuantizer.quantize(frame, settings, cancellation),
             Self::MostUsed => MostUsedQuantizer.quantize(frame, settings, cancellation),
+            Self::Octree => OctreeQuantizer.quantize(frame, settings, cancellation),
         }
     }
 
@@ -352,6 +601,7 @@ impl FrameQuantizer for QuantizerStrategy {
             Self::MostUsed => {
                 MostUsedQuantizer.build_global_palette(frames, settings, cancellation)
             }
+            Self::Octree => OctreeQuantizer.build_global_palette(frames, settings, cancellation),
         }
     }
 }
@@ -1157,10 +1407,11 @@ mod tests {
 
     use super::*;
 
-    const STRATEGIES: [QuantizerStrategy; 3] = [
+    const STRATEGIES: [QuantizerStrategy; 4] = [
         QuantizerStrategy::MedianCut,
         QuantizerStrategy::Grayscale,
         QuantizerStrategy::MostUsed,
+        QuantizerStrategy::Octree,
     ];
 
     const ERROR_DIFFUSION_MODES: [DitherMode; 9] = [
@@ -1216,6 +1467,64 @@ mod tests {
 
     fn palette_entries(palette: &ColorPalette) -> Vec<[u8; 3]> {
         palette.colors().as_chunks::<3>().0.to_vec()
+    }
+
+    fn complete_octree_histogram() -> Vec<HistogramBin> {
+        let mut histogram = vec![HistogramBin::default(); HISTOGRAM_LEN];
+        for (index, bin) in histogram.iter_mut().enumerate() {
+            let red =
+                (((index / (HISTOGRAM_CHANNEL_SIZE * HISTOGRAM_CHANNEL_SIZE)) << 3) | 4) as u8;
+            let green =
+                ((((index / HISTOGRAM_CHANNEL_SIZE) % HISTOGRAM_CHANNEL_SIZE) << 3) | 4) as u8;
+            let blue = (((index % HISTOGRAM_CHANNEL_SIZE) << 3) | 4) as u8;
+            bin.add(red, green, blue);
+        }
+        histogram
+    }
+
+    fn assert_valid_octree_frontier(nodes: &[OctreeNode], frontier: &[usize]) {
+        let mut active = vec![false; nodes.len()];
+        for &index in frontier {
+            assert!(!active[index], "frontier contains node {index} twice");
+            assert_ne!(nodes[index].count, 0);
+            active[index] = true;
+        }
+
+        fn visit(
+            node_index: usize,
+            nodes: &[OctreeNode],
+            active: &[bool],
+            has_active_ancestor: bool,
+        ) {
+            assert!(
+                !(has_active_ancestor && active[node_index]),
+                "frontier contains an ancestor and descendant"
+            );
+            let is_covered = has_active_ancestor || active[node_index];
+            let children = nodes[node_index]
+                .children
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>();
+            if children.is_empty() {
+                assert!(is_covered, "terminal octree leaf is not covered");
+            } else {
+                for child_index in children {
+                    visit(child_index, nodes, active, is_covered);
+                }
+            }
+        }
+
+        visit(0, nodes, &active, false);
+        assert_eq!(
+            frontier
+                .iter()
+                .map(|&index| nodes[index].count)
+                .sum::<u64>(),
+            nodes[0].count,
+            "frontier population does not equal root population"
+        );
     }
 
     fn assert_conservative_kernel(
@@ -1371,6 +1680,139 @@ mod tests {
             palette_entries(&first),
             vec![[0, 0, 0], [255, 0, 0], [0, 255, 0]]
         );
+    }
+
+    #[test]
+    fn octree_palette_is_golden_stable_and_preserves_transparency() {
+        let first_frame = frame_from_pixels(&[
+            [10, 20, 240, 255],
+            [10, 240, 20, 255],
+            [240, 10, 20, 255],
+            [240, 240, 10, 255],
+            [250, 250, 250, 0],
+        ]);
+        let second_frame = frame_from_pixels(&[
+            [20, 30, 250, 255],
+            [20, 250, 30, 255],
+            [250, 20, 30, 255],
+            [250, 250, 20, 255],
+        ]);
+        let forward = OctreeQuantizer
+            .build_global_palette(
+                &[first_frame.clone(), second_frame.clone()],
+                settings(5),
+                &NeverCancel,
+            )
+            .unwrap();
+        let reversed = OctreeQuantizer
+            .build_global_palette(&[second_frame, first_frame], settings(5), &NeverCancel)
+            .unwrap();
+
+        assert_eq!(forward, reversed);
+        assert_eq!(forward.transparent_index(), Some(0));
+        assert_eq!(
+            palette_entries(&forward),
+            vec![
+                [0, 0, 0],
+                [15, 25, 245],
+                [15, 245, 25],
+                [245, 15, 25],
+                [245, 245, 15],
+            ]
+        );
+    }
+
+    #[test]
+    fn octree_color_corpus_has_bounded_error_and_independent_selection() {
+        let mut pixels = Vec::with_capacity(16 * 16 * 4);
+        for y in 0_u8..16 {
+            for x in 0_u8..16 {
+                pixels.extend_from_slice(&[x * 17, y * 17, ((x * 5 + y * 11) % 16) * 17, 255]);
+            }
+        }
+        let frame = RgbaFrame::new(16, 16, pixels, 10_000).unwrap();
+        let settings = settings(16);
+        let octree = OctreeQuantizer
+            .build_global_palette(std::slice::from_ref(&frame), settings, &NeverCancel)
+            .unwrap();
+        let median = MedianCutQuantizer
+            .build_global_palette(std::slice::from_ref(&frame), settings, &NeverCancel)
+            .unwrap();
+
+        let palette_by_index = palette_entries(&octree);
+        let mut octree_colors = palette_by_index.clone();
+        let mut median_colors = palette_entries(&median);
+        octree_colors.sort_unstable();
+        median_colors.sort_unstable();
+        assert_ne!(octree_colors, median_colors);
+        assert!((2..=16).contains(&octree.color_count()));
+
+        let indices =
+            map_frame_to_palette(&frame, &octree, None, DitherMode::None, &NeverCancel).unwrap();
+        let squared_error = frame
+            .pixels()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(indices)
+            .map(|(pixel, palette_index)| {
+                let color = palette_by_index[usize::from(palette_index)];
+                (0..3)
+                    .map(|channel| i64::from(pixel[channel]) - i64::from(color[channel]))
+                    .map(|error| (error * error) as u64)
+                    .sum::<u64>()
+            })
+            .sum::<u64>();
+        let mean_squared_channel_error = squared_error / (16 * 16 * 3);
+        assert!(mean_squared_channel_error <= 1_500);
+    }
+
+    #[test]
+    fn octree_has_a_fixed_complete_tree_bound() {
+        let histogram = complete_octree_histogram();
+        let nodes = build_octree(&histogram, &NeverCancel).unwrap();
+        assert_eq!(nodes.len(), OCTREE_MAX_NODES);
+        let palette = reduce_octree(&nodes, 256, &NeverCancel).unwrap();
+        assert!(!palette.is_empty());
+        assert!(palette.len() <= 256);
+    }
+
+    #[test]
+    fn octree_frontier_always_partitions_the_root_population() {
+        let nodes = build_octree(&complete_octree_histogram(), &NeverCancel).unwrap();
+        for color_limit in [2, 16, 256, 4_094, 30_000, 32_768] {
+            let frontier = reduce_octree_frontier(&nodes, color_limit, &NeverCancel).unwrap();
+            assert!(frontier.len() <= color_limit);
+            assert_valid_octree_frontier(&nodes, &frontier);
+
+            if color_limit == 256 {
+                let first_depth = nodes[frontier[0]].depth;
+                assert!(
+                    frontier
+                        .iter()
+                        .any(|&index| nodes[index].depth != first_depth),
+                    "the regression case must stop partway through a depth"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn octree_checks_cancellation_during_build_and_reduction() {
+        let histogram = complete_octree_histogram();
+        let build_cancellation = CancelAfterChecks::new(3);
+        assert!(matches!(
+            build_octree(&histogram, &build_cancellation),
+            Err(QuantizationError::Cancelled)
+        ));
+
+        let nodes = build_octree(&histogram, &NeverCancel).unwrap();
+        let reduction_cancellation = CancelAfterChecks::new(3);
+        assert!(matches!(
+            reduce_octree(&nodes, 2, &reduction_cancellation),
+            Err(QuantizationError::Cancelled)
+        ));
+        assert!(reduction_cancellation.checks.load(Ordering::Relaxed) >= 4);
     }
 
     #[test]
