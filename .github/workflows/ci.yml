@@ -20,6 +20,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes \
+            clang \
+            libclang-dev \
             libpipewire-0.3-dev \
             libwayland-dev \
             libxkbcommon-dev \
