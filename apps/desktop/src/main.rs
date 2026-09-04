@@ -3,6 +3,7 @@
 //! Desktop entry point for the Linux-first `GifFromScreen` application.
 
 mod countdown;
+mod retarget;
 
 use std::{
     path::{Path, PathBuf},
@@ -20,8 +21,10 @@ use gif_from_screen_capture_linux::X11CaptureBackend;
 use gif_from_screen_gif::{CancellationFlag, EncodeOptions};
 use gif_from_screen_workflow::{
     CollectOptions, CollectionLimit, RecordToGifOptions, RecordToGifReport, RecordingControl,
-    RecordingController, WorkflowProgress, record_to_gif_controlled,
+    RecordingController, TargetUpdateRequest, TargetUpdateStatus, WorkflowProgress,
+    record_to_gif_controlled,
 };
+use retarget::{RegionRetargetPlan, RetargetCompletion};
 
 const APP_NAME: &str = "GifFromScreen";
 const RECORDER_BORDER_POINTS: f32 = 4.0;
@@ -82,6 +85,93 @@ struct RecordingJob {
     cancellation: CancellationFlag,
     controller: RecordingController,
     paused: bool,
+    terminal_requested: bool,
+    retarget: Option<RecordingRetarget>,
+}
+
+struct RecordingRetarget {
+    source: CaptureSourceId,
+    plan: RegionRetargetPlan,
+    pending: Option<TargetUpdateRequest>,
+}
+
+impl RecordingRetarget {
+    fn new(source: CaptureSourceId, initial: PhysicalRect) -> Self {
+        Self {
+            source,
+            plan: RegionRetargetPlan::new(initial),
+            pending: None,
+        }
+    }
+
+    fn observe(&mut self, controller: &RecordingController, candidate: PhysicalRect) {
+        if let Some(region) = self.plan.observe(candidate) {
+            self.send(controller, region);
+        }
+    }
+
+    fn poll(&mut self, controller: &RecordingController, allow_next: bool) -> Option<String> {
+        let status = self.pending.as_mut()?.status();
+        let (completion, notice) = match status {
+            TargetUpdateStatus::Applied => (RetargetCompletion::Applied, None),
+            TargetUpdateStatus::Rejected(error) => (
+                RetargetCompletion::Rejected,
+                Some(format!(
+                    "Could not move the capture area; recording continues at its last accepted position: {error}"
+                )),
+            ),
+            TargetUpdateStatus::WorkerExited => (
+                RetargetCompletion::WorkerExited,
+                Some(
+                    "Could not move the capture area because the recording worker has exited."
+                        .to_owned(),
+                ),
+            ),
+            // Pending and future non-terminal states remain in flight.
+            _ => return None,
+        };
+        self.pending = None;
+        if let Some(region) = self.plan.complete(completion, allow_next) {
+            self.send(controller, region);
+        }
+        notice
+    }
+
+    fn disable(&mut self) {
+        self.plan.disable();
+    }
+
+    fn send(&mut self, controller: &RecordingController, region: PhysicalRect) {
+        debug_assert!(self.pending.is_none());
+        self.pending = Some(controller.update_target(CaptureTarget::Region {
+            source: self.source.clone(),
+            region,
+        }));
+    }
+}
+
+impl RecordingJob {
+    fn observe_target(&mut self, candidate: PhysicalRect) {
+        if self.terminal_requested {
+            return;
+        }
+        if let Some(retarget) = &mut self.retarget {
+            retarget.observe(&self.controller, candidate);
+        }
+    }
+
+    fn poll_retarget(&mut self, allow_next: bool) -> Option<String> {
+        self.retarget
+            .as_mut()?
+            .poll(&self.controller, allow_next && !self.terminal_requested)
+    }
+
+    fn stop_retargeting(&mut self) {
+        self.terminal_requested = true;
+        if let Some(retarget) = &mut self.retarget {
+            retarget.disable();
+        }
+    }
 }
 
 struct RegionPicker {
@@ -127,6 +217,23 @@ enum RecorderStage {
     Recording,
     Paused,
     Finalizing,
+}
+
+impl RecorderStage {
+    const fn allows_moving(self) -> bool {
+        matches!(
+            self,
+            Self::Ready | Self::Countdown(_) | Self::Recording | Self::Paused
+        )
+    }
+
+    const fn allows_resizing(self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    const fn allows_retargeting(self) -> bool {
+        matches!(self, Self::Recording | Self::Paused)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -622,13 +729,24 @@ impl GifFromScreenApp {
             return;
         };
         let stage = self.recorder_stage();
-        let ready = stage == RecorderStage::Ready;
+        if stage == RecorderStage::Finalizing
+            && let Some(job) = &mut self.job
+        {
+            job.stop_retargeting();
+        }
+        let retarget_notice = self
+            .job
+            .as_mut()
+            .and_then(|job| job.poll_retarget(stage.allows_retargeting()));
+        if retarget_notice.is_some() {
+            self.notice = retarget_notice;
+        }
         let mut builder = egui::ViewportBuilder::default()
             .with_title("GifFromScreen recorder")
             .with_transparent(true)
             .with_decorations(false)
-            .with_resizable(ready)
-            .with_movable_by_background(ready)
+            .with_resizable(stage.allows_resizing())
+            .with_movable_by_background(stage.allows_moving())
             .with_min_inner_size([180.0, 130.0])
             .with_always_on_top()
             .with_has_shadow(false)
@@ -652,11 +770,12 @@ impl GifFromScreenApp {
             overlay.initialized = true;
         }
         if let Some(region) = frame.region {
-            self.settings.region_enabled = true;
-            self.settings.region_x = region.origin().x;
-            self.settings.region_y = region.origin().y;
-            self.settings.region_width = region.size().width();
-            self.settings.region_height = region.size().height();
+            apply_overlay_region(&mut self.settings, stage, region);
+            if should_sync_retarget(stage, frame.action)
+                && let Some(job) = &mut self.job
+            {
+                job.observe_target(region);
+            }
         }
         self.handle_recorder_overlay_action(context, frame.action);
     }
@@ -668,6 +787,9 @@ impl GifFromScreenApp {
         let Some(job) = &self.job else {
             return RecorderStage::Ready;
         };
+        if job.terminal_requested {
+            return RecorderStage::Finalizing;
+        }
         if job.paused {
             return RecorderStage::Paused;
         }
@@ -713,13 +835,15 @@ impl GifFromScreenApp {
                 }
             }
             RecorderOverlayAction::Stop => {
-                if let Some(job) = &self.job {
+                if let Some(job) = &mut self.job {
+                    job.stop_retargeting();
                     let _ = job.controller.stop();
                     self.notice = Some("Stopping and encoding…".into());
                 }
             }
             RecorderOverlayAction::Discard | RecorderOverlayAction::Close => {
-                if let Some(job) = &self.job {
+                if let Some(job) = &mut self.job {
+                    job.stop_retargeting();
                     let _ = job.controller.discard();
                     job.cancellation.cancel();
                     self.notice = Some("Discarding recording…".into());
@@ -788,6 +912,18 @@ impl GifFromScreenApp {
         let settings = self.settings.clone();
         let source_id = selected.id().clone();
         let source_kind = selected.kind();
+        let retarget = if settings.region_enabled {
+            let initial = PhysicalRect::new(
+                settings.region_x,
+                settings.region_y,
+                settings.region_width,
+                settings.region_height,
+            )
+            .map_err(|error| error.to_string())?;
+            Some(RecordingRetarget::new(source_id.clone(), initial))
+        } else {
+            None
+        };
         let cancellation = CancellationFlag::default();
         let worker_cancellation = cancellation.clone();
         let (controller, mut control) = RecordingController::channel();
@@ -820,6 +956,8 @@ impl GifFromScreenApp {
             cancellation,
             controller,
             paused: false,
+            terminal_requested: false,
+            retarget,
         });
         Ok(())
     }
@@ -892,7 +1030,7 @@ fn draw_recorder_overlay(
                 ),
                 egui::StrokeKind::Outside,
             );
-            if stage == RecorderStage::Ready {
+            if stage.allows_moving() {
                 let move_area = capture.shrink(18.0);
                 let move_response = ui
                     .interact(
@@ -902,6 +1040,8 @@ fn draw_recorder_overlay(
                     )
                     .on_hover_cursor(egui::CursorIcon::Move);
                 move_recorder_window(ui.ctx(), &move_response);
+            }
+            if stage.allows_resizing() {
                 add_recorder_resize_grips(ui, bounds);
             }
             capture
@@ -930,18 +1070,23 @@ fn draw_recorder_toolbar(
                 .fill(egui::Color32::from_rgb(28, 30, 34))
                 .inner_margin(8),
         )
-        .show(context, |ui| {
-            ui.horizontal_centered(|ui| match stage {
-                RecorderStage::Ready => {
+        .show(context, |ui| match stage {
+            RecorderStage::Ready => {
+                ui.horizontal_centered(|ui| {
                     action = show_ready_recorder_controls(ui, context);
-                }
-                RecorderStage::Countdown(remaining) => {
+                });
+            }
+            RecorderStage::Countdown(remaining) => {
+                ui.horizontal_centered(|ui| {
                     ui.strong(format!("Recording starts in {remaining}s"));
                     if ui.button("Cancel").clicked() {
                         action = RecorderOverlayAction::CancelCountdown;
                     }
-                }
-                RecorderStage::Recording => {
+                });
+                ui.horizontal_centered(|ui| show_recorder_position_controls(ui, context));
+            }
+            RecorderStage::Recording => {
+                ui.horizontal_centered(|ui| {
                     show_overlay_progress(ui, progress);
                     if ui.button("Pause").clicked() {
                         action = RecorderOverlayAction::Pause;
@@ -952,8 +1097,11 @@ fn draw_recorder_toolbar(
                     if ui.button("Discard").clicked() {
                         action = RecorderOverlayAction::Discard;
                     }
-                }
-                RecorderStage::Paused => {
+                });
+                ui.horizontal_centered(|ui| show_recorder_position_controls(ui, context));
+            }
+            RecorderStage::Paused => {
+                ui.horizontal_centered(|ui| {
                     ui.label("Paused");
                     if ui.button("Resume").clicked() {
                         action = RecorderOverlayAction::Resume;
@@ -964,15 +1112,18 @@ fn draw_recorder_toolbar(
                     if ui.button("Discard").clicked() {
                         action = RecorderOverlayAction::Discard;
                     }
-                }
-                RecorderStage::Finalizing => {
+                });
+                ui.horizontal_centered(|ui| show_recorder_position_controls(ui, context));
+            }
+            RecorderStage::Finalizing => {
+                ui.horizontal_centered(|ui| {
                     ui.spinner();
                     ui.label("Encoding GIF…");
                     if ui.button("Cancel").clicked() {
                         action = RecorderOverlayAction::Discard;
                     }
-                }
-            });
+                });
+            }
         });
     action
 }
@@ -986,21 +1137,7 @@ fn show_ready_recorder_controls(
         .num_columns(6)
         .spacing([4.0, 3.0])
         .show(ui, |ui| {
-            let drag = ui.add(egui::Label::new("Move").sense(egui::Sense::drag()));
-            move_recorder_window(context, &drag);
-            if ui.small_button("X-").clicked() {
-                nudge_recorder_window(context, -10.0, 0.0);
-            }
-            if ui.small_button("X+").clicked() {
-                nudge_recorder_window(context, 10.0, 0.0);
-            }
-            if ui.small_button("Y-").clicked() {
-                nudge_recorder_window(context, 0.0, -10.0);
-            }
-            if ui.small_button("Y+").clicked() {
-                nudge_recorder_window(context, 0.0, 10.0);
-            }
-            ui.label("10 px");
+            show_recorder_position_controls(ui, context);
             ui.end_row();
 
             if ui.small_button("W-").clicked() {
@@ -1024,6 +1161,24 @@ fn show_ready_recorder_controls(
             ui.end_row();
         });
     action
+}
+
+fn show_recorder_position_controls(ui: &mut egui::Ui, context: &egui::Context) {
+    let drag = ui.add(egui::Label::new("Move").sense(egui::Sense::drag()));
+    move_recorder_window(context, &drag);
+    if ui.small_button("X-").clicked() {
+        nudge_recorder_window(context, -10.0, 0.0);
+    }
+    if ui.small_button("X+").clicked() {
+        nudge_recorder_window(context, 10.0, 0.0);
+    }
+    if ui.small_button("Y-").clicked() {
+        nudge_recorder_window(context, 0.0, -10.0);
+    }
+    if ui.small_button("Y+").clicked() {
+        nudge_recorder_window(context, 0.0, 10.0);
+    }
+    ui.label("10 px");
 }
 
 fn show_overlay_progress(ui: &mut egui::Ui, progress: Option<WorkflowProgress>) {
@@ -1132,18 +1287,30 @@ fn move_recorder_window(context: &egui::Context, response: &egui::Response) {
 }
 
 fn nudge_recorder_window(context: &egui::Context, horizontal: f32, vertical: f32) {
+    let pixels_per_point = context.input(|input| {
+        input
+            .viewport()
+            .native_pixels_per_point
+            .unwrap_or_else(|| context.pixels_per_point())
+    });
+    let delta = egui::vec2(horizontal, vertical) / pixels_per_point;
     if let Some(position) = context.input(|input| input.viewport().outer_rect.map(|rect| rect.min))
     {
-        context.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-            position + egui::vec2(horizontal, vertical),
-        ));
+        context.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position + delta));
     }
 }
 
 fn nudge_recorder_size(context: &egui::Context, horizontal: f32, vertical: f32) {
+    let pixels_per_point = context.input(|input| {
+        input
+            .viewport()
+            .native_pixels_per_point
+            .unwrap_or_else(|| context.pixels_per_point())
+    });
+    let delta = egui::vec2(horizontal, vertical) / pixels_per_point;
     if let Some(size) = context.input(|input| input.viewport().inner_rect.map(|rect| rect.size())) {
         context.send_viewport_cmd(egui::ViewportCommand::InnerSize(
-            (size + egui::vec2(horizontal, vertical)).max(egui::vec2(180.0, 130.0)),
+            (size + delta).max(egui::vec2(180.0, 130.0)),
         ));
     }
 }
@@ -1394,6 +1561,33 @@ fn map_preview_selection(
     .ok()
 }
 
+fn apply_overlay_region(
+    settings: &mut RecordingSettings,
+    stage: RecorderStage,
+    region: PhysicalRect,
+) {
+    if !stage.allows_moving() {
+        return;
+    }
+    settings.region_enabled = true;
+    settings.region_x = region.origin().x;
+    settings.region_y = region.origin().y;
+    if stage.allows_resizing() {
+        settings.region_width = region.size().width();
+        settings.region_height = region.size().height();
+    }
+}
+
+const fn should_sync_retarget(stage: RecorderStage, action: RecorderOverlayAction) -> bool {
+    stage.allows_retargeting()
+        && !matches!(
+            action,
+            RecorderOverlayAction::Stop
+                | RecorderOverlayAction::Discard
+                | RecorderOverlayAction::Close
+        )
+}
+
 fn validate_settings(settings: &RecordingSettings) -> Result<(), String> {
     if settings.duration_ms == 0 || settings.duration_ms > 60_000 {
         return Err("Duration must be between 1 and 60000 ms.".into());
@@ -1520,8 +1714,9 @@ mod tests {
     use eframe::egui;
 
     use super::{
-        MAX_COUNTDOWN_SECONDS, RecordingSettings, fit_dimensions, map_preview_selection,
-        resize_nearest_rgba, validate_settings,
+        MAX_COUNTDOWN_SECONDS, RecorderOverlayAction, RecorderStage, RecordingSettings,
+        apply_overlay_region, fit_dimensions, map_preview_selection, resize_nearest_rgba,
+        should_sync_retarget, validate_settings,
     };
 
     #[test]
@@ -1565,5 +1760,100 @@ mod tests {
         let source = vec![1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255, 4, 0, 0, 255];
         let resized = resize_nearest_rgba(&source, 4, 1, 2, 1).unwrap();
         assert_eq!(resized, [1, 0, 0, 255, 3, 0, 0, 255]);
+    }
+
+    #[test]
+    fn recorder_stage_permissions_keep_size_locked_after_ready() {
+        for stage in [
+            RecorderStage::Ready,
+            RecorderStage::Countdown(3),
+            RecorderStage::Recording,
+            RecorderStage::Paused,
+        ] {
+            assert!(stage.allows_moving());
+        }
+        assert!(!RecorderStage::Finalizing.allows_moving());
+        assert!(RecorderStage::Ready.allows_resizing());
+        for stage in [
+            RecorderStage::Countdown(3),
+            RecorderStage::Recording,
+            RecorderStage::Paused,
+            RecorderStage::Finalizing,
+        ] {
+            assert!(!stage.allows_resizing());
+        }
+        assert!(RecorderStage::Recording.allows_retargeting());
+        assert!(RecorderStage::Paused.allows_retargeting());
+        assert!(!RecorderStage::Ready.allows_retargeting());
+        assert!(!RecorderStage::Countdown(3).allows_retargeting());
+        assert!(!RecorderStage::Finalizing.allows_retargeting());
+    }
+
+    #[test]
+    fn overlay_geometry_updates_size_only_while_ready() {
+        let mut settings = RecordingSettings::default();
+        apply_overlay_region(
+            &mut settings,
+            RecorderStage::Ready,
+            gif_from_screen_capture::PhysicalRect::new(10, 20, 800, 600).unwrap(),
+        );
+        assert_eq!(
+            (
+                settings.region_x,
+                settings.region_y,
+                settings.region_width,
+                settings.region_height
+            ),
+            (10, 20, 800, 600)
+        );
+
+        for (stage, x, y) in [
+            (RecorderStage::Countdown(2), 30, 40),
+            (RecorderStage::Recording, 50, 60),
+            (RecorderStage::Paused, 70, 80),
+        ] {
+            apply_overlay_region(
+                &mut settings,
+                stage,
+                gif_from_screen_capture::PhysicalRect::new(x, y, 801, 599).unwrap(),
+            );
+            assert_eq!((settings.region_x, settings.region_y), (x, y));
+            assert_eq!((settings.region_width, settings.region_height), (800, 600));
+        }
+
+        apply_overlay_region(
+            &mut settings,
+            RecorderStage::Finalizing,
+            gif_from_screen_capture::PhysicalRect::new(90, 100, 800, 600).unwrap(),
+        );
+        assert_eq!((settings.region_x, settings.region_y), (70, 80));
+        assert_eq!((settings.region_width, settings.region_height), (800, 600));
+    }
+
+    #[test]
+    fn terminal_actions_and_non_recording_stages_never_schedule_retargeting() {
+        assert!(should_sync_retarget(
+            RecorderStage::Recording,
+            RecorderOverlayAction::None
+        ));
+        assert!(should_sync_retarget(
+            RecorderStage::Paused,
+            RecorderOverlayAction::Resume
+        ));
+        for action in [
+            RecorderOverlayAction::Stop,
+            RecorderOverlayAction::Discard,
+            RecorderOverlayAction::Close,
+        ] {
+            assert!(!should_sync_retarget(RecorderStage::Recording, action));
+            assert!(!should_sync_retarget(RecorderStage::Paused, action));
+        }
+        for stage in [
+            RecorderStage::Ready,
+            RecorderStage::Countdown(1),
+            RecorderStage::Finalizing,
+        ] {
+            assert!(!should_sync_retarget(stage, RecorderOverlayAction::None));
+        }
     }
 }
