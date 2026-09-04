@@ -31,6 +31,7 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Cut, copy, and paste bounded frame selections with immutable-asset reuse.
 - [x] Show overflow-safe timing, selection, canvas, and asset statistics.
 - [x] Route dropped project, GIF, PNG, JPEG, BMP, and WebP paths into background jobs.
+- [x] Create, replace, remove, preview-render, and GIF-export Fade/Slide transitions.
 
 ## Delivery gates
 
@@ -60,7 +61,7 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [ ] Manual and periodic snapshots.
 - [x] Duplicate removal, frame reduction, Yoyo, and delay scaling.
 - [ ] Text, title, drawing, shapes, watermark, border, shadow, privacy effects.
-- [ ] Fade and slide transitions.
+- [x] Fade and slide transitions.
 - [x] Palette, dithering, transparency, and delta-frame controls.
 - [x] PNG/JPEG/BMP/WebP/GIF import.
 - [x] Single-slot frame clipboard and project statistics.
