@@ -368,7 +368,7 @@ fn captured_frame_to_gif(
         match frame.format() {
             PixelFormat::Rgba8 => pixels.extend_from_slice(row),
             PixelFormat::Bgra8 => {
-                for pixel in row.chunks_exact(4) {
+                for pixel in row.as_chunks::<4>().0 {
                     pixels.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
                 }
             }
