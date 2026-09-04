@@ -1024,8 +1024,13 @@ dependencies = [
  "eframe",
  "gif-from-screen-capture",
  "gif-from-screen-capture-linux",
+ "gif-from-screen-domain",
+ "gif-from-screen-editor",
  "gif-from-screen-gif",
+ "gif-from-screen-project",
  "gif-from-screen-workflow",
+ "tempfile",
+ "thiserror 2.0.20",
  "wgpu",
 ]
 

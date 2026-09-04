@@ -3,6 +3,7 @@
 //! Desktop entry point for the Linux-first `GifFromScreen` application.
 
 mod countdown;
+mod editor_workspace;
 mod retarget;
 
 use std::{
