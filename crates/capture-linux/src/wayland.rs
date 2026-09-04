@@ -21,8 +21,8 @@ use gif_from_screen_capture::{
 };
 use tokio::runtime::{Builder, Runtime};
 
-const MONITOR_SOURCE_ID: &str = "wayland:portal:monitor";
-const WINDOW_SOURCE_ID: &str = "wayland:portal:window";
+pub(crate) const MONITOR_SOURCE_ID: &str = "wayland:portal:monitor";
+pub(crate) const WINDOW_SOURCE_ID: &str = "wayland:portal:window";
 
 /// Live capabilities advertised by `org.freedesktop.portal.ScreenCast`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

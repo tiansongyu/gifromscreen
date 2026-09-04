@@ -5,7 +5,7 @@
 //! and returns an actionable uninitialized error. Native dependency probes are
 //! isolated behind the `native-wayland` and `native-x11` features.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use gif_from_screen_capture::{
     BackendDescriptor, BackendStatus, CapabilityStatus, CaptureBackend, CaptureCapabilities,
@@ -15,6 +15,8 @@ use std::env;
 
 #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
 mod wayland;
+#[cfg(all(target_os = "linux", feature = "native-wayland"))]
+mod wayland_pipewire;
 mod x11;
 
 #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
@@ -22,6 +24,8 @@ pub use wayland::{
     PortalStreamInfo, WaylandPortal, WaylandPortalCapabilities, WaylandPortalSession,
     WaylandPortalSessionState,
 };
+#[cfg(all(target_os = "linux", feature = "native-wayland"))]
+pub use wayland_pipewire::{WaylandCaptureBackend, WaylandCaptureSession};
 pub use x11::X11CaptureBackend;
 
 /// Display protocol selected for the Linux desktop session.
@@ -253,7 +257,7 @@ impl NativeBuildSupport {
 
     const fn supports(self, display_server: LinuxDisplayServer) -> bool {
         match display_server {
-            LinuxDisplayServer::Wayland => self.wayland_portal,
+            LinuxDisplayServer::Wayland => self.wayland_portal_pipewire,
             LinuxDisplayServer::X11 => self.x11rb,
         }
     }
@@ -272,10 +276,10 @@ pub struct LinuxBackendReport {
 
 /// Detected but not-yet-initialized Linux screen capture adapter.
 ///
-/// Explicit initialization opens a complete X11 backend or live Wayland
-/// `ScreenCast` portal probe. Until the selected native path is complete this
-/// wrapper never returns fake sources or a fake successful session; callers get
-/// [`CaptureErrorKind::BackendUninitialized`].
+/// Explicit initialization opens a complete X11 backend or the Wayland
+/// `ScreenCast` portal + `PipeWire` backend. Builds without the selected native
+/// feature never return fake sources or silently fall back to another display
+/// protocol; callers get [`CaptureErrorKind::BackendUninitialized`].
 #[derive(Debug, Clone)]
 pub struct LinuxCaptureBackend {
     environment: LinuxEnvironment,
@@ -339,16 +343,15 @@ impl LinuxCaptureBackend {
 
     /// Opens the detected native backend.
     ///
-    /// X11 returns a complete [`CaptureBackend`]. A Wayland build performs a
-    /// live `ScreenCast` portal probe, then reports the remaining `PipeWire` frame
-    /// consumer boundary explicitly rather than falling back to X11 or
-    /// returning a fake capture session.
+    /// Both native builds return complete [`CaptureBackend`] implementations.
+    /// Wayland uses a live `ScreenCast` portal probe and consumes the selected
+    /// node through `PipeWire`; it never falls back to X11.
     ///
     /// # Errors
     ///
     /// Returns [`CaptureError`] when no graphical session was detected, the
-    /// required native feature is disabled, X11 connection/setup fails, or the
-    /// detected backend has not been implemented yet.
+    /// required native feature is disabled, or the selected native connection
+    /// and capability probe fails.
     pub fn initialize_native(&self) -> Result<Box<dyn CaptureBackend>, CaptureError> {
         match self.report.environment.display_server() {
             Some(LinuxDisplayServer::X11) => {
@@ -363,14 +366,23 @@ impl LinuxCaptureBackend {
                     .map(|backend| Box::new(backend) as Box<dyn CaptureBackend>)
             }
             Some(LinuxDisplayServer::Wayland) => {
-                #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
+                #[cfg(all(target_os = "linux", feature = "native-wayland"))]
+                {
+                    WaylandCaptureBackend::connect()
+                        .map(|backend| Box::new(backend) as Box<dyn CaptureBackend>)
+                }
+                #[cfg(all(
+                    target_os = "linux",
+                    not(feature = "native-wayland"),
+                    feature = "wayland-portal"
+                ))]
                 {
                     let portal = self.initialize_wayland_portal()?;
                     let capabilities = portal.capabilities();
                     Err(CaptureError::backend_uninitialized(format!(
                         "Wayland ScreenCast portal v{} is reachable (monitor={}, window={}), but \
-                         the negotiated PipeWire video consumer is not yet connected to the \
-                         portable CaptureSession frame channel",
+                         the native PipeWire consumer is not compiled; enable the \
+                         'native-wayland' Cargo feature",
                         capabilities.version, capabilities.monitor, capabilities.window
                     )))
                 }

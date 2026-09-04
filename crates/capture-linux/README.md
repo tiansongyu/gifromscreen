@@ -6,21 +6,38 @@ Linux capture adapters for GifFromScreen.
   backend.
 - `wayland-portal` provides live XDG `ScreenCast` capability discovery and the
   full `CreateSession → SelectSources → Start → OpenPipeWireRemote` lifecycle.
-- `native-wayland` additionally links `pipewire-rs`; it requires PipeWire
-  development headers on the build host.
+- `native-wayland` adds the complete portal + `PipeWire` capture backend. It
+  requires PipeWire development headers on the build host. The Rust bindings
+  are pinned to the 0.6 series so a clean dependency resolution remains
+  compatible with PipeWire 0.3.48.
 
 The Wayland portal exposes synthetic “choose a screen/window” sources because
 the compositor owns source identity and the trusted selection dialog. Source
 and cursor requests are checked against live portal bit flags and never
 silently fall back. User cancellation is reported as a permission-class error.
-`WaylandPortalSession` keeps the D-Bus session alive while a caller transfers
-its `OwnedFd` to a PipeWire consumer, and closes the session on explicit close
-or drop.
+`WaylandPortalSession` keeps the D-Bus session alive while its `OwnedFd` is
+owned by the native video worker. The portable session closes the PipeWire
+stream first and the portal session afterward on stop, discard, error, or
+drop.
 
-This vertical slice ends at the real PipeWire node/remote handoff. It does not
-yet claim to implement the portable `CaptureBackend`: format negotiation,
-buffer conversion, cadence delivery, and pause/stop integration still need to
-connect the PipeWire stream callback to `CapturedFrame`. Consequently
-`LinuxCaptureBackend::initialize_native` reports this remaining boundary as an
-actionable uninitialized error on Wayland instead of returning a fake backend
-or falling back to X11.
+The native consumer negotiates raw `BGRA`, `RGBA`, `BGRx`, or `RGBx` video and
+converts mapped `MemPtr`/`MemFd` planes to tightly packed RGBA8
+`CapturedFrame`s. DMA-BUF-only or otherwise unmapped buffers are rejected with
+an explicit `UnsupportedCapability` error; there is no silent X11 fallback.
+Frames use active-session timestamps (paused time is excluded), cadence is
+deadline anchored, and a three-frame bounded channel drops late frames without
+rewriting sequence numbers or timestamps. Sequence gaps therefore expose
+backpressure to callers.
+
+Monitor/window choice remains in the trusted compositor dialog. Region capture
+is a source-local crop of the selected stream, and `update_target` can move that
+crop while recording provided its fixed output dimensions and selected portal
+source do not change. Pause/resume toggles the native stream; stop and discard
+wait for worker acknowledgement and close the portal lifecycle deterministically.
+
+Build both native Linux paths with:
+
+```sh
+cargo check -p gif-from-screen-capture-linux --no-default-features \
+  --features native-wayland,native-x11
+```
