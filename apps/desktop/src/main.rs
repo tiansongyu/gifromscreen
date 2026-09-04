@@ -3,6 +3,7 @@
 //! Desktop entry point for the Linux-first `GifFromScreen` application.
 
 mod blank_project_job;
+mod capture_source_job;
 mod countdown;
 mod editor_preview;
 mod editor_ui;
@@ -12,6 +13,7 @@ mod import_gif_job;
 mod import_static_image_job;
 mod open_project_job;
 mod retarget;
+mod wayland_prepare_job;
 
 use std::{
     collections::BTreeSet,
@@ -22,6 +24,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use capture_source_job::{CaptureSourceJob, CaptureSourceJobState};
 use countdown::{CountdownStart, CountdownTick, MAX_COUNTDOWN_SECONDS, RecordingCountdown};
 use editor_preview::EditorPreviewCache;
 use editor_ui::{EditorUiAction, EditorUiResult, EditorUiState, show_editor_ui};
@@ -33,10 +36,10 @@ use gif_from_screen_application::{
     ProjectFrameSelection, ProjectGifExportOptions, ProjectGifExportReport,
 };
 use gif_from_screen_capture::{
-    CaptureBackend, CaptureCadence, CaptureRequest, CaptureSource, CaptureSourceId,
-    CaptureSourceKind, CaptureTarget, CapturedFrame, CursorCaptureMode, PhysicalRect, PixelFormat,
+    CaptureCadence, CaptureRequest, CaptureSource, CaptureSourceId, CaptureSourceKind,
+    CaptureTarget, CapturedFrame, CursorCaptureMode, PhysicalRect, PixelFormat,
 };
-use gif_from_screen_capture_linux::X11CaptureBackend;
+use gif_from_screen_capture_linux::{LinuxDisplayServer, X11CaptureBackend};
 use gif_from_screen_domain::{
     DurationUs, FrameId, PhysicalSize as ProjectPhysicalSize, ProjectId, UnixTimeMs,
 };
@@ -59,6 +62,10 @@ use open_project_job::{
 };
 use retarget::{RegionRetargetPlan, RetargetCompletion};
 use uuid::Uuid;
+use wayland_prepare_job::{
+    FrozenSourcePreview, WaylandPrepareJob, WaylandPrepareJobEvent, WaylandPrepareJobState,
+    WaylandPrepareOutcome,
+};
 
 const APP_NAME: &str = "GifFromScreen";
 const RECORDER_BORDER_POINTS: f32 = 4.0;
@@ -431,6 +438,11 @@ struct RegionPicker {
     selection: Option<PhysicalRect>,
 }
 
+struct WaylandFrozenPreview {
+    texture: egui::TextureHandle,
+    source_size: gif_from_screen_capture::PhysicalSize,
+}
+
 struct RecorderOverlay {
     initial_position: egui::Pos2,
     initial_size: egui::Vec2,
@@ -496,6 +508,11 @@ struct GifFromScreenApp {
     settings: RecordingSettings,
     sources: Vec<CaptureSource>,
     selected_source: usize,
+    display_server: Option<LinuxDisplayServer>,
+    source_catalog_attempted: bool,
+    source_catalog_job: CaptureSourceJob,
+    wayland_prepare_job: WaylandPrepareJob,
+    wayland_frozen_preview: Option<WaylandFrozenPreview>,
     region_picker: Option<RegionPicker>,
     recorder_overlay: Option<RecorderOverlay>,
     main_window_snapshot: Option<MainWindowSnapshot>,
@@ -519,20 +536,17 @@ struct GifFromScreenApp {
 
 impl Default for GifFromScreenApp {
     fn default() -> Self {
-        let (sources, notice) = match load_x11_sources() {
-            Ok(sources) => (sources, None),
-            Err(error) => (Vec::new(), Some(error)),
-        };
-        let selected_source = sources
-            .iter()
-            .position(|source| !source.name().contains("(root)"))
-            .unwrap_or(0);
         Self {
             view: AppView::Landing,
-            notice,
+            notice: None,
             settings: RecordingSettings::default(),
-            sources,
-            selected_source,
+            sources: Vec::new(),
+            selected_source: 0,
+            display_server: None,
+            source_catalog_attempted: false,
+            source_catalog_job: CaptureSourceJob::default(),
+            wayland_prepare_job: WaylandPrepareJob::default(),
+            wayland_frozen_preview: None,
             region_picker: None,
             recorder_overlay: None,
             main_window_snapshot: None,
@@ -567,6 +581,8 @@ impl Drop for GifFromScreenApp {
 
 impl eframe::App for GifFromScreenApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.receive_capture_source_result();
+        self.receive_wayland_prepare_messages(context);
         self.receive_job_messages();
         self.receive_export_messages();
         self.receive_open_project_messages();
@@ -606,6 +622,8 @@ impl eframe::App for GifFromScreenApp {
             || self.open_project_job.state() == OpenProjectJobState::Running
             || self.import_gif_job.state() == ImportGifJobState::Running
             || self.import_image_job.state() == ImportStaticImageJobState::Running
+            || self.source_catalog_job.state() == CaptureSourceJobState::Loading
+            || self.wayland_prepare_job.is_active()
         {
             context.request_repaint_after(Duration::from_millis(33));
         }
@@ -623,11 +641,16 @@ impl eframe::App for GifFromScreenApp {
                         .add_enabled(back_enabled, egui::Button::new("Back"))
                         .clicked()
                 {
+                    if self.view == AppView::ScreenRecorder && self.wayland_prepare_job.is_active()
+                    {
+                        let _ = self.wayland_prepare_job.cancel();
+                        self.wayland_frozen_preview = None;
+                    }
                     self.view = AppView::Landing;
                 }
                 ui.heading(APP_NAME);
                 ui.separator();
-                ui.label("Linux X11 preview");
+                ui.label("Linux capture preview");
             });
         });
 
@@ -671,6 +694,8 @@ impl GifFromScreenApp {
             || self.recorder_overlay.is_some()
             || self.recording_countdown.is_active()
             || self.region_picker.is_some()
+            || self.wayland_prepare_job.is_active()
+            || self.wayland_frozen_preview.is_some()
         {
             FileDropActivity::Recording
         } else if self.open_project_job.state() != OpenProjectJobState::Idle {
@@ -747,7 +772,7 @@ impl GifFromScreenApp {
                 if landing_action(
                     &mut columns[0],
                     "Screen recorder",
-                    "Record an X11 monitor or physical-pixel region.",
+                    "Record a Linux monitor, window, or physical-pixel region.",
                     true,
                 ) {
                     self.view = AppView::ScreenRecorder;
@@ -1042,11 +1067,20 @@ impl GifFromScreenApp {
     }
 
     fn show_screen_recorder(&mut self, ui: &mut egui::Ui) {
+        self.ensure_capture_source_catalog();
+        if self.wayland_prepare_job.is_active() || self.wayland_frozen_preview.is_some() {
+            self.show_wayland_preparation(ui);
+            return;
+        }
         if self.region_picker.is_some() {
             self.show_region_picker(ui);
             return;
         }
-        ui.heading("X11 screen recorder");
+        ui.heading(match self.display_server {
+            Some(LinuxDisplayServer::Wayland) => "Wayland screen recorder",
+            Some(LinuxDisplayServer::X11) => "X11 screen recorder",
+            Some(_) | None => "Linux screen recorder",
+        });
         ui.label("Capture and durable project creation run on a background worker.");
         ui.add_space(12.0);
         self.show_recording_settings(ui);
@@ -1055,7 +1089,10 @@ impl GifFromScreenApp {
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    self.job.is_none() && self.recorder_overlay.is_none(),
+                    self.job.is_none()
+                        && self.recorder_overlay.is_none()
+                        && !self.sources.is_empty()
+                        && self.source_catalog_job.state() != CaptureSourceJobState::Loading,
                     egui::Button::new("Open recorder frame"),
                 )
                 .clicked()
@@ -1135,10 +1172,10 @@ impl GifFromScreenApp {
             .show(ui, |ui| {
                 ui.label("Capture source");
                 ui.horizontal(|ui| {
-                    let selected_name = self
-                        .sources
-                        .get(self.selected_source)
-                        .map_or_else(|| "No X11 source".to_owned(), |source| source.name().into());
+                    let selected_name = self.sources.get(self.selected_source).map_or_else(
+                        || "No capture source".to_owned(),
+                        |source| source.name().into(),
+                    );
                     egui::ComboBox::from_id_salt("capture_source")
                         .selected_text(selected_name)
                         .show_ui(ui, |ui| {
@@ -1152,6 +1189,9 @@ impl GifFromScreenApp {
                         });
                     if ui.button("Refresh").clicked() {
                         self.refresh_sources();
+                    }
+                    if self.source_catalog_job.state() == CaptureSourceJobState::Loading {
+                        ui.spinner();
                     }
                 });
                 ui.end_row();
@@ -1217,10 +1257,19 @@ impl GifFromScreenApp {
                 rect.origin().y,
                 source.kind()
             ));
+        } else if self.display_server == Some(LinuxDisplayServer::Wayland)
+            && self.sources.get(self.selected_source).is_some()
+        {
+            ui.weak(
+                "Wayland keeps source geometry private. The system chooser will open in the background, then the first PipeWire frame will provide a frozen preview.",
+            );
         }
     }
 
     fn begin_region_picker(&mut self, context: &egui::Context) -> Result<(), String> {
+        if self.display_server == Some(LinuxDisplayServer::Wayland) {
+            return self.begin_wayland_preparation();
+        }
         let source = self
             .sources
             .get(self.selected_source)
@@ -1349,6 +1398,9 @@ impl GifFromScreenApp {
     #[allow(clippy::cast_precision_loss)]
     fn open_recorder_overlay(&mut self, context: &egui::Context) -> Result<(), String> {
         validate_settings(&self.settings)?;
+        if self.display_server == Some(LinuxDisplayServer::Wayland) {
+            return self.begin_wayland_preparation();
+        }
         let main_window = context
             .input(|input| {
                 let viewport = input.viewport();
@@ -1683,16 +1735,177 @@ impl GifFromScreenApp {
         Ok(())
     }
 
-    fn refresh_sources(&mut self) {
-        match load_x11_sources() {
-            Ok(sources) => {
+    fn ensure_capture_source_catalog(&mut self) {
+        if self.source_catalog_attempted {
+            return;
+        }
+        self.source_catalog_attempted = true;
+        match self.source_catalog_job.start() {
+            Ok(()) => self.notice = Some("Loading Linux capture sources…".to_owned()),
+            Err(error) => self.notice = Some(error.to_string()),
+        }
+    }
+
+    fn receive_capture_source_result(&mut self) {
+        if !self.source_catalog_job.drain() {
+            return;
+        }
+        let Some(result) = self.source_catalog_job.take_result() else {
+            self.notice = Some("Capture-source worker returned no result.".to_owned());
+            return;
+        };
+        match result {
+            Ok(catalog) => {
+                let display_server = catalog.display_server();
+                let sources = catalog.into_sources();
+                let selected_source = sources
+                    .iter()
+                    .position(|source| !source.name().contains("(root)"))
+                    .unwrap_or(0);
+                self.display_server = Some(display_server);
                 self.sources = sources;
-                self.selected_source = self
-                    .selected_source
-                    .min(self.sources.len().saturating_sub(1));
-                self.notice = Some(format!("Found {} X11 capture sources.", self.sources.len()));
+                self.selected_source = selected_source;
+                self.notice = Some(format!(
+                    "Found {} {:?} capture source option(s).",
+                    self.sources.len(),
+                    display_server
+                ));
             }
-            Err(error) => self.notice = Some(error),
+            Err(error) => {
+                self.display_server = None;
+                self.sources.clear();
+                self.selected_source = 0;
+                self.notice = Some(format!("Could not load Linux capture sources: {error}"));
+            }
+        }
+    }
+
+    fn begin_wayland_preparation(&mut self) -> Result<(), String> {
+        if self.wayland_prepare_job.is_active() {
+            return Ok(());
+        }
+        let source = self
+            .sources
+            .get(self.selected_source)
+            .cloned()
+            .ok_or_else(|| "No Wayland portal source is selected.".to_owned())?;
+        self.wayland_frozen_preview = None;
+        self.wayland_prepare_job
+            .start(source, self.settings.fps)
+            .map_err(|error| error.to_string())?;
+        self.notice = Some(
+            "Opening the Wayland system chooser in the background. Select a screen or window to prepare its frozen preview."
+                .to_owned(),
+        );
+        Ok(())
+    }
+
+    fn receive_wayland_prepare_messages(&mut self, context: &egui::Context) {
+        for event in self.wayland_prepare_job.drain() {
+            match event {
+                WaylandPrepareJobEvent::StateChanged(state) => {
+                    self.notice = Some(wayland_prepare_state_notice(state).to_owned());
+                }
+                WaylandPrepareJobEvent::PreviewReady(preview) => {
+                    match frozen_preview_image(&preview) {
+                        Ok(image) => {
+                            let source_size = preview.size();
+                            let texture = context.load_texture(
+                                "wayland-frozen-source-preview",
+                                image,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            self.wayland_frozen_preview = Some(WaylandFrozenPreview {
+                                texture,
+                                source_size,
+                            });
+                            self.notice = Some(format!(
+                                "Wayland source prepared at {}×{} pixels. The native session is paused and retained by its worker.",
+                                source_size.width(),
+                                source_size.height()
+                            ));
+                        }
+                        Err(error) => {
+                            let _ = self.wayland_prepare_job.cancel();
+                            self.notice = Some(error);
+                        }
+                    }
+                }
+                WaylandPrepareJobEvent::Finished => {
+                    self.wayland_frozen_preview = None;
+                    self.notice = Some(match self.wayland_prepare_job.take_result() {
+                        Some(Ok(WaylandPrepareOutcome::Cancelled)) => {
+                            "Wayland source preparation cancelled and its portal session closed."
+                                .to_owned()
+                        }
+                        Some(Err(error)) => {
+                            format!("Could not prepare Wayland source: {error}")
+                        }
+                        None => "Wayland preparation ended without a result.".to_owned(),
+                    });
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn show_wayland_preparation(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Wayland source preparation");
+        if let Some(preview) = &self.wayland_frozen_preview {
+            ui.label(format!(
+                "Frozen {}×{} PipeWire frame",
+                preview.source_size.width(),
+                preview.source_size.height()
+            ));
+            ui.weak(
+                "This is a source-local preview, not a window positioned over global desktop coordinates.",
+            );
+            ui.add_space(8.0);
+            let available = ui.available_size();
+            let texture_size = preview.texture.size_vec2();
+            let scale = (available.x.max(1.0) / texture_size.x)
+                .min((available.y - 90.0).max(1.0) / texture_size.y)
+                .min(1.0);
+            ui.add(egui::Image::new(&preview.texture).fit_to_exact_size(texture_size * scale));
+            ui.add_space(8.0);
+            ui.label(
+                "The same native session remains paused in the background. Region selection and recording commit are connected in the next slice.",
+            );
+        } else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(wayland_prepare_state_notice(
+                    self.wayland_prepare_job.state(),
+                ));
+            });
+        }
+        ui.add_space(8.0);
+        let cancelling = self.wayland_prepare_job.state() == WaylandPrepareJobState::Cancelling;
+        if ui
+            .add_enabled(!cancelling, egui::Button::new("Cancel preparation"))
+            .clicked()
+            && self.wayland_prepare_job.cancel()
+        {
+            self.notice = Some(
+                "Cancellation requested. A prepared session will close immediately; an open system chooser may still need to be dismissed."
+                    .to_owned(),
+            );
+        }
+    }
+
+    fn refresh_sources(&mut self) {
+        if self.source_catalog_job.state() == CaptureSourceJobState::Loading {
+            self.notice = Some("Capture-source refresh is already running.".to_owned());
+            return;
+        }
+        if self.wayland_prepare_job.is_active() {
+            let _ = self.wayland_prepare_job.cancel();
+            self.wayland_frozen_preview = None;
+        }
+        self.source_catalog_attempted = true;
+        match self.source_catalog_job.start() {
+            Ok(()) => self.notice = Some("Refreshing Linux capture sources…".to_owned()),
+            Err(error) => self.notice = Some(error.to_string()),
         }
     }
 
@@ -2676,6 +2889,61 @@ fn overlay_region_from_viewport(
     region.fits_within(source_geometry.size()).then_some(region)
 }
 
+const fn wayland_prepare_state_notice(state: WaylandPrepareJobState) -> &'static str {
+    match state {
+        WaylandPrepareJobState::Idle => "Wayland source preparation is idle.",
+        WaylandPrepareJobState::Connecting => {
+            "Connecting to the Wayland ScreenCast portal in the background…"
+        }
+        WaylandPrepareJobState::Choosing => {
+            "Choose a screen or window in the trusted system dialog…"
+        }
+        WaylandPrepareJobState::WaitingForFrame => {
+            "The portal selection is ready; waiting for the first mapped PipeWire frame…"
+        }
+        WaylandPrepareJobState::Prepared => {
+            "The frozen preview is ready and its native session is paused."
+        }
+        WaylandPrepareJobState::Cancelling => {
+            "Cancellation requested. If the trusted chooser is still open, close it to finish portal teardown."
+        }
+        WaylandPrepareJobState::Finished => "Wayland source preparation finished.",
+    }
+}
+
+fn frozen_preview_image(preview: &FrozenSourcePreview) -> Result<egui::ColorImage, String> {
+    const MAX_PREVIEW_WIDTH: u32 = 1_600;
+    const MAX_PREVIEW_HEIGHT: u32 = 900;
+
+    let source_size = preview.size();
+    let (width, height) = fit_dimensions(
+        source_size.width(),
+        source_size.height(),
+        MAX_PREVIEW_WIDTH,
+        MAX_PREVIEW_HEIGHT,
+    );
+    let resized;
+    let rgba = if (width, height) == (source_size.width(), source_size.height()) {
+        preview.rgba()
+    } else {
+        resized = resize_nearest_rgba(
+            preview.rgba(),
+            source_size.width(),
+            source_size.height(),
+            width,
+            height,
+        )?;
+        &resized
+    };
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        [
+            usize::try_from(width).map_err(|_| "preview width is too large")?,
+            usize::try_from(height).map_err(|_| "preview height is too large")?,
+        ],
+        rgba,
+    ))
+}
+
 fn frame_to_preview(frame: &CapturedFrame) -> Result<(egui::ColorImage, u32, u32), String> {
     const MAX_PREVIEW_WIDTH: u32 = 1_600;
     const MAX_PREVIEW_HEIGHT: u32 = 900;
@@ -3367,19 +3635,6 @@ const fn frame_retention(changes_only: bool) -> FrameRetention {
         FrameRetention::ChangesOnly
     } else {
         FrameRetention::All
-    }
-}
-
-fn load_x11_sources() -> Result<Vec<CaptureSource>, String> {
-    let backend = X11CaptureBackend::connect(None)
-        .map_err(|error| format!("Could not connect to X11: {error}"))?;
-    let sources = backend
-        .list_sources()
-        .map_err(|error| format!("Could not enumerate X11 sources: {error}"))?;
-    if sources.is_empty() {
-        Err("X11 did not report any capture sources.".into())
-    } else {
-        Ok(sources)
     }
 }
 
