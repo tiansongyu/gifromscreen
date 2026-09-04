@@ -9,7 +9,8 @@ Implemented now:
 - exact duplicate-frame merging;
 - once, finite, and infinite loop behavior;
 - deterministic local or memory-bounded global palettes with 2–256 entries;
-- selectable Median Cut, Grayscale, Most Used, and Octree built-in quantizers;
+- selectable Median Cut, Grayscale, Most Used, Octree, and NeuQuant built-in
+  quantizers;
 - no dithering, ordered Bayer 4x4, Floyd-Steinberg, Atkinson, Burkes,
   Sierra Lite, Two-row Sierra, full three-row Sierra, Jarvis–Judice–Ninke,
   Stucki, and Stevenson–Arce strategies;
@@ -57,17 +58,25 @@ prioritizes frequent colors and resolves ties lexicographically. `Octree` builds
 a fixed-depth RGB tree from the bounded 5-bit/channel histogram, collapses the
 least-populated deepest nodes with Morton-path tie-breaking, and emits frontier
 leaves in Morton order. A complete tree is capped at 37,449 nodes, independent
-of input dimensions or frame count. All four strategies work with
+of input dimensions or frame count. All five strategies work with
 `PaletteMode::LocalPerFrame` and `PaletteMode::Global`, reserve transparency
 inside the requested color count, and honor cooperative cancellation. Supplying
 a custom `FrameQuantizer` through `BuiltinGifEncoder::new` overrides the option.
+
+`NeuQuant` trains the permissively licensed `color_quant` implementation on an
+even deterministic sample capped at 65,536 opaque pixels. Training always uses
+the library's documented 64–256 neuron range and a valid 1–30 sample factor;
+requests below 64 colors frequency-prune the learned codebook with stable RGB
+tie-breaking. Transparent pixels never enter the network and index zero remains
+reserved exclusively for transparency. Global source-frame buffering remains
+governed by `EncodeOptions::global_palette_buffer_limit_bytes`.
 
 `RgbaFrame` carries an optional dirty rectangle and `FrameQuantizer` remains
 replaceable. Additional palette/optimization implementations can therefore be
 added behind the same application port:
 
 - fixed and custom palette planners;
-- NeuQuant/Wu quantizers;
+- Wu quantization;
 - more aggressive transparent-rectangle and disposal optimization;
 - lossy similar-frame merging.
 

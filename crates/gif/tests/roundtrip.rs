@@ -53,7 +53,13 @@ fn quantizer_roundtrip(strategy: QuantizerStrategy) {
 
     for palette_mode in [PaletteMode::LocalPerFrame, PaletteMode::Global] {
         let options = EncodeOptions {
-            max_colors: 4,
+            // Force NeuQuant's learned-codebook path (rather than its exact
+            // small-color shortcut) in both local and global modes.
+            max_colors: if strategy == QuantizerStrategy::NeuQuant {
+                3
+            } else {
+                4
+            },
             merge_duplicate_frames: false,
             transparency: Transparency::AlphaThreshold(128),
             palette_mode,
@@ -127,6 +133,11 @@ fn most_used_roundtrips_with_local_and_global_palettes() {
 #[test]
 fn octree_roundtrips_with_local_and_global_palettes() {
     quantizer_roundtrip(QuantizerStrategy::Octree);
+}
+
+#[test]
+fn neuquant_roundtrips_with_local_and_global_palettes() {
+    quantizer_roundtrip(QuantizerStrategy::NeuQuant);
 }
 
 #[test]

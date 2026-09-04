@@ -7,6 +7,7 @@ license.workspace = true
 description = "GIF encoding port and permissively licensed built-in encoder for GifFromScreen"
 
 [dependencies]
+color_quant = "1.1"
 gif.workspace = true
 thiserror.workspace = true
 

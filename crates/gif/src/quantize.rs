@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::{CancellationToken, QuantizationError, RgbaFrame};
 
 const HISTOGRAM_CHANNEL_BITS: usize = 5;
@@ -59,7 +61,8 @@ pub enum DitherMode {
 /// shared global palette. [`MedianCut`](Self::MedianCut) is the general-purpose
 /// default, [`Grayscale`](Self::Grayscale) deliberately removes hue, and
 /// [`MostUsed`](Self::MostUsed) favors the most frequent source colors, and
-/// [`Octree`](Self::Octree) prunes a bounded RGB octree.
+/// [`Octree`](Self::Octree) prunes a bounded RGB octree. [`NeuQuant`](Self::NeuQuant)
+/// trains a bounded Kohonen network over a deterministic sample.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum QuantizerStrategy {
@@ -72,6 +75,8 @@ pub enum QuantizerStrategy {
     MostUsed,
     /// A deterministic, population-pruned RGB octree.
     Octree,
+    /// Bounded deterministic NeuQuant neural-network color reduction.
+    NeuQuant,
 }
 
 /// RGB palette shared by every image descriptor in a GIF.
@@ -214,6 +219,19 @@ pub struct MostUsedQuantizer;
 /// left-aligned Morton prefix, so palette indices are reproducible as well.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OctreeQuantizer;
+
+/// Deterministic NeuQuant adapter with bounded training memory.
+///
+/// Transparent pixels are excluded from training and reserve palette index
+/// zero through the shared palette finalizer. Opaque inputs are sampled evenly
+/// in presentation order to at most 65,536 pixels. The permissive
+/// `color_quant` implementation is always called with its documented color
+/// range of 64–256 and sample factor range of 1–30; smaller requested palettes
+/// are produced by frequency-pruning the trained codebook with RGB ordering as
+/// a stable tie-break. Final opaque colors are sorted lexicographically, so
+/// palette indices are deterministic.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NeuQuantQuantizer;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct HistogramBin {
@@ -454,6 +472,172 @@ fn octree_branch(color: [u8; 3], depth: u8) -> usize {
         | usize::from((color[2] >> shift) & 1)
 }
 
+const NEUQUANT_MIN_TRAINING_COLORS: usize = 64;
+const NEUQUANT_MAX_TRAINING_PIXELS: usize = 65_536;
+const NEUQUANT_DEFAULT_SAMPLE_FACTOR: i32 = 10;
+const NEUQUANT_SMALL_INPUT_PIXELS: usize = 1_000;
+
+struct NeuQuantInput {
+    training_rgba: Vec<u8>,
+    exact_colors: Option<Vec<[u8; 3]>>,
+    has_transparency: bool,
+}
+
+fn collect_neuquant_input(
+    frames: &[RgbaFrame],
+    settings: QuantizationSettings,
+    cancellation: &dyn CancellationToken,
+) -> Result<NeuQuantInput, QuantizationError> {
+    validate_settings(settings)?;
+    check_now(cancellation)?;
+    let exact_color_cap = usize::from(settings.max_colors);
+    let mut exact_colors = Some(BTreeSet::new());
+    let mut has_transparency = settings.reserve_transparency;
+    let mut opaque_pixels = 0_u64;
+    let mut visited = 0_usize;
+    for frame in frames {
+        for pixel in frame.pixels().as_chunks::<4>().0 {
+            check_cancellation(visited, cancellation)?;
+            visited = visited.wrapping_add(1);
+            if is_transparent(pixel[3], settings.alpha_threshold) {
+                has_transparency = true;
+                continue;
+            }
+            opaque_pixels = opaque_pixels.checked_add(1).ok_or_else(|| {
+                QuantizationError::InvalidPalette("opaque pixel count overflowed u64".to_owned())
+            })?;
+            if let Some(colors) = &mut exact_colors {
+                colors.insert([pixel[0], pixel[1], pixel[2]]);
+                if colors.len() > exact_color_cap {
+                    exact_colors = None;
+                }
+            }
+        }
+    }
+
+    let opaque_limit = opaque_color_limit(settings.max_colors, has_transparency);
+    if exact_colors
+        .as_ref()
+        .is_some_and(|colors| colors.len() > opaque_limit)
+    {
+        exact_colors = None;
+    }
+    if let Some(colors) = exact_colors {
+        return Ok(NeuQuantInput {
+            training_rgba: Vec::new(),
+            exact_colors: Some(colors.into_iter().collect()),
+            has_transparency,
+        });
+    }
+
+    let sample_pixels = usize::try_from(
+        opaque_pixels.min(u64::try_from(NEUQUANT_MAX_TRAINING_PIXELS).unwrap_or(u64::MAX)),
+    )
+    .map_err(|_| {
+        QuantizationError::InvalidPalette("NeuQuant sample length exceeds usize".to_owned())
+    })?;
+    let sample_bytes = sample_pixels.checked_mul(4).ok_or_else(|| {
+        QuantizationError::InvalidPalette("NeuQuant sample byte length overflowed".to_owned())
+    })?;
+    let mut training_rgba = Vec::new();
+    training_rgba.try_reserve_exact(sample_bytes).map_err(|_| {
+        QuantizationError::InvalidPalette(format!(
+            "could not allocate bounded {sample_bytes}-byte NeuQuant sample"
+        ))
+    })?;
+    let mut opaque_index = 0_u64;
+    let sample_pixels_u128 = u128::try_from(sample_pixels).map_err(|_| {
+        QuantizationError::InvalidPalette("NeuQuant sample length exceeds u128".to_owned())
+    })?;
+    visited = 0;
+    for frame in frames {
+        for pixel in frame.pixels().as_chunks::<4>().0 {
+            check_cancellation(visited, cancellation)?;
+            visited = visited.wrapping_add(1);
+            if is_transparent(pixel[3], settings.alpha_threshold) {
+                continue;
+            }
+            let before = u128::from(opaque_index) * sample_pixels_u128 / u128::from(opaque_pixels);
+            opaque_index += 1;
+            let after = u128::from(opaque_index) * sample_pixels_u128 / u128::from(opaque_pixels);
+            if after != before {
+                training_rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+            }
+        }
+    }
+    debug_assert_eq!(training_rgba.len(), sample_bytes);
+    Ok(NeuQuantInput {
+        training_rgba,
+        exact_colors: None,
+        has_transparency,
+    })
+}
+
+fn make_neuquant_palette(
+    frames: &[RgbaFrame],
+    settings: QuantizationSettings,
+    cancellation: &dyn CancellationToken,
+) -> Result<ColorPalette, QuantizationError> {
+    let input = collect_neuquant_input(frames, settings, cancellation)?;
+    if let Some(colors) = input.exact_colors {
+        return finish_palette(colors, input.has_transparency);
+    }
+
+    let opaque_limit = opaque_color_limit(settings.max_colors, input.has_transparency);
+    let training_colors = opaque_limit.clamp(NEUQUANT_MIN_TRAINING_COLORS, 256);
+    let training_pixels = input.training_rgba.len() / 4;
+    let sample_factor = if training_pixels < NEUQUANT_SMALL_INPUT_PIXELS {
+        1
+    } else {
+        NEUQUANT_DEFAULT_SAMPLE_FACTOR
+    };
+    debug_assert!((1..=30).contains(&sample_factor));
+    debug_assert!((NEUQUANT_MIN_TRAINING_COLORS..=256).contains(&training_colors));
+    check_now(cancellation)?;
+    let quantizer =
+        color_quant::NeuQuant::new(sample_factor, training_colors, &input.training_rgba);
+    check_now(cancellation)?;
+
+    let color_map = quantizer.color_map_rgb();
+    if color_map.len() != training_colors * 3 {
+        return Err(QuantizationError::InvalidPalette(format!(
+            "NeuQuant produced {} RGB bytes for {training_colors} colors",
+            color_map.len()
+        )));
+    }
+    let mut usage = BTreeMap::<[u8; 3], u64>::new();
+    for color in color_map.as_chunks::<3>().0 {
+        usage.entry([color[0], color[1], color[2]]).or_default();
+    }
+    for (pixel_index, pixel) in input.training_rgba.as_chunks::<4>().0.iter().enumerate() {
+        check_cancellation(pixel_index, cancellation)?;
+        let color_index = quantizer.index_of(pixel);
+        let offset = color_index.checked_mul(3).ok_or_else(|| {
+            QuantizationError::InvalidPalette("NeuQuant palette index overflowed".to_owned())
+        })?;
+        let color = color_map.get(offset..offset + 3).ok_or_else(|| {
+            QuantizationError::InvalidPalette(format!(
+                "NeuQuant returned out-of-range color index {color_index}"
+            ))
+        })?;
+        *usage.entry([color[0], color[1], color[2]]).or_default() += 1;
+    }
+    let mut candidates = usage.into_iter().collect::<Vec<_>>();
+    candidates.sort_unstable_by(|(left_color, left_count), (right_color, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_color.cmp(right_color))
+    });
+    let mut colors = candidates
+        .into_iter()
+        .take(opaque_limit)
+        .map(|(color, _)| color)
+        .collect::<Vec<_>>();
+    colors.sort_unstable();
+    check_now(cancellation)?;
+    finish_palette(colors, input.has_transparency)
+}
+
 impl FrameQuantizer for MedianCutQuantizer {
     fn quantize(
         &self,
@@ -570,6 +754,26 @@ impl FrameQuantizer for OctreeQuantizer {
     }
 }
 
+impl FrameQuantizer for NeuQuantQuantizer {
+    fn quantize(
+        &self,
+        frame: &RgbaFrame,
+        settings: QuantizationSettings,
+        cancellation: &dyn CancellationToken,
+    ) -> Result<IndexedFrame, QuantizationError> {
+        quantize_frame(self, frame, settings, cancellation)
+    }
+
+    fn build_global_palette(
+        &self,
+        frames: &[RgbaFrame],
+        settings: QuantizationSettings,
+        cancellation: &dyn CancellationToken,
+    ) -> Result<ColorPalette, QuantizationError> {
+        make_neuquant_palette(frames, settings, cancellation)
+    }
+}
+
 impl FrameQuantizer for QuantizerStrategy {
     fn quantize(
         &self,
@@ -582,6 +786,7 @@ impl FrameQuantizer for QuantizerStrategy {
             Self::Grayscale => GrayscaleQuantizer.quantize(frame, settings, cancellation),
             Self::MostUsed => MostUsedQuantizer.quantize(frame, settings, cancellation),
             Self::Octree => OctreeQuantizer.quantize(frame, settings, cancellation),
+            Self::NeuQuant => NeuQuantQuantizer.quantize(frame, settings, cancellation),
         }
     }
 
@@ -602,6 +807,9 @@ impl FrameQuantizer for QuantizerStrategy {
                 MostUsedQuantizer.build_global_palette(frames, settings, cancellation)
             }
             Self::Octree => OctreeQuantizer.build_global_palette(frames, settings, cancellation),
+            Self::NeuQuant => {
+                NeuQuantQuantizer.build_global_palette(frames, settings, cancellation)
+            }
         }
     }
 }
@@ -1407,11 +1615,12 @@ mod tests {
 
     use super::*;
 
-    const STRATEGIES: [QuantizerStrategy; 4] = [
+    const STRATEGIES: [QuantizerStrategy; 5] = [
         QuantizerStrategy::MedianCut,
         QuantizerStrategy::Grayscale,
         QuantizerStrategy::MostUsed,
         QuantizerStrategy::Octree,
+        QuantizerStrategy::NeuQuant,
     ];
 
     const ERROR_DIFFUSION_MODES: [DitherMode; 9] = [
@@ -1467,6 +1676,28 @@ mod tests {
 
     fn palette_entries(palette: &ColorPalette) -> Vec<[u8; 3]> {
         palette.colors().as_chunks::<3>().0.to_vec()
+    }
+
+    fn photo_like_frame(phase: u32) -> RgbaFrame {
+        const WIDTH: u16 = 48;
+        const HEIGHT: u16 = 32;
+        let mut pixels = Vec::with_capacity(usize::from(WIDTH) * usize::from(HEIGHT) * 4);
+        for y in 0..u32::from(HEIGHT) {
+            for x in 0..u32::from(WIDTH) {
+                let red = (x * 255 / (u32::from(WIDTH) - 1) + y * 3 + phase * 17) % 256;
+                let green = (y * 255 / (u32::from(HEIGHT) - 1) + x * 2 + phase * 29) % 256;
+                let blue = ((x + y) * 255 / (u32::from(WIDTH) + u32::from(HEIGHT) - 2)
+                    + (x * y + phase * 31) % 97)
+                    % 256;
+                pixels.extend_from_slice(&[
+                    u8::try_from(red).unwrap(),
+                    u8::try_from(green).unwrap(),
+                    u8::try_from(blue).unwrap(),
+                    255,
+                ]);
+            }
+        }
+        RgbaFrame::new(WIDTH, HEIGHT, pixels, 10_000).unwrap()
     }
 
     fn complete_octree_histogram() -> Vec<HistogramBin> {
@@ -1813,6 +2044,125 @@ mod tests {
             Err(QuantizationError::Cancelled)
         ));
         assert!(reduction_cancellation.checks.load(Ordering::Relaxed) >= 4);
+    }
+
+    #[test]
+    fn neuquant_is_deterministic_bounded_and_selects_independently() {
+        let frames = [photo_like_frame(0), photo_like_frame(1)];
+        let settings = settings(32);
+        let first = NeuQuantQuantizer
+            .build_global_palette(&frames, settings, &NeverCancel)
+            .unwrap();
+        let second = NeuQuantQuantizer
+            .build_global_palette(&frames, settings, &NeverCancel)
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.transparent_index(), None);
+        assert!((2..=32).contains(&first.color_count()));
+        assert!(
+            palette_entries(&first)
+                .windows(2)
+                .all(|colors| colors[0] <= colors[1])
+        );
+
+        let median = MedianCutQuantizer
+            .build_global_palette(&frames, settings, &NeverCancel)
+            .unwrap();
+        let octree = OctreeQuantizer
+            .build_global_palette(&frames, settings, &NeverCancel)
+            .unwrap();
+        let mut neuquant_colors = palette_entries(&first);
+        let mut median_colors = palette_entries(&median);
+        let mut octree_colors = palette_entries(&octree);
+        neuquant_colors.sort_unstable();
+        median_colors.sort_unstable();
+        octree_colors.sort_unstable();
+        assert_ne!(neuquant_colors, median_colors);
+        assert_ne!(neuquant_colors, octree_colors);
+
+        let palette_by_index = palette_entries(&first);
+        let mut squared_error = 0_u64;
+        let mut channel_count = 0_u64;
+        for frame in &frames {
+            let indices =
+                map_frame_to_palette(frame, &first, None, DitherMode::None, &NeverCancel).unwrap();
+            for (pixel, palette_index) in frame.pixels().as_chunks::<4>().0.iter().zip(indices) {
+                let color = palette_by_index[usize::from(palette_index)];
+                for channel in 0..3 {
+                    let error = i64::from(pixel[channel]) - i64::from(color[channel]);
+                    squared_error += u64::try_from(error * error).unwrap();
+                    channel_count += 1;
+                }
+            }
+        }
+        let mean_squared_channel_error = squared_error / channel_count;
+        assert!(
+            mean_squared_channel_error <= 800,
+            "NeuQuant color corpus MSE was {mean_squared_channel_error}"
+        );
+    }
+
+    #[test]
+    fn neuquant_reserves_zero_for_transparency_without_opaque_collisions() {
+        const WIDTH: u16 = 40;
+        const HEIGHT: u16 = 20;
+        let mut pixels = Vec::with_capacity(usize::from(WIDTH) * usize::from(HEIGHT) * 4);
+        for index in 0..usize::from(WIDTH) * usize::from(HEIGHT) {
+            let value = u8::try_from(index % 256).unwrap();
+            let transparent = index.is_multiple_of(11);
+            pixels.extend_from_slice(&[
+                value,
+                value.wrapping_mul(3),
+                value.wrapping_mul(7),
+                if transparent { 0 } else { 255 },
+            ]);
+        }
+        let frame = RgbaFrame::new(WIDTH, HEIGHT, pixels, 10_000).unwrap();
+        let indexed = NeuQuantQuantizer
+            .quantize(&frame, settings(16), &NeverCancel)
+            .unwrap();
+        assert_eq!(indexed.transparent_index(), Some(0));
+        assert!(indexed.palette().len() / 3 <= 16);
+        for (pixel_index, (&palette_index, pixel)) in indexed
+            .indices()
+            .iter()
+            .zip(frame.pixels().as_chunks::<4>().0)
+            .enumerate()
+        {
+            if pixel[3] == 0 {
+                assert_eq!(palette_index, 0, "transparent pixel {pixel_index}");
+            } else {
+                assert_ne!(palette_index, 0, "opaque pixel {pixel_index}");
+                assert!(usize::from(palette_index) < indexed.palette().len() / 3);
+            }
+        }
+    }
+
+    #[test]
+    fn neuquant_sampling_is_bounded_and_checks_cancellation_mid_scan() {
+        const WIDTH: u16 = 257;
+        const HEIGHT: u16 = 256;
+        let pixels = (0..usize::from(WIDTH) * usize::from(HEIGHT))
+            .flat_map(|index| {
+                let value = u8::try_from(index % 256).unwrap();
+                [value, value.wrapping_mul(17), value.wrapping_mul(31), 255]
+            })
+            .collect();
+        let frame = RgbaFrame::new(WIDTH, HEIGHT, pixels, 10_000).unwrap();
+        let input =
+            collect_neuquant_input(std::slice::from_ref(&frame), settings(16), &NeverCancel)
+                .unwrap();
+        assert_eq!(input.training_rgba.len(), NEUQUANT_MAX_TRAINING_PIXELS * 4);
+        assert!(input.exact_colors.is_none());
+        assert!((1..=30).contains(&NEUQUANT_DEFAULT_SAMPLE_FACTOR));
+        assert!((64..=256).contains(&NEUQUANT_MIN_TRAINING_COLORS));
+
+        let cancellation = CancelAfterChecks::new(2);
+        assert!(matches!(
+            collect_neuquant_input(std::slice::from_ref(&frame), settings(16), &cancellation),
+            Err(QuantizationError::Cancelled)
+        ));
+        assert!(cancellation.checks.load(Ordering::Relaxed) >= 3);
     }
 
     #[test]
