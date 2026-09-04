@@ -30,6 +30,10 @@ pub(crate) struct EditorUiState {
     pub(crate) frame_number_input: String,
     /// Project-relative time input in integer milliseconds.
     pub(crate) time_ms_input: String,
+    /// Inclusive project-relative range start in integer milliseconds.
+    pub(crate) time_range_start_ms_input: String,
+    /// Exclusive project-relative range end in integer milliseconds.
+    pub(crate) time_range_end_ms_input: String,
     /// Microsecond input shared by override and signed adjustment actions.
     pub(crate) duration_us_input: String,
     /// Positive percentage input used to scale selected frame delays.
@@ -59,6 +63,8 @@ impl Default for EditorUiState {
         Self {
             frame_number_input: "1".into(),
             time_ms_input: "0".into(),
+            time_range_start_ms_input: "0".into(),
+            time_range_end_ms_input: "1000".into(),
             duration_us_input: "100000".into(),
             percentage_input: "100".into(),
             frame_expression: "1".into(),
@@ -118,6 +124,9 @@ pub(crate) enum EditorUiOperation {
     ToggleFrame,
     ExtendFrameRange,
     SelectExpression,
+    SelectTimeRange,
+    KeepTimeRange,
+    DeleteTimeRange,
     Playback,
     PlaybackStep,
     Undo,
@@ -178,6 +187,7 @@ pub(crate) fn show_editor_ui(
     ui.separator();
     show_navigation_toolbar(ui, workspace, state, now, &mut results);
     show_selection_toolbar(ui, workspace, state, now, &mut results);
+    show_time_range_toolbar(ui, workspace, state, now, &mut results);
     show_edit_toolbar(ui, workspace, state, now, &mut results);
     show_transform_toolbar(ui, workspace, state, now, &mut results);
     ui.separator();
@@ -368,6 +378,83 @@ fn show_selection_toolbar(
         if ui.button("Apply selection").clicked() {
             apply_frame_expression(workspace, state, now, results);
         }
+    });
+}
+
+fn show_time_range_toolbar(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    now: Instant,
+    results: &mut Vec<EditorUiResult>,
+) {
+    ui.group(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Time range [start, end) ms");
+            ui.label("Start");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.time_range_start_ms_input)
+                    .desired_width(84.0),
+            );
+            ui.label("End");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.time_range_end_ms_input).desired_width(84.0),
+            );
+            if ui.button("Select range").clicked() {
+                match parse_time_range(state) {
+                    Ok((start, end)) => {
+                        let result = workspace.select_time_range(start, end);
+                        record_selection_result(
+                            workspace,
+                            state,
+                            now,
+                            results,
+                            EditorUiOperation::SelectTimeRange,
+                            result,
+                        );
+                    }
+                    Err(message) => {
+                        push_failure(results, EditorUiOperation::SelectTimeRange, message);
+                    }
+                }
+            }
+            if ui.button("Keep range").clicked() {
+                match parse_time_range(state) {
+                    Ok((start, end)) => {
+                        let result = workspace.keep_time_range(start, end);
+                        record_project_result(
+                            workspace,
+                            state,
+                            now,
+                            results,
+                            EditorUiOperation::KeepTimeRange,
+                            result,
+                        );
+                    }
+                    Err(message) => {
+                        push_failure(results, EditorUiOperation::KeepTimeRange, message);
+                    }
+                }
+            }
+            if ui.button("Delete range").clicked() {
+                match parse_time_range(state) {
+                    Ok((start, end)) => {
+                        let result = workspace.delete_time_range(start, end);
+                        record_project_result(
+                            workspace,
+                            state,
+                            now,
+                            results,
+                            EditorUiOperation::DeleteTimeRange,
+                            result,
+                        );
+                    }
+                    Err(message) => {
+                        push_failure(results, EditorUiOperation::DeleteTimeRange, message);
+                    }
+                }
+            }
+        });
     });
 }
 
@@ -933,6 +1020,13 @@ fn parse_time_ms(input: &str) -> Result<TimeUs, String> {
     Ok(TimeUs::new(microseconds))
 }
 
+fn parse_time_range(state: &EditorUiState) -> Result<(TimeUs, TimeUs), String> {
+    Ok((
+        parse_time_ms(&state.time_range_start_ms_input)?,
+        parse_time_ms(&state.time_range_end_ms_input)?,
+    ))
+}
+
 fn parse_duration_us(input: &str) -> Result<DurationUs, String> {
     let microseconds = parse_input::<u64>(input, "frame delay in microseconds")?;
     DurationUs::new(microseconds).ok_or_else(|| "frame delay must be positive".to_owned())
@@ -1156,7 +1250,7 @@ mod tests {
     use super::{
         EditorUiOperation, EditorUiState, FILMSTRIP_ITEM_WIDTH, OrientationControl, PlaybackClock,
         frame_click_operation, orientation_operation, parse_crop, parse_duration_us,
-        parse_output_size, parse_time_ms, to_ui_points, visible_widget_range,
+        parse_output_size, parse_time_ms, parse_time_range, to_ui_points, visible_widget_range,
     };
 
     #[test]
@@ -1164,6 +1258,8 @@ mod tests {
         let state = EditorUiState::default();
         assert_eq!(state.frame_number_input, "1");
         assert_eq!(state.time_ms_input, "0");
+        assert_eq!(state.time_range_start_ms_input, "0");
+        assert_eq!(state.time_range_end_ms_input, "1000");
         assert_eq!(state.duration_us_input, "100000");
         assert_eq!(state.percentage_input, "100");
         assert_eq!(state.frame_expression, "1");
@@ -1203,6 +1299,24 @@ mod tests {
         assert_eq!(parse_duration_us("1").unwrap(), DurationUs::new(1).unwrap());
         assert!(parse_duration_us("0").is_err());
         assert!(parse_duration_us("not a number").is_err());
+    }
+
+    #[test]
+    fn time_range_inputs_reuse_millisecond_semantics_and_reject_overflow() {
+        let mut state = EditorUiState {
+            time_range_start_ms_input: " 12 ".to_owned(),
+            time_range_end_ms_input: "34".to_owned(),
+            ..EditorUiState::default()
+        };
+        assert_eq!(
+            parse_time_range(&state).unwrap(),
+            (TimeUs::new(12_000), TimeUs::new(34_000))
+        );
+
+        state.time_range_end_ms_input = u64::MAX.to_string();
+        assert!(parse_time_range(&state).is_err());
+        state.time_range_end_ms_input.clear();
+        assert!(parse_time_range(&state).is_err());
     }
 
     #[test]

@@ -9,9 +9,10 @@ use gif_from_screen_domain::{
     DurationUs, EditCommand, FrameId, PhysicalRect, PhysicalSize, ProjectManifest, TimeUs,
 };
 use gif_from_screen_editor::{
-    ClipTransformEdit, EditorError, TimelineSelection, TimelineSelectionError, adjust_duration,
-    delete_frames, delete_frames_after, delete_frames_before, edit_clip_transforms,
-    move_selected_left, move_selected_right, override_duration, reverse_selected, scale_duration,
+    ClipTransformEdit, EditorError, FrameTimeRangeError, TimelineSelection, TimelineSelectionError,
+    adjust_duration, delete_frames, delete_frames_after, delete_frames_before,
+    edit_clip_transforms, move_selected_left, move_selected_right, override_duration,
+    reverse_selected, scale_duration, select_frames_by_time_range,
 };
 use gif_from_screen_project::{
     ActiveProject, AssetIssue, JournalRecoveryReport, LockPolicy, OpenedProject, ProjectError,
@@ -242,6 +243,59 @@ impl EditorWorkspace {
             .select_time(&self.project.manifest().timeline, time)?)
     }
 
+    /// Replaces the selection with frames intersecting the half-open range `[start, end)`.
+    pub(crate) fn select_time_range(
+        &mut self,
+        start: TimeUs,
+        end: TimeUs,
+    ) -> Result<(), EditorWorkspaceError> {
+        let frame_ids = self.frame_ids_in_time_range(start, end)?;
+        let selection = selection_for_frame_ids(self.project.manifest(), &frame_ids)?;
+        self.selection = selection;
+        Ok(())
+    }
+
+    /// Atomically removes every frame outside `[start, end)` and selects the retained range.
+    pub(crate) fn keep_time_range(
+        &mut self,
+        start: TimeUs,
+        end: TimeUs,
+    ) -> Result<(), EditorWorkspaceError> {
+        let retained = self.frame_ids_in_time_range(start, end)?;
+        let retained_set: BTreeSet<_> = retained.iter().copied().collect();
+        let removed = self
+            .project
+            .manifest()
+            .timeline
+            .frames
+            .iter()
+            .filter(|frame| !retained_set.contains(&frame.id))
+            .map(|frame| frame.id)
+            .collect::<Vec<_>>();
+        if removed.is_empty() {
+            return Err(EditorWorkspaceError::NoFramesOutsideTimeRange {
+                start_us: start.get(),
+                end_us: end.get(),
+            });
+        }
+        let retained_selection = selection_for_frame_ids(self.project.manifest(), &retained)?;
+        let command = delete_frames_atomically(self.project.manifest(), removed);
+        self.execute(command)?;
+        self.selection = retained_selection;
+        Ok(())
+    }
+
+    /// Atomically removes every frame intersecting the half-open range `[start, end)`.
+    pub(crate) fn delete_time_range(
+        &mut self,
+        start: TimeUs,
+        end: TimeUs,
+    ) -> Result<(), EditorWorkspaceError> {
+        let removed = self.frame_ids_in_time_range(start, end)?;
+        let command = delete_frames_atomically(self.project.manifest(), removed);
+        self.execute(command)
+    }
+
     /// Commits one command and records its inverse in bounded session history.
     ///
     /// Selection and both history stacks remain unchanged when the commit fails.
@@ -440,6 +494,35 @@ impl EditorWorkspace {
         let command = edit_clip_transforms(self.project.manifest(), selected, edit)?;
         self.execute(command)
     }
+
+    fn frame_ids_in_time_range(
+        &self,
+        start: TimeUs,
+        end: TimeUs,
+    ) -> Result<Vec<FrameId>, EditorWorkspaceError> {
+        let frame_ids = select_frames_by_time_range(&self.project.manifest().timeline, start, end)?;
+        if frame_ids.is_empty() {
+            return Err(EditorWorkspaceError::EmptyTimeRange {
+                start_us: start.get(),
+                end_us: end.get(),
+            });
+        }
+        Ok(frame_ids)
+    }
+}
+
+fn selection_for_frame_ids(
+    manifest: &ProjectManifest,
+    frame_ids: &[FrameId],
+) -> Result<TimelineSelection, TimelineSelectionError> {
+    let mut selection = TimelineSelection::new();
+    let Some((first, rest)) = frame_ids.split_first() else {
+        return Ok(selection);
+    };
+    let last = rest.last().unwrap_or(first);
+    selection.select_only(&manifest.timeline, *last)?;
+    selection.extend_range(&manifest.timeline, *first)?;
+    Ok(selection)
 }
 
 fn push_bounded(history: &mut Vec<EditCommand>, command: EditCommand, limit: usize) {
@@ -483,6 +566,25 @@ pub(crate) enum EditorWorkspaceError {
     /// A selection or navigation request was invalid.
     #[error(transparent)]
     Selection(#[from] TimelineSelectionError),
+    /// The requested time range was reversed or the timeline duration overflowed.
+    #[error(transparent)]
+    TimeRange(#[from] FrameTimeRangeError),
+    /// The half-open range intersects no timeline frame.
+    #[error("time range [{start_us}, {end_us})us contains no frames")]
+    EmptyTimeRange {
+        /// Inclusive project-relative start time.
+        start_us: u64,
+        /// Exclusive project-relative end time.
+        end_us: u64,
+    },
+    /// Keeping this range would not remove any frame.
+    #[error("all frames are already inside time range [{start_us}, {end_us})us")]
+    NoFramesOutsideTimeRange {
+        /// Inclusive project-relative start time.
+        start_us: u64,
+        /// Exclusive project-relative end time.
+        end_us: u64,
+    },
     /// Session history must retain at least one entry.
     #[error("editor history limit must be greater than zero")]
     ZeroHistoryLimit,
@@ -909,6 +1011,87 @@ mod tests {
         ));
         assert!(error.to_string().contains("at least one frame"));
         assert!(!workspace.is_dirty());
+        assert!(!workspace.can_undo());
+    }
+
+    #[test]
+    fn time_range_select_keep_undo_redo_and_reopen_are_consistent() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = create_workspace(&directory, &[10, 20, 30, 40], 16);
+
+        workspace
+            .select_time_range(TimeUs::new(10), TimeUs::new(60))
+            .unwrap();
+        assert_eq!(selected(&workspace), [2, 3]);
+        assert_eq!(workspace.selection().current(), Some(frame_id(2)));
+        assert!(!workspace.is_dirty());
+
+        workspace
+            .keep_time_range(TimeUs::new(10), TimeUs::new(60))
+            .unwrap();
+        assert_eq!(order(&workspace), [2, 3]);
+        assert_eq!(selected(&workspace), [2, 3]);
+        assert!(workspace.is_dirty());
+        assert!(workspace.undo().unwrap());
+        assert_eq!(order(&workspace), [1, 2, 3, 4]);
+        assert!(workspace.redo().unwrap());
+        assert_eq!(order(&workspace), [2, 3]);
+        drop(workspace);
+
+        let reopened =
+            EditorWorkspace::open(directory.path(), LockPolicy::FailIfPresent, 16).unwrap();
+        assert_eq!(order(&reopened), [2, 3]);
+        assert!(reopened.is_dirty());
+    }
+
+    #[test]
+    fn delete_time_range_is_one_undoable_journal_edit() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = create_workspace(&directory, &[10, 20, 30, 40], 8);
+
+        workspace
+            .delete_time_range(TimeUs::new(10), TimeUs::new(60))
+            .unwrap();
+        assert_eq!(order(&workspace), [1, 4]);
+        assert!(workspace.undo().unwrap());
+        assert_eq!(order(&workspace), [1, 2, 3, 4]);
+        assert!(!workspace.undo().unwrap());
+    }
+
+    #[test]
+    fn time_range_boundaries_and_empty_results_are_typed_without_state_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = create_workspace(&directory, &[10, 20], 8);
+        workspace.select_only(frame_id(2)).unwrap();
+        let selection_before = workspace.selection().clone();
+        let revision_before = workspace.manifest().revision;
+
+        assert!(matches!(
+            workspace.select_time_range(TimeUs::new(10), TimeUs::new(10)),
+            Err(EditorWorkspaceError::EmptyTimeRange {
+                start_us: 10,
+                end_us: 10,
+            })
+        ));
+        assert!(matches!(
+            workspace.delete_time_range(TimeUs::new(31), TimeUs::new(40)),
+            Err(EditorWorkspaceError::EmptyTimeRange { .. })
+        ));
+        assert!(matches!(
+            workspace.keep_time_range(TimeUs::new(20), TimeUs::new(10)),
+            Err(EditorWorkspaceError::TimeRange(
+                FrameTimeRangeError::Reversed {
+                    start_us: 20,
+                    end_us: 10,
+                }
+            ))
+        ));
+        assert!(matches!(
+            workspace.keep_time_range(TimeUs::ZERO, TimeUs::new(30)),
+            Err(EditorWorkspaceError::NoFramesOutsideTimeRange { .. })
+        ));
+        assert_eq!(workspace.selection(), &selection_before);
+        assert_eq!(workspace.manifest().revision, revision_before);
         assert!(!workspace.can_undo());
     }
 }
