@@ -9,12 +9,14 @@ use gif_from_screen_domain::{
 };
 use thiserror::Error;
 
+mod clip_transform;
 mod duplicates;
 mod frame_selection;
 mod selection;
 mod virtual_filmstrip;
 mod yoyo;
 
+pub use clip_transform::{ClipTransformEdit, edit_clip_transforms};
 pub use duplicates::{
     DuplicateDelayMode, DuplicateFrameRetention, FrameComparison, FrameSimilarityProvider,
     RemoveDuplicateFramesOptions, remove_duplicate_frames,
@@ -621,6 +623,42 @@ pub enum EditorError {
     /// A selection referred to a frame outside the project.
     #[error("selected frame {0} does not exist")]
     UnknownSelectedFrame(FrameId),
+    /// A selected frame refers to an asset absent from the manifest.
+    #[error("selected frame {frame_id} refers to missing asset {asset_id}")]
+    MissingFrameAsset {
+        /// Selected frame whose source cannot be resolved.
+        frame_id: FrameId,
+        /// Missing immutable source asset.
+        asset_id: gif_from_screen_domain::AssetId,
+    },
+    /// A selected frame's asset kind cannot provide original frame pixels.
+    #[error("selected frame {frame_id} asset {asset_id} is not a frame raster")]
+    UnsupportedFrameAsset {
+        /// Selected frame whose source kind is incompatible.
+        frame_id: FrameId,
+        /// Incompatible source asset.
+        asset_id: gif_from_screen_domain::AssetId,
+    },
+    /// A crop rectangle is empty or its coordinates overflow.
+    #[error("crop rectangle {0:?} is empty or has overflowing coordinates")]
+    InvalidCrop(gif_from_screen_domain::PhysicalRect),
+    /// A crop rectangle lies outside one selected frame's immutable source asset.
+    #[error(
+        "crop {crop:?} for frame {frame_id} does not fit source asset {asset_id} size {source_size:?}"
+    )]
+    CropOutsideFrameAsset {
+        /// Selected frame rejected by the shared crop.
+        frame_id: FrameId,
+        /// Immutable source asset for that frame.
+        asset_id: gif_from_screen_domain::AssetId,
+        /// Requested source-coordinate crop.
+        crop: gif_from_screen_domain::PhysicalRect,
+        /// Original source-asset dimensions.
+        source_size: gif_from_screen_domain::PhysicalSize,
+    },
+    /// A requested pre-rotation output size is empty or invalid.
+    #[error("clip output size {0:?} is invalid")]
+    InvalidOutputSize(gif_from_screen_domain::PhysicalSize),
     /// There are no frames before the selected range.
     #[error("there are no frames before the selection")]
     NoFramesBeforeSelection,
