@@ -6,7 +6,7 @@ use gif_from_screen_capture::{
 #[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
 use gif_from_screen_capture::{CursorMetadata, PhysicalPosition, PhysicalRect, PhysicalSize};
 #[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(all(target_os = "linux", feature = "native-x11"))]
 mod native {
@@ -35,10 +35,10 @@ mod native {
         BackendDescriptor, BackendStatus, CaptureBackend, CaptureCapabilities, CaptureError,
         CaptureErrorKind, CaptureRequest, CaptureSession, CaptureSource, CaptureTarget,
         CapturedFrame, PhysicalPosition, PhysicalRect, PhysicalSize, RecoveryHint,
-        WindowFilterFacts, X11CursorSnapshot, active_session_elapsed, composite_cursor,
-        decode_text_property, decode_u32_property, decode_zpixmap, ensure_fixed_canvas,
-        format_window_source_id, intersect_rect, parse_window_source_id, should_list_window,
-        translate_region,
+        WindowFilterFacts, X11CursorSnapshot, active_session_elapsed, advance_periodic_deadline,
+        composite_cursor, decode_text_property, decode_u32_property, decode_zpixmap,
+        ensure_fixed_canvas, format_window_source_id, intersect_rect, parse_window_source_id,
+        should_list_window, translate_region,
     };
     use crate::x11::{ByteOrder, PixelLayout};
 
@@ -679,9 +679,7 @@ mod native {
                     }
                     thread::sleep(wait);
                 }
-                self.next_due = Instant::now()
-                    .checked_add(period)
-                    .unwrap_or_else(Instant::now);
+                self.next_due = advance_periodic_deadline(self.next_due, Instant::now(), period);
             }
 
             let elapsed = active_session_elapsed(self.started_at.elapsed(), self.accumulated_pause)
@@ -1244,6 +1242,38 @@ mod native {
             RecoveryHint::ChooseDifferentSource,
         )
     }
+}
+
+/// Advances a periodic schedule from its prior deadline rather than from a late observation.
+///
+/// Missing one or more capture slots moves directly to the first future slot. This keeps a fixed
+/// cadence from accumulating capture-time drift while still allowing timestamps to expose the
+/// actual elapsed presentation time instead of synthesizing dropped images.
+#[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
+fn advance_periodic_deadline(deadline: Instant, observed: Instant, period: Duration) -> Instant {
+    if period.is_zero() {
+        return observed;
+    }
+    if deadline > observed {
+        return deadline;
+    }
+
+    let period_nanos = period.as_nanos();
+    let elapsed_periods = observed.duration_since(deadline).as_nanos() / period_nanos;
+    let steps = elapsed_periods.saturating_add(1);
+    let Some(advance_nanos) = period_nanos.checked_mul(steps) else {
+        return observed.checked_add(period).unwrap_or(observed);
+    };
+    let seconds = advance_nanos / 1_000_000_000;
+    let nanos = u32::try_from(advance_nanos % 1_000_000_000)
+        .expect("subsecond nanoseconds are always below one billion");
+    let Ok(seconds) = u64::try_from(seconds) else {
+        return observed.checked_add(period).unwrap_or(observed);
+    };
+    deadline
+        .checked_add(Duration::new(seconds, nanos))
+        .or_else(|| observed.checked_add(period))
+        .unwrap_or(observed)
 }
 
 #[cfg(not(all(target_os = "linux", feature = "native-x11")))]
@@ -1896,6 +1926,35 @@ mod tests {
         green_mask: 0x0000_ff00,
         blue_mask: 0x0000_00ff,
     };
+
+    #[test]
+    fn fixed_cadence_deadlines_skip_missed_slots_without_accumulating_drift() {
+        let origin = Instant::now();
+        let period = Duration::from_millis(100);
+
+        let first = advance_periodic_deadline(origin, origin, period);
+        assert_eq!(first, origin + period);
+
+        // A frame arriving 30ms late still targets the original 200ms slot,
+        // rather than drifting the schedule to 230ms.
+        let second = advance_periodic_deadline(first, origin + Duration::from_millis(130), period);
+        assert_eq!(second, origin + Duration::from_millis(200));
+
+        // Crossing several slots advances in one bounded arithmetic step.
+        let after_gap =
+            advance_periodic_deadline(second, origin + Duration::from_millis(550), period);
+        assert_eq!(after_gap, origin + Duration::from_millis(600));
+
+        // A defensive zero period makes no progress beyond the observation.
+        assert_eq!(
+            advance_periodic_deadline(
+                after_gap,
+                origin + Duration::from_millis(700),
+                Duration::ZERO
+            ),
+            origin + Duration::from_millis(700)
+        );
+    }
 
     fn cursor(
         position_x: i32,
