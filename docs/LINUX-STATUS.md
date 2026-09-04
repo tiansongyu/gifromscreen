@@ -12,6 +12,9 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Complete capture contracts, a synthetic source, and Linux runtime detection.
 - [x] Connect the CLI vertical slice: synthetic capture -> project -> GIF.
 - [x] Connect the first desktop X11 record-to-GIF vertical slice.
+- [x] Hide the main UI while a standalone recorder frame is active.
+- [x] Move and resize the recorder frame before capture; keep its border and controls outside the GIF.
+- [x] Start, pause, resume, stop-and-save, and discard from the recorder frame.
 
 ## Delivery gates
 
@@ -27,8 +30,8 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 
 ### M1 — usable alpha
 
-- [ ] Monitor and region recorder.
-- [ ] Countdown, record, pause, resume, stop, discard.
+- [x] X11 monitor, window, and region recorder.
+- [ ] Countdown; record, pause, resume, stop, and discard are complete.
 - [ ] Project autosave and crash recovery.
 - [ ] Filmstrip selection, delete, reorder, reverse, delays, undo/redo.
 - [ ] Crop and resize.
