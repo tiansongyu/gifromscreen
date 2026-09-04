@@ -28,6 +28,9 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Negotiate a real Wayland ScreenCast Portal session through the PipeWire FD handoff.
 - [x] Stream X11 recording frames into the recoverable project journal while capture is active.
 - [x] Consume mapped Wayland PipeWire frames through a bounded native capture session.
+- [x] Continue a Portal-prepared Wayland session into recording without reopening the chooser.
+- [x] Hide the main UI and use a standalone Wayland frozen-preview crop controller with countdown, live fixed-size movement, pause/resume, stop, and discard.
+- [x] Drop setup frames at the Wayland recording boundary and translate cropped damage, cursor, and input metadata.
 - [x] Cut, copy, and paste bounded frame selections with immutable-asset reuse.
 - [x] Show overflow-safe timing, selection, canvas, and asset statistics.
 - [x] Route dropped project, GIF, PNG, JPEG, BMP, and WebP paths into background jobs.
@@ -49,7 +52,7 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 
 - [x] X11 monitor, window, and region recorder.
 - [x] Countdown; record, pause, resume, stop, and discard are complete.
-- [x] Project autosave and crash recovery for active X11 recordings and editor changes.
+- [x] Project autosave and crash recovery for active X11/Wayland recordings and editor changes.
 - [x] Filmstrip selection, delete, reorder, reverse, delays, undo/redo.
 - [x] Crop and resize.
 - [x] GIF colors, loop, duration, duplicate merge, progress, cancellation.
