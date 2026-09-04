@@ -13,6 +13,7 @@ mod retarget;
 
 use std::{
     collections::BTreeSet,
+    ffi::{OsStr, OsString},
     fs, io,
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
@@ -71,6 +72,14 @@ enum AppView {
     ImportGif,
     ScreenRecorder,
     Editor,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StartupIntent {
+    None,
+    OpenProject(PathBuf),
+    ImportGif(PathBuf),
+    Invalid(String),
 }
 
 #[derive(Clone, Debug)]
@@ -497,6 +506,27 @@ impl eframe::App for GifFromScreenApp {
 }
 
 impl GifFromScreenApp {
+    fn apply_startup_intent(&mut self, intent: StartupIntent) {
+        match intent {
+            StartupIntent::None => {}
+            StartupIntent::OpenProject(path) => {
+                self.view = AppView::OpenProject;
+                self.open_project_path = path.to_string_lossy().into_owned();
+                if let Err(error) = self.start_open_project() {
+                    self.notice = Some(format!("Could not open startup project: {error}"));
+                }
+            }
+            StartupIntent::ImportGif(path) => {
+                self.view = AppView::ImportGif;
+                self.import_gif_path = path.to_string_lossy().into_owned();
+                if let Err(error) = self.start_import_gif() {
+                    self.notice = Some(format!("Could not import startup GIF: {error}"));
+                }
+            }
+            StartupIntent::Invalid(message) => self.notice = Some(message),
+        }
+    }
+
     fn show_landing(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
             ui.add_space(48.0);
@@ -2830,7 +2860,59 @@ fn landing_cards_fit(available_width: f32, column_spacing: f32) -> bool {
     available_width >= LANDING_CARD_MIN_WIDTH * 2.0 + column_spacing
 }
 
+fn parse_startup_intent(arguments: impl IntoIterator<Item = OsString>) -> StartupIntent {
+    let mut arguments = arguments.into_iter();
+    let Some(first) = arguments.next() else {
+        return StartupIntent::None;
+    };
+    let (kind, path) = if first == OsStr::new("--project") {
+        let Some(path) = arguments.next() else {
+            return StartupIntent::Invalid("--project requires a .gfsproj path".to_owned());
+        };
+        (StartupIntentKind::Project, PathBuf::from(path))
+    } else if first == OsStr::new("--import-gif") {
+        let Some(path) = arguments.next() else {
+            return StartupIntent::Invalid("--import-gif requires a .gif path".to_owned());
+        };
+        (StartupIntentKind::Gif, PathBuf::from(path))
+    } else if first.to_string_lossy().starts_with('-') {
+        return StartupIntent::Invalid(format!(
+            "Unknown desktop argument '{}'. Use --project PATH or --import-gif PATH.",
+            first.to_string_lossy()
+        ));
+    } else {
+        let path = PathBuf::from(first);
+        let kind = if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gif"))
+        {
+            StartupIntentKind::Gif
+        } else {
+            StartupIntentKind::Project
+        };
+        (kind, path)
+    };
+    if let Some(unexpected) = arguments.next() {
+        return StartupIntent::Invalid(format!(
+            "Unexpected extra desktop argument '{}'.",
+            unexpected.to_string_lossy()
+        ));
+    }
+    match kind {
+        StartupIntentKind::Project => StartupIntent::OpenProject(path),
+        StartupIntentKind::Gif => StartupIntent::ImportGif(path),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupIntentKind {
+    Project,
+    Gif,
+}
+
 fn main() -> eframe::Result {
+    let startup_intent = parse_startup_intent(std::env::args_os().skip(1));
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
@@ -2843,7 +2925,11 @@ fn main() -> eframe::Result {
     eframe::run_native(
         APP_NAME,
         options,
-        Box::new(|_creation_context| Ok(Box::<GifFromScreenApp>::default())),
+        Box::new(move |_creation_context| {
+            let mut app = GifFromScreenApp::default();
+            app.apply_startup_intent(startup_intent);
+            Ok(Box::new(app))
+        }),
     )
 }
 
@@ -2851,6 +2937,7 @@ fn main() -> eframe::Result {
 mod tests {
     use std::{
         collections::BTreeSet,
+        ffi::OsString,
         fs,
         path::{Path, PathBuf},
         time::{Duration, Instant},
@@ -2874,13 +2961,13 @@ mod tests {
         AppView, EDITOR_PREVIEW_MAX_SIZE, EditorExportSettings, ExportDitherChoice,
         ExportFrameScope, ExportLoopChoice, ExportPaletteChoice, ExportQuantizerChoice,
         GifFromScreenApp, MAX_COUNTDOWN_SECONDS, MAX_RECORDING_DURATION_MS, RecorderOverlayAction,
-        RecorderStage, RecordingSettings, activate_editor, apply_overlay_region,
+        RecorderStage, RecordingSettings, StartupIntent, activate_editor, apply_overlay_region,
         build_project_export_options, can_navigate_back, collection_limit, collection_options,
         default_gif_path_for_project, edited_gif_path_for_import, export_job_is_active,
         export_result_notice, fit_dimensions, frame_retention, landing_cards_fit,
-        map_preview_selection, project_path_for_output, remove_completed_project,
-        resize_nearest_rgba, resolve_export_selection, should_sync_retarget,
-        show_editor_scroll_area, validate_export_output, validate_settings,
+        map_preview_selection, parse_startup_intent, project_path_for_output,
+        remove_completed_project, resize_nearest_rgba, resolve_export_selection,
+        should_sync_retarget, show_editor_scroll_area, validate_export_output, validate_settings,
     };
     use crate::editor_workspace::EditorWorkspace;
     use crate::export_job::{ExportJobError, ExportJobState};
@@ -2917,6 +3004,38 @@ mod tests {
         settings.fps = 10;
         settings.output = "capture.mp4".into();
         assert!(validate_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn desktop_startup_arguments_route_projects_and_gifs_without_flag_guessing() {
+        assert_eq!(
+            parse_startup_intent(Vec::<OsString>::new()),
+            StartupIntent::None
+        );
+        assert_eq!(
+            parse_startup_intent(["--project", "/tmp/demo.gfsproj"].map(OsString::from)),
+            StartupIntent::OpenProject(PathBuf::from("/tmp/demo.gfsproj"))
+        );
+        assert_eq!(
+            parse_startup_intent(["--import-gif", "/tmp/demo.data"].map(OsString::from)),
+            StartupIntent::ImportGif(PathBuf::from("/tmp/demo.data"))
+        );
+        assert_eq!(
+            parse_startup_intent([OsString::from("/tmp/demo.GIF")]),
+            StartupIntent::ImportGif(PathBuf::from("/tmp/demo.GIF"))
+        );
+        assert_eq!(
+            parse_startup_intent([OsString::from("/tmp/demo.gfsproj")]),
+            StartupIntent::OpenProject(PathBuf::from("/tmp/demo.gfsproj"))
+        );
+        assert!(matches!(
+            parse_startup_intent([OsString::from("--unknown")]),
+            StartupIntent::Invalid(message) if message.contains("Unknown desktop argument")
+        ));
+        assert!(matches!(
+            parse_startup_intent(["--project", "one", "two"].map(OsString::from)),
+            StartupIntent::Invalid(message) if message.contains("Unexpected extra")
+        ));
     }
 
     #[test]
