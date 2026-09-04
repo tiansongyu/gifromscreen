@@ -12,7 +12,7 @@ use gif_from_screen_editor::{
     override_duration, reverse_selected, scale_duration,
 };
 use gif_from_screen_project::{
-    ActiveProject, AssetIssue, JournalRecoveryReport, LockPolicy, ProjectError,
+    ActiveProject, AssetIssue, JournalRecoveryReport, LockPolicy, OpenedProject, ProjectError,
 };
 use thiserror::Error;
 
@@ -46,6 +46,22 @@ impl EditorWorkspace {
         history_limit: usize,
     ) -> Result<Self, EditorWorkspaceError> {
         let opened = ActiveProject::open(root, lock_policy)?;
+        Self::from_opened(opened, history_limit)
+    }
+
+    /// Consumes an already-opened project without reacquiring its lock or repeating recovery.
+    ///
+    /// The opening recovery report and asset issues are retained for the UI. A non-empty timeline
+    /// initially selects its first frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EditorWorkspaceError::ZeroHistoryLimit`] when `history_limit` is zero, or a
+    /// selection error if the recovered timeline cannot select its reported first frame.
+    pub(crate) fn from_opened(
+        opened: OpenedProject,
+        history_limit: usize,
+    ) -> Result<Self, EditorWorkspaceError> {
         let dirty = opened.journal_recovery.replayed_records > 0
             || opened.journal_recovery.snapshot_revision
                 != opened.journal_recovery.recovered_revision
@@ -54,6 +70,9 @@ impl EditorWorkspace {
         workspace.dirty = dirty;
         workspace.journal_recovery = Some(opened.journal_recovery);
         workspace.asset_issues = opened.asset_issues;
+        if !workspace.manifest().timeline.frames.is_empty() {
+            workspace.select_first()?;
+        }
         Ok(workspace)
     }
 
@@ -545,6 +564,31 @@ mod tests {
         assert!(!reopened.can_undo());
         reopened.checkpoint().unwrap();
         assert!(!reopened.is_dirty());
+    }
+
+    #[test]
+    fn from_opened_keeps_recovery_issues_lock_and_selects_first_frame() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut active = ActiveProject::create(directory.path(), manifest(&[10, 20])).unwrap();
+        let canvas = active.manifest().canvas.clone();
+        active.commit(EditCommand::SetCanvas { canvas }).unwrap();
+        drop(active);
+        let opened = ActiveProject::open(directory.path(), LockPolicy::FailIfPresent).unwrap();
+
+        let workspace = EditorWorkspace::from_opened(opened, 8).unwrap();
+
+        assert!(workspace.is_dirty());
+        assert_eq!(workspace.journal_recovery().unwrap().replayed_records, 1);
+        assert!(matches!(
+            workspace.asset_issues(),
+            [AssetIssue::Missing { .. }]
+        ));
+        assert_eq!(workspace.selection().current(), Some(frame_id(1)));
+        assert!(directory.path().join("project.lock").exists());
+        assert!(matches!(
+            ActiveProject::open(directory.path(), LockPolicy::FailIfPresent),
+            Err(ProjectError::AlreadyLocked { .. })
+        ));
     }
 
     #[test]

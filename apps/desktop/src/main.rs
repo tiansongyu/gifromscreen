@@ -39,12 +39,13 @@ use gif_from_screen_gif::{
     CancellationFlag, CancellationToken as _, DeltaMode, DitherMode, EncodeOptions, LoopBehavior,
     PaletteMode, QuantizerStrategy, Transparency,
 };
-use gif_from_screen_project::ActiveProject;
+use gif_from_screen_project::{ActiveProject, LockPolicy, OpenedProject};
 use gif_from_screen_workflow::{
     CollectOptions, CollectedRecording, CollectionLimit, FrameRetention, RecordingControl,
     RecordingController, TargetUpdateRequest, TargetUpdateStatus, WorkflowProgress,
     collect_controlled,
 };
+use open_project_job::{OpenProjectJob, OpenProjectJobEvent, OpenProjectJobState};
 use retarget::{RegionRetargetPlan, RetargetCompletion};
 use uuid::Uuid;
 
@@ -63,6 +64,7 @@ fn recorder_viewport_id() -> egui::ViewportId {
 enum AppView {
     #[default]
     Landing,
+    OpenProject,
     ScreenRecorder,
     Editor,
 }
@@ -368,6 +370,8 @@ struct GifFromScreenApp {
     recording_countdown: RecordingCountdown,
     job: Option<RecordingJob>,
     progress: Option<WorkflowProgress>,
+    open_project_path: String,
+    open_project_job: OpenProjectJob,
     editor_workspace: Option<EditorWorkspace>,
     editor_ui_state: EditorUiState,
     editor_preview_cache: EditorPreviewCache,
@@ -398,6 +402,8 @@ impl Default for GifFromScreenApp {
             recording_countdown: RecordingCountdown::default(),
             job: None,
             progress: None,
+            open_project_path: String::new(),
+            open_project_job: OpenProjectJob::default(),
             editor_workspace: None,
             editor_ui_state: EditorUiState::default(),
             editor_preview_cache: EditorPreviewCache::new(),
@@ -420,6 +426,7 @@ impl eframe::App for GifFromScreenApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive_job_messages();
         self.receive_export_messages();
+        self.receive_open_project_messages();
         self.advance_recording_countdown(context);
         if self.restore_main_window {
             if let Some(snapshot) = self.main_window_snapshot.take() {
@@ -440,13 +447,19 @@ impl eframe::App for GifFromScreenApp {
             || self.recorder_overlay.is_some()
             || self.recording_countdown.is_active()
             || export_job_is_active(self.export_job.state())
+            || self.open_project_job.state() == OpenProjectJobState::Running
         {
             context.request_repaint_after(Duration::from_millis(33));
         }
 
         egui::TopBottomPanel::top("app_header").show(context, |ui| {
             ui.horizontal(|ui| {
-                if self.view != AppView::Landing && ui.button("Back").clicked() {
+                let back_enabled = can_navigate_back(self.view, self.open_project_job.state());
+                if self.view != AppView::Landing
+                    && ui
+                        .add_enabled(back_enabled, egui::Button::new("Back"))
+                        .clicked()
+                {
                     self.view = AppView::Landing;
                 }
                 ui.heading(APP_NAME);
@@ -457,6 +470,7 @@ impl eframe::App for GifFromScreenApp {
 
         egui::CentralPanel::default().show(context, |ui| match self.view {
             AppView::Landing => self.show_landing(ui),
+            AppView::OpenProject => self.show_open_project(ui),
             AppView::ScreenRecorder => self.show_screen_recorder(ui),
             AppView::Editor => self.show_editor(ui),
         });
@@ -486,12 +500,12 @@ impl GifFromScreenApp {
                 }
                 if landing_action(
                     &mut columns[1],
-                    "Open or import",
-                    "Open a project, GIF, image sequence, or video.",
-                    false,
+                    "Open project",
+                    "Open an existing .gfsproj directory. GIF and media import are planned next.",
+                    true,
                 ) {
-                    self.notice =
-                        Some("Import is scheduled after the first recorder slice.".into());
+                    self.view = AppView::OpenProject;
+                    self.notice = None;
                 }
             });
 
@@ -516,6 +530,62 @@ impl GifFromScreenApp {
                 ui.label(notice);
             }
         });
+    }
+
+    fn show_open_project(&mut self, ui: &mut egui::Ui) {
+        let running = self.open_project_job.state() == OpenProjectJobState::Running;
+        ui.heading("Open editable project");
+        ui.label("Choose an existing .gfsproj directory containing manifest.json.");
+        ui.weak("Importing GIF, image sequences, and video is planned next.");
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.label("Project directory");
+            ui.add_enabled(
+                !running,
+                egui::TextEdit::singleline(&mut self.open_project_path)
+                    .desired_width(420.0)
+                    .hint_text("/path/to/animation.gfsproj"),
+            );
+        });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!running, egui::Button::new("Open"))
+                .clicked()
+                && let Err(error) = self.start_open_project()
+            {
+                self.notice = Some(format!("Could not start opening project: {error}"));
+            }
+            if ui
+                .add_enabled(
+                    can_navigate_back(self.view, self.open_project_job.state()),
+                    egui::Button::new("Back"),
+                )
+                .clicked()
+            {
+                self.view = AppView::Landing;
+            }
+            if running {
+                ui.spinner();
+                ui.label("Opening and recovering project…");
+            }
+        });
+        if let Some(notice) = &self.notice {
+            ui.add_space(12.0);
+            ui.label(notice);
+        }
+    }
+
+    fn start_open_project(&mut self) -> Result<(), String> {
+        let path = self.open_project_path.trim();
+        if path.is_empty() {
+            return Err("Select a .gfsproj directory first.".to_owned());
+        }
+        self.open_project_job
+            .start(PathBuf::from(path), LockPolicy::FailIfPresent)
+            .map_err(|error| error.to_string())?;
+        self.notice = Some("Opening project in the background…".to_owned());
+        Ok(())
     }
 
     fn show_screen_recorder(&mut self, ui: &mut egui::Ui) {
@@ -1288,6 +1358,44 @@ impl GifFromScreenApp {
         );
         self.export_job = ExportJob::default();
         self.notice = Some(notice);
+    }
+
+    fn receive_open_project_messages(&mut self) {
+        let finished = self
+            .open_project_job
+            .drain()
+            .into_iter()
+            .any(|event| event == OpenProjectJobEvent::Finished);
+        if !finished {
+            return;
+        }
+        let result = self.open_project_job.take_result();
+        self.open_project_job = OpenProjectJob::default();
+        self.notice = Some(match result {
+            Some(Ok(opened)) => match self.activate_opened_project(opened) {
+                Ok(notice) => notice,
+                Err(error) => format!("Could not prepare opened project: {error}"),
+            },
+            Some(Err(error)) => format!("Could not open project: {error}"),
+            None => "Project-open worker finished without a result.".to_owned(),
+        });
+    }
+
+    fn activate_opened_project(&mut self, opened: OpenedProject) -> Result<String, String> {
+        let workspace = EditorWorkspace::from_opened(opened, EDITOR_HISTORY_LIMIT)
+            .map_err(|error| error.to_string())?;
+        let output = default_gif_path_for_project(workspace.project_root());
+        let output_exists = output.exists();
+        let notice = opened_project_notice(&workspace, &output, output_exists);
+
+        self.editor_workspace = Some(workspace);
+        self.editor_ui_state = EditorUiState::default();
+        self.editor_preview_cache = EditorPreviewCache::new();
+        self.editor_export_settings = EditorExportSettings::default();
+        self.export_job = ExportJob::default();
+        self.settings.output = output.to_string_lossy().into_owned();
+        self.view = AppView::Editor;
+        Ok(notice)
     }
 
     fn finish_recording_job(&mut self) {
@@ -2270,6 +2378,10 @@ const fn export_job_is_active(state: ExportJobState) -> bool {
     matches!(state, ExportJobState::Running | ExportJobState::Cancelling)
 }
 
+const fn can_navigate_back(view: AppView, open_state: OpenProjectJobState) -> bool {
+    !(matches!(view, AppView::OpenProject) && matches!(open_state, OpenProjectJobState::Running))
+}
+
 fn export_result_notice(result: Result<ProjectGifExportReport, ExportJobError>) -> String {
     match result {
         Ok(report) => format!(
@@ -2281,6 +2393,49 @@ fn export_result_notice(result: Result<ProjectGifExportReport, ExportJobError>) 
         ),
         Err(error) => format!("GIF export failed: {error}"),
     }
+}
+
+fn default_gif_path_for_project(project_root: &Path) -> PathBuf {
+    project_root.with_extension("gif")
+}
+
+fn opened_project_notice(
+    workspace: &EditorWorkspace,
+    output: &Path,
+    output_exists: bool,
+) -> String {
+    let mut details = vec![format!(
+        "Opened {} frame(s) from {}.",
+        workspace.manifest().timeline.frames.len(),
+        workspace.project_root().display()
+    )];
+    if let Some(recovery) = workspace.journal_recovery() {
+        if recovery.replayed_records > 0 {
+            details.push(format!(
+                "Recovered {} journal edit(s); the manifest snapshot should be checkpointed.",
+                recovery.replayed_records
+            ));
+        }
+        if !recovery.is_clean() {
+            details.push(format!(
+                "Journal recovery stopped at a non-clean tail ({:?}); repair is required before editing.",
+                recovery.stop_reason
+            ));
+        }
+    }
+    if !workspace.asset_issues().is_empty() {
+        details.push(format!(
+            "Found {} asset issue(s); affected previews and GIF export remain unavailable.",
+            workspace.asset_issues().len()
+        ));
+    }
+    if output_exists {
+        details.push(format!(
+            "The default GIF {} already exists; enable Overwrite output to replace it.",
+            output.display()
+        ));
+    }
+    details.join(" ")
 }
 
 fn activate_editor(
@@ -2536,7 +2691,7 @@ mod tests {
         collections::BTreeSet,
         fs,
         path::{Path, PathBuf},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use eframe::egui;
@@ -2556,15 +2711,17 @@ mod tests {
     use super::{
         AppView, EDITOR_PREVIEW_MAX_SIZE, EditorExportSettings, ExportDitherChoice,
         ExportFrameScope, ExportLoopChoice, ExportPaletteChoice, ExportQuantizerChoice,
-        MAX_COUNTDOWN_SECONDS, MAX_RECORDING_DURATION_MS, RecorderOverlayAction, RecorderStage,
-        RecordingSettings, activate_editor, apply_overlay_region, build_project_export_options,
-        collection_limit, collection_options, export_job_is_active, export_result_notice,
-        fit_dimensions, frame_retention, map_preview_selection, project_path_for_output,
-        remove_completed_project, resize_nearest_rgba, resolve_export_selection,
-        should_sync_retarget, show_editor_scroll_area, validate_export_output, validate_settings,
+        GifFromScreenApp, MAX_COUNTDOWN_SECONDS, MAX_RECORDING_DURATION_MS, RecorderOverlayAction,
+        RecorderStage, RecordingSettings, activate_editor, apply_overlay_region,
+        build_project_export_options, can_navigate_back, collection_limit, collection_options,
+        default_gif_path_for_project, export_job_is_active, export_result_notice, fit_dimensions,
+        frame_retention, map_preview_selection, project_path_for_output, remove_completed_project,
+        resize_nearest_rgba, resolve_export_selection, should_sync_retarget,
+        show_editor_scroll_area, validate_export_output, validate_settings,
     };
     use crate::editor_workspace::EditorWorkspace;
     use crate::export_job::{ExportJobError, ExportJobState};
+    use crate::open_project_job::OpenProjectJobState;
     use gif_from_screen_workflow::{CollectionLimit, FrameRetention};
 
     #[test]
@@ -2870,6 +3027,99 @@ mod tests {
             .unwrap();
         project.checkpoint_and_compact().unwrap();
         project
+    }
+
+    fn drain_open_job(app: &mut GifFromScreenApp) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.open_project_job.state() == OpenProjectJobState::Running {
+            app.receive_open_project_messages();
+            assert!(Instant::now() < deadline, "project-open job timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn project_root_derives_default_gif_path() {
+        assert_eq!(
+            default_gif_path_for_project(Path::new("/tmp/demo.gfsproj")),
+            PathBuf::from("/tmp/demo.gif")
+        );
+        assert_eq!(
+            default_gif_path_for_project(Path::new("/tmp/demo.project")),
+            PathBuf::from("/tmp/demo.gif")
+        );
+    }
+
+    #[test]
+    fn running_open_job_locks_both_back_navigation_controls() {
+        assert!(!can_navigate_back(
+            AppView::OpenProject,
+            OpenProjectJobState::Running
+        ));
+        for state in [OpenProjectJobState::Idle, OpenProjectJobState::Finished] {
+            assert!(can_navigate_back(AppView::OpenProject, state));
+        }
+        assert!(can_navigate_back(
+            AppView::Editor,
+            OpenProjectJobState::Running
+        ));
+    }
+
+    #[test]
+    fn successful_open_job_enters_editor_and_resets_editor_state() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("existing.gfsproj");
+        drop(single_frame_project(&root));
+        let output = directory.path().join("existing.gif");
+        fs::write(&output, b"existing").unwrap();
+        let mut app = GifFromScreenApp::default();
+        app.view = AppView::OpenProject;
+        app.open_project_path = root.to_string_lossy().into_owned();
+        app.editor_ui_state.frame_number_input = "99".to_owned();
+        app.editor_export_settings.overwrite = true;
+
+        app.start_open_project().unwrap();
+        assert_eq!(app.open_project_job.state(), OpenProjectJobState::Running);
+        drain_open_job(&mut app);
+
+        assert_eq!(app.open_project_job.state(), OpenProjectJobState::Idle);
+        assert_eq!(app.view, AppView::Editor);
+        assert_eq!(Path::new(&app.settings.output), output);
+        assert_eq!(app.editor_ui_state.frame_number_input, "1");
+        assert_eq!(app.editor_export_settings, EditorExportSettings::default());
+        assert_eq!(
+            app.editor_workspace.as_ref().unwrap().selection().current(),
+            Some(FrameId::from_u128(7))
+        );
+        let notice = app.notice.as_deref().unwrap();
+        assert!(notice.contains("Opened 1 frame"));
+        assert!(notice.contains("enable Overwrite"));
+    }
+
+    #[test]
+    fn failed_open_job_returns_to_retryable_open_view() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("broken.gfsproj");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("manifest.json"), b"{broken").unwrap();
+        let mut app = GifFromScreenApp::default();
+        app.view = AppView::OpenProject;
+        app.open_project_path = root.to_string_lossy().into_owned();
+
+        app.start_open_project().unwrap();
+        drain_open_job(&mut app);
+
+        assert_eq!(app.open_project_job.state(), OpenProjectJobState::Idle);
+        assert_eq!(app.view, AppView::OpenProject);
+        assert!(app.editor_workspace.is_none());
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("Could not open project")
+        );
+        app.start_open_project().unwrap();
+        assert_eq!(app.open_project_job.state(), OpenProjectJobState::Running);
     }
 
     #[test]
