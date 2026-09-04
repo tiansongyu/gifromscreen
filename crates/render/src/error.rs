@@ -38,11 +38,9 @@ pub enum SurfaceError {
     },
 }
 
-/// Effects intentionally deferred beyond the first CPU-renderer milestone.
+/// Effects intentionally deferred beyond the current CPU-renderer milestone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnsupportedEffect {
-    /// Drop shadow.
-    Shadow,
     /// Masked cinemagraph composition.
     Cinemagraph,
 }
@@ -50,7 +48,6 @@ pub enum UnsupportedEffect {
 impl std::fmt::Display for UnsupportedEffect {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::Shadow => "shadow",
             Self::Cinemagraph => "cinemagraph",
         })
     }

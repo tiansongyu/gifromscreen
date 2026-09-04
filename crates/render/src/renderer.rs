@@ -8,10 +8,10 @@ use crate::{
     CancellationToken, RenderError, RgbaSurface, UnsupportedEffect, surface::checked_byte_len,
 };
 
-/// Largest supported radius for the deterministic region blur.
+/// Largest supported radius for deterministic blur and shadow effects.
 ///
 /// The cap bounds parameter-driven work at region edges and keeps horizontal
-/// channel sums representable as `u32` in the blur working buffer.
+/// channel sums representable as `u32` in the region-blur working buffer.
 pub const MAX_BLUR_RADIUS: u16 = 256;
 
 const CANCELLATION_PIXEL_INTERVAL: u32 = 1_024;
@@ -358,7 +358,29 @@ fn apply_effect<C: CancellationToken + ?Sized>(
             }
             apply_blur(surface, *region, *radius, limits, cancellation)
         }
-        Effect::Shadow { .. } => Err(RenderError::UnsupportedEffect(UnsupportedEffect::Shadow)),
+        Effect::Shadow {
+            offset_x,
+            offset_y,
+            blur_radius,
+            color,
+        } => {
+            if *blur_radius > MAX_BLUR_RADIUS {
+                return Err(RenderError::InvalidEffectParameter {
+                    effect: "shadow",
+                    parameter: "blur_radius",
+                    value: u64::from(*blur_radius),
+                });
+            }
+            apply_shadow(
+                surface,
+                *offset_x,
+                *offset_y,
+                *blur_radius,
+                *color,
+                limits,
+                cancellation,
+            )
+        }
         Effect::Cinemagraph { .. } => Err(RenderError::UnsupportedEffect(
             UnsupportedEffect::Cinemagraph,
         )),
@@ -590,6 +612,197 @@ fn write_alpha_weighted_average(
             .expect("an alpha-weighted average of u8 colors remains an u8");
     }
     destination[3] = u8::try_from(alpha).expect("an average of u8 alpha remains an u8");
+}
+
+/// Applies a drop shadow without expanding the surface.
+///
+/// Conceptually the current alpha mask is translated on an infinite transparent
+/// plane, blurred with a `(2 * radius + 1)` square box kernel, and then clipped
+/// back to the existing canvas. The shadow color's alpha scales the blurred
+/// mask. Finally, each original straight-alpha pixel is composited source-over
+/// the shadow, so the shadow can only show through behind transparent content.
+fn apply_shadow<C: CancellationToken + ?Sized>(
+    surface: &mut RgbaSurface,
+    offset_x: i32,
+    offset_y: i32,
+    radius: u16,
+    color: Rgba,
+    limits: RenderLimits,
+    cancellation: &C,
+) -> Result<(), RenderError> {
+    check_cancelled(cancellation)?;
+    let (mut alpha_integral, stride) = allocate_shadow_integral(surface.size(), limits)?;
+    check_cancelled(cancellation)?;
+    build_alpha_integral(surface, &mut alpha_integral, stride, cancellation)?;
+    check_cancelled(cancellation)?;
+
+    let radius = i64::from(radius);
+    let kernel_width = u64::try_from(radius * 2 + 1).expect("a u16 radius has a positive kernel");
+    let sample_count = kernel_width * kernel_width;
+    let width = i64::from(surface.width());
+    let height = i64::from(surface.height());
+    let offset_x = i64::from(offset_x);
+    let offset_y = i64::from(offset_y);
+
+    for destination_y in 0..surface.height() {
+        check_cancelled(cancellation)?;
+        for destination_x in 0..surface.width() {
+            if destination_x != 0 && destination_x % CANCELLATION_PIXEL_INTERVAL == 0 {
+                check_cancelled(cancellation)?;
+            }
+
+            // Sampling the translated mask at the destination is equivalent to
+            // sampling the original mask at destination - offset. i64 covers
+            // every u32 canvas coordinate, i32 offset, and supported radius.
+            let center_x = i64::from(destination_x) - offset_x;
+            let center_y = i64::from(destination_y) - offset_y;
+            let left = (center_x - radius).clamp(0, width);
+            let right = (center_x + radius + 1).clamp(0, width);
+            let top = (center_y - radius).clamp(0, height);
+            let bottom = (center_y + radius + 1).clamp(0, height);
+            let alpha_sum =
+                integral_rectangle_sum(&alpha_integral, stride, left, top, right, bottom);
+            let blurred_alpha = (alpha_sum + sample_count / 2) / sample_count;
+            let shadow_alpha = (blurred_alpha * u64::from(color.alpha) + 127) / u64::from(u8::MAX);
+            let shadow_alpha =
+                u8::try_from(shadow_alpha).expect("scaling an alpha mask remains in u8 range");
+            composite_original_over_shadow(
+                surface,
+                destination_x,
+                destination_y,
+                color,
+                shadow_alpha,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn allocate_shadow_integral(
+    size: PhysicalSize,
+    limits: RenderLimits,
+) -> Result<(Vec<u64>, usize), RenderError> {
+    let source_pixels = size
+        .area()
+        .expect("a validated surface has a representable pixel count");
+    if source_pixels.checked_mul(u64::from(u8::MAX)).is_none() {
+        return Err(RenderError::EffectWorkingMemorySizeOverflow { effect: "shadow" });
+    }
+
+    let stride_u64 = u64::from(size.width.get()) + 1;
+    let rows_u64 = u64::from(size.height.get()) + 1;
+    let entry_count_u64 = stride_u64
+        .checked_mul(rows_u64)
+        .ok_or(RenderError::EffectWorkingMemorySizeOverflow { effect: "shadow" })?;
+    let entry_count = usize::try_from(entry_count_u64)
+        .map_err(|_| RenderError::EffectWorkingMemorySizeOverflow { effect: "shadow" })?;
+    let working_bytes = entry_count
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or(RenderError::EffectWorkingMemorySizeOverflow { effect: "shadow" })?;
+    if working_bytes > limits.max_surface_bytes {
+        return Err(RenderError::EffectWorkingMemoryLimitExceeded {
+            effect: "shadow",
+            requested: working_bytes,
+            limit: limits.max_surface_bytes,
+        });
+    }
+
+    let mut alpha_integral = Vec::new();
+    alpha_integral.try_reserve_exact(entry_count).map_err(|_| {
+        RenderError::EffectWorkingMemoryAllocationFailed {
+            effect: "shadow",
+            requested: working_bytes,
+        }
+    })?;
+    alpha_integral.resize(entry_count, 0_u64);
+    let stride = usize::try_from(stride_u64)
+        .expect("a representable integral-buffer length has a representable stride");
+    Ok((alpha_integral, stride))
+}
+
+fn build_alpha_integral<C: CancellationToken + ?Sized>(
+    surface: &RgbaSurface,
+    alpha_integral: &mut [u64],
+    stride: usize,
+    cancellation: &C,
+) -> Result<(), RenderError> {
+    for y in 0..surface.height() {
+        check_cancelled(cancellation)?;
+        let integral_row = usize::try_from(u64::from(y + 1))
+            .expect("a surface row remains representable")
+            * stride;
+        let previous_row =
+            usize::try_from(u64::from(y)).expect("a surface row remains representable") * stride;
+        let mut row_sum = 0_u64;
+        for x in 0..surface.width() {
+            if x != 0 && x % CANCELLATION_PIXEL_INTERVAL == 0 {
+                check_cancelled(cancellation)?;
+            }
+            row_sum += u64::from(surface.pixels()[surface.byte_offset(x, y) + 3]);
+            let column =
+                usize::try_from(u64::from(x + 1)).expect("a surface column remains representable");
+            alpha_integral[integral_row + column] = alpha_integral[previous_row + column] + row_sum;
+        }
+    }
+    Ok(())
+}
+
+fn integral_rectangle_sum(
+    integral: &[u64],
+    stride: usize,
+    left: i64,
+    top: i64,
+    right: i64,
+    bottom: i64,
+) -> u64 {
+    if left >= right || top >= bottom {
+        return 0;
+    }
+
+    let left = usize::try_from(left).expect("clamped coordinates are non-negative");
+    let top = usize::try_from(top).expect("clamped coordinates are non-negative");
+    let right = usize::try_from(right).expect("clamped coordinates are non-negative");
+    let bottom = usize::try_from(bottom).expect("clamped coordinates are non-negative");
+    let right_band = integral[bottom * stride + right] - integral[top * stride + right];
+    let left_band = integral[bottom * stride + left] - integral[top * stride + left];
+    right_band - left_band
+}
+
+fn composite_original_over_shadow(
+    surface: &mut RgbaSurface,
+    x: u32,
+    y: u32,
+    shadow_color: Rgba,
+    shadow_alpha: u8,
+) {
+    let offset = surface.byte_offset(x, y);
+    let destination = &mut surface.pixels_mut()[offset..offset + 4];
+    let source = [
+        destination[0],
+        destination[1],
+        destination[2],
+        destination[3],
+    ];
+    let source_alpha = u32::from(source[3]);
+    let destination_alpha = u32::from(shadow_alpha);
+    let inverse_source_alpha = 255 - source_alpha;
+    let output_alpha_numerator = source_alpha * 255 + destination_alpha * inverse_source_alpha;
+    if output_alpha_numerator == 0 {
+        destination.copy_from_slice(&[0, 0, 0, 0]);
+        return;
+    }
+
+    let shadow_channels = [shadow_color.red, shadow_color.green, shadow_color.blue];
+    for channel in 0..3 {
+        let premultiplied_numerator = u32::from(source[channel]) * source_alpha * 255
+            + u32::from(shadow_channels[channel]) * destination_alpha * inverse_source_alpha;
+        destination[channel] = u8::try_from(
+            (premultiplied_numerator + output_alpha_numerator / 2) / output_alpha_numerator,
+        )
+        .expect("source-over color remains in u8 range");
+    }
+    destination[3] = u8::try_from((output_alpha_numerator + 127) / 255)
+        .expect("source-over alpha remains in u8 range");
 }
 
 fn validate_percent(effect: &'static str, amount: u8) -> Result<(), RenderError> {
@@ -970,6 +1183,180 @@ mod tests {
     }
 
     #[test]
+    fn golden_shadow_translates_blurs_and_stays_on_the_existing_canvas() {
+        let source = RgbaSurface::new(
+            PhysicalSize::new(4, 3).unwrap(),
+            vec![
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 200, 100, 50, 255, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        )
+        .unwrap();
+        let effect = Effect::Shadow {
+            offset_x: 1,
+            offset_y: 0,
+            blur_radius: 1,
+            color: Rgba {
+                red: 10,
+                green: 20,
+                blue: 30,
+                alpha: 180,
+            },
+        };
+        let rendered = CpuRenderer::new()
+            .render_clip(
+                &clip(ClipTransform::default(), vec![effect]),
+                &provider(source),
+                &crate::NeverCancel,
+            )
+            .unwrap();
+
+        assert_eq!(rendered.size(), PhysicalSize::new(4, 3).unwrap());
+        assert_eq!(
+            rendered.pixels(),
+            &[
+                0, 0, 0, 0, 10, 20, 30, 20, 10, 20, 30, 20, 10, 20, 30, 20, 0, 0, 0, 0, 200, 100,
+                50, 255, 10, 20, 30, 20, 10, 20, 30, 20, 0, 0, 0, 0, 10, 20, 30, 20, 10, 20, 30,
+                20, 10, 20, 30, 20,
+            ]
+        );
+    }
+
+    #[test]
+    fn shadow_blurs_on_an_infinite_transparent_plane_before_edge_clipping() {
+        let source = RgbaSurface::new(
+            PhysicalSize::new(3, 1).unwrap(),
+            vec![100, 110, 120, 255, 0, 0, 0, 0, 0, 0, 0, 0],
+        )
+        .unwrap();
+        let effect = Effect::Shadow {
+            offset_x: -1,
+            offset_y: 0,
+            blur_radius: 2,
+            color: Rgba {
+                red: 1,
+                green: 2,
+                blue: 3,
+                alpha: 255,
+            },
+        };
+        let rendered = CpuRenderer::new()
+            .render_clip(
+                &clip(ClipTransform::default(), vec![effect]),
+                &provider(source),
+                &crate::NeverCancel,
+            )
+            .unwrap();
+
+        // The translated mask pixel is centered just outside x = 0. Its blur
+        // halo still reaches x = 1 before the final result is clipped.
+        assert_eq!(
+            rendered.pixels(),
+            &[100, 110, 120, 255, 1, 2, 3, 10, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn hard_shadow_uses_alpha_mask_and_straight_alpha_source_over() {
+        let source = RgbaSurface::new(
+            PhysicalSize::new(2, 1).unwrap(),
+            vec![200, 100, 50, 128, 250, 1, 2, 0],
+        )
+        .unwrap();
+        let effect = Effect::Shadow {
+            offset_x: 1,
+            offset_y: 0,
+            blur_radius: 0,
+            color: Rgba {
+                red: 20,
+                green: 40,
+                blue: 60,
+                alpha: 128,
+            },
+        };
+        let rendered = CpuRenderer::new()
+            .render_clip(
+                &clip(ClipTransform::default(), vec![effect]),
+                &provider(source),
+                &crate::NeverCancel,
+            )
+            .unwrap();
+        assert_eq!(rendered.pixels(), &[200, 100, 50, 128, 20, 40, 60, 64]);
+
+        let overlap =
+            RgbaSurface::new(PhysicalSize::new(1, 1).unwrap(), vec![200, 100, 50, 128]).unwrap();
+        let effect = Effect::Shadow {
+            offset_x: 0,
+            offset_y: 0,
+            blur_radius: 0,
+            color: Rgba {
+                red: 20,
+                green: 40,
+                blue: 60,
+                alpha: 128,
+            },
+        };
+        let rendered = CpuRenderer::new()
+            .render_clip(
+                &clip(ClipTransform::default(), vec![effect]),
+                &provider(overlap),
+                &crate::NeverCancel,
+            )
+            .unwrap();
+        assert_eq!(rendered.pixels(), &[164, 88, 52, 160]);
+    }
+
+    #[test]
+    fn shadow_canonicalizes_fully_transparent_composition() {
+        let source =
+            RgbaSurface::new(PhysicalSize::new(1, 1).unwrap(), vec![250, 100, 50, 0]).unwrap();
+        let effect = Effect::Shadow {
+            offset_x: 0,
+            offset_y: 0,
+            blur_radius: 0,
+            color: Rgba {
+                red: 1,
+                green: 2,
+                blue: 3,
+                alpha: 255,
+            },
+        };
+        let rendered = CpuRenderer::new()
+            .render_clip(
+                &clip(ClipTransform::default(), vec![effect]),
+                &provider(source),
+                &crate::NeverCancel,
+            )
+            .unwrap();
+        assert_eq!(rendered.pixels(), &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn shadow_offsets_cover_the_full_i32_range_without_overflow() {
+        for (offset_x, offset_y) in [(i32::MIN, i32::MAX), (i32::MAX, i32::MIN)] {
+            let effect = Effect::Shadow {
+                offset_x,
+                offset_y,
+                blur_radius: MAX_BLUR_RADIUS,
+                color: Rgba {
+                    red: 1,
+                    green: 2,
+                    blue: 3,
+                    alpha: 255,
+                },
+            };
+            let rendered = CpuRenderer::new()
+                .render_clip(
+                    &clip(ClipTransform::default(), vec![effect]),
+                    &provider(opaque_red_surface(1, 1, &[73])),
+                    &crate::NeverCancel,
+                )
+                .unwrap();
+            assert_eq!(rendered.pixels(), &[73, 0, 0, 255]);
+        }
+    }
+
+    #[test]
     fn invalid_geometry_and_effect_parameters_are_rejected() {
         let bad_crop = ClipTransform {
             crop: Some(PhysicalRect::new(3, 0, 2, 1).unwrap()),
@@ -1018,20 +1405,32 @@ mod tests {
                 }) if value == u64::from(invalid_radius)
             ));
         }
+
+        let invalid_shadow = Effect::Shadow {
+            offset_x: 0,
+            offset_y: 0,
+            blur_radius: MAX_BLUR_RADIUS + 1,
+            color: Rgba::TRANSPARENT,
+        };
+        assert!(matches!(
+            CpuRenderer::new().render_clip(
+                &clip(ClipTransform::default(), vec![invalid_shadow]),
+                &provider(labelled_surface(1, 1)),
+                &crate::NeverCancel
+            ),
+            Err(RenderError::InvalidEffectParameter {
+                effect: "shadow",
+                parameter: "blur_radius",
+                value,
+            }) if value == u64::from(MAX_BLUR_RADIUS + 1)
+        ));
     }
 
     #[test]
     fn unsupported_effect_is_explicit() {
-        let effect = Effect::Shadow {
-            offset_x: 1,
-            offset_y: 1,
-            blur_radius: 2,
-            color: Rgba {
-                red: 0,
-                green: 0,
-                blue: 0,
-                alpha: 128,
-            },
+        let effect = Effect::Cinemagraph {
+            mask_asset: AssetId::from_digest([8; 32]),
+            invert_mask: false,
         };
         assert!(matches!(
             CpuRenderer::new().render_clip(
@@ -1039,7 +1438,9 @@ mod tests {
                 &provider(labelled_surface(1, 1)),
                 &crate::NeverCancel
             ),
-            Err(RenderError::UnsupportedEffect(UnsupportedEffect::Shadow))
+            Err(RenderError::UnsupportedEffect(
+                UnsupportedEffect::Cinemagraph
+            ))
         ));
     }
 
@@ -1088,6 +1489,58 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_is_observed_during_shadow_mask_processing() {
+        // Checks zero through five reach the first integral-image row. Check six
+        // fires on the second row, after the shadow working buffer was allocated.
+        let cancellation = CancelAfterChecks(AtomicUsize::new(0), 6);
+        let effect = Effect::Shadow {
+            offset_x: 1,
+            offset_y: 1,
+            blur_radius: 2,
+            color: Rgba {
+                red: 0,
+                green: 0,
+                blue: 0,
+                alpha: 128,
+            },
+        };
+        assert!(matches!(
+            CpuRenderer::new().render_clip(
+                &clip(ClipTransform::default(), vec![effect]),
+                &provider(labelled_surface(8, 8)),
+                &cancellation
+            ),
+            Err(RenderError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn cancellation_is_observed_during_shadow_compositing() {
+        // Integral construction consumes checks five through twelve; check 13
+        // is the boundary before composition and check 15 reaches its row loop.
+        let cancellation = CancelAfterChecks(AtomicUsize::new(0), 15);
+        let effect = Effect::Shadow {
+            offset_x: 1,
+            offset_y: 1,
+            blur_radius: 2,
+            color: Rgba {
+                red: 0,
+                green: 0,
+                blue: 0,
+                alpha: 128,
+            },
+        };
+        assert!(matches!(
+            CpuRenderer::new().render_clip(
+                &clip(ClipTransform::default(), vec![effect]),
+                &provider(labelled_surface(8, 8)),
+                &cancellation
+            ),
+            Err(RenderError::Cancelled)
+        ));
+    }
+
+    #[test]
     fn blur_working_memory_is_limited_before_allocation() {
         let renderer = CpuRenderer::with_limits(RenderLimits {
             max_surface_bytes: 32,
@@ -1106,6 +1559,36 @@ mod tests {
                 effect: "blur",
                 requested: 64,
                 limit: 32,
+            })
+        ));
+    }
+
+    #[test]
+    fn shadow_working_memory_is_limited_before_allocation() {
+        let renderer = CpuRenderer::with_limits(RenderLimits {
+            max_surface_bytes: 64,
+        });
+        let effect = Effect::Shadow {
+            offset_x: 1,
+            offset_y: 1,
+            blur_radius: 1,
+            color: Rgba {
+                red: 0,
+                green: 0,
+                blue: 0,
+                alpha: 128,
+            },
+        };
+        assert!(matches!(
+            renderer.render_clip(
+                &clip(ClipTransform::default(), vec![effect]),
+                &provider(labelled_surface(2, 2)),
+                &crate::NeverCancel
+            ),
+            Err(RenderError::EffectWorkingMemoryLimitExceeded {
+                effect: "shadow",
+                requested: 72,
+                limit: 64,
             })
         ));
     }
