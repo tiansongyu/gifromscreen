@@ -3,8 +3,8 @@ use std::io::Write;
 use crate::quantize::{indexed_to_rgba, map_frame_to_palette};
 use crate::{
     CancellationToken, ColorPalette, DitherMode, EncodePhase, EncodeProgress, FrameQuantizer,
-    GifEncodeError, GifTimingQuantizer, IteratorFrameSource, MedianCutQuantizer, NeverCancel,
-    NoopProgress, ProgressSink, QuantizationError, QuantizationSettings, RgbaFrame,
+    GifEncodeError, GifTimingQuantizer, IteratorFrameSource, NeverCancel, NoopProgress,
+    ProgressSink, QuantizationError, QuantizationSettings, QuantizerStrategy, RgbaFrame,
     RgbaFrameSource,
 };
 
@@ -69,6 +69,9 @@ pub struct EncodeOptions {
     pub merge_duplicate_frames: bool,
     pub transparency: Transparency,
     pub palette_mode: PaletteMode,
+    /// Built-in palette quantizer used when the encoder has no custom
+    /// [`FrameQuantizer`].
+    pub quantizer: QuantizerStrategy,
     pub delta_mode: DeltaMode,
     pub dither: DitherMode,
     /// Maximum RGBA pixel bytes retained while planning a global palette.
@@ -83,6 +86,7 @@ impl Default for EncodeOptions {
             merge_duplicate_frames: true,
             transparency: Transparency::default(),
             palette_mode: PaletteMode::default(),
+            quantizer: QuantizerStrategy::default(),
             delta_mode: DeltaMode::default(),
             dither: DitherMode::default(),
             global_palette_buffer_limit_bytes: DEFAULT_GLOBAL_PALETTE_BUFFER_LIMIT_BYTES,
@@ -128,28 +132,40 @@ pub trait GifEncoder: Send + Sync {
 }
 
 /// Built-in permissive GIF89a/LZW adapter backed by `image-gif`.
+#[derive(Default)]
 pub struct BuiltinGifEncoder {
-    quantizer: Box<dyn FrameQuantizer>,
+    custom_quantizer: Option<Box<dyn FrameQuantizer>>,
 }
 
 impl std::fmt::Debug for BuiltinGifEncoder {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("BuiltinGifEncoder")
-            .field("quantizer", &"dyn FrameQuantizer")
+            .field(
+                "quantizer",
+                &if self.custom_quantizer.is_some() {
+                    "custom FrameQuantizer"
+                } else {
+                    "EncodeOptions::quantizer"
+                },
+            )
             .finish()
     }
 }
 
-impl Default for BuiltinGifEncoder {
-    fn default() -> Self {
-        Self::new(Box::new(MedianCutQuantizer))
-    }
-}
-
 impl BuiltinGifEncoder {
+    /// Create an encoder whose custom quantizer overrides
+    /// [`EncodeOptions::quantizer`].
     pub fn new(quantizer: Box<dyn FrameQuantizer>) -> Self {
-        Self { quantizer }
+        Self {
+            custom_quantizer: Some(quantizer),
+        }
+    }
+
+    fn quantizer<'a>(&'a self, options: &'a EncodeOptions) -> &'a dyn FrameQuantizer {
+        self.custom_quantizer
+            .as_deref()
+            .unwrap_or(&options.quantizer)
     }
 
     /// Convenience entry point for an owned, infallible frame iterator.
@@ -221,7 +237,7 @@ impl BuiltinGifEncoder {
                 alpha_threshold(options.transparency),
             );
             let prepared = prepare_local_frame(
-                &*self.quantizer,
+                self.quantizer(options),
                 &pending,
                 options,
                 clear_after,
@@ -256,7 +272,7 @@ impl BuiltinGifEncoder {
             transition_needs_background_clear(&pending, next, alpha_threshold(options.transparency))
         });
         let prepared = prepare_local_frame(
-            &*self.quantizer,
+            self.quantizer(options),
             &pending,
             options,
             clear_after,
@@ -323,7 +339,7 @@ impl BuiltinGifEncoder {
             total_frames_hint,
         );
         let palette = self
-            .quantizer
+            .quantizer(options)
             .build_global_palette(
                 &frames,
                 QuantizationSettings {

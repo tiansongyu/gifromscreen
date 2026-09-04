@@ -29,6 +29,24 @@ pub enum DitherMode {
     FloydSteinberg,
 }
 
+/// Deterministic quantizer provided by the built-in encoder.
+///
+/// The selected strategy is used for both local per-frame palettes and a
+/// shared global palette. [`MedianCut`](Self::MedianCut) is the general-purpose
+/// default, [`Grayscale`](Self::Grayscale) deliberately removes hue, and
+/// [`MostUsed`](Self::MostUsed) favors the most frequent source colors.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum QuantizerStrategy {
+    /// Frequency-weighted median cut over a bounded RGB histogram.
+    #[default]
+    MedianCut,
+    /// Frequency-weighted median cut after conversion to grayscale.
+    Grayscale,
+    /// The most frequent colors in a bounded RGB histogram.
+    MostUsed,
+}
+
 /// RGB palette shared by every image descriptor in a GIF.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ColorPalette {
@@ -141,6 +159,22 @@ pub trait FrameQuantizer: Send + Sync {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MedianCutQuantizer;
 
+/// Deterministic grayscale quantizer.
+///
+/// Source pixels are converted to integer BT.601 luma before a
+/// frequency-weighted one-dimensional median cut is applied.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GrayscaleQuantizer;
+
+/// Deterministic high-frequency-color quantizer.
+///
+/// Colors are selected by descending frequency from the same bounded
+/// 5-bit/channel histogram used by [`MedianCutQuantizer`]. Equal-frequency
+/// colors are ordered lexicographically, so output never depends on hash-map
+/// iteration order.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MostUsedQuantizer;
+
 #[derive(Clone, Copy, Debug, Default)]
 struct HistogramBin {
     red_sum: u64,
@@ -180,21 +214,7 @@ impl FrameQuantizer for MedianCutQuantizer {
         settings: QuantizationSettings,
         cancellation: &dyn CancellationToken,
     ) -> Result<IndexedFrame, QuantizationError> {
-        let palette =
-            self.build_global_palette(std::slice::from_ref(frame), settings, cancellation)?;
-        let indices = map_frame_to_palette(
-            frame,
-            &palette,
-            settings.alpha_threshold,
-            DitherMode::None,
-            cancellation,
-        )?;
-        IndexedFrame::new(
-            palette.colors,
-            indices,
-            palette.transparent_index,
-            usize::from(frame.width()) * usize::from(frame.height()),
-        )
+        quantize_frame(self, frame, settings, cancellation)
     }
 
     fn build_global_palette(
@@ -203,46 +223,218 @@ impl FrameQuantizer for MedianCutQuantizer {
         settings: QuantizationSettings,
         cancellation: &dyn CancellationToken,
     ) -> Result<ColorPalette, QuantizationError> {
-        validate_settings(settings)?;
-        check_now(cancellation)?;
-
-        let mut histogram = vec![HistogramBin::default(); HISTOGRAM_LEN];
-        let mut has_transparency = settings.reserve_transparency;
-        let mut visited_pixels = 0_usize;
-        for frame in frames {
-            for pixel in frame.pixels().as_chunks::<4>().0 {
-                check_cancellation(visited_pixels, cancellation)?;
-                visited_pixels = visited_pixels.wrapping_add(1);
-                if is_transparent(pixel[3], settings.alpha_threshold) {
-                    has_transparency = true;
-                    continue;
-                }
-                let index = histogram_index(pixel[0], pixel[1], pixel[2]);
-                histogram[index].add(pixel[0], pixel[1], pixel[2]);
-            }
-        }
+        let (histogram, has_transparency) = build_rgb_histogram(frames, settings, cancellation)?;
 
         let points = histogram_points(&histogram);
-        let reserved_colors = usize::from(has_transparency);
-        let opaque_limit = usize::from(settings.max_colors).saturating_sub(reserved_colors);
+        let opaque_limit = opaque_color_limit(settings.max_colors, has_transparency);
         let mut opaque_palette = make_palette(&points, opaque_limit, cancellation)?;
         opaque_palette.sort_unstable();
 
-        let transparent_index = has_transparency.then_some(0);
-        let mut colors = Vec::with_capacity((opaque_palette.len() + reserved_colors).max(2) * 3);
-        if has_transparency {
-            // RGB values at a transparent index are irrelevant, but a stable
-            // black entry makes byte output deterministic.
-            colors.extend_from_slice(&[0, 0, 0]);
-        }
-        for color in opaque_palette {
-            colors.extend_from_slice(&color);
-        }
-        while colors.len() < 6 {
-            colors.extend_from_slice(&[0, 0, 0]);
-        }
-        ColorPalette::new(colors, transparent_index)
+        finish_palette(opaque_palette, has_transparency)
     }
+}
+
+impl FrameQuantizer for GrayscaleQuantizer {
+    fn quantize(
+        &self,
+        frame: &RgbaFrame,
+        settings: QuantizationSettings,
+        cancellation: &dyn CancellationToken,
+    ) -> Result<IndexedFrame, QuantizationError> {
+        quantize_frame(self, frame, settings, cancellation)
+    }
+
+    fn build_global_palette(
+        &self,
+        frames: &[RgbaFrame],
+        settings: QuantizationSettings,
+        cancellation: &dyn CancellationToken,
+    ) -> Result<ColorPalette, QuantizationError> {
+        let (histogram, has_transparency) =
+            build_grayscale_histogram(frames, settings, cancellation)?;
+        let points = grayscale_points(&histogram);
+        let opaque_limit = opaque_color_limit(settings.max_colors, has_transparency);
+        let mut opaque_palette = make_palette(&points, opaque_limit, cancellation)?;
+        opaque_palette.sort_unstable();
+
+        finish_palette(opaque_palette, has_transparency)
+    }
+}
+
+impl FrameQuantizer for MostUsedQuantizer {
+    fn quantize(
+        &self,
+        frame: &RgbaFrame,
+        settings: QuantizationSettings,
+        cancellation: &dyn CancellationToken,
+    ) -> Result<IndexedFrame, QuantizationError> {
+        quantize_frame(self, frame, settings, cancellation)
+    }
+
+    fn build_global_palette(
+        &self,
+        frames: &[RgbaFrame],
+        settings: QuantizationSettings,
+        cancellation: &dyn CancellationToken,
+    ) -> Result<ColorPalette, QuantizationError> {
+        let (histogram, has_transparency) = build_rgb_histogram(frames, settings, cancellation)?;
+        let mut points = histogram_points(&histogram);
+        points.sort_unstable_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.rgb.cmp(&right.rgb))
+        });
+        check_now(cancellation)?;
+
+        let opaque_limit = opaque_color_limit(settings.max_colors, has_transparency);
+        let opaque_palette = points
+            .into_iter()
+            .take(opaque_limit)
+            .map(|point| point.rgb)
+            .collect();
+
+        finish_palette(opaque_palette, has_transparency)
+    }
+}
+
+impl FrameQuantizer for QuantizerStrategy {
+    fn quantize(
+        &self,
+        frame: &RgbaFrame,
+        settings: QuantizationSettings,
+        cancellation: &dyn CancellationToken,
+    ) -> Result<IndexedFrame, QuantizationError> {
+        match self {
+            Self::MedianCut => MedianCutQuantizer.quantize(frame, settings, cancellation),
+            Self::Grayscale => GrayscaleQuantizer.quantize(frame, settings, cancellation),
+            Self::MostUsed => MostUsedQuantizer.quantize(frame, settings, cancellation),
+        }
+    }
+
+    fn build_global_palette(
+        &self,
+        frames: &[RgbaFrame],
+        settings: QuantizationSettings,
+        cancellation: &dyn CancellationToken,
+    ) -> Result<ColorPalette, QuantizationError> {
+        match self {
+            Self::MedianCut => {
+                MedianCutQuantizer.build_global_palette(frames, settings, cancellation)
+            }
+            Self::Grayscale => {
+                GrayscaleQuantizer.build_global_palette(frames, settings, cancellation)
+            }
+            Self::MostUsed => {
+                MostUsedQuantizer.build_global_palette(frames, settings, cancellation)
+            }
+        }
+    }
+}
+
+fn quantize_frame(
+    quantizer: &dyn FrameQuantizer,
+    frame: &RgbaFrame,
+    settings: QuantizationSettings,
+    cancellation: &dyn CancellationToken,
+) -> Result<IndexedFrame, QuantizationError> {
+    let palette =
+        quantizer.build_global_palette(std::slice::from_ref(frame), settings, cancellation)?;
+    let indices = map_frame_to_palette(
+        frame,
+        &palette,
+        settings.alpha_threshold,
+        DitherMode::None,
+        cancellation,
+    )?;
+    IndexedFrame::new(
+        palette.colors,
+        indices,
+        palette.transparent_index,
+        usize::from(frame.width()) * usize::from(frame.height()),
+    )
+}
+
+fn build_rgb_histogram(
+    frames: &[RgbaFrame],
+    settings: QuantizationSettings,
+    cancellation: &dyn CancellationToken,
+) -> Result<(Vec<HistogramBin>, bool), QuantizationError> {
+    validate_settings(settings)?;
+    check_now(cancellation)?;
+
+    let mut histogram = vec![HistogramBin::default(); HISTOGRAM_LEN];
+    let mut has_transparency = settings.reserve_transparency;
+    let mut visited_pixels = 0_usize;
+    for frame in frames {
+        for pixel in frame.pixels().as_chunks::<4>().0 {
+            check_cancellation(visited_pixels, cancellation)?;
+            visited_pixels = visited_pixels.wrapping_add(1);
+            if is_transparent(pixel[3], settings.alpha_threshold) {
+                has_transparency = true;
+                continue;
+            }
+            let index = histogram_index(pixel[0], pixel[1], pixel[2]);
+            histogram[index].add(pixel[0], pixel[1], pixel[2]);
+        }
+    }
+    Ok((histogram, has_transparency))
+}
+
+fn build_grayscale_histogram(
+    frames: &[RgbaFrame],
+    settings: QuantizationSettings,
+    cancellation: &dyn CancellationToken,
+) -> Result<([u64; 256], bool), QuantizationError> {
+    validate_settings(settings)?;
+    check_now(cancellation)?;
+
+    let mut histogram = [0_u64; 256];
+    let mut has_transparency = settings.reserve_transparency;
+    let mut visited_pixels = 0_usize;
+    for frame in frames {
+        for pixel in frame.pixels().as_chunks::<4>().0 {
+            check_cancellation(visited_pixels, cancellation)?;
+            visited_pixels = visited_pixels.wrapping_add(1);
+            if is_transparent(pixel[3], settings.alpha_threshold) {
+                has_transparency = true;
+                continue;
+            }
+            let gray = grayscale_luma(pixel[0], pixel[1], pixel[2]);
+            histogram[usize::from(gray)] += 1;
+        }
+    }
+    Ok((histogram, has_transparency))
+}
+
+fn finish_palette(
+    opaque_palette: Vec<[u8; 3]>,
+    has_transparency: bool,
+) -> Result<ColorPalette, QuantizationError> {
+    let reserved_colors = usize::from(has_transparency);
+    let transparent_index = has_transparency.then_some(0);
+    let mut colors = Vec::with_capacity((opaque_palette.len() + reserved_colors).max(2) * 3);
+    if has_transparency {
+        // RGB values at a transparent index are irrelevant, but a stable
+        // black entry makes byte output deterministic.
+        colors.extend_from_slice(&[0, 0, 0]);
+    }
+    for color in opaque_palette {
+        colors.extend_from_slice(&color);
+    }
+    while colors.len() < 6 {
+        colors.extend_from_slice(&[0, 0, 0]);
+    }
+    ColorPalette::new(colors, transparent_index)
+}
+
+const fn opaque_color_limit(max_colors: u16, has_transparency: bool) -> usize {
+    (max_colors as usize).saturating_sub(has_transparency as usize)
+}
+
+const fn grayscale_luma(red: u8, green: u8, blue: u8) -> u8 {
+    let weighted = red as u32 * 77 + green as u32 * 150 + blue as u32 * 29 + 128;
+    (weighted >> 8) as u8
 }
 
 pub(crate) fn map_frame_to_palette(
@@ -319,6 +511,21 @@ fn histogram_points(histogram: &[HistogramBin]) -> Vec<ColorPoint> {
         .map(|bin| ColorPoint {
             rgb: bin.average(),
             count: bin.count,
+        })
+        .collect()
+}
+
+fn grayscale_points(histogram: &[u64; 256]) -> Vec<ColorPoint> {
+    histogram
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count != 0)
+        .map(|(gray, &count)| {
+            let gray = gray as u8;
+            ColorPoint {
+                rgb: [gray, gray, gray],
+                count,
+            }
         })
         .collect()
 }
@@ -659,9 +866,37 @@ fn color_distance(left: [u8; 3], right: [u8; 3]) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use crate::NeverCancel;
+    use crate::{CancellationFlag, NeverCancel};
 
     use super::*;
+
+    const STRATEGIES: [QuantizerStrategy; 3] = [
+        QuantizerStrategy::MedianCut,
+        QuantizerStrategy::Grayscale,
+        QuantizerStrategy::MostUsed,
+    ];
+
+    fn frame_from_pixels(pixels: &[[u8; 4]]) -> RgbaFrame {
+        RgbaFrame::new(
+            u16::try_from(pixels.len()).unwrap(),
+            1,
+            pixels.iter().flatten().copied().collect(),
+            10_000,
+        )
+        .unwrap()
+    }
+
+    const fn settings(max_colors: u16) -> QuantizationSettings {
+        QuantizationSettings {
+            max_colors,
+            alpha_threshold: Some(128),
+            reserve_transparency: false,
+        }
+    }
+
+    fn palette_entries(palette: &ColorPalette) -> Vec<[u8; 3]> {
+        palette.colors().as_chunks::<3>().0.to_vec()
+    }
 
     #[test]
     fn respects_two_color_limit() {
@@ -705,6 +940,158 @@ mod tests {
         assert_eq!(indexed.indices()[0], 0);
         assert_eq!(indexed.indices()[1], 1);
         assert_eq!(indexed.palette().len(), 6);
+    }
+
+    #[test]
+    fn median_cut_palette_is_deterministic_and_preserves_transparency() {
+        let frame = frame_from_pixels(&[
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 0, 0, 255],
+            [9, 8, 7, 0],
+        ]);
+
+        let first = MedianCutQuantizer
+            .build_global_palette(std::slice::from_ref(&frame), settings(4), &NeverCancel)
+            .unwrap();
+        let second = MedianCutQuantizer
+            .build_global_palette(std::slice::from_ref(&frame), settings(4), &NeverCancel)
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.transparent_index(), Some(0));
+        assert_eq!(
+            palette_entries(&first),
+            vec![[0, 0, 0], [0, 0, 255], [0, 255, 0], [255, 0, 0]]
+        );
+    }
+
+    #[test]
+    fn grayscale_palette_is_deterministic_and_preserves_transparency() {
+        let frame = frame_from_pixels(&[
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 255, 255],
+            [9, 8, 7, 0],
+        ]);
+
+        let first = GrayscaleQuantizer
+            .build_global_palette(std::slice::from_ref(&frame), settings(5), &NeverCancel)
+            .unwrap();
+        let second = GrayscaleQuantizer
+            .build_global_palette(std::slice::from_ref(&frame), settings(5), &NeverCancel)
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.transparent_index(), Some(0));
+        assert_eq!(
+            palette_entries(&first),
+            vec![
+                [0, 0, 0],
+                [29, 29, 29],
+                [77, 77, 77],
+                [149, 149, 149],
+                [255, 255, 255]
+            ]
+        );
+    }
+
+    #[test]
+    fn most_used_palette_is_deterministic_and_frequency_ordered() {
+        let frame = frame_from_pixels(&[
+            [255, 0, 0, 255],
+            [255, 0, 0, 255],
+            [255, 0, 0, 255],
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 255, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [0, 0, 255, 255],
+            [9, 8, 7, 0],
+        ]);
+
+        let first = MostUsedQuantizer
+            .build_global_palette(std::slice::from_ref(&frame), settings(3), &NeverCancel)
+            .unwrap();
+        let second = MostUsedQuantizer
+            .build_global_palette(std::slice::from_ref(&frame), settings(3), &NeverCancel)
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.transparent_index(), Some(0));
+        assert_eq!(
+            palette_entries(&first),
+            vec![[0, 0, 0], [255, 0, 0], [0, 255, 0]]
+        );
+    }
+
+    #[test]
+    fn every_strategy_supports_two_and_256_color_limits() {
+        let transparent = frame_from_pixels(&[[255, 0, 0, 255], [0, 0, 0, 0]]);
+        let gradient = frame_from_pixels(
+            &(0_u8..=u8::MAX)
+                .map(|gray| [gray, gray, gray, 255])
+                .collect::<Vec<_>>(),
+        );
+
+        for strategy in STRATEGIES {
+            let minimum = strategy
+                .quantize(&transparent, settings(2), &NeverCancel)
+                .unwrap();
+            assert_eq!(minimum.palette().len() / 3, 2);
+            assert_eq!(minimum.transparent_index(), Some(0));
+            assert_eq!(minimum.indices(), [1, 0]);
+
+            let maximum = strategy
+                .quantize(&gradient, settings(256), &NeverCancel)
+                .unwrap();
+            assert!((2..=256).contains(&(maximum.palette().len() / 3)));
+            assert!(
+                maximum
+                    .indices()
+                    .iter()
+                    .all(|&index| usize::from(index) < maximum.palette().len() / 3)
+            );
+        }
+    }
+
+    #[test]
+    fn every_strategy_honors_cancellation() {
+        let frame = frame_from_pixels(&[[255, 0, 0, 255], [0, 255, 0, 255]]);
+        let cancellation = CancellationFlag::default();
+        cancellation.cancel();
+
+        for strategy in STRATEGIES {
+            assert_eq!(
+                strategy.quantize(&frame, settings(2), &cancellation),
+                Err(QuantizationError::Cancelled)
+            );
+            assert_eq!(
+                strategy.build_global_palette(
+                    std::slice::from_ref(&frame),
+                    settings(2),
+                    &cancellation
+                ),
+                Err(QuantizationError::Cancelled)
+            );
+        }
+    }
+
+    #[test]
+    fn every_strategy_rejects_color_limits_outside_gif_range() {
+        let frame = frame_from_pixels(&[[255, 0, 0, 255]]);
+
+        for strategy in STRATEGIES {
+            for max_colors in [1, 257] {
+                assert!(matches!(
+                    strategy.quantize(&frame, settings(max_colors), &NeverCancel),
+                    Err(QuantizationError::InvalidPalette(_))
+                ));
+            }
+        }
     }
 
     #[test]

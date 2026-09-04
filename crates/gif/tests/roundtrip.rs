@@ -2,7 +2,8 @@ use std::io::Cursor;
 
 use gif_from_screen_gif::{
     BuiltinGifEncoder, CancellationFlag, DeltaMode, EncodeOptions, EncodePhase, EncodeProgress,
-    GifEncodeError, GifEncoder, IteratorFrameSource, LoopBehavior, PaletteMode, RgbaFrame,
+    GifEncodeError, GifEncoder, IteratorFrameSource, LoopBehavior, PaletteMode, QuantizerStrategy,
+    RgbaFrame, Transparency,
 };
 
 fn solid_frame(color: [u8; 4], duration_us: u64) -> RgbaFrame {
@@ -26,6 +27,101 @@ fn decode_summary(bytes: &[u8]) -> (gif::Repeat, Vec<u16>, u16, u16) {
         delays.push(frame.delay);
     }
     (repeat, delays, width, height)
+}
+
+fn quantizer_roundtrip(strategy: QuantizerStrategy) {
+    let frames = [
+        RgbaFrame::new(
+            4,
+            1,
+            vec![
+                255, 0, 0, 255, 0, 255, 0, 255, 12, 34, 56, 0, 0, 0, 255, 255,
+            ],
+            10_000,
+        )
+        .unwrap(),
+        RgbaFrame::new(
+            4,
+            1,
+            vec![
+                255, 255, 0, 255, 65, 43, 21, 64, 0, 255, 255, 255, 255, 0, 255, 255,
+            ],
+            20_000,
+        )
+        .unwrap(),
+    ];
+
+    for palette_mode in [PaletteMode::LocalPerFrame, PaletteMode::Global] {
+        let options = EncodeOptions {
+            max_colors: 4,
+            merge_duplicate_frames: false,
+            transparency: Transparency::AlphaThreshold(128),
+            palette_mode,
+            quantizer: strategy,
+            ..EncodeOptions::default()
+        };
+        let mut first_bytes = Vec::new();
+        let mut second_bytes = Vec::new();
+
+        BuiltinGifEncoder::default()
+            .encode_frames(frames.clone(), &mut first_bytes, &options)
+            .unwrap();
+        BuiltinGifEncoder::default()
+            .encode_frames(frames.clone(), &mut second_bytes, &options)
+            .unwrap();
+        assert_eq!(first_bytes, second_bytes);
+
+        let mut indexed_decoder = gif::DecodeOptions::new()
+            .read_info(Cursor::new(&first_bytes))
+            .unwrap();
+        if palette_mode == PaletteMode::Global {
+            assert!(indexed_decoder.global_palette().is_some());
+        }
+        while let Some(frame) = indexed_decoder.read_next_frame().unwrap() {
+            assert_eq!(
+                frame.palette.is_some(),
+                palette_mode == PaletteMode::LocalPerFrame
+            );
+            assert!(frame.transparent.is_some());
+        }
+
+        let mut rgba_options = gif::DecodeOptions::new();
+        rgba_options.set_color_output(gif::ColorOutput::RGBA);
+        let mut rgba_decoder = rgba_options.read_info(Cursor::new(&first_bytes)).unwrap();
+        let first = rgba_decoder.read_next_frame().unwrap().unwrap().clone();
+        let second = rgba_decoder.read_next_frame().unwrap().unwrap().clone();
+        assert!(rgba_decoder.read_next_frame().unwrap().is_none());
+        assert_eq!(first.delay, 1);
+        assert_eq!(second.delay, 2);
+        assert_eq!(first.buffer[11], 0);
+        assert_eq!(second.buffer[7], 0);
+
+        if strategy == QuantizerStrategy::Grayscale {
+            for frame in [&first, &second] {
+                for pixel in frame.buffer.as_chunks::<4>().0 {
+                    if pixel[3] != 0 {
+                        assert_eq!(pixel[0], pixel[1]);
+                        assert_eq!(pixel[1], pixel[2]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn median_cut_roundtrips_with_local_and_global_palettes() {
+    quantizer_roundtrip(QuantizerStrategy::MedianCut);
+}
+
+#[test]
+fn grayscale_roundtrips_with_local_and_global_palettes() {
+    quantizer_roundtrip(QuantizerStrategy::Grayscale);
+}
+
+#[test]
+fn most_used_roundtrips_with_local_and_global_palettes() {
+    quantizer_roundtrip(QuantizerStrategy::MostUsed);
 }
 
 #[test]

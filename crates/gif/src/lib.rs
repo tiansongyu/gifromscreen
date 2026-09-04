@@ -1,9 +1,10 @@
 //! GIF encoding boundary and built-in encoder for GifFromScreen.
 //!
 //! The public port deals only in owned, full-canvas, straight-alpha sRGB RGBA8
-//! frames. The built-in adapter currently emits full-size frames with a local,
-//! deterministic median-cut palette. More sophisticated palette and delta-frame
-//! pipelines can be added without exposing the underlying `gif` crate.
+//! frames. The built-in adapter supports deterministic median-cut, grayscale,
+//! and most-used-color quantizers with local or global palettes. More
+//! sophisticated palette and delta-frame pipelines can be added without
+//! exposing the underlying `gif` crate.
 
 #![forbid(unsafe_code)]
 
@@ -26,8 +27,8 @@ pub use encoder::{
 pub use error::{FrameError, FrameSourceError, GifEncodeError, QuantizationError};
 pub use frame::{DirtyRect, RgbaFrame};
 pub use quantize::{
-    ColorPalette, DitherMode, FrameQuantizer, IndexedFrame, MedianCutQuantizer,
-    QuantizationSettings,
+    ColorPalette, DitherMode, FrameQuantizer, GrayscaleQuantizer, IndexedFrame, MedianCutQuantizer,
+    MostUsedQuantizer, QuantizationSettings, QuantizerStrategy,
 };
 pub use source::{IteratorFrameSource, RgbaFrameSource};
 pub use timing::{GIF_TICK_US, GifTimingQuantizer};
