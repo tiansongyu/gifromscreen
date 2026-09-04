@@ -6,7 +6,10 @@ use gif_from_screen_capture::{
 };
 use gif_from_screen_gif::{CancellationToken, RgbaFrame};
 
-use crate::{WorkflowError, WorkflowPhase, WorkflowProgress, WorkflowProgressSink};
+use crate::{
+    RecordingControl, WorkflowError, WorkflowPhase, WorkflowProgress, WorkflowProgressSink,
+    control::ControlOutcome,
+};
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DEFAULT_TAIL_FRAME_DURATION: Duration = Duration::from_millis(100);
@@ -96,6 +99,7 @@ enum StopReason {
     DurationReached,
     FrameLimitReached,
     EndOfStream,
+    UserStopped,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -136,6 +140,47 @@ pub fn collect(
     cancellation: &dyn CancellationToken,
     progress: &mut dyn WorkflowProgressSink,
 ) -> Result<CollectedRecording, WorkflowError> {
+    collect_internal(backend, request, options, cancellation, progress, None)
+}
+
+/// Starts a capture session that can be paused, resumed, stopped, or discarded.
+///
+/// A stop request keeps collected frames and completes normally. A discard
+/// request returns [`WorkflowError::Discarded`] and best-effort discards the
+/// native session. Control commands are observed at most one `poll_interval`
+/// after they are sent.
+///
+/// # Errors
+///
+/// Returns [`WorkflowError`] for invalid options, capture/control failures,
+/// cancellation, discard, malformed frames, resource limits, or an empty
+/// recording.
+pub fn collect_controlled(
+    backend: &dyn CaptureBackend,
+    request: CaptureRequest,
+    options: &CollectOptions,
+    control: &mut RecordingControl,
+    cancellation: &dyn CancellationToken,
+    progress: &mut dyn WorkflowProgressSink,
+) -> Result<CollectedRecording, WorkflowError> {
+    collect_internal(
+        backend,
+        request,
+        options,
+        cancellation,
+        progress,
+        Some(control),
+    )
+}
+
+fn collect_internal(
+    backend: &dyn CaptureBackend,
+    request: CaptureRequest,
+    options: &CollectOptions,
+    cancellation: &dyn CancellationToken,
+    progress: &mut dyn WorkflowProgressSink,
+    control: Option<&mut RecordingControl>,
+) -> Result<CollectedRecording, WorkflowError> {
     let options = validate_options(options)?;
     ensure_not_cancelled(cancellation)?;
     progress.report(WorkflowProgress::capture(
@@ -145,7 +190,7 @@ pub fn collect(
     ));
 
     let mut session = backend.start_session(request)?;
-    let result = collect_session(&mut *session, options, cancellation, progress);
+    let result = collect_session(&mut *session, options, cancellation, progress, control);
     match result {
         Ok(recording) => Ok(recording),
         Err(error) => {
@@ -210,6 +255,7 @@ fn collect_session(
     options: ValidatedOptions,
     cancellation: &dyn CancellationToken,
     progress: &mut dyn WorkflowProgressSink,
+    mut control: Option<&mut RecordingControl>,
 ) -> Result<CollectedRecording, WorkflowError> {
     let mut captures = Vec::new();
     let mut rgba_bytes = 0_u64;
@@ -220,8 +266,24 @@ fn collect_session(
 
     let stop_reason = loop {
         ensure_not_cancelled(cancellation)?;
+        if let Some(control) = control.as_deref_mut() {
+            match control.apply_pending(session)? {
+                ControlOutcome::Continue => {}
+                ControlOutcome::Stop => break StopReason::UserStopped,
+                ControlOutcome::Discard => return Err(WorkflowError::Discarded),
+            }
+        }
         if duration_deadline_reached(options.limit) {
             break StopReason::DurationReached;
+        }
+        if session.state() == CaptureSessionState::Paused {
+            progress.report(WorkflowProgress::capture(
+                WorkflowPhase::Paused,
+                u64::try_from(captures.len()).unwrap_or(u64::MAX),
+                Duration::from_micros(current_timestamp_span(&captures)),
+            ));
+            std::thread::sleep(bounded_poll_interval(options.limit, options.poll_interval));
+            continue;
         }
         let poll_interval = bounded_poll_interval(options.limit, options.poll_interval);
         match session.poll_frame(poll_interval)? {

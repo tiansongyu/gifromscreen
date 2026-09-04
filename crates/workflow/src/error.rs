@@ -17,6 +17,10 @@ pub enum WorkflowError {
     #[error("recording was cancelled")]
     Cancelled,
 
+    /// The user requested that the active recording and its output be discarded.
+    #[error("recording was discarded")]
+    Discarded,
+
     /// The capture stream ended before producing a usable frame.
     #[error("the capture stream produced no frames")]
     EmptyCapture,

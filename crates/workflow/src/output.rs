@@ -10,8 +10,8 @@ use gif_from_screen_gif::{
 };
 
 use crate::{
-    CollectOptions, CollectionSummary, WorkflowError, WorkflowPhase, WorkflowProgress,
-    WorkflowProgressSink, collect,
+    CollectOptions, CollectedRecording, CollectionSummary, RecordingControl, WorkflowError,
+    WorkflowPhase, WorkflowProgress, WorkflowProgressSink, collect, collect_controlled,
 };
 
 /// Collection and encoding configuration for [`record_to_gif`].
@@ -85,6 +85,48 @@ pub fn record_to_gif(
     )
 }
 
+/// Captures and exports while accepting pause, resume, stop, and discard commands.
+///
+/// Stop completes the GIF with frames collected so far. Discard returns
+/// [`WorkflowError::Discarded`] without creating or replacing the target.
+/// This synchronous function is intended to run on an application-owned
+/// background thread.
+///
+/// # Errors
+///
+/// Returns [`WorkflowError`] when capture control, collection, encoding,
+/// filesystem synchronization, or atomic commit fails.
+#[allow(clippy::too_many_arguments)]
+pub fn record_to_gif_controlled(
+    backend: &dyn CaptureBackend,
+    request: CaptureRequest,
+    target: impl AsRef<Path>,
+    options: &RecordToGifOptions,
+    control: &mut RecordingControl,
+    cancellation: &dyn CancellationToken,
+    progress: &mut dyn WorkflowProgressSink,
+) -> Result<RecordToGifReport, WorkflowError> {
+    let target = target.as_ref().to_path_buf();
+    let partial = partial_output_path(&target)?;
+    let recording = collect_controlled(
+        backend,
+        request,
+        &options.collection,
+        control,
+        cancellation,
+        progress,
+    )?;
+    finish_recording(
+        &BuiltinGifEncoder::default(),
+        recording,
+        target,
+        &partial,
+        options,
+        cancellation,
+        progress,
+    )
+}
+
 /// Captures frames and atomically exports them with a supplied GIF encoder.
 ///
 /// The target is never written directly. Encoding occurs in a sibling
@@ -116,6 +158,27 @@ pub fn record_to_gif_with_encoder(
         cancellation,
         progress,
     )?;
+    finish_recording(
+        encoder,
+        recording,
+        target,
+        &partial,
+        options,
+        cancellation,
+        progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_recording(
+    encoder: &dyn GifEncoder,
+    recording: CollectedRecording,
+    target: PathBuf,
+    partial: &Path,
+    options: &RecordToGifOptions,
+    cancellation: &dyn CancellationToken,
+    progress: &mut dyn WorkflowProgressSink,
+) -> Result<RecordToGifReport, WorkflowError> {
     let collection = recording.summary();
 
     if cancellation.is_cancelled() {
@@ -125,7 +188,7 @@ pub fn record_to_gif_with_encoder(
     let encode_result = encode_partial(
         encoder,
         recording.into_frames(),
-        &partial,
+        partial,
         &options.encoding,
         collection,
         cancellation,
@@ -133,7 +196,7 @@ pub fn record_to_gif_with_encoder(
     );
     let (encoding, bytes_written) = match encode_result {
         Ok(report) => report,
-        Err(error) => return Err(cleanup_after_failure(&partial, error)),
+        Err(error) => return Err(cleanup_after_failure(partial, error)),
     };
 
     progress.report(WorkflowProgress::capture(
@@ -141,9 +204,9 @@ pub fn record_to_gif_with_encoder(
         collection.frames,
         std::time::Duration::from_micros(collection.duration_us),
     ));
-    if let Err(source) = fs::rename(&partial, &target) {
+    if let Err(source) = fs::rename(partial, &target) {
         let error = WorkflowError::output_io("atomically commit output", &target, source);
-        return Err(cleanup_after_failure(&partial, error));
+        return Err(cleanup_after_failure(partial, error));
     }
     progress.report(WorkflowProgress::capture(
         WorkflowPhase::Complete,

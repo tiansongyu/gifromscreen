@@ -10,6 +10,8 @@ pub enum WorkflowPhase {
     StartingCapture,
     /// Frames are being collected and normalized.
     Capturing,
+    /// The native capture session is paused and remains controllable.
+    Paused,
     /// The native capture session is being stopped.
     StoppingCapture,
     /// Collected frames are being encoded into a temporary GIF.

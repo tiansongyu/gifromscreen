@@ -8,16 +8,19 @@
 #![forbid(unsafe_code)]
 
 mod collect;
+mod control;
 mod error;
 mod output;
 mod progress;
 
 pub use collect::{
     CollectOptions, CollectedRecording, CollectionLimit, CollectionSummary, collect,
+    collect_controlled,
 };
+pub use control::{RecordingControl, RecordingController};
 pub use error::WorkflowError;
 pub use output::{
     RecordToGifOptions, RecordToGifReport, partial_output_path, record_to_gif,
-    record_to_gif_with_encoder,
+    record_to_gif_controlled, record_to_gif_with_encoder,
 };
 pub use progress::{NoopWorkflowProgress, WorkflowPhase, WorkflowProgress, WorkflowProgressSink};

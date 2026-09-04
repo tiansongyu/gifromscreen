@@ -10,8 +10,9 @@ use gif_from_screen_capture::{
 };
 use gif_from_screen_gif::{CancellationFlag, NeverCancel};
 use gif_from_screen_workflow::{
-    CollectOptions, CollectionLimit, NoopWorkflowProgress, RecordToGifOptions, WorkflowError,
-    collect, partial_output_path, record_to_gif,
+    CollectOptions, CollectionLimit, NoopWorkflowProgress, RecordToGifOptions, RecordingController,
+    WorkflowError, WorkflowPhase, WorkflowProgress, collect, partial_output_path, record_to_gif,
+    record_to_gif_controlled,
 };
 
 fn request() -> CaptureRequest {
@@ -287,4 +288,74 @@ fn cancellation_and_encode_failure_leave_no_partial_output() {
     assert!(matches!(error, WorkflowError::Encode(_)));
     assert!(!partial.exists());
     assert_eq!(fs::read(target).unwrap(), b"original");
+}
+
+#[test]
+fn controlled_stop_encodes_frames_collected_so_far() {
+    let backend = SyntheticCaptureBackend::new(vec![
+        frame(1, 0, 1, 1, 4, PixelFormat::Rgba8, vec![255, 0, 0, 255]),
+        frame(2, 20_000, 1, 1, 4, PixelFormat::Rgba8, vec![0, 255, 0, 255]),
+        frame(3, 40_000, 1, 1, 4, PixelFormat::Rgba8, vec![0, 0, 255, 255]),
+    ]);
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("stopped.gif");
+    let (controller, mut control) = RecordingController::channel();
+    let progress_controller = controller.clone();
+    let options = RecordToGifOptions {
+        collection: max_frames_options(3, 15_000),
+        ..RecordToGifOptions::default()
+    };
+
+    let report = record_to_gif_controlled(
+        &backend,
+        request(),
+        &target,
+        &options,
+        &mut control,
+        &NeverCancel,
+        &mut move |progress: WorkflowProgress| {
+            if progress.phase == WorkflowPhase::Capturing && progress.frames_captured == 2 {
+                assert!(progress_controller.stop());
+            }
+        },
+    )
+    .unwrap();
+
+    assert_eq!(report.collection.frames, 2);
+    assert_eq!(report.collection.duration_us, 35_000);
+    assert!(target.is_file());
+}
+
+#[test]
+fn controlled_discard_never_creates_an_output() {
+    let backend = SyntheticCaptureBackend::new(vec![
+        frame(1, 0, 1, 1, 4, PixelFormat::Rgba8, vec![255, 0, 0, 255]),
+        frame(2, 20_000, 1, 1, 4, PixelFormat::Rgba8, vec![0, 255, 0, 255]),
+    ]);
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("discarded.gif");
+    let (controller, mut control) = RecordingController::channel();
+    let progress_controller = controller.clone();
+
+    let error = record_to_gif_controlled(
+        &backend,
+        request(),
+        &target,
+        &RecordToGifOptions {
+            collection: max_frames_options(2, 10_000),
+            ..RecordToGifOptions::default()
+        },
+        &mut control,
+        &NeverCancel,
+        &mut move |progress: WorkflowProgress| {
+            if progress.phase == WorkflowPhase::Capturing && progress.frames_captured == 1 {
+                assert!(progress_controller.discard());
+            }
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, WorkflowError::Discarded));
+    assert!(!target.exists());
+    assert!(!partial_output_path(&target).unwrap().exists());
 }
