@@ -11,6 +11,7 @@ gif-from-screen-capture-linux = { path = "../../crates/capture-linux", features 
 gif-from-screen-domain = { path = "../../crates/domain" }
 gif-from-screen-gif = { path = "../../crates/gif" }
 gif-from-screen-project = { path = "../../crates/project" }
+gif-from-screen-render = { path = "../../crates/render" }
 
 [lints]
 workspace = true

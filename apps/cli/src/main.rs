@@ -10,12 +10,16 @@ use gif_from_screen_capture::{
 };
 use gif_from_screen_capture_linux::X11CaptureBackend;
 use gif_from_screen_domain::{
-    AssetDescriptor, AssetKind, Canvas, CanvasBackground, CaptureMetadata, ClipTransform,
-    ColorSpace, DurationUs, EditCommand, FrameClip, FrameId, PhysicalSize, ProjectId,
-    ProjectManifest, RasterEncoding, UnixTimeMs,
+    AssetDescriptor, AssetId, AssetKind, Canvas, CanvasBackground, CaptureMetadata, ClipTransform,
+    ColorSpace, DurationUs, EdgeWidths, EditCommand, Effect, FrameClip, FrameId,
+    PhysicalRect as DomainRect, PhysicalSize, ProjectId, ProjectManifest, RasterEncoding, Rgba,
+    UnixTimeMs,
 };
 use gif_from_screen_gif::{BuiltinGifEncoder, EncodeOptions, RgbaFrame};
 use gif_from_screen_project::{ActiveProject, LockPolicy};
+use gif_from_screen_render::{
+    AssetProviderError, CpuRenderer, FrameAssetProvider, NeverCancel, RgbaSurface,
+};
 
 fn main() {
     if let Err(error) = run() {
@@ -118,9 +122,26 @@ fn write_demo_project(
             id: FrameId::from_u128(unique_u128()),
             asset_id,
             duration: DurationUs::new(frame.duration_us()).ok_or("zero frame duration")?,
-            transform: ClipTransform::default(),
+            transform: ClipTransform {
+                crop: Some(DomainRect::new(4, 4, 152, 88)?),
+                output_size: Some(PhysicalSize::new(u32::from(WIDTH), u32::from(HEIGHT))?),
+                ..ClipTransform::default()
+            },
             capture_metadata: CaptureMetadata::default(),
-            effects: Vec::new(),
+            effects: vec![Effect::Border {
+                widths: EdgeWidths {
+                    top: 2,
+                    right: 2,
+                    bottom: 2,
+                    left: 2,
+                },
+                color: Rgba {
+                    red: 242,
+                    green: 153,
+                    blue: 74,
+                    alpha: 255,
+                },
+            }],
         };
         let mut commands = Vec::with_capacity(2);
         if !project.manifest().assets.contains_key(&asset_id) {
@@ -145,6 +166,10 @@ fn export_project(project_root: &Path, output: &Path) -> Result<(), Box<dyn std:
     if !opened.asset_issues.is_empty() {
         return Err(format!("project has asset problems: {:?}", opened.asset_issues).into());
     }
+    let renderer = CpuRenderer::new();
+    let provider = ProjectAssetProvider {
+        project: &opened.project,
+    };
     let frames = opened
         .project
         .manifest()
@@ -152,29 +177,14 @@ fn export_project(project_root: &Path, output: &Path) -> Result<(), Box<dyn std:
         .frames
         .iter()
         .map(|clip| {
-            if clip.transform != ClipTransform::default() || !clip.effects.is_empty() {
-                return Err(
-                    "project requires the render pipeline, which is not connected yet".into(),
-                );
-            }
-            let descriptor = opened
-                .project
-                .manifest()
-                .assets
-                .get(&clip.asset_id)
-                .ok_or("frame asset descriptor is missing")?;
-            let AssetKind::Frame { size, encoding } = &descriptor.kind else {
-                return Err("timeline item does not reference a frame asset".into());
-            };
-            if *encoding != RasterEncoding::Rgba8 {
-                return Err(
-                    "only raw RGBA8 project assets are supported by this vertical slice".into(),
-                );
-            }
-            let width = u16::try_from(size.width.get())?;
-            let height = u16::try_from(size.height.get())?;
-            let pixels = opened.project.assets().read(clip.asset_id)?;
-            RgbaFrame::new(width, height, pixels, clip.duration.get()).map_err(Into::into)
+            let surface = renderer.render_clip(clip, &provider, &NeverCancel)?;
+            RgbaFrame::new(
+                u16::try_from(surface.width())?,
+                u16::try_from(surface.height())?,
+                surface.into_pixels(),
+                clip.duration.get(),
+            )
+            .map_err(Into::into)
         })
         .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
 
@@ -186,6 +196,42 @@ fn export_project(project_root: &Path, output: &Path) -> Result<(), Box<dyn std:
         output.display()
     );
     Ok(())
+}
+
+struct ProjectAssetProvider<'a> {
+    project: &'a ActiveProject,
+}
+
+impl FrameAssetProvider for ProjectAssetProvider<'_> {
+    fn load_rgba8(&self, asset_id: AssetId) -> Result<RgbaSurface, AssetProviderError> {
+        let descriptor = self
+            .project
+            .manifest()
+            .assets
+            .get(&asset_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("asset descriptor {asset_id} is missing"),
+                )
+            })?;
+        let AssetKind::Frame { size, encoding } = &descriptor.kind else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("asset {asset_id} is not a frame"),
+            )
+            .into());
+        };
+        if *encoding != RasterEncoding::Rgba8 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("asset {asset_id} is not stored as raw RGBA8"),
+            )
+            .into());
+        }
+        let pixels = self.project.assets().read(asset_id)?;
+        RgbaSurface::new(*size, pixels).map_err(Into::into)
+    }
 }
 
 fn write_gif_frames(
