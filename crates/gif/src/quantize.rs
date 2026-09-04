@@ -44,6 +44,13 @@ pub enum DitherMode {
     TwoRowSierra,
     /// Full three-row Sierra error diffusion.
     Sierra,
+    /// Three-row Jarvis–Judice–Ninke error diffusion.
+    JarvisJudiceNinke,
+    /// Three-row Stucki error diffusion.
+    Stucki,
+    /// Four-row Stevenson–Arce error diffusion with a sparse seven-column
+    /// neighborhood.
+    StevensonArce,
 }
 
 /// Deterministic quantizer provided by the built-in encoder.
@@ -524,6 +531,30 @@ pub(crate) fn map_frame_to_palette(
             SIERRA,
             cancellation,
         ),
+        DitherMode::JarvisJudiceNinke => map_with_error_diffusion(
+            frame,
+            palette.transparent_index,
+            &opaque_colors,
+            alpha_threshold,
+            JARVIS_JUDICE_NINKE,
+            cancellation,
+        ),
+        DitherMode::Stucki => map_with_error_diffusion(
+            frame,
+            palette.transparent_index,
+            &opaque_colors,
+            alpha_threshold,
+            STUCKI,
+            cancellation,
+        ),
+        DitherMode::StevensonArce => map_with_error_diffusion(
+            frame,
+            palette.transparent_index,
+            &opaque_colors,
+            alpha_threshold,
+            STEVENSON_ARCE,
+            cancellation,
+        ),
     }
 }
 
@@ -673,7 +704,7 @@ fn map_with_bayer(
     Ok(indices)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DiffusionTap {
     x: isize,
     row: usize,
@@ -751,6 +782,81 @@ const SIERRA: DiffusionKernel = DiffusionKernel {
         tap(-1, 2, 2),
         tap(0, 2, 3),
         tap(1, 2, 2),
+    ],
+};
+
+// Jarvis, Judice, and Ninke, “A Survey of Techniques for the Display of
+// Continuous Tone Pictures on Bi-Level Displays”, Computer Graphics and Image
+// Processing 5 (1976), pp. 13–40. `X` is the current pixel:
+//
+//           X   7   5
+//   3   5   7   5   3
+//   1   3   5   3   1   × 1/48
+const JARVIS_JUDICE_NINKE: DiffusionKernel = DiffusionKernel {
+    divisor: 48,
+    taps: &[
+        tap(1, 0, 7),
+        tap(2, 0, 5),
+        tap(-2, 1, 3),
+        tap(-1, 1, 5),
+        tap(0, 1, 7),
+        tap(1, 1, 5),
+        tap(2, 1, 3),
+        tap(-2, 2, 1),
+        tap(-1, 2, 3),
+        tap(0, 2, 5),
+        tap(1, 2, 3),
+        tap(2, 2, 1),
+    ],
+};
+
+// Stucki, “MECCA — A Multiple-Error Correcting Computation Algorithm for
+// Bi-Level Image Hardcopy Reproduction”, IBM Research Report RZ1060 (1981):
+//
+//           X   8   4
+//   2   4   8   4   2
+//   1   2   4   2   1   × 1/42
+const STUCKI: DiffusionKernel = DiffusionKernel {
+    divisor: 42,
+    taps: &[
+        tap(1, 0, 8),
+        tap(2, 0, 4),
+        tap(-2, 1, 2),
+        tap(-1, 1, 4),
+        tap(0, 1, 8),
+        tap(1, 1, 4),
+        tap(2, 1, 2),
+        tap(-2, 2, 1),
+        tap(-1, 2, 2),
+        tap(0, 2, 4),
+        tap(1, 2, 2),
+        tap(2, 2, 1),
+    ],
+};
+
+// Stevenson and Arce, “Binary Display of Hexagonally Sampled Continuous-Tone
+// Images”, JOSA A 2(7) (1985), pp. 1009–1013, doi:10.1364/JOSAA.2.001009.
+// The sparse rectangular-lattice coefficient matrix is (`.` means zero):
+//
+//               X   .  32
+//  12   .  26   .  30   .  16
+//   .  12   .  26   .  12   .
+//   5   .  12   .  12   .   5   × 1/200
+const STEVENSON_ARCE: DiffusionKernel = DiffusionKernel {
+    divisor: 200,
+    taps: &[
+        tap(2, 0, 32),
+        tap(-3, 1, 12),
+        tap(-1, 1, 26),
+        tap(1, 1, 30),
+        tap(3, 1, 16),
+        tap(-2, 2, 12),
+        tap(0, 2, 26),
+        tap(2, 2, 12),
+        tap(-3, 3, 5),
+        tap(-1, 3, 12),
+        tap(1, 3, 12),
+        tap(3, 3, 5),
     ],
 };
 
@@ -1057,13 +1163,16 @@ mod tests {
         QuantizerStrategy::MostUsed,
     ];
 
-    const ERROR_DIFFUSION_MODES: [DitherMode; 6] = [
+    const ERROR_DIFFUSION_MODES: [DitherMode; 9] = [
         DitherMode::FloydSteinberg,
         DitherMode::Atkinson,
         DitherMode::Burkes,
         DitherMode::SierraLite,
         DitherMode::TwoRowSierra,
         DitherMode::Sierra,
+        DitherMode::JarvisJudiceNinke,
+        DitherMode::Stucki,
+        DitherMode::StevensonArce,
     ];
 
     #[derive(Debug)]
@@ -1107,6 +1216,31 @@ mod tests {
 
     fn palette_entries(palette: &ColorPalette) -> Vec<[u8; 3]> {
         palette.colors().as_chunks::<3>().0.to_vec()
+    }
+
+    fn assert_conservative_kernel(
+        kernel: DiffusionKernel,
+        expected_divisor: i32,
+        expected_taps: &[DiffusionTap],
+    ) {
+        assert_eq!(kernel.divisor, expected_divisor);
+        assert_eq!(kernel.taps, expected_taps);
+        assert_eq!(
+            kernel.taps.iter().map(|tap| tap.weight).sum::<i32>(),
+            kernel.divisor
+        );
+        for (index, current) in kernel.taps.iter().enumerate() {
+            assert!(current.weight > 0);
+            assert!(current.row > 0 || current.x > 0);
+            assert!(
+                kernel.taps[index + 1..]
+                    .iter()
+                    .all(|other| (current.x, current.row) != (other.x, other.row)),
+                "duplicate diffusion coordinate ({}, {})",
+                current.x,
+                current.row
+            );
+        }
     }
 
     #[test]
@@ -1318,6 +1452,116 @@ mod tests {
         assert!(none.iter().all(|&index| index == none[0]));
         assert!(bayer.contains(&0) && bayer.contains(&1));
         assert_ne!(bayer, none);
+    }
+
+    #[test]
+    fn extended_kernel_layouts_match_their_published_matrices() {
+        assert_conservative_kernel(
+            JARVIS_JUDICE_NINKE,
+            48,
+            &[
+                tap(1, 0, 7),
+                tap(2, 0, 5),
+                tap(-2, 1, 3),
+                tap(-1, 1, 5),
+                tap(0, 1, 7),
+                tap(1, 1, 5),
+                tap(2, 1, 3),
+                tap(-2, 2, 1),
+                tap(-1, 2, 3),
+                tap(0, 2, 5),
+                tap(1, 2, 3),
+                tap(2, 2, 1),
+            ],
+        );
+        assert_conservative_kernel(
+            STUCKI,
+            42,
+            &[
+                tap(1, 0, 8),
+                tap(2, 0, 4),
+                tap(-2, 1, 2),
+                tap(-1, 1, 4),
+                tap(0, 1, 8),
+                tap(1, 1, 4),
+                tap(2, 1, 2),
+                tap(-2, 2, 1),
+                tap(-1, 2, 2),
+                tap(0, 2, 4),
+                tap(1, 2, 2),
+                tap(2, 2, 1),
+            ],
+        );
+        assert_conservative_kernel(
+            STEVENSON_ARCE,
+            200,
+            &[
+                tap(2, 0, 32),
+                tap(-3, 1, 12),
+                tap(-1, 1, 26),
+                tap(1, 1, 30),
+                tap(3, 1, 16),
+                tap(-2, 2, 12),
+                tap(0, 2, 26),
+                tap(2, 2, 12),
+                tap(-3, 3, 5),
+                tap(-1, 3, 12),
+                tap(1, 3, 12),
+                tap(3, 3, 5),
+            ],
+        );
+    }
+
+    #[test]
+    fn extended_modes_match_golden_indices() {
+        let grays = [
+            60, 117, 48, 189, 183, 30, 52, 120, 134, 178, 180, 27, 145, 201, 118, 114, 3, 87, 251,
+            107, 232, 170, 189, 99, 63, 38, 46, 37, 18, 94, 132, 85, 76, 150, 201, 120, 82, 208,
+            198, 219, 176, 221, 182, 237, 74, 41, 227, 234,
+        ];
+        let pixels = grays
+            .into_iter()
+            .flat_map(|gray| [gray, gray, gray, 255])
+            .collect();
+        let frame = RgbaFrame::new(8, 6, pixels, 10_000).unwrap();
+        let palette = ColorPalette::new(
+            vec![0, 0, 0, 85, 85, 85, 170, 170, 170, 255, 255, 255],
+            None,
+        )
+        .unwrap();
+
+        let expected = [
+            (
+                DitherMode::JarvisJudiceNinke,
+                [
+                    1, 1, 1, 2, 2, 0, 1, 1, 2, 2, 2, 0, 2, 2, 1, 2, 0, 1, 3, 1, 3, 2, 2, 1, 1, 0,
+                    1, 1, 0, 1, 2, 1, 1, 2, 2, 1, 1, 2, 2, 3, 2, 3, 2, 3, 1, 1, 3, 3,
+                ],
+            ),
+            (
+                DitherMode::Stucki,
+                [
+                    1, 1, 1, 2, 2, 0, 1, 1, 2, 2, 2, 0, 2, 2, 1, 2, 0, 1, 3, 1, 3, 2, 2, 1, 1, 0,
+                    1, 1, 0, 1, 2, 1, 1, 2, 2, 1, 1, 3, 2, 3, 2, 3, 2, 3, 1, 0, 3, 3,
+                ],
+            ),
+            (
+                DitherMode::StevensonArce,
+                [
+                    1, 1, 1, 2, 2, 0, 1, 1, 2, 2, 2, 0, 2, 2, 2, 1, 0, 1, 3, 1, 3, 2, 2, 1, 1, 0,
+                    1, 1, 0, 1, 2, 1, 1, 2, 2, 1, 1, 2, 2, 3, 2, 3, 2, 3, 1, 1, 3, 3,
+                ],
+            ),
+        ];
+
+        for (mode, expected_indices) in expected {
+            let actual = map_frame_to_palette(&frame, &palette, None, mode, &NeverCancel).unwrap();
+            assert_eq!(
+                actual.as_slice(),
+                expected_indices.as_slice(),
+                "{mode:?} golden indices changed"
+            );
+        }
     }
 
     #[test]

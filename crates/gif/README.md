@@ -11,7 +11,8 @@ Implemented now:
 - deterministic local or memory-bounded global palettes with 2–256 entries;
 - selectable Median Cut, Grayscale, and Most Used built-in quantizers;
 - no dithering, ordered Bayer 4x4, Floyd-Steinberg, Atkinson, Burkes,
-  Sierra Lite, Two-row Sierra, and full three-row Sierra strategies;
+  Sierra Lite, Two-row Sierra, full three-row Sierra, Jarvis–Judice–Ninke,
+  Stucki, and Stevenson–Arce strategies;
 - 1-bit transparency via an alpha threshold;
 - changed-rectangle encoding with disposal-to-background when opaque pixels
   become transparent;
@@ -42,12 +43,13 @@ let options = EncodeOptions {
 };
 ```
 
-`Bayer4x4` uses a fixed ordered matrix. The six error-diffusion modes scan
+`Bayer4x4` uses a fixed ordered matrix. The nine error-diffusion modes scan
 left-to-right deterministically: `FloydSteinberg`, `Atkinson`, `Burkes`,
-`SierraLite`, `TwoRowSierra`, and `Sierra` (the full three-row variant).
-Transparent pixels neither receive nor emit diffusion error, and their hidden
-RGB values cannot alter neighboring opaque pixels. Every mapper cooperatively
-checks the export cancellation token while it works.
+`SierraLite`, `TwoRowSierra`, `Sierra` (the full three-row variant),
+`JarvisJudiceNinke`, `Stucki`, and `StevensonArce`. Transparent pixels neither
+receive nor emit diffusion error, and their hidden RGB values cannot alter
+neighboring opaque pixels. Every mapper cooperatively checks the export
+cancellation token while it works.
 
 `MedianCut` is the balanced general-purpose choice. `Grayscale` converts source
 colors to deterministic BT.601 luma values before palette reduction. `MostUsed`
