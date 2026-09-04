@@ -44,3 +44,47 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets --all-features
 
+  native-capture-ubuntu-22:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Ubuntu 22.04 native capture libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            clang \
+            libclang-dev \
+            libpipewire-0.3-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache native capture build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native-capture-ubuntu-22
+
+      - name: Check native Wayland and X11 adapters
+        run: >-
+          cargo check --locked -p gif-from-screen-capture-linux
+          --no-default-features --features native-wayland,native-x11
+
+      - name: Test native capture adapters
+        run: >-
+          cargo test --locked -p gif-from-screen-capture-linux --lib
+          --no-default-features --features native-wayland,native-x11
+
+      - name: Lint native capture adapters
+        run: >-
+          cargo clippy --locked -p gif-from-screen-capture-linux --all-targets
+          --no-default-features --features native-wayland,native-x11 -- -D warnings
