@@ -16,7 +16,7 @@ GifFromScreen 是一个使用 Rust 实现的本地 GIF 录制与逐帧编辑工�
 - 对齐 ScreenToGif 2.43.2 的录制、逐帧编辑、项目管理和 GIF 导出能力。
 - 最终输出只支持 GIF；不复制 ScreenToGif 的非 GIF 导出格式。
 - 采用 clean-room 行为兼容方式，不复制上游名称、图标、界面素材或 C#/WPF 源码。
-- 当前 Linux X11 已打通录制、动态移动取景框、项目编辑和 GIF 导出；Wayland Portal/PipeWire adapter 是后续发行门槛。macOS 工作暂缓。
+- 当前 Linux X11 已打通录制、动态移动取景框、项目编辑和 GIF 导出。Wayland Portal/PipeWire 原生后端已能协商并消费帧；桌面流程接线以及 GNOME/KDE 实机验收仍是发行门槛。macOS 工作暂缓。
 
 ## 当前可用流程
 
@@ -43,4 +43,5 @@ cargo run -p gif-from-screen
 cargo run -p gif-from-screen -- --project /path/to/animation.gfsproj
 cargo run -p gif-from-screen -- --import-gif /path/to/animation.gif
 cargo run -p gif-from-screen -- --import-image /path/to/image.png
+cargo test -p gif-from-screen-capture-linux --lib --no-default-features --features native-wayland,native-x11
 ```

@@ -27,6 +27,7 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Reduce frames, build Yoyo loops, scale delays, and remove rendered duplicates.
 - [x] Negotiate a real Wayland ScreenCast Portal session through the PipeWire FD handoff.
 - [x] Stream X11 recording frames into the recoverable project journal while capture is active.
+- [x] Consume mapped Wayland PipeWire frames through a bounded native capture session.
 
 ## Delivery gates
 
@@ -35,7 +36,7 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] X11 real screen/region capture through GetImage.
 - [ ] GNOME Wayland Portal + PipeWire capture.
 - [ ] KDE Wayland Portal + PipeWire capture.
-- [ ] Bounded queue and dropped-frame timing compensation.
+- [x] Bounded queue and dropped-frame timing compensation.
 - [ ] Long-recording frame-store benchmark.
 - [x] Initial GIF timing, loop, transparency, delta and disposal round-trip corpus.
 - [x] 50,000-frame virtualized timeline prototype.
