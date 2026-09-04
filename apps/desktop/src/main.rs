@@ -3,6 +3,7 @@
 //! Desktop entry point for the Linux-first `GifFromScreen` application.
 
 mod blank_project_job;
+mod blank_project_ui;
 mod capture_source_job;
 mod countdown;
 mod editor_preview;
@@ -28,6 +29,12 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use blank_project_job::{
+    BlankProjectJob, BlankProjectJobEvent, BlankProjectJobState, BlankProjectRequest,
+};
+use blank_project_ui::{
+    BlankBackgroundChoice, BlankProjectUiAction, BlankProjectUiState, show_blank_project_ui,
+};
 use capture_source_job::{CaptureSourceJob, CaptureSourceJobState};
 use countdown::{CountdownStart, CountdownTick, MAX_COUNTDOWN_SECONDS, RecordingCountdown};
 use editor_preview::EditorPreviewCache;
@@ -36,8 +43,9 @@ use editor_workspace::EditorWorkspace;
 use eframe::egui;
 use export_job::{ExportJob, ExportJobError, ExportJobEvent, ExportJobState};
 use gif_from_screen_application::{
-    IncrementalRecordingProject, IncrementalRecordingProjectOptions, ProjectExportSnapshot,
-    ProjectFrameSelection, ProjectGifExportOptions, ProjectGifExportReport,
+    DEFAULT_BLANK_FRAME_LIMIT_BYTES, IncrementalRecordingProject,
+    IncrementalRecordingProjectOptions, ProjectExportSnapshot, ProjectFrameSelection,
+    ProjectGifExportOptions, ProjectGifExportReport,
 };
 use gif_from_screen_capture::{
     CaptureCadence, CaptureRequest, CaptureSource, CaptureSourceId, CaptureSourceKind,
@@ -45,7 +53,7 @@ use gif_from_screen_capture::{
 };
 use gif_from_screen_capture_linux::{LinuxDisplayServer, X11CaptureBackend};
 use gif_from_screen_domain::{
-    DurationUs, FrameId, PhysicalSize as ProjectPhysicalSize, ProjectId, UnixTimeMs,
+    DurationUs, FrameId, PhysicalSize as ProjectPhysicalSize, ProjectId, Rgba, UnixTimeMs,
 };
 use gif_from_screen_gif::{
     CancellationFlag, CancellationToken as _, DeltaMode, DitherMode, EncodeOptions, LoopBehavior,
@@ -107,6 +115,7 @@ enum AppView {
     ImportGif,
     ImportImage,
     ImportImageSequence,
+    NewBlankAnimation,
     ScreenRecorder,
     Editor,
 }
@@ -145,6 +154,7 @@ enum FileDropActivity {
     GifImport,
     ImageImport,
     ImageSequenceImport,
+    BlankCreation,
     Export,
 }
 
@@ -565,6 +575,8 @@ struct GifFromScreenApp {
     import_image_job: ImportStaticImageJob,
     import_sequence_ui: StaticSequenceUiState,
     import_sequence_job: ImportStaticSequenceJob,
+    blank_project_ui: BlankProjectUiState,
+    blank_project_job: BlankProjectJob,
     editor_workspace: Option<EditorWorkspace>,
     editor_ui_state: EditorUiState,
     editor_preview_cache: EditorPreviewCache,
@@ -602,6 +614,8 @@ impl Default for GifFromScreenApp {
             import_image_job: ImportStaticImageJob::default(),
             import_sequence_ui: StaticSequenceUiState::default(),
             import_sequence_job: ImportStaticSequenceJob::default(),
+            blank_project_ui: BlankProjectUiState::default(),
+            blank_project_job: BlankProjectJob::default(),
             editor_workspace: None,
             editor_ui_state: EditorUiState::default(),
             editor_preview_cache: EditorPreviewCache::new(),
@@ -630,6 +644,7 @@ impl eframe::App for GifFromScreenApp {
         self.receive_import_gif_messages();
         self.receive_import_image_messages();
         self.receive_import_sequence_messages();
+        self.receive_blank_project_messages();
         let dropped_paths = context.input(|input| {
             input
                 .raw
@@ -672,6 +687,7 @@ impl eframe::App for GifFromScreenApp {
             || self.import_gif_job.state() == ImportGifJobState::Running
             || self.import_image_job.state() == ImportStaticImageJobState::Running
             || self.import_sequence_job.state() == ImportStaticSequenceJobState::Running
+            || self.blank_project_job.state() == BlankProjectJobState::Running
             || self.source_catalog_job.state() == CaptureSourceJobState::Loading
             || self.wayland_prepare_job.is_active()
         {
@@ -686,6 +702,7 @@ impl eframe::App for GifFromScreenApp {
                     self.import_gif_job.state(),
                     self.import_image_job.state(),
                     self.import_sequence_job.state(),
+                    self.blank_project_job.state(),
                 );
                 if self.view != AppView::Landing
                     && ui
@@ -711,6 +728,7 @@ impl eframe::App for GifFromScreenApp {
             AppView::ImportGif => self.show_import_gif(ui),
             AppView::ImportImage => self.show_import_image(ui),
             AppView::ImportImageSequence => self.show_import_sequence(ui),
+            AppView::NewBlankAnimation => self.show_blank_project(ui),
             AppView::ScreenRecorder => self.show_screen_recorder(ui),
             AppView::Editor => self.show_editor(ui),
         });
@@ -759,6 +777,8 @@ impl GifFromScreenApp {
             FileDropActivity::ImageImport
         } else if self.import_sequence_job.state() != ImportStaticSequenceJobState::Idle {
             FileDropActivity::ImageSequenceImport
+        } else if self.blank_project_job.state() != BlankProjectJobState::Idle {
+            FileDropActivity::BlankCreation
         } else if self.export_job.state() != ExportJobState::Idle {
             FileDropActivity::Export
         } else {
@@ -886,6 +906,19 @@ impl GifFromScreenApp {
             ui.columns(LANDING_COLUMN_COUNT, |columns| {
                 if landing_action(
                     &mut columns[0],
+                    "New blank animation",
+                    "Start with a transparent or solid-color canvas.",
+                    true,
+                ) {
+                    self.blank_project_ui = BlankProjectUiState::default();
+                    self.view = AppView::NewBlankAnimation;
+                    self.notice = Some(
+                        "Choose the canvas, background, first-frame duration, and a new project path."
+                            .to_owned(),
+                    );
+                }
+                if landing_action(
+                    &mut columns[1],
                     "Import image sequence",
                     "Build an animation from ordered PNG, JPEG, BMP, or WebP files.",
                     true,
@@ -896,12 +929,6 @@ impl GifFromScreenApp {
                             .to_owned(),
                     );
                 }
-                let _ = landing_action(
-                    &mut columns[1],
-                    "More recorders",
-                    "Webcam and drawing-board capture.",
-                    false,
-                );
             });
 
             if let Some(notice) = &self.notice {
@@ -965,6 +992,7 @@ impl GifFromScreenApp {
                         self.import_gif_job.state(),
                         self.import_image_job.state(),
                         self.import_sequence_job.state(),
+                        self.blank_project_job.state(),
                     ),
                     egui::Button::new("Back"),
                 )
@@ -1038,6 +1066,7 @@ impl GifFromScreenApp {
                         self.import_gif_job.state(),
                         self.import_image_job.state(),
                         self.import_sequence_job.state(),
+                        self.blank_project_job.state(),
                     ),
                     egui::Button::new("Back"),
                 )
@@ -1107,6 +1136,7 @@ impl GifFromScreenApp {
                         self.import_gif_job.state(),
                         self.import_image_job.state(),
                         self.import_sequence_job.state(),
+                        self.blank_project_job.state(),
                     ),
                     egui::Button::new("Back"),
                 )
@@ -1167,6 +1197,35 @@ impl GifFromScreenApp {
         self.notice = Some(format!(
             "Importing {frame_count} ordered images in the background. This bounded operation cannot be cancelled."
         ));
+        Ok(())
+    }
+
+    fn show_blank_project(&mut self, ui: &mut egui::Ui) {
+        let running = self.blank_project_job.state() == BlankProjectJobState::Running;
+        match show_blank_project_ui(ui, &mut self.blank_project_ui, running) {
+            BlankProjectUiAction::None => {}
+            BlankProjectUiAction::Start => {
+                if let Err(error) = self.start_blank_project() {
+                    self.notice = Some(format!("Could not start blank project creation: {error}"));
+                }
+            }
+            BlankProjectUiAction::Back => self.view = AppView::Landing,
+        }
+        if let Some(notice) = &self.notice {
+            ui.add_space(12.0);
+            ui.label(notice);
+        }
+    }
+
+    fn start_blank_project(&mut self) -> Result<(), String> {
+        let request = build_blank_project_request(&self.blank_project_ui)?;
+        self.blank_project_job
+            .start(request)
+            .map_err(|error| error.to_string())?;
+        self.notice = Some(
+            "Creating the bounded blank animation in the background. This operation cannot be cancelled."
+                .to_owned(),
+        );
         Ok(())
     }
 
@@ -2531,6 +2590,54 @@ impl GifFromScreenApp {
             "Imported {} ordered images into {}. Default GIF output is {}.{existing}",
             summary.frames,
             summary.project_path.display(),
+            output.display()
+        ))
+    }
+
+    fn receive_blank_project_messages(&mut self) {
+        let finished = self
+            .blank_project_job
+            .drain()
+            .into_iter()
+            .any(|event| event == BlankProjectJobEvent::Finished);
+        if !finished {
+            return;
+        }
+        let result = self.blank_project_job.take_result();
+        self.blank_project_job = BlankProjectJob::default();
+        self.notice = Some(match result {
+            Some(Ok(project)) => match self.activate_blank_project(project) {
+                Ok(notice) => notice,
+                Err(error) => format!("Could not prepare the blank project editor: {error}"),
+            },
+            Some(Err(error)) => format!(
+                "Could not create blank animation: {error}. Adjust the original form and retry."
+            ),
+            None => {
+                "Blank-project worker finished without a result. You can retry safely.".to_owned()
+            }
+        });
+    }
+
+    fn activate_blank_project(&mut self, project: ActiveProject) -> Result<String, String> {
+        let output = project.layout().root.with_extension("gif");
+        let output_exists = output.exists();
+        let summary = activate_editor(&mut self.view, &mut self.editor_workspace, project)?;
+        self.editor_ui_state = EditorUiState::default();
+        self.editor_preview_cache = EditorPreviewCache::new();
+        self.editor_export_settings = EditorExportSettings::default();
+        self.export_job = ExportJob::default();
+        self.blank_project_ui = BlankProjectUiState::default();
+        self.settings.output = output.to_string_lossy().into_owned();
+        let existing = if output_exists {
+            " The default GIF already exists; enable Overwrite before exporting."
+        } else {
+            ""
+        };
+        Ok(format!(
+            "Blank animation ready at {} with one {:.3}s frame. Default GIF output is {}.{existing}",
+            summary.project_path.display(),
+            Duration::from_micros(summary.duration_us).as_secs_f64(),
             output.display()
         ))
     }
@@ -3984,6 +4091,7 @@ const fn can_navigate_back(
     import_state: ImportGifJobState,
     image_state: ImportStaticImageJobState,
     sequence_state: ImportStaticSequenceJobState,
+    blank_state: BlankProjectJobState,
 ) -> bool {
     !((matches!(view, AppView::OpenProject) && matches!(open_state, OpenProjectJobState::Running))
         || (matches!(view, AppView::ImportGif)
@@ -3991,7 +4099,9 @@ const fn can_navigate_back(
         || (matches!(view, AppView::ImportImage)
             && matches!(image_state, ImportStaticImageJobState::Running))
         || (matches!(view, AppView::ImportImageSequence)
-            && matches!(sequence_state, ImportStaticSequenceJobState::Running)))
+            && matches!(sequence_state, ImportStaticSequenceJobState::Running))
+        || (matches!(view, AppView::NewBlankAnimation)
+            && matches!(blank_state, BlankProjectJobState::Running)))
 }
 
 fn export_result_notice(result: Result<ProjectGifExportReport, ExportJobError>) -> String {
@@ -4096,12 +4206,6 @@ fn build_static_sequence_request(
         frame_ids.push(FrameId::from_u128(Uuid::new_v4().as_u128()));
         display_names.push(display_name.to_string_lossy().into_owned());
     }
-    let created_millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("System clock is before the Unix epoch: {error}"))?
-        .as_millis();
-    let created_millis = i64::try_from(created_millis)
-        .map_err(|_| "Current time does not fit the project timestamp.".to_owned())?;
     Ok(ImportStaticSequenceRequest {
         inputs,
         target: PathBuf::from(target),
@@ -4116,9 +4220,62 @@ fn build_static_sequence_request(
         project_id: ProjectId::from_u128(Uuid::new_v4().as_u128()),
         frame_ids,
         app_version: env!("CARGO_PKG_VERSION").to_owned(),
-        created_at: UnixTimeMs::new(created_millis),
+        created_at: current_project_created_at()?,
         display_names,
     })
+}
+
+fn build_blank_project_request(state: &BlankProjectUiState) -> Result<BlankProjectRequest, String> {
+    let target = state.target.trim();
+    if target.is_empty() {
+        return Err("Choose a new .gfsproj target directory.".to_owned());
+    }
+    if state.width > u32::from(u16::MAX) || state.height > u32::from(u16::MAX) {
+        return Err("Blank canvas width and height must not exceed 65,535 pixels.".to_owned());
+    }
+    let canvas = ProjectPhysicalSize::new(state.width, state.height)
+        .map_err(|error| format!("Blank canvas is invalid: {error}"))?;
+    let duration_us = state
+        .frame_duration_ms
+        .checked_mul(1_000)
+        .and_then(DurationUs::new)
+        .ok_or_else(|| "Initial frame duration must be positive and fit u64.".to_owned())?;
+    let background = match state.background_choice {
+        BlankBackgroundChoice::Transparent => Rgba::TRANSPARENT,
+        BlankBackgroundChoice::Solid if state.alpha > 0 => Rgba {
+            red: state.red,
+            green: state.green,
+            blue: state.blue,
+            alpha: state.alpha,
+        },
+        BlankBackgroundChoice::Solid => {
+            return Err(
+                "Solid background alpha must be at least 1; choose Transparent for alpha 0."
+                    .to_owned(),
+            );
+        }
+    };
+    Ok(BlankProjectRequest {
+        target: PathBuf::from(target),
+        canvas,
+        background,
+        frame_duration: duration_us,
+        frame_limit_bytes: DEFAULT_BLANK_FRAME_LIMIT_BYTES,
+        project_id: ProjectId::from_u128(Uuid::new_v4().as_u128()),
+        frame_id: FrameId::from_u128(Uuid::new_v4().as_u128()),
+        app_version: env!("CARGO_PKG_VERSION").to_owned(),
+        created_at: current_project_created_at()?,
+    })
+}
+
+fn current_project_created_at() -> Result<UnixTimeMs, String> {
+    let created_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("System clock is before the Unix epoch: {error}"))?
+        .as_millis();
+    let created_millis = i64::try_from(created_millis)
+        .map_err(|_| "Current time does not fit the project timestamp.".to_owned())?;
+    Ok(UnixTimeMs::new(created_millis))
 }
 
 fn static_sequence_duration_policy(
@@ -4540,6 +4697,7 @@ const fn file_drop_block_reason(activity: FileDropActivity) -> Option<&'static s
         FileDropActivity::GifImport => Some("a GIF import is active"),
         FileDropActivity::ImageImport => Some("an image import is active"),
         FileDropActivity::ImageSequenceImport => Some("an image-sequence import is active"),
+        FileDropActivity::BlankCreation => Some("blank-project creation is active"),
         FileDropActivity::Export => Some("a GIF export is active"),
     }
 }
@@ -4775,14 +4933,15 @@ mod tests {
 
     use eframe::egui;
     use gif_from_screen_application::{
-        IncrementalRecordingProject, IncrementalRecordingProjectOptions, ProjectFrameSelection,
-        ProjectGifExportReport,
+        DEFAULT_BLANK_FRAME_LIMIT_BYTES, IncrementalRecordingProject,
+        IncrementalRecordingProjectOptions, ProjectFrameSelection, ProjectGifExportReport,
     };
     use gif_from_screen_capture::{CaptureSourceId, CaptureSourceKind, PhysicalRect};
     use gif_from_screen_domain::{
         AssetDescriptor, AssetKind, Canvas, CanvasBackground, CaptureMetadata, ClipTransform,
         ColorSpace, DurationUs, EditCommand, FrameClip, FrameId, PhysicalSize as DomainSize,
-        ProjectId, ProjectManifest, ProjectRevision, RasterEncoding, SourceProvenance, UnixTimeMs,
+        ProjectId, ProjectManifest, ProjectRevision, RasterEncoding, Rgba, SourceProvenance,
+        UnixTimeMs,
     };
     use gif_from_screen_gif::{
         BuiltinGifEncoder, DeltaMode, DitherMode, EncodeOptions, EncodeReport, LoopBehavior,
@@ -4801,19 +4960,22 @@ mod tests {
         FileDropActivity, FileDropCandidate, FileDropRoute, GifFromScreenApp,
         IncrementalProjectFrameSink, MAX_COUNTDOWN_SECONDS, MAX_RECORDING_DURATION_MS,
         RecorderOverlayAction, RecorderStage, RecordingSettings, RecordingWorkerRequest,
-        StartupIntent, activate_editor, apply_overlay_region, build_project_export_options,
-        build_static_sequence_request, can_navigate_back, collection_limit, collection_options,
-        create_incremental_recording_project, default_gif_path_for_project,
-        default_sequence_project_path, edited_gif_path_for_import, editor_result_notice,
-        export_job_is_active, export_result_notice, file_drop_block_reason, fit_dimensions,
-        frame_retention, has_static_image_extension, initial_wayland_region, landing_cards_fit,
-        map_preview_selection, open_project_controls_enabled, open_project_lock_policy,
-        parse_startup_intent, prepare_file_drop_route, project_path_for_output,
-        recording_project_canvas, remove_completed_project, remove_recording_project_path,
-        resize_nearest_rgba, resolve_export_selection, route_file_drop, should_sync_retarget,
-        show_editor_scroll_area, static_sequence_duration_policy, static_sequence_loop_behavior,
-        translate_source_region, validate_export_output, validate_settings,
+        StartupIntent, activate_editor, apply_overlay_region, build_blank_project_request,
+        build_project_export_options, build_static_sequence_request, can_navigate_back,
+        collection_limit, collection_options, create_incremental_recording_project,
+        default_gif_path_for_project, default_sequence_project_path, edited_gif_path_for_import,
+        editor_result_notice, export_job_is_active, export_result_notice, file_drop_block_reason,
+        fit_dimensions, frame_retention, has_static_image_extension, initial_wayland_region,
+        landing_cards_fit, map_preview_selection, open_project_controls_enabled,
+        open_project_lock_policy, parse_startup_intent, prepare_file_drop_route,
+        project_path_for_output, recording_project_canvas, remove_completed_project,
+        remove_recording_project_path, resize_nearest_rgba, resolve_export_selection,
+        route_file_drop, should_sync_retarget, show_editor_scroll_area,
+        static_sequence_duration_policy, static_sequence_loop_behavior, translate_source_region,
+        validate_export_output, validate_settings,
     };
+    use crate::blank_project_job::BlankProjectJobState;
+    use crate::blank_project_ui::{BlankBackgroundChoice, BlankProjectUiState};
     use crate::editor_ui::{EditorUiAction, EditorUiFailure, EditorUiOperation};
     use crate::editor_workspace::EditorWorkspace;
     use crate::export_job::{ExportJobError, ExportJobState};
@@ -5021,6 +5183,7 @@ mod tests {
                 FileDropActivity::ImageSequenceImport,
                 "image-sequence import",
             ),
+            (FileDropActivity::BlankCreation, "blank-project creation"),
             (FileDropActivity::Export, "GIF export"),
         ] {
             assert!(file_drop_block_reason(activity).unwrap().contains(expected));
@@ -5070,6 +5233,69 @@ mod tests {
             ImportedLoopBehavior::Infinite
         );
         assert!(static_sequence_loop_behavior(StaticSequenceLoopChoice::Finite, 0).is_err());
+    }
+
+    #[test]
+    fn blank_form_maps_canvas_background_duration_limit_and_metadata() {
+        let transparent = BlankProjectUiState {
+            width: 320,
+            height: 240,
+            frame_duration_ms: 75,
+            target: "transparent.gfsproj".to_owned(),
+            ..BlankProjectUiState::default()
+        };
+        let request = build_blank_project_request(&transparent).unwrap();
+        assert_eq!(request.target, PathBuf::from("transparent.gfsproj"));
+        assert_eq!(request.canvas, DomainSize::new(320, 240).unwrap());
+        assert_eq!(request.background, Rgba::TRANSPARENT);
+        assert_eq!(request.frame_duration, DurationUs::new(75_000).unwrap());
+        assert_eq!(request.frame_limit_bytes, DEFAULT_BLANK_FRAME_LIMIT_BYTES);
+        assert!(!request.project_id.is_nil());
+        assert!(!request.frame_id.is_nil());
+
+        let solid = BlankProjectUiState {
+            background_choice: BlankBackgroundChoice::Solid,
+            red: 10,
+            green: 20,
+            blue: 30,
+            alpha: 128,
+            ..transparent.clone()
+        };
+        assert_eq!(
+            build_blank_project_request(&solid).unwrap().background,
+            Rgba {
+                red: 10,
+                green: 20,
+                blue: 30,
+                alpha: 128,
+            }
+        );
+
+        for invalid in [
+            BlankProjectUiState {
+                width: 0,
+                ..transparent.clone()
+            },
+            BlankProjectUiState {
+                width: u32::from(u16::MAX) + 1,
+                ..transparent.clone()
+            },
+            BlankProjectUiState {
+                frame_duration_ms: 0,
+                ..transparent.clone()
+            },
+            BlankProjectUiState {
+                target: "  ".to_owned(),
+                ..transparent.clone()
+            },
+            BlankProjectUiState {
+                background_choice: BlankBackgroundChoice::Solid,
+                alpha: 0,
+                ..transparent
+            },
+        ] {
+            assert!(build_blank_project_request(&invalid).is_err());
+        }
     }
 
     #[test]
@@ -5466,6 +5692,15 @@ mod tests {
         }
     }
 
+    fn drain_blank_project_job(app: &mut GifFromScreenApp) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.blank_project_job.state() == BlankProjectJobState::Running {
+            app.receive_blank_project_messages();
+            assert!(Instant::now() < deadline, "blank-project job timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn project_root_derives_default_gif_path() {
         assert_eq!(
@@ -5521,6 +5756,7 @@ mod tests {
             ImportGifJobState::Idle,
             ImportStaticImageJobState::Idle,
             ImportStaticSequenceJobState::Idle,
+            BlankProjectJobState::Idle,
         ));
         for state in [OpenProjectJobState::Idle, OpenProjectJobState::Finished] {
             assert!(can_navigate_back(
@@ -5529,6 +5765,7 @@ mod tests {
                 ImportGifJobState::Idle,
                 ImportStaticImageJobState::Idle,
                 ImportStaticSequenceJobState::Idle,
+                BlankProjectJobState::Idle,
             ));
         }
         assert!(can_navigate_back(
@@ -5537,6 +5774,7 @@ mod tests {
             ImportGifJobState::Running,
             ImportStaticImageJobState::Running,
             ImportStaticSequenceJobState::Running,
+            BlankProjectJobState::Running,
         ));
     }
 
@@ -5548,6 +5786,7 @@ mod tests {
             ImportGifJobState::Running,
             ImportStaticImageJobState::Idle,
             ImportStaticSequenceJobState::Idle,
+            BlankProjectJobState::Idle,
         ));
         for state in [ImportGifJobState::Idle, ImportGifJobState::Finished] {
             assert!(can_navigate_back(
@@ -5556,6 +5795,7 @@ mod tests {
                 state,
                 ImportStaticImageJobState::Idle,
                 ImportStaticSequenceJobState::Idle,
+                BlankProjectJobState::Idle,
             ));
         }
         assert!(can_navigate_back(
@@ -5564,6 +5804,7 @@ mod tests {
             ImportGifJobState::Running,
             ImportStaticImageJobState::Running,
             ImportStaticSequenceJobState::Running,
+            BlankProjectJobState::Running,
         ));
     }
 
@@ -5575,6 +5816,7 @@ mod tests {
             ImportGifJobState::Idle,
             ImportStaticImageJobState::Running,
             ImportStaticSequenceJobState::Idle,
+            BlankProjectJobState::Idle,
         ));
         for state in [
             ImportStaticImageJobState::Idle,
@@ -5586,6 +5828,7 @@ mod tests {
                 ImportGifJobState::Idle,
                 state,
                 ImportStaticSequenceJobState::Idle,
+                BlankProjectJobState::Idle,
             ));
         }
     }
@@ -5598,6 +5841,7 @@ mod tests {
             ImportGifJobState::Idle,
             ImportStaticImageJobState::Idle,
             ImportStaticSequenceJobState::Running,
+            BlankProjectJobState::Idle,
         ));
         for state in [
             ImportStaticSequenceJobState::Idle,
@@ -5608,6 +5852,29 @@ mod tests {
                 OpenProjectJobState::Idle,
                 ImportGifJobState::Idle,
                 ImportStaticImageJobState::Idle,
+                state,
+                BlankProjectJobState::Idle,
+            ));
+        }
+    }
+
+    #[test]
+    fn running_blank_project_creation_locks_top_and_page_back_navigation() {
+        assert!(!can_navigate_back(
+            AppView::NewBlankAnimation,
+            OpenProjectJobState::Idle,
+            ImportGifJobState::Idle,
+            ImportStaticImageJobState::Idle,
+            ImportStaticSequenceJobState::Idle,
+            BlankProjectJobState::Running,
+        ));
+        for state in [BlankProjectJobState::Idle, BlankProjectJobState::Finished] {
+            assert!(can_navigate_back(
+                AppView::NewBlankAnimation,
+                OpenProjectJobState::Idle,
+                ImportGifJobState::Idle,
+                ImportStaticImageJobState::Idle,
+                ImportStaticSequenceJobState::Idle,
                 state,
             ));
         }
@@ -5806,6 +6073,137 @@ mod tests {
             app.import_sequence_job.state(),
             ImportStaticSequenceJobState::Idle
         );
+    }
+
+    #[test]
+    fn successful_blank_project_enters_editor_and_resets_one_shot_job() {
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("blank.gfsproj");
+        let color = Rgba {
+            red: 12,
+            green: 34,
+            blue: 56,
+            alpha: 200,
+        };
+        let mut app = GifFromScreenApp::default();
+        app.view = AppView::NewBlankAnimation;
+        app.blank_project_ui = BlankProjectUiState {
+            width: 2,
+            height: 1,
+            background_choice: BlankBackgroundChoice::Solid,
+            red: color.red,
+            green: color.green,
+            blue: color.blue,
+            alpha: color.alpha,
+            frame_duration_ms: 75,
+            target: target.to_string_lossy().into_owned(),
+        };
+
+        app.start_blank_project().unwrap();
+        assert_eq!(app.blank_project_job.state(), BlankProjectJobState::Running);
+        assert_eq!(app.file_drop_activity(), FileDropActivity::BlankCreation);
+        drain_blank_project_job(&mut app);
+
+        assert_eq!(app.blank_project_job.state(), BlankProjectJobState::Idle);
+        assert_eq!(app.view, AppView::Editor);
+        assert_eq!(
+            Path::new(&app.settings.output),
+            target.with_extension("gif")
+        );
+        assert_eq!(app.blank_project_ui.width, 640);
+        assert_eq!(app.blank_project_ui.height, 480);
+        assert_eq!(
+            app.blank_project_ui.background_choice,
+            BlankBackgroundChoice::Transparent
+        );
+        assert_eq!(app.blank_project_ui.frame_duration_ms, 100);
+        assert!(app.blank_project_ui.target.ends_with(".gfsproj"));
+        let workspace = app.editor_workspace.as_ref().unwrap();
+        assert_eq!(workspace.project_root(), target);
+        assert_eq!(
+            workspace.manifest().canvas.size,
+            DomainSize::new(2, 1).unwrap()
+        );
+        assert_eq!(
+            workspace.manifest().canvas.background,
+            CanvasBackground::Solid(color)
+        );
+        assert_eq!(workspace.manifest().timeline.frames.len(), 1);
+        let frame = &workspace.manifest().timeline.frames[0];
+        assert_eq!(frame.duration, DurationUs::new(75_000).unwrap());
+        assert_eq!(
+            workspace
+                .active_project()
+                .assets()
+                .read(frame.asset_id)
+                .unwrap(),
+            [12, 34, 56, 200, 12, 34, 56, 200]
+        );
+        assert_eq!(workspace.selection().current(), Some(frame.id));
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("Blank animation ready")
+        );
+    }
+
+    #[test]
+    fn blank_project_path_failure_keeps_form_and_allows_retry() {
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("existing.gfsproj");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("sentinel"), b"keep").unwrap();
+        let mut app = GifFromScreenApp::default();
+        app.view = AppView::NewBlankAnimation;
+        app.blank_project_ui = BlankProjectUiState {
+            target: target.to_string_lossy().into_owned(),
+            ..BlankProjectUiState::default()
+        };
+        let original_form = app.blank_project_ui.clone();
+
+        let error = app.start_blank_project().unwrap_err();
+        assert!(error.contains("already exists"));
+        assert_eq!(app.blank_project_job.state(), BlankProjectJobState::Idle);
+        assert_eq!(app.blank_project_ui, original_form);
+        assert_eq!(fs::read(target.join("sentinel")).unwrap(), b"keep");
+
+        fs::remove_dir_all(&target).unwrap();
+        app.start_blank_project().unwrap();
+        drain_blank_project_job(&mut app);
+        assert_eq!(app.view, AppView::Editor);
+        assert_eq!(app.blank_project_job.state(), BlankProjectJobState::Idle);
+    }
+
+    #[test]
+    fn blank_project_worker_failure_keeps_form_and_allows_retry() {
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("bounded.gfsproj");
+        let mut app = GifFromScreenApp::default();
+        app.view = AppView::NewBlankAnimation;
+        app.blank_project_ui = BlankProjectUiState {
+            width: u32::from(u16::MAX),
+            height: u32::from(u16::MAX),
+            target: target.to_string_lossy().into_owned(),
+            ..BlankProjectUiState::default()
+        };
+        let original_form = app.blank_project_ui.clone();
+
+        app.start_blank_project().unwrap();
+        drain_blank_project_job(&mut app);
+
+        assert_eq!(app.view, AppView::NewBlankAnimation);
+        assert_eq!(app.blank_project_job.state(), BlankProjectJobState::Idle);
+        assert_eq!(app.blank_project_ui, original_form);
+        assert!(!target.exists());
+        assert!(app.notice.as_deref().unwrap().contains("original form"));
+
+        app.blank_project_ui.width = 1;
+        app.blank_project_ui.height = 1;
+        app.start_blank_project().unwrap();
+        drain_blank_project_job(&mut app);
+        assert_eq!(app.view, AppView::Editor);
+        assert_eq!(app.blank_project_job.state(), BlankProjectJobState::Idle);
     }
 
     #[test]
