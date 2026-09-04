@@ -168,7 +168,9 @@ pub enum PersistDecodedAnimationError {
 /// disposal, so every stored immutable asset is one complete straight-alpha
 /// RGBA8 canvas. Content-addressed storage deduplicates repeated composed
 /// frames while timeline clips retain their individual durations. The source
-/// GIF loop extension seeds the `Imported GIF` export preset.
+/// GIF loop extension seeds the `Imported GIF` export preset: infinite and
+/// positive finite counts are retained, while a source without a loop
+/// extension maps to `GifLoop::Finite(1)`.
 ///
 /// # Errors
 ///
