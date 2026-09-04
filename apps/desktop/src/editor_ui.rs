@@ -13,8 +13,8 @@ use std::{
 use eframe::egui;
 use gif_from_screen_domain::{DurationUs, FrameId, PhysicalRect, PhysicalSize, TimeUs};
 use gif_from_screen_editor::{
-    ReduceDelayMode, VirtualFilmstripError, VirtualFilmstripLayout, YoyoScope,
-    parse_frame_expression,
+    DuplicateDelayMode, DuplicateFrameRetention, ReduceDelayMode, VirtualFilmstripError,
+    VirtualFilmstripLayout, YoyoScope, parse_frame_expression,
 };
 
 use crate::editor_workspace::{EditorWorkspace, EditorWorkspaceError};
@@ -47,6 +47,12 @@ pub(crate) struct EditorUiState {
     pub(crate) yoyo_scope: YoyoScope,
     /// Whether Yoyo clones both source endpoints onto its reverse leg.
     pub(crate) yoyo_repeat_endpoints: bool,
+    /// Inclusive rendered-similarity threshold for duplicate removal.
+    pub(crate) duplicate_threshold_input: String,
+    /// Which frame survives a duplicate run.
+    pub(crate) duplicate_retention: DuplicateFrameRetention,
+    /// How duplicate-run delay is assigned to its survivor.
+    pub(crate) duplicate_delay_mode: DuplicateDelayMode,
     /// Comma/range expression used to replace the current frame selection.
     pub(crate) frame_expression: String,
     /// Source-coordinate crop X input in physical pixels.
@@ -80,6 +86,9 @@ impl Default for EditorUiState {
             reduce_delay_mode: ReduceDelayMode::DontAdjust,
             yoyo_scope: YoyoScope::Selection,
             yoyo_repeat_endpoints: false,
+            duplicate_threshold_input: "100".into(),
+            duplicate_retention: DuplicateFrameRetention::First,
+            duplicate_delay_mode: DuplicateDelayMode::Sum,
             frame_expression: "1".into(),
             crop_x_input: "0".into(),
             crop_y_input: "0".into(),
@@ -155,6 +164,7 @@ pub(crate) enum EditorUiOperation {
     ScaleDuration,
     ReduceFrames,
     Yoyo,
+    RemoveDuplicates,
     ApplyCrop,
     ClearCrop,
     Resize,
@@ -716,7 +726,76 @@ fn show_advanced_timing_toolbar(
                 );
             }
         });
+        show_duplicate_controls(ui, workspace, state, now, results);
     });
+}
+
+fn show_duplicate_controls(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    now: Instant,
+    results: &mut Vec<EditorUiResult>,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Rendered duplicates ≥");
+        ui.add(
+            egui::TextEdit::singleline(&mut state.duplicate_threshold_input).desired_width(48.0),
+        );
+        ui.label("%");
+        egui::ComboBox::from_id_salt("duplicate_retention")
+            .selected_text(duplicate_retention_label(state.duplicate_retention))
+            .show_ui(ui, |ui| {
+                for retention in [
+                    DuplicateFrameRetention::First,
+                    DuplicateFrameRetention::Last,
+                ] {
+                    ui.selectable_value(
+                        &mut state.duplicate_retention,
+                        retention,
+                        duplicate_retention_label(retention),
+                    );
+                }
+            });
+        egui::ComboBox::from_id_salt("duplicate_delay_mode")
+            .selected_text(duplicate_delay_label(state.duplicate_delay_mode))
+            .show_ui(ui, |ui| {
+                for mode in [
+                    DuplicateDelayMode::Keep,
+                    DuplicateDelayMode::Sum,
+                    DuplicateDelayMode::Average,
+                ] {
+                    ui.selectable_value(
+                        &mut state.duplicate_delay_mode,
+                        mode,
+                        duplicate_delay_label(mode),
+                    );
+                }
+            });
+        if ui.button("Remove duplicates").clicked() {
+            match parse_similarity_threshold(&state.duplicate_threshold_input) {
+                Ok(threshold) => {
+                    let result = workspace.remove_duplicate_selection(
+                        threshold,
+                        state.duplicate_retention,
+                        state.duplicate_delay_mode,
+                    );
+                    record_project_result(
+                        workspace,
+                        state,
+                        now,
+                        results,
+                        EditorUiOperation::RemoveDuplicates,
+                        result,
+                    );
+                }
+                Err(message) => {
+                    push_failure(results, EditorUiOperation::RemoveDuplicates, message);
+                }
+            }
+        }
+    });
+    ui.weak("Synchronous scan is limited to 256 selected frames and bounded render surfaces.");
 }
 
 const fn reduce_delay_label(mode: ReduceDelayMode) -> &'static str {
@@ -740,6 +819,29 @@ fn parse_keep_every(input: &str) -> Result<usize, String> {
         return Err("reduce interval must be at least 2".to_owned());
     }
     Ok(keep_every)
+}
+
+const fn duplicate_retention_label(retention: DuplicateFrameRetention) -> &'static str {
+    match retention {
+        DuplicateFrameRetention::First => "Keep first",
+        DuplicateFrameRetention::Last => "Keep last",
+    }
+}
+
+const fn duplicate_delay_label(mode: DuplicateDelayMode) -> &'static str {
+    match mode {
+        DuplicateDelayMode::Keep => "Keep delay",
+        DuplicateDelayMode::Sum => "Sum delay",
+        DuplicateDelayMode::Average => "Average delay",
+    }
+}
+
+fn parse_similarity_threshold(input: &str) -> Result<u8, String> {
+    let threshold = parse_input::<u8>(input, "duplicate similarity threshold")?;
+    if threshold > 100 {
+        return Err("duplicate similarity threshold must be between 0 and 100".to_owned());
+    }
+    Ok(threshold)
 }
 
 fn show_transform_toolbar(
@@ -1360,12 +1462,15 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use gif_from_screen_domain::{DurationUs, FrameId, PhysicalRect, PhysicalSize, TimeUs};
-    use gif_from_screen_editor::{ReduceDelayMode, YoyoScope};
+    use gif_from_screen_editor::{
+        DuplicateDelayMode, DuplicateFrameRetention, ReduceDelayMode, YoyoScope,
+    };
 
     use super::{
         EditorUiOperation, EditorUiState, FILMSTRIP_ITEM_WIDTH, OrientationControl, PlaybackClock,
-        frame_click_operation, orientation_operation, parse_crop, parse_duration_us,
-        parse_keep_every, parse_output_size, parse_time_ms, parse_time_range, reduce_delay_label,
+        duplicate_delay_label, duplicate_retention_label, frame_click_operation,
+        orientation_operation, parse_crop, parse_duration_us, parse_keep_every, parse_output_size,
+        parse_similarity_threshold, parse_time_ms, parse_time_range, reduce_delay_label,
         to_ui_points, visible_widget_range, yoyo_scope_label,
     };
 
@@ -1382,6 +1487,9 @@ mod tests {
         assert_eq!(state.reduce_delay_mode, ReduceDelayMode::DontAdjust);
         assert_eq!(state.yoyo_scope, YoyoScope::Selection);
         assert!(!state.yoyo_repeat_endpoints);
+        assert_eq!(state.duplicate_threshold_input, "100");
+        assert_eq!(state.duplicate_retention, DuplicateFrameRetention::First);
+        assert_eq!(state.duplicate_delay_mode, DuplicateDelayMode::Sum);
         assert_eq!(state.frame_expression, "1");
         assert_eq!(state.crop_x_input, "0");
         assert_eq!(state.crop_y_input, "0");
@@ -1459,6 +1567,23 @@ mod tests {
         }
         for scope in [YoyoScope::Selection, YoyoScope::EntireTimeline] {
             assert!(!yoyo_scope_label(scope).is_empty());
+        }
+        assert_eq!(parse_similarity_threshold("0").unwrap(), 0);
+        assert_eq!(parse_similarity_threshold("100").unwrap(), 100);
+        assert!(parse_similarity_threshold("101").is_err());
+        assert!(parse_similarity_threshold("-1").is_err());
+        for retention in [
+            DuplicateFrameRetention::First,
+            DuplicateFrameRetention::Last,
+        ] {
+            assert!(!duplicate_retention_label(retention).is_empty());
+        }
+        for mode in [
+            DuplicateDelayMode::Keep,
+            DuplicateDelayMode::Sum,
+            DuplicateDelayMode::Average,
+        ] {
+            assert!(!duplicate_delay_label(mode).is_empty());
         }
     }
 

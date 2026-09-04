@@ -312,15 +312,7 @@ fn prepare_preview(
     preview_limit_bytes: usize,
 ) -> Result<PreparedPreview, EditorPreviewError> {
     validate_preview_bounds(max_size)?;
-    let (clip, source) = load_frame_source(project, frame_id, render_surface_limit_bytes)?;
-    let asset_id = clip.asset_id;
-    let provider = SingleFrameProvider { asset_id, source };
-    let cpu_renderer = CpuRenderer::with_limits(RenderLimits {
-        max_surface_bytes: render_surface_limit_bytes,
-    });
-    let rendered_surface = cpu_renderer
-        .render_clip(&clip, &provider, &NeverCancel)
-        .map_err(|source| EditorPreviewError::Render { frame_id, source })?;
+    let rendered_surface = render_frame_surface(project, frame_id, render_surface_limit_bytes)?;
     let rendered_size = [rendered_surface.width(), rendered_surface.height()];
     let preview_size = fit_preview_dimensions(rendered_size, max_size)?;
     let preview_bytes = checked_rgba_byte_len(preview_size)?;
@@ -340,6 +332,27 @@ fn prepare_preview(
         preview_size,
         rgba,
     })
+}
+
+/// Safely loads and CPU-renders one frame with a strict per-surface memory limit.
+///
+/// This is the shared final-pixel path used by previews and exact duplicate detection. It verifies
+/// descriptor shape, file length, content digest, raw RGBA encoding, and renderer limits before
+/// returning the fully transformed/effected surface.
+pub(crate) fn render_frame_surface(
+    project: &ActiveProject,
+    frame_id: FrameId,
+    render_surface_limit_bytes: usize,
+) -> Result<RgbaSurface, EditorPreviewError> {
+    let (clip, source) = load_frame_source(project, frame_id, render_surface_limit_bytes)?;
+    let asset_id = clip.asset_id;
+    let provider = SingleFrameProvider { asset_id, source };
+    let cpu_renderer = CpuRenderer::with_limits(RenderLimits {
+        max_surface_bytes: render_surface_limit_bytes,
+    });
+    cpu_renderer
+        .render_clip(&clip, &provider, &NeverCancel)
+        .map_err(|source| EditorPreviewError::Render { frame_id, source })
 }
 
 fn load_frame_source(

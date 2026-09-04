@@ -9,17 +9,25 @@ use gif_from_screen_domain::{
     DurationUs, EditCommand, FrameId, PhysicalRect, PhysicalSize, ProjectManifest, TimeUs,
 };
 use gif_from_screen_editor::{
-    ClipTransformEdit, EditorError, FrameTimeRangeError, ReduceDelayMode, ReduceOptions,
-    TimelineSelection, TimelineSelectionError, YoyoOptions, YoyoScope, adjust_duration,
-    delete_frames, delete_frames_after, delete_frames_before, edit_clip_transforms,
-    move_selected_left, move_selected_right, override_duration, reduce_frames, reverse_selected,
-    scale_duration, select_frames_by_time_range, yoyo_frames,
+    ClipTransformEdit, DuplicateDelayMode, DuplicateFrameRetention, EditorError, FrameComparison,
+    FrameSimilarityProvider, FrameTimeRangeError, ReduceDelayMode, ReduceOptions,
+    RemoveDuplicateFramesOptions, TimelineSelection, TimelineSelectionError, YoyoOptions,
+    YoyoScope, adjust_duration, delete_frames, delete_frames_after, delete_frames_before,
+    edit_clip_transforms, move_selected_left, move_selected_right, override_duration,
+    reduce_frames, remove_duplicate_frames, reverse_selected, scale_duration,
+    select_frames_by_time_range, yoyo_frames,
 };
 use gif_from_screen_project::{
     ActiveProject, AssetIssue, JournalRecoveryReport, LockPolicy, OpenedProject, ProjectError,
 };
+use gif_from_screen_render::RgbaSurface;
 use thiserror::Error;
 use uuid::Uuid;
+
+use crate::editor_preview::{EditorPreviewError, render_frame_surface};
+
+const MAX_SYNCHRONOUS_DUPLICATE_SCAN_FRAMES: usize = 256;
+const DUPLICATE_RENDER_SURFACE_LIMIT_BYTES: usize = 128 * 1024 * 1024;
 
 /// Durable editor state owned by the desktop application.
 ///
@@ -404,6 +412,42 @@ impl EditorWorkspace {
         self.execute(command)
     }
 
+    /// Removes adjacent rendered duplicates from the current selection.
+    ///
+    /// The synchronous scan is capped at 256 selected frames. Each comparison uses the same safe
+    /// final CPU-render path as editor previews with a 128 MiB per-surface limit.
+    pub(crate) fn remove_duplicate_selection(
+        &mut self,
+        threshold: u8,
+        retention: DuplicateFrameRetention,
+        delay_mode: DuplicateDelayMode,
+    ) -> Result<(), EditorWorkspaceError> {
+        let selected = self.selected_frame_ids()?;
+        if selected.len() > MAX_SYNCHRONOUS_DUPLICATE_SCAN_FRAMES {
+            return Err(EditorWorkspaceError::DuplicateScanTooLarge {
+                selected: selected.len(),
+                maximum: MAX_SYNCHRONOUS_DUPLICATE_SCAN_FRAMES,
+            });
+        }
+        let command = {
+            let provider = ExactRenderedFrameProvider {
+                project: &self.project,
+                render_surface_limit_bytes: DUPLICATE_RENDER_SURFACE_LIMIT_BYTES,
+            };
+            remove_duplicate_frames(
+                self.project.manifest(),
+                selected,
+                RemoveDuplicateFramesOptions {
+                    threshold,
+                    retention,
+                    delay_mode,
+                },
+                &provider,
+            )?
+        };
+        self.execute(command)
+    }
+
     /// Appends a reversed clone leg for the selected range or complete timeline.
     pub(crate) fn yoyo(
         &mut self,
@@ -555,6 +599,76 @@ impl EditorWorkspace {
     }
 }
 
+struct ExactRenderedFrameProvider<'a> {
+    project: &'a ActiveProject,
+    render_surface_limit_bytes: usize,
+}
+
+impl FrameSimilarityProvider for ExactRenderedFrameProvider<'_> {
+    type Error = ExactDuplicateRenderError;
+
+    fn compare(&self, first: FrameId, second: FrameId) -> Result<FrameComparison, Self::Error> {
+        let first_surface =
+            render_frame_surface(self.project, first, self.render_surface_limit_bytes).map_err(
+                |source| ExactDuplicateRenderError {
+                    frame_id: first,
+                    source,
+                },
+            )?;
+        let second_surface =
+            render_frame_surface(self.project, second, self.render_surface_limit_bytes).map_err(
+                |source| ExactDuplicateRenderError {
+                    frame_id: second,
+                    source,
+                },
+            )?;
+        Ok(rendered_similarity(&first_surface, &second_surface))
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("could not render frame {frame_id} for duplicate comparison: {source}")]
+struct ExactDuplicateRenderError {
+    frame_id: FrameId,
+    #[source]
+    source: EditorPreviewError,
+}
+
+fn rendered_similarity(first: &RgbaSurface, second: &RgbaSurface) -> FrameComparison {
+    if first.size() != second.size() {
+        return FrameComparison::DifferentDimensions;
+    }
+    let mut distance = 0_u128;
+    for (first_pixel, second_pixel) in first
+        .pixels()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(second.pixels().as_chunks::<4>().0)
+    {
+        let first_alpha = u32::from(first_pixel[3]);
+        let second_alpha = u32::from(second_pixel[3]);
+        for channel in 0..3 {
+            let first_premultiplied = (u32::from(first_pixel[channel]) * first_alpha + 127) / 255;
+            let second_premultiplied =
+                (u32::from(second_pixel[channel]) * second_alpha + 127) / 255;
+            distance += u128::from(first_premultiplied.abs_diff(second_premultiplied));
+        }
+        distance += u128::from(first_alpha.abs_diff(second_alpha));
+    }
+    let pixel_count = u128::try_from(first.pixels().len() / 4).unwrap_or(u128::MAX);
+    let maximum_distance = pixel_count.saturating_mul(4 * 255);
+    if maximum_distance == 0 {
+        return FrameComparison::SimilarityPercent(100);
+    }
+    let similarity = maximum_distance
+        .saturating_sub(distance)
+        .saturating_mul(100)
+        .saturating_add(maximum_distance / 2)
+        / maximum_distance;
+    FrameComparison::SimilarityPercent(u8::try_from(similarity).unwrap_or(100))
+}
+
 fn selection_for_frame_ids(
     manifest: &ProjectManifest,
     frame_ids: &[FrameId],
@@ -628,6 +742,14 @@ pub(crate) enum EditorWorkspaceError {
         start_us: u64,
         /// Exclusive project-relative end time.
         end_us: u64,
+    },
+    /// The bounded synchronous duplicate scan would require too many rendered frames.
+    #[error("exact duplicate scan selected {selected} frames; the synchronous limit is {maximum}")]
+    DuplicateScanTooLarge {
+        /// Number of selected frames requested by the UI.
+        selected: usize,
+        /// Maximum frames accepted by one synchronous scan.
+        maximum: usize,
     },
     /// Session history must retain at least one entry.
     #[error("editor history limit must be greater than zero")]
@@ -707,6 +829,64 @@ mod tests {
     ) -> EditorWorkspace {
         let active = ActiveProject::create(directory.path(), manifest(durations)).unwrap();
         EditorWorkspace::from_active(active, history_limit).unwrap()
+    }
+
+    fn create_rendered_duplicate_workspace(directory: &TempDir) -> EditorWorkspace {
+        let size = PhysicalSize::new(2, 1).unwrap();
+        let manifest = ProjectManifest::new(
+            ProjectId::from_u128(900),
+            "duplicate-render-test",
+            UnixTimeMs::new(1),
+            Canvas {
+                size,
+                color_space: ColorSpace::Srgb,
+                background: CanvasBackground::Transparent,
+            },
+        )
+        .unwrap();
+        let mut active = ActiveProject::create(directory.path(), manifest).unwrap();
+        let sources = [
+            vec![255, 0, 0, 255, 10, 20, 30, 0],
+            vec![255, 0, 0, 255, 200, 100, 50, 0],
+            vec![9, 8, 7, 0, 255, 0, 0, 255],
+            vec![0, 0, 0, 255, 50, 60, 70, 0],
+        ];
+        let mut descriptors = BTreeMap::new();
+        let mut frames = Vec::new();
+        for (index, pixels) in sources.into_iter().enumerate() {
+            let asset_id = active.assets().put(&pixels).unwrap();
+            descriptors.entry(asset_id).or_insert(AssetDescriptor {
+                id: asset_id,
+                byte_len: 8,
+                kind: AssetKind::Frame {
+                    size,
+                    encoding: RasterEncoding::Rgba8,
+                },
+            });
+            frames.push(FrameClip {
+                id: frame_id(u128::try_from(index).unwrap() + 1),
+                asset_id,
+                duration: DurationUs::new(10 * (u64::try_from(index).unwrap() + 1)).unwrap(),
+                transform: if index == 2 {
+                    ClipTransform {
+                        flip_horizontal: true,
+                        ..ClipTransform::default()
+                    }
+                } else {
+                    ClipTransform::default()
+                },
+                capture_metadata: CaptureMetadata::default(),
+                effects: Vec::new(),
+            });
+        }
+        let mut commands = descriptors
+            .into_values()
+            .map(|asset| EditCommand::RegisterAsset { asset })
+            .collect::<Vec<_>>();
+        commands.push(EditCommand::InsertFrames { index: 0, frames });
+        active.commit(EditCommand::Compound { commands }).unwrap();
+        active.checkpoint_and_compact().unwrap();
+        EditorWorkspace::from_active(active, 16).unwrap()
     }
 
     fn order(workspace: &EditorWorkspace) -> Vec<u128> {
@@ -1216,5 +1396,81 @@ mod tests {
         assert_eq!(durations(&workspace), [120]);
         assert!(workspace.undo().unwrap());
         assert_eq!(durations(&workspace), [100]);
+    }
+
+    #[test]
+    fn exact_duplicate_scan_uses_final_rendered_transparent_pixels_and_is_reversible() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = create_rendered_duplicate_workspace(&directory);
+        workspace.select_all();
+
+        workspace
+            .remove_duplicate_selection(
+                100,
+                DuplicateFrameRetention::First,
+                DuplicateDelayMode::Sum,
+            )
+            .unwrap();
+        assert_eq!(order(&workspace), [1, 4]);
+        assert_eq!(durations(&workspace), [60, 40]);
+        assert!(workspace.undo().unwrap());
+        assert_eq!(order(&workspace), [1, 2, 3, 4]);
+        assert_eq!(durations(&workspace), [10, 20, 30, 40]);
+        assert!(workspace.redo().unwrap());
+        assert_eq!(order(&workspace), [1, 4]);
+        drop(workspace);
+
+        let reopened =
+            EditorWorkspace::open(directory.path(), LockPolicy::FailIfPresent, 16).unwrap();
+        assert_eq!(order(&reopened), [1, 4]);
+        assert_eq!(durations(&reopened), [60, 40]);
+    }
+
+    #[test]
+    fn duplicate_threshold_retention_and_average_delay_are_honored() {
+        let exact_directory = tempfile::tempdir().unwrap();
+        let mut exact = create_rendered_duplicate_workspace(&exact_directory);
+        exact.select_all();
+        exact
+            .remove_duplicate_selection(
+                100,
+                DuplicateFrameRetention::Last,
+                DuplicateDelayMode::Average,
+            )
+            .unwrap();
+        assert_eq!(order(&exact), [3, 4]);
+        assert_eq!(durations(&exact), [20, 40]);
+
+        let threshold_directory = tempfile::tempdir().unwrap();
+        let mut threshold = create_rendered_duplicate_workspace(&threshold_directory);
+        threshold.select_all();
+        threshold
+            .remove_duplicate_selection(80, DuplicateFrameRetention::Last, DuplicateDelayMode::Keep)
+            .unwrap();
+        assert_eq!(order(&threshold), [4]);
+        assert_eq!(durations(&threshold), [40]);
+    }
+
+    #[test]
+    fn synchronous_duplicate_scan_rejects_unbounded_selection_before_rendering() {
+        let directory = tempfile::tempdir().unwrap();
+        let durations = vec![1; MAX_SYNCHRONOUS_DUPLICATE_SCAN_FRAMES + 1];
+        let mut workspace = create_workspace(&directory, &durations, 4);
+        workspace.select_all();
+
+        assert!(matches!(
+            workspace.remove_duplicate_selection(
+                100,
+                DuplicateFrameRetention::First,
+                DuplicateDelayMode::Keep,
+            ),
+            Err(EditorWorkspaceError::DuplicateScanTooLarge {
+                selected,
+                maximum,
+            }) if selected == MAX_SYNCHRONOUS_DUPLICATE_SCAN_FRAMES + 1
+                && maximum == MAX_SYNCHRONOUS_DUPLICATE_SCAN_FRAMES
+        ));
+        assert!(!workspace.is_dirty());
+        assert!(!workspace.can_undo());
     }
 }
