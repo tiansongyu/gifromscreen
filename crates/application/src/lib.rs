@@ -2,12 +2,17 @@
 
 //! Application-level state machines and use-case orchestration.
 
+mod blank_project;
 mod import_project;
 mod project_export;
 mod recording_project;
 mod rgba_project;
 mod static_image_project;
 
+pub use blank_project::{
+    BLANK_ANIMATION_PRESET_NAME, BlankAnimationProjectOptions, CreateBlankAnimationError,
+    DEFAULT_BLANK_FRAME_LIMIT_BYTES, create_blank_animation_project,
+};
 pub use import_project::{
     DecodedAnimationProjectOptions, IMPORTED_GIF_PRESET_NAME, PersistDecodedAnimationError,
     persist_decoded_animation,
