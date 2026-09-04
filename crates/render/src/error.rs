@@ -101,20 +101,42 @@ pub enum RenderError {
         #[source]
         source: AssetProviderError,
     },
-    /// An overlay span cannot represent its exclusive endpoint.
-    #[error("raster overlay {overlay_id} time span overflows the project clock")]
+    /// A supported overlay span cannot represent its exclusive endpoint.
+    #[error("overlay {overlay_id} time span overflows the project clock")]
     OverlaySpanOverflow {
         /// Overlay with an overflowing span.
         overlay_id: OverlayId,
     },
-    /// The active raster-overlay sorting plan exceeded the platform address space.
-    #[error("active raster overlay plan item count overflowed")]
+    /// The active supported-overlay sorting plan exceeded the platform address space.
+    #[error("active overlay plan item count overflowed")]
     OverlayPlanSizeOverflow,
-    /// Reserving the active raster-overlay sorting plan failed.
-    #[error("could not allocate an active raster overlay plan for {requested} items")]
+    /// Reserving the active supported-overlay sorting plan failed.
+    #[error("could not allocate an active overlay plan for {requested} items")]
     OverlayPlanAllocationFailed {
         /// Number of plan entries requested at the failed growth point.
         requested: usize,
+    },
+    /// Shape or drawing geometry is malformed and cannot be rasterized deterministically.
+    #[error("overlay {overlay_id} has invalid geometry: {reason}")]
+    InvalidOverlayGeometry {
+        /// Overlay item with malformed geometry.
+        overlay_id: OverlayId,
+        /// Stable validation reason.
+        reason: &'static str,
+    },
+    /// A drawing pressure exceeds the normalized 0..=1000 range.
+    #[error(
+        "drawing overlay {overlay_id} point {point_index} has pressure {pressure_milli}, above {maximum}"
+    )]
+    InvalidDrawingPressure {
+        /// Drawing overlay item.
+        overlay_id: OverlayId,
+        /// Zero-based point position.
+        point_index: usize,
+        /// Rejected pressure value.
+        pressure_milli: u16,
+        /// Maximum normalized pressure.
+        maximum: u16,
     },
     /// A requested crop is empty, overflows, or extends outside the source.
     #[error("crop {crop:?} does not fit within the {source_width}x{source_height} source surface")]

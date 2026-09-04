@@ -9,9 +9,11 @@
 //! outside the canvas, clips the result to the canvas, and composites the
 //! original pixels over the colored mask. A zero shadow radius is a valid hard
 //! shadow, radii above [`MAX_BLUR_RADIUS`] are rejected, and every `i32` offset
-//! is accepted with overflow-free clipping. Keeping this pipeline CPU-only
-//! gives exports a stable reference implementation across Linux machines and
-//! graphics drivers.
+//! is accepted with overflow-free clipping. Timed Raster, Shape, and Drawing
+//! overlays are then composited in stable z/track/item order with hard-edged,
+//! allocation-free vector rasterization and straight-alpha blend modes. Keeping
+//! this pipeline CPU-only gives exports a stable reference implementation across
+//! Linux machines and graphics drivers.
 
 #![forbid(unsafe_code)]
 

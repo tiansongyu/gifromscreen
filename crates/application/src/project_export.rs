@@ -1701,8 +1701,8 @@ mod tests {
         AssetDescriptor, BlendMode, Canvas, CanvasBackground, CaptureMetadata, ClipTransform,
         ColorSpace, DurationUs, EdgeWidths, EditCommand, Effect, FrameClip, OverlayContent,
         OverlayItem, OverlayTrack, PhysicalPoint, PhysicalPx, PhysicalSize, ProjectId,
-        ProjectManifest, Rgba, SlideDirection, TimelineSpan, TrackId, Transition, TransitionId,
-        TransitionKind, UnixTimeMs,
+        ProjectManifest, Rgba, ShapeKind, SlideDirection, StrokePoint, TimelineSpan, TrackId,
+        Transition, TransitionId, TransitionKind, UnixTimeMs,
     };
     use gif_from_screen_gif::{CancellationFlag, DitherMode, PaletteMode};
     use gif_from_screen_project::LockPolicy;
@@ -1997,6 +1997,80 @@ mod tests {
         assert_eq!(
             decode_rgba(&output),
             [(1, vec![255, 0, 0, 255, 255, 0, 0, 255])]
+        );
+    }
+
+    #[test]
+    fn shape_and_drawing_overlays_flow_through_project_export() {
+        let directory = tempdir().unwrap();
+        let black = [0, 0, 0, 255].repeat(3);
+        let (mut snapshot, _) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(3, 1).unwrap(),
+            &[TestClip::rgba(1, &black, 10_000)],
+        );
+        let span = TimelineSpan {
+            start: TimeUs::ZERO,
+            duration: DurationUs::new(10_000).unwrap(),
+        };
+        snapshot
+            .manifest
+            .timeline
+            .overlay_tracks
+            .push(OverlayTrack {
+                id: TrackId::from_u128(1),
+                name: "vector watermark".to_owned(),
+                visible: true,
+                opacity: 255,
+                blend_mode: BlendMode::Normal,
+                items: vec![
+                    OverlayItem {
+                        id: OverlayId::from_u128(1),
+                        span,
+                        z_index: 0,
+                        content: OverlayContent::Shape {
+                            kind: ShapeKind::Rectangle,
+                            bounds: gif_from_screen_domain::PhysicalRect::new(0, 0, 3, 1).unwrap(),
+                            stroke_width: 0,
+                            stroke: Rgba::TRANSPARENT,
+                            fill: Some(Rgba {
+                                red: 255,
+                                green: 0,
+                                blue: 0,
+                                alpha: 255,
+                            }),
+                        },
+                    },
+                    OverlayItem {
+                        id: OverlayId::from_u128(2),
+                        span,
+                        z_index: 1,
+                        content: OverlayContent::Drawing {
+                            points: vec![StrokePoint {
+                                point: PhysicalPoint {
+                                    x: PhysicalPx::new(1),
+                                    y: PhysicalPx::ZERO,
+                                },
+                                pressure_milli: 1_000,
+                            }],
+                            width: 1,
+                            color: Rgba {
+                                red: 0,
+                                green: 255,
+                                blue: 0,
+                                alpha: 255,
+                            },
+                        },
+                    },
+                ],
+            });
+        let output = directory.path().join("vector-overlays.gif");
+
+        export(&snapshot, &output, &ProjectGifExportOptions::default()).unwrap();
+
+        assert_eq!(
+            decode_rgba(&output),
+            [(1, vec![255, 0, 0, 255, 0, 255, 0, 255, 255, 0, 0, 255])]
         );
     }
 

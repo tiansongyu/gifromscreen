@@ -725,7 +725,7 @@ mod tests {
         AssetDescriptor, BlendMode, Canvas, CanvasBackground, CaptureMetadata, ClipTransform,
         ColorSpace, DurationUs, EditCommand, Effect, FrameClip, OverlayContent, OverlayId,
         OverlayItem, OverlayTrack, PhysicalPoint, PhysicalPx, PhysicalRect, PhysicalSize,
-        ProjectManifest, TimelineSpan, TrackId, UnixTimeMs,
+        ProjectManifest, Rgba, ShapeKind, StrokePoint, TimelineSpan, TrackId, UnixTimeMs,
     };
     use tempfile::{TempDir, tempdir};
 
@@ -1040,6 +1040,78 @@ mod tests {
 
         let rendered = render_frame_surface(&project, frame_id, 16).unwrap();
         assert_eq!(rendered.pixels(), [255, 0, 0, 255, 255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn shape_and_drawing_overlays_flow_through_editor_preview() {
+        let size = PhysicalSize::new(3, 1).unwrap();
+        let (_scratch, mut project, frame_id, _) = project_with_frame(
+            &[0, 0, 0, 255].repeat(3),
+            size,
+            ClipTransform::default(),
+            Vec::new(),
+        );
+        let span = TimelineSpan {
+            start: TimeUs::ZERO,
+            duration: DurationUs::new(10_000).unwrap(),
+        };
+        project
+            .commit(EditCommand::UpsertOverlayTrack {
+                track: OverlayTrack {
+                    id: TrackId::from_u128(1),
+                    name: "vector preview".to_owned(),
+                    visible: true,
+                    opacity: 255,
+                    blend_mode: BlendMode::Normal,
+                    items: vec![
+                        OverlayItem {
+                            id: OverlayId::from_u128(1),
+                            span,
+                            z_index: 0,
+                            content: OverlayContent::Shape {
+                                kind: ShapeKind::Rectangle,
+                                bounds: PhysicalRect::new(0, 0, 3, 1).unwrap(),
+                                stroke_width: 0,
+                                stroke: Rgba::TRANSPARENT,
+                                fill: Some(Rgba {
+                                    red: 255,
+                                    green: 0,
+                                    blue: 0,
+                                    alpha: 255,
+                                }),
+                            },
+                        },
+                        OverlayItem {
+                            id: OverlayId::from_u128(2),
+                            span,
+                            z_index: 1,
+                            content: OverlayContent::Drawing {
+                                points: vec![StrokePoint {
+                                    point: PhysicalPoint {
+                                        x: PhysicalPx::new(1),
+                                        y: PhysicalPx::ZERO,
+                                    },
+                                    pressure_milli: 1_000,
+                                }],
+                                width: 1,
+                                color: Rgba {
+                                    red: 0,
+                                    green: 255,
+                                    blue: 0,
+                                    alpha: 255,
+                                },
+                            },
+                        },
+                    ],
+                },
+            })
+            .unwrap();
+
+        let rendered = render_frame_surface(&project, frame_id, 12).unwrap();
+        assert_eq!(
+            rendered.pixels(),
+            [255, 0, 0, 255, 0, 255, 0, 255, 255, 0, 0, 255]
+        );
     }
 
     #[test]
