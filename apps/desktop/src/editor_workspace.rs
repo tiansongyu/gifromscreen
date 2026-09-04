@@ -10,17 +10,19 @@ use std::{
 
 use gif_from_screen_domain::{
     DurationUs, EditCommand, Effect, FrameId, PhysicalRect, PhysicalSize, ProjectManifest, TimeUs,
+    Transition,
 };
 use gif_from_screen_editor::{
     ClipTransformEdit, DuplicateDelayMode, DuplicateFrameRetention, EditorError, EditorStatistics,
     EditorStatisticsError, FrameClipboard, FrameComparison, FrameEffectEdit,
-    FrameSimilarityProvider, FrameTimeRangeError, ReduceDelayMode, ReduceOptions,
-    RemoveDuplicateFramesOptions, TimelineSelection, TimelineSelectionError, YoyoOptions,
-    YoyoScope, adjust_duration, copy_selected_frames, cut_selected_frames, delete_frames,
-    delete_frames_after, delete_frames_before, edit_clip_transforms, edit_frame_effects,
-    move_selected_left, move_selected_right, override_duration, paste_frame_clipboard,
-    project_statistics, reduce_frames, remove_duplicate_frames, reverse_selected, scale_duration,
-    select_frames_by_time_range, yoyo_frames,
+    FrameSimilarityProvider, FrameTimeRangeError, FrameTransitionSettings, ReduceDelayMode,
+    ReduceOptions, RemoveDuplicateFramesOptions, TimelineSelection, TimelineSelectionError,
+    YoyoOptions, YoyoScope, adjust_duration, copy_selected_frames, cut_selected_frames,
+    delete_frames, delete_frames_after, delete_frames_before, edit_clip_transforms,
+    edit_frame_effects, move_selected_left, move_selected_right, override_duration,
+    paste_frame_clipboard, project_statistics, reduce_frames, remove_duplicate_frames,
+    remove_transition_after, reverse_selected, scale_duration, select_frames_by_time_range,
+    set_transition_after, yoyo_frames,
 };
 use gif_from_screen_project::{
     ActiveProject, AssetIssue, JournalRecoveryReport, LockPolicy, OpenedProject, ProjectError,
@@ -536,6 +538,50 @@ impl EditorWorkspace {
         self.execute(command)
     }
 
+    /// Returns the transition from the current frame to its immediate successor, if present.
+    pub(crate) fn current_transition(&self) -> Option<&Transition> {
+        let current = self.selection.current()?;
+        let index = self
+            .project
+            .manifest()
+            .timeline
+            .frames
+            .iter()
+            .position(|frame| frame.id == current)?;
+        let next = self
+            .project
+            .manifest()
+            .timeline
+            .frames
+            .get(index.checked_add(1)?)?;
+        self.project
+            .manifest()
+            .timeline
+            .transitions
+            .iter()
+            .find(|transition| transition.from_frame == current && transition.to_frame == next.id)
+    }
+
+    /// Creates or replaces the transition from the current frame to its immediate successor.
+    pub(crate) fn set_current_transition(
+        &mut self,
+        settings: FrameTransitionSettings,
+    ) -> Result<(), EditorWorkspaceError> {
+        let command = set_transition_after(
+            self.project.manifest(),
+            self.selection.current(),
+            settings,
+            || gif_from_screen_domain::TransitionId::from_u128(Uuid::new_v4().as_u128()),
+        )?;
+        self.execute(command)
+    }
+
+    /// Removes the transition from the current frame to its immediate successor.
+    pub(crate) fn remove_current_transition(&mut self) -> Result<(), EditorWorkspaceError> {
+        let command = remove_transition_after(self.project.manifest(), self.selection.current())?;
+        self.execute(command)
+    }
+
     /// Appends one validated effect to every selected frame.
     pub(crate) fn add_selection_effect(
         &mut self,
@@ -893,7 +939,8 @@ mod tests {
     use gif_from_screen_domain::{
         AssetDescriptor, AssetId, AssetKind, Canvas, CanvasBackground, CaptureMetadata,
         ClipTransform, ColorSpace, FrameClip, PhysicalSize, ProjectId, ProjectManifest,
-        ProjectRevision, QuarterTurn, RasterEncoding, Timeline, UnixTimeMs,
+        ProjectRevision, QuarterTurn, RasterEncoding, Rgba, SlideDirection, Timeline,
+        TransitionKind, UnixTimeMs,
     };
     use tempfile::TempDir;
 
@@ -1824,5 +1871,98 @@ mod tests {
         ));
         assert!(!workspace.is_dirty());
         assert!(!workspace.can_undo());
+    }
+
+    #[test]
+    fn current_transition_create_replace_delete_is_journaled_undoable_and_reopenable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = create_workspace(&directory, &[10, 20, 30], 8);
+        workspace.select_only(frame_id(1)).unwrap();
+        workspace
+            .set_current_transition(FrameTransitionSettings {
+                duration: DurationUs::new(4).unwrap(),
+                steps: 2,
+                kind: TransitionKind::FadeToNext,
+            })
+            .unwrap();
+        let transition_id = workspace.current_transition().unwrap().id;
+        assert_eq!(workspace.manifest().timeline.transitions.len(), 1);
+
+        workspace
+            .set_current_transition(FrameTransitionSettings {
+                duration: DurationUs::new(9).unwrap(),
+                steps: 3,
+                kind: TransitionKind::Slide {
+                    direction: SlideDirection::Right,
+                },
+            })
+            .unwrap();
+        assert_eq!(workspace.manifest().timeline.transitions.len(), 1);
+        assert_eq!(workspace.current_transition().unwrap().id, transition_id);
+        assert!(matches!(
+            workspace.current_transition().unwrap().kind,
+            TransitionKind::Slide {
+                direction: SlideDirection::Right
+            }
+        ));
+
+        assert!(workspace.undo().unwrap());
+        assert_eq!(workspace.current_transition().unwrap().steps, 2);
+        assert!(matches!(
+            workspace.current_transition().unwrap().kind,
+            TransitionKind::FadeToNext
+        ));
+        assert!(workspace.redo().unwrap());
+        assert_eq!(workspace.current_transition().unwrap().steps, 3);
+
+        workspace.remove_current_transition().unwrap();
+        assert!(workspace.current_transition().is_none());
+        assert!(workspace.undo().unwrap());
+        assert_eq!(workspace.current_transition().unwrap().id, transition_id);
+        drop(workspace);
+
+        let reopened =
+            EditorWorkspace::open(directory.path(), LockPolicy::FailIfPresent, 8).unwrap();
+        let transition = reopened.current_transition().unwrap();
+        assert_eq!(transition.id, transition_id);
+        assert_eq!(transition.duration, DurationUs::new(9).unwrap());
+        assert_eq!(transition.steps, 3);
+        assert_eq!(reopened.manifest().revision, ProjectRevision::new(6));
+    }
+
+    #[test]
+    fn current_transition_requires_a_selected_nonfinal_frame_without_polluting_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = create_workspace(&directory, &[10, 20], 8);
+        let settings = FrameTransitionSettings {
+            duration: DurationUs::new(1).unwrap(),
+            steps: 1,
+            kind: TransitionKind::FadeToColor {
+                color: Rgba::TRANSPARENT,
+            },
+        };
+
+        assert!(matches!(
+            workspace.set_current_transition(settings.clone()),
+            Err(EditorWorkspaceError::Editor(
+                EditorError::NoCurrentFrameForTransition
+            ))
+        ));
+        workspace.select_last().unwrap();
+        assert!(matches!(
+            workspace.set_current_transition(settings),
+            Err(EditorWorkspaceError::Editor(
+                EditorError::NoFrameAfterTransitionAnchor(frame)
+            )) if frame == frame_id(2)
+        ));
+        assert!(matches!(
+            workspace.remove_current_transition(),
+            Err(EditorWorkspaceError::Editor(
+                EditorError::NoFrameAfterTransitionAnchor(frame)
+            )) if frame == frame_id(2)
+        ));
+        assert!(!workspace.is_dirty());
+        assert!(!workspace.can_undo());
+        assert!(!workspace.can_redo());
     }
 }

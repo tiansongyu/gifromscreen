@@ -12,11 +12,13 @@ use std::{
 
 use eframe::egui;
 use gif_from_screen_domain::{
-    DurationUs, EdgeWidths, Effect, FrameId, PhysicalRect, PhysicalSize, Rgba, TimeUs,
+    DurationUs, EdgeWidths, Effect, FrameId, MAX_TRANSITION_STEPS, PhysicalRect, PhysicalSize,
+    Rgba, SlideDirection, TimeUs, Transition, TransitionKind,
 };
 use gif_from_screen_editor::{
-    DuplicateDelayMode, DuplicateFrameRetention, MAX_FRAME_EFFECT_BLUR_RADIUS, ReduceDelayMode,
-    VirtualFilmstripError, VirtualFilmstripLayout, YoyoScope, parse_frame_expression,
+    DuplicateDelayMode, DuplicateFrameRetention, FrameTransitionSettings,
+    MAX_FRAME_EFFECT_BLUR_RADIUS, ReduceDelayMode, VirtualFilmstripError, VirtualFilmstripLayout,
+    YoyoScope, parse_frame_expression,
 };
 
 use crate::editor_workspace::{EditorWorkspace, EditorWorkspaceError};
@@ -35,6 +37,17 @@ pub(crate) enum EffectChoice {
     Lighten,
     Border,
     Shadow,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum TransitionChoice {
+    #[default]
+    FadeToNext,
+    FadeToColor,
+    SlideLeft,
+    SlideRight,
+    SlideUp,
+    SlideDown,
 }
 
 /// Ephemeral editor controls and playback state retained between egui frames.
@@ -90,6 +103,16 @@ pub(crate) struct EditorUiState {
     pub(crate) effect_color_alpha_input: String,
     /// Comma/range expression used to replace the current frame selection.
     pub(crate) frame_expression: String,
+    /// Outgoing transition family for the current frame.
+    pub(crate) transition_choice: TransitionChoice,
+    /// Total added transition duration in microseconds.
+    pub(crate) transition_duration_us_input: String,
+    /// Number of generated transition frames.
+    pub(crate) transition_steps_input: String,
+    pub(crate) transition_color_red_input: String,
+    pub(crate) transition_color_green_input: String,
+    pub(crate) transition_color_blue_input: String,
+    pub(crate) transition_color_alpha_input: String,
     /// Source-coordinate crop X input in physical pixels.
     pub(crate) crop_x_input: String,
     /// Source-coordinate crop Y input in physical pixels.
@@ -145,6 +168,13 @@ impl Default for EditorUiState {
             effect_color_blue_input: "0".into(),
             effect_color_alpha_input: "255".into(),
             frame_expression: "1".into(),
+            transition_choice: TransitionChoice::FadeToNext,
+            transition_duration_us_input: "100000".into(),
+            transition_steps_input: "5".into(),
+            transition_color_red_input: "0".into(),
+            transition_color_green_input: "0".into(),
+            transition_color_blue_input: "0".into(),
+            transition_color_alpha_input: "255".into(),
             crop_x_input: "0".into(),
             crop_y_input: "0".into(),
             crop_width_input: "1".into(),
@@ -226,6 +256,8 @@ pub(crate) enum EditorUiOperation {
     AddEffect,
     ReplaceEffect,
     ClearEffects,
+    SetTransition,
+    DeleteTransition,
     SaveCheckpoint,
     SaveAndCompact,
     RepairJournal,
@@ -292,6 +324,7 @@ pub(crate) fn show_editor_ui(
     show_time_range_toolbar(ui, workspace, state, now, &mut results);
     show_edit_toolbar(ui, workspace, state, now, &mut results);
     show_advanced_timing_toolbar(ui, workspace, state, now, &mut results);
+    show_transition_toolbar(ui, workspace, state, now, &mut results);
     show_transform_toolbar(ui, workspace, state, now, &mut results);
     show_effect_toolbar(ui, workspace, state, now, &mut results);
     ui.separator();
@@ -1100,6 +1133,183 @@ fn parse_similarity_threshold(input: &str) -> Result<u8, String> {
         return Err("duplicate similarity threshold must be between 0 and 100".to_owned());
     }
     Ok(threshold)
+}
+
+fn show_transition_toolbar(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    now: Instant,
+    results: &mut Vec<EditorUiResult>,
+) {
+    egui::CollapsingHeader::new("Transitions")
+        .default_open(false)
+        .show(ui, |ui| {
+            if let Some(transition) = workspace.current_transition() {
+                ui.label(format_transition_summary(transition));
+            } else {
+                ui.weak("The current frame has no outgoing transition.");
+            }
+            show_transition_inputs(ui, state);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Create / replace").clicked() {
+                    match build_transition_settings(state) {
+                        Ok(settings) => {
+                            let result = workspace.set_current_transition(settings);
+                            record_project_result(
+                                workspace,
+                                state,
+                                now,
+                                results,
+                                EditorUiOperation::SetTransition,
+                                result,
+                            );
+                        }
+                        Err(message) => {
+                            push_failure(results, EditorUiOperation::SetTransition, message);
+                        }
+                    }
+                }
+                if ui.button("Delete current pair transition").clicked() {
+                    let result = workspace.remove_current_transition();
+                    record_project_result(
+                        workspace,
+                        state,
+                        now,
+                        results,
+                        EditorUiOperation::DeleteTransition,
+                        result,
+                    );
+                }
+            });
+            ui.weak(format!(
+                "Duration is added to the timeline; steps must be 1..={MAX_TRANSITION_STEPS}."
+            ));
+        });
+}
+
+fn show_transition_inputs(ui: &mut egui::Ui, state: &mut EditorUiState) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Type");
+        egui::ComboBox::from_id_salt("current_frame_transition_kind")
+            .selected_text(transition_choice_label(state.transition_choice))
+            .show_ui(ui, |ui| {
+                for choice in [
+                    TransitionChoice::FadeToNext,
+                    TransitionChoice::FadeToColor,
+                    TransitionChoice::SlideLeft,
+                    TransitionChoice::SlideRight,
+                    TransitionChoice::SlideUp,
+                    TransitionChoice::SlideDown,
+                ] {
+                    ui.selectable_value(
+                        &mut state.transition_choice,
+                        choice,
+                        transition_choice_label(choice),
+                    );
+                }
+            });
+        ui.label("Total µs");
+        ui.add(
+            egui::TextEdit::singleline(&mut state.transition_duration_us_input).desired_width(92.0),
+        );
+        ui.label("Steps");
+        compact_input(ui, &mut state.transition_steps_input);
+    });
+    if state.transition_choice == TransitionChoice::FadeToColor {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Fade RGBA");
+            compact_input(ui, &mut state.transition_color_red_input);
+            compact_input(ui, &mut state.transition_color_green_input);
+            compact_input(ui, &mut state.transition_color_blue_input);
+            compact_input(ui, &mut state.transition_color_alpha_input);
+        });
+    }
+}
+
+fn build_transition_settings(state: &EditorUiState) -> Result<FrameTransitionSettings, String> {
+    let duration_us = parse_input::<u64>(
+        &state.transition_duration_us_input,
+        "transition duration in microseconds",
+    )?;
+    let duration = DurationUs::new(duration_us)
+        .ok_or_else(|| "transition duration must be positive".to_owned())?;
+    let steps = parse_input::<u16>(&state.transition_steps_input, "transition steps")?;
+    if !(1..=MAX_TRANSITION_STEPS).contains(&steps) {
+        return Err(format!(
+            "transition steps must be between 1 and {MAX_TRANSITION_STEPS}"
+        ));
+    }
+    if duration.get() < u64::from(steps) {
+        return Err("transition duration must provide at least 1 µs per step".to_owned());
+    }
+    let kind = match state.transition_choice {
+        TransitionChoice::FadeToNext => TransitionKind::FadeToNext,
+        TransitionChoice::FadeToColor => TransitionKind::FadeToColor {
+            color: parse_transition_color(state)?,
+        },
+        TransitionChoice::SlideLeft => TransitionKind::Slide {
+            direction: SlideDirection::Left,
+        },
+        TransitionChoice::SlideRight => TransitionKind::Slide {
+            direction: SlideDirection::Right,
+        },
+        TransitionChoice::SlideUp => TransitionKind::Slide {
+            direction: SlideDirection::Up,
+        },
+        TransitionChoice::SlideDown => TransitionKind::Slide {
+            direction: SlideDirection::Down,
+        },
+    };
+    Ok(FrameTransitionSettings {
+        duration,
+        steps,
+        kind,
+    })
+}
+
+fn parse_transition_color(state: &EditorUiState) -> Result<Rgba, String> {
+    Ok(Rgba {
+        red: parse_input::<u8>(&state.transition_color_red_input, "transition red")?,
+        green: parse_input::<u8>(&state.transition_color_green_input, "transition green")?,
+        blue: parse_input::<u8>(&state.transition_color_blue_input, "transition blue")?,
+        alpha: parse_input::<u8>(&state.transition_color_alpha_input, "transition alpha")?,
+    })
+}
+
+const fn transition_choice_label(choice: TransitionChoice) -> &'static str {
+    match choice {
+        TransitionChoice::FadeToNext => "Fade to next",
+        TransitionChoice::FadeToColor => "Fade to RGBA",
+        TransitionChoice::SlideLeft => "Slide left",
+        TransitionChoice::SlideRight => "Slide right",
+        TransitionChoice::SlideUp => "Slide up",
+        TransitionChoice::SlideDown => "Slide down",
+    }
+}
+
+fn format_transition_summary(transition: &Transition) -> String {
+    format!(
+        "Current outgoing: {} · {} step(s) · {} µs added",
+        match &transition.kind {
+            TransitionKind::FadeToNext => "Fade to next",
+            TransitionKind::FadeToColor { .. } => "Fade to RGBA",
+            TransitionKind::Slide {
+                direction: SlideDirection::Left,
+            } => "Slide left",
+            TransitionKind::Slide {
+                direction: SlideDirection::Right,
+            } => "Slide right",
+            TransitionKind::Slide {
+                direction: SlideDirection::Up,
+            } => "Slide up",
+            TransitionKind::Slide {
+                direction: SlideDirection::Down,
+            } => "Slide down",
+        },
+        transition.steps,
+        transition.duration.get()
+    )
 }
 
 fn show_transform_toolbar(
@@ -1990,20 +2200,23 @@ fn schedule_playback_repaint(context: &egui::Context, state: &EditorUiState, now
 mod tests {
     use std::time::{Duration, Instant};
 
-    use gif_from_screen_domain::{DurationUs, Effect, FrameId, PhysicalRect, PhysicalSize, TimeUs};
+    use gif_from_screen_domain::{
+        DurationUs, Effect, FrameId, MAX_TRANSITION_STEPS, PhysicalRect, PhysicalSize, Rgba,
+        SlideDirection, TimeUs, TransitionKind,
+    };
     use gif_from_screen_editor::{
         DuplicateDelayMode, DuplicateFrameRetention, ReduceDelayMode, YoyoScope,
     };
 
     use super::{
         EditorUiAction, EditorUiOperation, EditorUiState, EffectChoice, FILMSTRIP_ITEM_WIDTH,
-        OrientationControl, PlaybackClock, build_effect, duplicate_delay_label,
-        duplicate_retention_label, effect_choice_label, format_duration_us,
-        format_optional_duration, frame_click_operation, orientation_operation, parse_crop,
-        parse_duration_us, parse_effect_index, parse_keep_every, parse_output_size,
-        parse_similarity_threshold, parse_time_ms, parse_time_range, push_notice,
-        reduce_delay_label, repair_journal_notice, to_ui_points, visible_widget_range,
-        yoyo_scope_label,
+        OrientationControl, PlaybackClock, TransitionChoice, build_effect,
+        build_transition_settings, duplicate_delay_label, duplicate_retention_label,
+        effect_choice_label, format_duration_us, format_optional_duration, frame_click_operation,
+        orientation_operation, parse_crop, parse_duration_us, parse_effect_index, parse_keep_every,
+        parse_output_size, parse_similarity_threshold, parse_time_ms, parse_time_range,
+        push_notice, reduce_delay_label, repair_journal_notice, to_ui_points,
+        transition_choice_label, visible_widget_range, yoyo_scope_label,
     };
 
     #[test]
@@ -2030,6 +2243,13 @@ mod tests {
         assert_eq!(state.effect_region_height_input, "1");
         assert_eq!(state.effect_color_alpha_input, "255");
         assert_eq!(state.frame_expression, "1");
+        assert_eq!(state.transition_choice, TransitionChoice::FadeToNext);
+        assert_eq!(state.transition_duration_us_input, "100000");
+        assert_eq!(state.transition_steps_input, "5");
+        assert_eq!(state.transition_color_red_input, "0");
+        assert_eq!(state.transition_color_green_input, "0");
+        assert_eq!(state.transition_color_blue_input, "0");
+        assert_eq!(state.transition_color_alpha_input, "255");
         assert_eq!(state.crop_x_input, "0");
         assert_eq!(state.crop_y_input, "0");
         assert_eq!(state.crop_width_input, "1");
@@ -2124,6 +2344,94 @@ mod tests {
         ] {
             assert!(!duplicate_delay_label(mode).is_empty());
         }
+    }
+
+    #[test]
+    fn every_transition_choice_builds_typed_settings_from_default_inputs() {
+        let mut state = EditorUiState::default();
+        for choice in [
+            TransitionChoice::FadeToNext,
+            TransitionChoice::FadeToColor,
+            TransitionChoice::SlideLeft,
+            TransitionChoice::SlideRight,
+            TransitionChoice::SlideUp,
+            TransitionChoice::SlideDown,
+        ] {
+            state.transition_choice = choice;
+            let settings = build_transition_settings(&state).unwrap();
+            assert_eq!(settings.duration, DurationUs::new(100_000).unwrap());
+            assert_eq!(settings.steps, 5);
+            assert!(!transition_choice_label(choice).is_empty());
+            assert!(matches!(
+                (choice, settings.kind),
+                (TransitionChoice::FadeToNext, TransitionKind::FadeToNext)
+                    | (
+                        TransitionChoice::FadeToColor,
+                        TransitionKind::FadeToColor {
+                            color: Rgba {
+                                red: 0,
+                                green: 0,
+                                blue: 0,
+                                alpha: 255
+                            }
+                        }
+                    )
+                    | (
+                        TransitionChoice::SlideLeft,
+                        TransitionKind::Slide {
+                            direction: SlideDirection::Left
+                        }
+                    )
+                    | (
+                        TransitionChoice::SlideRight,
+                        TransitionKind::Slide {
+                            direction: SlideDirection::Right
+                        }
+                    )
+                    | (
+                        TransitionChoice::SlideUp,
+                        TransitionKind::Slide {
+                            direction: SlideDirection::Up
+                        }
+                    )
+                    | (
+                        TransitionChoice::SlideDown,
+                        TransitionKind::Slide {
+                            direction: SlideDirection::Down
+                        }
+                    )
+            ));
+        }
+    }
+
+    #[test]
+    fn transition_inputs_reject_zero_overflow_short_duration_and_bad_rgba() {
+        let mut state = EditorUiState::default();
+        for steps in ["0".to_owned(), (MAX_TRANSITION_STEPS + 1).to_string()] {
+            state.transition_steps_input = steps;
+            assert!(build_transition_settings(&state).is_err());
+        }
+        state.transition_steps_input = u32::from(u16::MAX).to_string();
+        assert!(build_transition_settings(&state).is_err());
+        state.transition_steps_input = "5".to_owned();
+        state.transition_duration_us_input = "0".to_owned();
+        assert!(build_transition_settings(&state).is_err());
+        state.transition_duration_us_input = "4".to_owned();
+        assert!(build_transition_settings(&state).is_err());
+        state.transition_duration_us_input = u64::MAX.to_string();
+        assert!(build_transition_settings(&state).is_ok());
+
+        state.transition_choice = TransitionChoice::FadeToColor;
+        state.transition_color_alpha_input = "256".to_owned();
+        assert!(build_transition_settings(&state).is_err());
+        state.transition_color_alpha_input = "0".to_owned();
+        let settings = build_transition_settings(&state).unwrap();
+        assert!(matches!(
+            settings.kind,
+            TransitionKind::FadeToColor {
+                color: Rgba::TRANSPARENT
+            }
+        ));
     }
 
     #[test]

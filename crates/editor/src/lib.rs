@@ -14,6 +14,7 @@ mod duplicates;
 mod frame_clipboard;
 mod frame_effect;
 mod frame_selection;
+mod frame_transition;
 mod selection;
 mod statistics;
 mod virtual_filmstrip;
@@ -32,6 +33,9 @@ pub use frame_effect::{FrameEffectEdit, MAX_FRAME_EFFECT_BLUR_RADIUS, edit_frame
 pub use frame_selection::{
     FrameExpressionError, FrameExpressionErrorReason, FrameTimeRangeError, parse_frame_expression,
     select_frames_by_time_range,
+};
+pub use frame_transition::{
+    FrameTransitionSettings, remove_transition_after, set_transition_after,
 };
 pub use selection::{TimelineSelection, TimelineSelectionError};
 pub use statistics::{
@@ -818,6 +822,50 @@ pub enum EditorError {
     /// A generated frame identity was already present or returned earlier in this edit.
     #[error("the generated frame id {0} conflicts with another timeline frame")]
     GeneratedFrameIdConflict(FrameId),
+    /// A frame transition operation requires a current frame.
+    #[error("select a current frame before editing its outgoing transition")]
+    NoCurrentFrameForTransition,
+    /// The current frame is the final timeline frame and therefore has no outgoing pair.
+    #[error("frame {0} is the final timeline frame and has no next-frame transition")]
+    NoFrameAfterTransitionAnchor(FrameId),
+    /// A transition step count must be within the domain's bounded positive range.
+    #[error("transition steps must be between 1 and {maximum}, got {steps}")]
+    InvalidTransitionSteps {
+        /// Rejected intermediate-frame count.
+        steps: u16,
+        /// Largest supported intermediate-frame count.
+        maximum: u16,
+    },
+    /// The total added duration cannot give every transition step a positive duration.
+    #[error("transition duration {duration_us}us is shorter than its {steps} steps")]
+    TransitionDurationTooShort {
+        /// Rejected total added duration.
+        duration_us: u64,
+        /// Requested intermediate-frame count.
+        steps: u16,
+    },
+    /// A transition identity generator returned the reserved nil identity.
+    #[error("the transition id generator returned the reserved nil identity")]
+    GeneratedNilTransitionId,
+    /// A generated transition identity conflicts with an existing transition.
+    #[error("the generated transition id {0} conflicts with an existing transition")]
+    GeneratedTransitionIdConflict(gif_from_screen_domain::TransitionId),
+    /// Corrupt input contains multiple transitions for one ordered endpoint pair.
+    #[error("multiple transitions target frames {from_frame} -> {to_frame}")]
+    AmbiguousTransitionPair {
+        /// Outgoing endpoint.
+        from_frame: FrameId,
+        /// Incoming endpoint.
+        to_frame: FrameId,
+    },
+    /// Removing a transition was requested for an endpoint pair without one.
+    #[error("frames {from_frame} -> {to_frame} have no transition to remove")]
+    MissingTransitionPair {
+        /// Outgoing endpoint.
+        from_frame: FrameId,
+        /// Incoming endpoint.
+        to_frame: FrameId,
+    },
 }
 
 #[cfg(test)]
