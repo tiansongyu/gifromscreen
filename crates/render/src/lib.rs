@@ -17,12 +17,14 @@
 
 mod control;
 mod error;
+mod overlay;
 mod renderer;
 mod surface;
 mod transition;
 
 pub use control::{CancellationToken, NeverCancel};
 pub use error::{RenderError, SurfaceError, UnsupportedEffect};
+pub use overlay::{RasterOverlayAsset, active_raster_overlay_assets};
 pub use renderer::{
     AssetProviderError, CpuRenderer, FrameAssetProvider, MAX_BLUR_RADIUS, RenderLimits,
 };

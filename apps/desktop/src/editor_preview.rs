@@ -4,16 +4,20 @@
 // by the editor view model.
 #![allow(dead_code)]
 
-use std::{collections::VecDeque, fs, io, path::PathBuf};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    fs, io,
+    path::PathBuf,
+};
 
 use eframe::egui;
 use gif_from_screen_domain::{
-    AssetId, AssetKind, FrameId, ProjectId, ProjectRevision, RasterEncoding,
+    AssetId, AssetKind, FrameId, OverlayId, ProjectId, ProjectRevision, RasterEncoding, TimeUs,
 };
 use gif_from_screen_project::{ActiveProject, ProjectError};
 use gif_from_screen_render::{
     AssetProviderError, CpuRenderer, FrameAssetProvider, NeverCancel, RenderError, RenderLimits,
-    RgbaSurface, SurfaceError,
+    RgbaSurface, SurfaceError, active_raster_overlay_assets,
 };
 use thiserror::Error;
 
@@ -36,9 +40,16 @@ pub(crate) enum EditorPreviewError {
     InvalidPreviewBounds { width: u32, height: u32 },
     #[error("frame {frame_id} is not present in the active project")]
     FrameNotFound { frame_id: FrameId },
+    #[error("project time overflows before frame {frame_id}")]
+    FrameTimeOverflow { frame_id: FrameId },
     #[error("frame {frame_id} references missing asset descriptor {asset_id}")]
     MissingAssetDescriptor {
         frame_id: FrameId,
+        asset_id: AssetId,
+    },
+    #[error("raster overlay {overlay_id} references missing asset descriptor {asset_id}")]
+    MissingOverlayAssetDescriptor {
+        overlay_id: OverlayId,
         asset_id: AssetId,
     },
     #[error("asset map key {asset_id} does not match descriptor id {descriptor_id}")]
@@ -48,10 +59,29 @@ pub(crate) enum EditorPreviewError {
     },
     #[error("asset {asset_id} is not a frame asset: {kind:?}")]
     InvalidAssetKind { asset_id: AssetId, kind: AssetKind },
+    #[error("raster overlay {overlay_id} asset {asset_id} is not a raster: {kind:?}")]
+    InvalidOverlayAssetKind {
+        overlay_id: OverlayId,
+        asset_id: AssetId,
+        kind: AssetKind,
+    },
     #[error("frame asset {asset_id} uses unsupported encoding {encoding:?}; expected raw RGBA8")]
     UnsupportedAssetEncoding {
         asset_id: AssetId,
         encoding: RasterEncoding,
+    },
+    #[error("raster overlay {overlay_id} asset {asset_id} uses unsupported encoding {encoding:?}")]
+    UnsupportedOverlayAssetEncoding {
+        overlay_id: OverlayId,
+        asset_id: AssetId,
+        encoding: RasterEncoding,
+    },
+    #[error("could not plan raster overlays for frame {frame_id} at {time_us}us: {source}")]
+    OverlayPlan {
+        frame_id: FrameId,
+        time_us: u64,
+        #[source]
+        source: RenderError,
     },
     #[error("raw RGBA8 byte length overflows for asset {asset_id} at {width}x{height}")]
     SourceByteLengthOverflow {
@@ -82,12 +112,16 @@ pub(crate) enum EditorPreviewError {
         expected: u64,
         actual: u64,
     },
-    #[error("asset {asset_id} needs {required} bytes, above the {limit}-byte preview load limit")]
+    #[error(
+        "loading asset {asset_id} would retain {required} bytes, above the {limit}-byte preview source limit"
+    )]
     SourceMemoryLimitExceeded {
         asset_id: AssetId,
         required: u64,
         limit: usize,
     },
+    #[error("preview source-memory accounting overflowed while adding asset {asset_id}")]
+    SourceMemorySizeOverflow { asset_id: AssetId },
     #[error("could not read and verify frame asset {asset_id}: {source}")]
     AssetRead {
         asset_id: AssetId,
@@ -337,59 +371,170 @@ fn prepare_preview(
 /// Safely loads and CPU-renders one frame with a strict per-surface memory limit.
 ///
 /// This is the shared final-pixel path used by previews and exact duplicate detection. It verifies
-/// descriptor shape, file length, content digest, raw RGBA encoding, and renderer limits before
-/// returning the fully transformed/effected surface.
+/// descriptor shape, file length, content digest, raw RGBA encoding, aggregate provider limits,
+/// and renderer limits before returning the fully transformed/effected/overlaid surface.
 pub(crate) fn render_frame_surface(
     project: &ActiveProject,
     frame_id: FrameId,
     render_surface_limit_bytes: usize,
 ) -> Result<RgbaSurface, EditorPreviewError> {
-    let (clip, source) = load_frame_source(project, frame_id, render_surface_limit_bytes)?;
-    let asset_id = clip.asset_id;
-    let provider = SingleFrameProvider { asset_id, source };
+    let (clip, sample_time, provider) =
+        load_frame_sources(project, frame_id, render_surface_limit_bytes)?;
     let cpu_renderer = CpuRenderer::with_limits(RenderLimits {
         max_surface_bytes: render_surface_limit_bytes,
     });
     cpu_renderer
-        .render_clip(&clip, &provider, &NeverCancel)
+        .render_clip_with_raster_overlays(
+            &clip,
+            &project.manifest().timeline.overlay_tracks,
+            sample_time,
+            &provider,
+            &NeverCancel,
+        )
         .map_err(|source| EditorPreviewError::Render { frame_id, source })
 }
 
-fn load_frame_source(
+fn load_frame_sources(
     project: &ActiveProject,
     frame_id: FrameId,
     render_surface_limit_bytes: usize,
-) -> Result<(gif_from_screen_domain::FrameClip, RgbaSurface), EditorPreviewError> {
+) -> Result<
+    (
+        gif_from_screen_domain::FrameClip,
+        TimeUs,
+        PreviewAssetProvider,
+    ),
+    EditorPreviewError,
+> {
     let clip = project
         .manifest()
         .timeline
         .frames
         .iter()
         .find(|clip| clip.id == frame_id)
-        .ok_or(EditorPreviewError::FrameNotFound { frame_id })?;
-    let asset_id = clip.asset_id;
+        .ok_or(EditorPreviewError::FrameNotFound { frame_id })?
+        .clone();
+    let sample_time = project
+        .manifest()
+        .timeline
+        .frame_start(frame_id)
+        .ok_or(EditorPreviewError::FrameTimeOverflow { frame_id })?;
+    let active_overlays = active_raster_overlay_assets(
+        &project.manifest().timeline.overlay_tracks,
+        sample_time,
+        &NeverCancel,
+    )
+    .map_err(|source| EditorPreviewError::OverlayPlan {
+        frame_id,
+        time_us: sample_time.get(),
+        source,
+    })?;
+    let mut provider = PreviewAssetProvider {
+        assets: BTreeMap::new(),
+    };
+    let mut retained_bytes = 0_u64;
+    load_preview_raster(
+        project,
+        clip.asset_id,
+        PreviewRasterRole::Frame { frame_id },
+        render_surface_limit_bytes,
+        &mut retained_bytes,
+        &mut provider.assets,
+    )?;
+    for overlay in active_overlays {
+        load_preview_raster(
+            project,
+            overlay.asset_id,
+            PreviewRasterRole::Overlay {
+                overlay_id: overlay.overlay_id,
+            },
+            render_surface_limit_bytes,
+            &mut retained_bytes,
+            &mut provider.assets,
+        )?;
+    }
+    Ok((clip, sample_time, provider))
+}
+
+#[derive(Clone, Copy)]
+enum PreviewRasterRole {
+    Frame { frame_id: FrameId },
+    Overlay { overlay_id: OverlayId },
+}
+
+fn preview_raster_shape(
+    kind: &AssetKind,
+    role: PreviewRasterRole,
+    asset_id: AssetId,
+) -> Result<(gif_from_screen_domain::PhysicalSize, RasterEncoding), EditorPreviewError> {
+    match (role, kind) {
+        (PreviewRasterRole::Frame { .. }, AssetKind::Frame { size, encoding })
+        | (
+            PreviewRasterRole::Overlay { .. },
+            AssetKind::Frame { size, encoding }
+            | AssetKind::OverlayImage { size, encoding }
+            | AssetKind::Mask { size, encoding },
+        ) => Ok((*size, *encoding)),
+        (PreviewRasterRole::Frame { .. }, kind) => Err(EditorPreviewError::InvalidAssetKind {
+            asset_id,
+            kind: kind.clone(),
+        }),
+        (PreviewRasterRole::Overlay { overlay_id }, kind) => {
+            Err(EditorPreviewError::InvalidOverlayAssetKind {
+                overlay_id,
+                asset_id,
+                kind: kind.clone(),
+            })
+        }
+    }
+}
+
+fn load_preview_raster(
+    project: &ActiveProject,
+    asset_id: AssetId,
+    role: PreviewRasterRole,
+    render_surface_limit_bytes: usize,
+    retained_bytes: &mut u64,
+    assets: &mut BTreeMap<AssetId, RgbaSurface>,
+) -> Result<(), EditorPreviewError> {
     let descriptor = project
         .manifest()
         .assets
         .get(&asset_id)
-        .ok_or(EditorPreviewError::MissingAssetDescriptor { frame_id, asset_id })?;
+        .ok_or_else(|| match role {
+            PreviewRasterRole::Frame { frame_id } => {
+                EditorPreviewError::MissingAssetDescriptor { frame_id, asset_id }
+            }
+            PreviewRasterRole::Overlay { overlay_id } => {
+                EditorPreviewError::MissingOverlayAssetDescriptor {
+                    overlay_id,
+                    asset_id,
+                }
+            }
+        })?;
     if descriptor.id != asset_id {
         return Err(EditorPreviewError::DescriptorIdMismatch {
             asset_id,
             descriptor_id: descriptor.id,
         });
     }
-    let (source_size, encoding) = match &descriptor.kind {
-        AssetKind::Frame { size, encoding } => (*size, *encoding),
-        kind => {
-            return Err(EditorPreviewError::InvalidAssetKind {
-                asset_id,
-                kind: kind.clone(),
-            });
-        }
-    };
+    let (source_size, encoding) = preview_raster_shape(&descriptor.kind, role, asset_id)?;
     if encoding != RasterEncoding::Rgba8 {
-        return Err(EditorPreviewError::UnsupportedAssetEncoding { asset_id, encoding });
+        return Err(match role {
+            PreviewRasterRole::Frame { .. } => {
+                EditorPreviewError::UnsupportedAssetEncoding { asset_id, encoding }
+            }
+            PreviewRasterRole::Overlay { overlay_id } => {
+                EditorPreviewError::UnsupportedOverlayAssetEncoding {
+                    overlay_id,
+                    asset_id,
+                    encoding,
+                }
+            }
+        });
+    }
+    if assets.contains_key(&asset_id) {
+        return Ok(());
     }
 
     let width = source_size.width.get();
@@ -427,10 +572,13 @@ fn load_frame_source(
             actual: file_bytes,
         });
     }
-    if file_bytes > u64::try_from(render_surface_limit_bytes).unwrap_or(u64::MAX) {
+    let required = retained_bytes
+        .checked_add(file_bytes)
+        .ok_or(EditorPreviewError::SourceMemorySizeOverflow { asset_id })?;
+    if required > u64::try_from(render_surface_limit_bytes).unwrap_or(u64::MAX) {
         return Err(EditorPreviewError::SourceMemoryLimitExceeded {
             asset_id,
-            required: file_bytes,
+            required,
             limit: render_surface_limit_bytes,
         });
     }
@@ -441,30 +589,27 @@ fn load_frame_source(
         .map_err(|source| EditorPreviewError::AssetRead { asset_id, source })?;
     let source = RgbaSurface::new(source_size, pixels)
         .map_err(|source| EditorPreviewError::InvalidSurface { asset_id, source })?;
-    Ok((clip.clone(), source))
+    assets.insert(asset_id, source);
+    *retained_bytes = required;
+    Ok(())
 }
 
 #[derive(Debug, Error)]
-#[error("renderer requested unexpected asset {actual}; preview owns only {expected}")]
+#[error("renderer requested asset {actual} outside the bounded preview provider")]
 struct UnexpectedAsset {
-    expected: AssetId,
     actual: AssetId,
 }
 
-struct SingleFrameProvider {
-    asset_id: AssetId,
-    source: RgbaSurface,
+struct PreviewAssetProvider {
+    assets: BTreeMap<AssetId, RgbaSurface>,
 }
 
-impl FrameAssetProvider for SingleFrameProvider {
+impl FrameAssetProvider for PreviewAssetProvider {
     fn load_rgba8(&self, asset_id: AssetId) -> Result<RgbaSurface, AssetProviderError> {
-        if asset_id != self.asset_id {
-            return Err(Box::new(UnexpectedAsset {
-                expected: self.asset_id,
-                actual: asset_id,
-            }));
-        }
-        Ok(self.source.clone())
+        self.assets
+            .get(&asset_id)
+            .cloned()
+            .ok_or_else(|| Box::new(UnexpectedAsset { actual: asset_id }) as AssetProviderError)
     }
 }
 
@@ -577,9 +722,10 @@ fn resize_nearest_rgba(
 mod tests {
     use super::*;
     use gif_from_screen_domain::{
-        AssetDescriptor, Canvas, CanvasBackground, CaptureMetadata, ClipTransform, ColorSpace,
-        DurationUs, EditCommand, Effect, FrameClip, PhysicalRect, PhysicalSize, ProjectManifest,
-        UnixTimeMs,
+        AssetDescriptor, BlendMode, Canvas, CanvasBackground, CaptureMetadata, ClipTransform,
+        ColorSpace, DurationUs, EditCommand, Effect, FrameClip, OverlayContent, OverlayId,
+        OverlayItem, OverlayTrack, PhysicalPoint, PhysicalPx, PhysicalRect, PhysicalSize,
+        ProjectManifest, TimelineSpan, TrackId, UnixTimeMs,
     };
     use tempfile::{TempDir, tempdir};
 
@@ -642,6 +788,58 @@ mod tests {
             })
             .unwrap();
         (scratch, project, frame_id, asset_id)
+    }
+
+    fn add_raster_overlay(
+        project: &mut ActiveProject,
+        pixels: &[u8],
+        size: PhysicalSize,
+    ) -> (AssetId, OverlayTrack) {
+        let asset_id = project.assets().put(pixels).unwrap();
+        let track = OverlayTrack {
+            id: TrackId::from_u128(1),
+            name: "preview watermark".to_owned(),
+            visible: true,
+            opacity: 255,
+            blend_mode: BlendMode::Normal,
+            items: vec![OverlayItem {
+                id: OverlayId::from_u128(1),
+                span: TimelineSpan {
+                    start: TimeUs::ZERO,
+                    duration: DurationUs::new(10_000).unwrap(),
+                },
+                z_index: 0,
+                content: OverlayContent::Raster {
+                    asset_id,
+                    position: PhysicalPoint {
+                        x: PhysicalPx::new(1),
+                        y: PhysicalPx::ZERO,
+                    },
+                    size,
+                    opacity: 255,
+                },
+            }],
+        };
+        project
+            .commit(EditCommand::Compound {
+                commands: vec![
+                    EditCommand::RegisterAsset {
+                        asset: AssetDescriptor {
+                            id: asset_id,
+                            byte_len: u64::try_from(pixels.len()).unwrap(),
+                            kind: AssetKind::OverlayImage {
+                                size,
+                                encoding: RasterEncoding::Rgba8,
+                            },
+                        },
+                    },
+                    EditCommand::UpsertOverlayTrack {
+                        track: track.clone(),
+                    },
+                ],
+            })
+            .unwrap();
+        (asset_id, track)
     }
 
     #[test]
@@ -766,6 +964,82 @@ mod tests {
                 10, 20, 30, 64, 100, 50, 25, 255, 100, 50, 25, 255,
             ]
         );
+    }
+
+    #[test]
+    fn preview_uses_shared_raster_compositor_and_bounded_multi_asset_provider() {
+        let base_size = PhysicalSize::new(2, 1).unwrap();
+        let (_scratch, mut project, frame_id, _) = project_with_frame(
+            &[0, 0, 255, 255, 0, 0, 255, 255],
+            base_size,
+            ClipTransform::default(),
+            Vec::new(),
+        );
+        let (overlay_asset, mut track) = add_raster_overlay(
+            &mut project,
+            &[255, 0, 0, 255],
+            PhysicalSize::new(1, 1).unwrap(),
+        );
+
+        assert!(matches!(
+            render_frame_surface(&project, frame_id, 11),
+            Err(EditorPreviewError::SourceMemoryLimitExceeded {
+                asset_id,
+                required: 12,
+                limit: 11,
+            }) if asset_id == overlay_asset
+        ));
+        let rendered = render_frame_surface(&project, frame_id, 12).unwrap();
+        assert_eq!(rendered.pixels(), [0, 0, 255, 255, 255, 0, 0, 255]);
+
+        track.visible = false;
+        project
+            .commit(EditCommand::UpsertOverlayTrack { track })
+            .unwrap();
+        fs::remove_file(project.assets().asset_path(overlay_asset)).unwrap();
+        let hidden = render_frame_surface(&project, frame_id, 8).unwrap();
+        assert_eq!(hidden.pixels(), [0, 0, 255, 255, 0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn preview_overlay_can_reuse_the_identical_content_addressed_frame_asset() {
+        let size = PhysicalSize::new(2, 1).unwrap();
+        let (_scratch, mut project, frame_id, frame_asset) = project_with_frame(
+            &[255, 0, 0, 255, 0, 255, 0, 255],
+            size,
+            ClipTransform::default(),
+            Vec::new(),
+        );
+        let track = OverlayTrack {
+            id: TrackId::from_u128(1),
+            name: "shared asset watermark".to_owned(),
+            visible: true,
+            opacity: 255,
+            blend_mode: BlendMode::Normal,
+            items: vec![OverlayItem {
+                id: OverlayId::from_u128(1),
+                span: TimelineSpan {
+                    start: TimeUs::ZERO,
+                    duration: DurationUs::new(10_000).unwrap(),
+                },
+                z_index: 0,
+                content: OverlayContent::Raster {
+                    asset_id: frame_asset,
+                    position: PhysicalPoint {
+                        x: PhysicalPx::new(1),
+                        y: PhysicalPx::ZERO,
+                    },
+                    size: PhysicalSize::new(1, 1).unwrap(),
+                    opacity: 255,
+                },
+            }],
+        };
+        project
+            .commit(EditCommand::UpsertOverlayTrack { track })
+            .unwrap();
+
+        let rendered = render_frame_surface(&project, frame_id, 16).unwrap();
+        assert_eq!(rendered.pixels(), [255, 0, 0, 255, 255, 0, 0, 255]);
     }
 
     #[test]

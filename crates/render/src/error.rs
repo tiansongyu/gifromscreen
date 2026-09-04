@@ -1,4 +1,4 @@
-use gif_from_screen_domain::{AssetId, PhysicalRect};
+use gif_from_screen_domain::{AssetId, OverlayId, PhysicalRect};
 use thiserror::Error;
 
 use crate::AssetProviderError;
@@ -89,6 +89,32 @@ pub enum RenderError {
         /// Provider-specific cause.
         #[source]
         source: AssetProviderError,
+    },
+    /// A raster overlay asset provider failed.
+    #[error("could not load RGBA8 raster overlay {overlay_id} asset {asset_id}: {source}")]
+    OverlayAssetLoad {
+        /// Overlay item whose immutable pixels were requested.
+        overlay_id: OverlayId,
+        /// Referenced raster asset.
+        asset_id: AssetId,
+        /// Provider-specific cause.
+        #[source]
+        source: AssetProviderError,
+    },
+    /// An overlay span cannot represent its exclusive endpoint.
+    #[error("raster overlay {overlay_id} time span overflows the project clock")]
+    OverlaySpanOverflow {
+        /// Overlay with an overflowing span.
+        overlay_id: OverlayId,
+    },
+    /// The active raster-overlay sorting plan exceeded the platform address space.
+    #[error("active raster overlay plan item count overflowed")]
+    OverlayPlanSizeOverflow,
+    /// Reserving the active raster-overlay sorting plan failed.
+    #[error("could not allocate an active raster overlay plan for {requested} items")]
+    OverlayPlanAllocationFailed {
+        /// Number of plan entries requested at the failed growth point.
+        requested: usize,
     },
     /// A requested crop is empty, overflows, or extends outside the source.
     #[error("crop {crop:?} does not fit within the {source_width}x{source_height} source surface")]

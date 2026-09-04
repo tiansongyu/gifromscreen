@@ -4,8 +4,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use gif_from_screen_domain::{
-    AssetId, AssetKind, FrameClip, FrameId, MAX_TRANSITION_STEPS, ProjectId, ProjectManifest,
-    ProjectRevision, RasterEncoding, Transition, TransitionId,
+    AssetId, AssetKind, FrameClip, FrameId, MAX_TRANSITION_STEPS, OverlayId, OverlayTrack,
+    ProjectId, ProjectManifest, ProjectRevision, RasterEncoding, TimeUs, Transition, TransitionId,
 };
 use gif_from_screen_gif::{
     BuiltinGifEncoder, CancellationToken as GifCancellationToken, EncodeOptions, EncodeProgress,
@@ -16,7 +16,7 @@ use gif_from_screen_project::{ActiveProject, AssetStore, ProjectError};
 use gif_from_screen_render::{
     AssetProviderError, CancellationToken as RenderCancellationToken, CpuRenderer,
     FrameAssetProvider, RenderError, RenderLimits, RgbaSurface, SurfaceError, TransitionProgress,
-    render_transition,
+    active_raster_overlay_assets, render_transition,
 };
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -363,6 +363,114 @@ pub enum ProjectGifExportError {
         source: SurfaceError,
     },
 
+    /// An active raster overlay references no descriptor in the snapshot manifest.
+    #[error("raster overlay {overlay_id} references missing asset descriptor {asset_id}")]
+    MissingOverlayAssetDescriptor {
+        /// Active raster overlay.
+        overlay_id: OverlayId,
+        /// Missing content-addressed asset identifier.
+        asset_id: AssetId,
+    },
+
+    /// An active raster overlay references a non-raster asset kind.
+    #[error("raster overlay {overlay_id} references non-raster asset {asset_id}: {kind:?}")]
+    InvalidOverlayAssetKind {
+        /// Active raster overlay.
+        overlay_id: OverlayId,
+        /// Incompatible content-addressed asset identifier.
+        asset_id: AssetId,
+        /// Incompatible descriptor kind.
+        kind: AssetKind,
+    },
+
+    /// The raster-overlay compositor currently requires raw RGBA8 assets.
+    #[error("raster overlay {overlay_id} asset {asset_id} uses unsupported encoding {encoding:?}")]
+    UnsupportedOverlayAssetEncoding {
+        /// Active raster overlay.
+        overlay_id: OverlayId,
+        /// Incompatible content-addressed asset identifier.
+        asset_id: AssetId,
+        /// Unsupported persisted encoding.
+        encoding: RasterEncoding,
+    },
+
+    /// An active immutable raster-overlay asset file is missing.
+    #[error(
+        "raster overlay {overlay_id} asset {asset_id} is missing at {path}",
+        path = path.display()
+    )]
+    MissingOverlayAssetFile {
+        /// Active raster overlay.
+        overlay_id: OverlayId,
+        /// Missing content-addressed asset identifier.
+        asset_id: AssetId,
+        /// Expected immutable asset path.
+        path: PathBuf,
+    },
+
+    /// An active raster-overlay asset no longer matches its content digest.
+    #[error("raster overlay {overlay_id} asset {asset_id} is corrupt: {source}")]
+    CorruptOverlayAsset {
+        /// Active raster overlay.
+        overlay_id: OverlayId,
+        /// Corrupt content-addressed asset identifier.
+        asset_id: AssetId,
+        /// Original project-store integrity error.
+        #[source]
+        source: ProjectError,
+    },
+
+    /// An active raster-overlay asset could not be read or verified.
+    #[error("could not read raster overlay {overlay_id} asset {asset_id}: {source}")]
+    ReadOverlayAsset {
+        /// Active raster overlay.
+        overlay_id: OverlayId,
+        /// Unreadable content-addressed asset identifier.
+        asset_id: AssetId,
+        /// Original project-store failure.
+        #[source]
+        source: ProjectError,
+    },
+
+    /// An overlay descriptor byte length differs from verified asset content.
+    #[error(
+        "raster overlay {overlay_id} asset {asset_id} has {actual} bytes but its descriptor declares {expected}"
+    )]
+    OverlayAssetLengthMismatch {
+        /// Active raster overlay.
+        overlay_id: OverlayId,
+        /// Inconsistent content-addressed asset identifier.
+        asset_id: AssetId,
+        /// Byte length persisted in the descriptor.
+        expected: u64,
+        /// Verified asset-file byte length.
+        actual: u64,
+    },
+
+    /// Verified raster-overlay bytes do not form the descriptor's RGBA surface.
+    #[error("raster overlay {overlay_id} asset {asset_id} is not valid RGBA8: {source}")]
+    InvalidOverlayAssetSurface {
+        /// Active raster overlay.
+        overlay_id: OverlayId,
+        /// Invalid content-addressed asset identifier.
+        asset_id: AssetId,
+        /// Renderer surface validation failure.
+        #[source]
+        source: SurfaceError,
+    },
+
+    /// Resolving active raster overlays failed for one selected frame time.
+    #[error("could not plan raster overlays for frame {frame_id} at {time_us}us: {source}")]
+    PlanRasterOverlays {
+        /// Selected project frame.
+        frame_id: FrameId,
+        /// Original project-relative frame start.
+        time_us: u64,
+        /// Renderer planning failure.
+        #[source]
+        source: RenderError,
+    },
+
     /// CPU transform/effect rendering failed for one frame.
     #[error("could not render selected frame {frame_id} at position {selection_index}: {source}")]
     RenderFrame {
@@ -473,7 +581,7 @@ pub enum ProjectGifExportError {
         step: u16,
         /// Deterministic renderer failure.
         #[source]
-        source: RenderError,
+        source: Box<RenderError>,
     },
 
     /// A custom palette was paired with an invalid encoder color limit.
@@ -591,6 +699,7 @@ pub fn export_project_snapshot_to_gif(
     }
 
     let clips = select_clips(&snapshot.manifest, &options.frames)?;
+    let frame_times = selected_frame_start_times(&snapshot.manifest, &clips)?;
     let selected_frames =
         u64::try_from(clips.len()).map_err(|_| ProjectGifExportError::OutputFrameCountOverflow)?;
     let transitions = applicable_transitions(&snapshot.manifest, &clips)?;
@@ -601,13 +710,16 @@ pub fn export_project_snapshot_to_gif(
     let (assets, source_bytes) = load_selected_assets(
         snapshot,
         &clips,
+        &frame_times,
         options.render_buffer_limit_bytes,
         cancellation,
     )?;
     let provider = LoadedAssetProvider { assets };
     let gif_frames = render_selected_frames(
         &clips,
+        &frame_times,
         &transitions,
+        &snapshot.manifest.timeline.overlay_tracks,
         &provider,
         source_bytes,
         options.render_buffer_limit_bytes,
@@ -750,12 +862,15 @@ fn validate_expanded_duration(
 }
 
 #[allow(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "the bounded two-surface lookahead keeps output ordering and memory accounting auditable"
 )]
 fn render_selected_frames(
     clips: &[FrameClip],
+    frame_times: &[TimeUs],
     transitions: &[Option<Transition>],
+    overlay_tracks: &[OverlayTrack],
     provider: &LoadedAssetProvider,
     source_bytes: u64,
     buffer_limit_bytes: u64,
@@ -771,7 +886,9 @@ fn render_selected_frames(
     let mut current = render_clip_surface(
         &cpu_renderer,
         &clips[0],
+        frame_times[0],
         0,
+        overlay_tracks,
         provider,
         &render_cancellation,
         execution,
@@ -788,7 +905,9 @@ fn render_selected_frames(
         let next = render_clip_surface(
             &cpu_renderer,
             next_clip,
+            frame_times[selection_index + 1],
             selection_index + 1,
+            overlay_tracks,
             provider,
             &render_cancellation,
             execution,
@@ -824,7 +943,7 @@ fn render_selected_frames(
                         ProjectGifExportError::RenderTransition {
                             transition: transition.clone(),
                             step,
-                            source,
+                            source: Box::new(source),
                         }
                     })?;
                 let surface = render_transition(
@@ -841,7 +960,7 @@ fn render_selected_frames(
                         ProjectGifExportError::RenderTransition {
                             transition: transition.clone(),
                             step,
-                            source,
+                            source: Box::new(source),
                         }
                     }
                 })?;
@@ -902,17 +1021,23 @@ fn surface_to_gif_frame(
         .map_err(|source| ProjectGifExportError::BuildGifFrame { frame_id, source })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the helper keeps frame identity, timeline sample, provider, and cancellation context explicit"
+)]
 fn render_clip_surface(
     renderer: &CpuRenderer,
     clip: &FrameClip,
+    sample_time: TimeUs,
     selection_index: usize,
+    overlay_tracks: &[OverlayTrack],
     provider: &LoadedAssetProvider,
     cancellation: &RenderCancellationAdapter<'_>,
     execution: &ExportExecution<'_>,
 ) -> Result<RgbaSurface, ProjectGifExportError> {
     ensure_not_cancelled(execution.cancellation)?;
     renderer
-        .render_clip(clip, provider, cancellation)
+        .render_clip_with_raster_overlays(clip, overlay_tracks, sample_time, provider, cancellation)
         .map_err(|source| {
             if execution.cancellation.is_cancelled() {
                 ProjectGifExportError::Cancelled
@@ -1151,9 +1276,45 @@ fn select_clips(
     }
 }
 
+fn selected_frame_start_times(
+    manifest: &ProjectManifest,
+    clips: &[FrameClip],
+) -> Result<Vec<TimeUs>, ProjectGifExportError> {
+    let mut starts = BTreeMap::new();
+    let mut start_us = 0_u64;
+    for frame in &manifest.timeline.frames {
+        starts.insert(frame.id, TimeUs::new(start_us));
+        start_us = start_us
+            .checked_add(frame.duration.get())
+            .ok_or(ProjectGifExportError::OutputDurationOverflow)?;
+    }
+    let mut selected = Vec::new();
+    selected.try_reserve_exact(clips.len()).map_err(|_| {
+        ProjectGifExportError::OutputFrameAllocationFailed {
+            requested: clips.len(),
+        }
+    })?;
+    for (selection_index, clip) in clips.iter().enumerate() {
+        selected.push(
+            *starts
+                .get(&clip.id)
+                .ok_or(ProjectGifExportError::UnknownFrame {
+                    selection_index,
+                    frame_id: clip.id,
+                })?,
+        );
+    }
+    Ok(selected)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "frame and active-overlay assets share one ordered aggregate memory budget"
+)]
 fn load_selected_assets(
     snapshot: &ProjectExportSnapshot,
     clips: &[FrameClip],
+    frame_times: &[TimeUs],
     buffer_limit_bytes: u64,
     cancellation: &dyn GifCancellationToken,
 ) -> Result<(BTreeMap<AssetId, RgbaSurface>, u64), ProjectGifExportError> {
@@ -1215,7 +1376,149 @@ fn load_selected_assets(
         loaded.insert(clip.asset_id, surface);
         loaded_bytes = required_bytes;
     }
+    let render_cancellation = RenderCancellationAdapter(cancellation);
+    let mut overlay_assets = BTreeMap::new();
+    for (clip, sample_time) in clips.iter().zip(frame_times.iter().copied()) {
+        ensure_not_cancelled(cancellation)?;
+        let active = active_raster_overlay_assets(
+            &snapshot.manifest.timeline.overlay_tracks,
+            sample_time,
+            &render_cancellation,
+        )
+        .map_err(|source| {
+            if cancellation.is_cancelled() || matches!(&source, RenderError::Cancelled) {
+                ProjectGifExportError::Cancelled
+            } else {
+                ProjectGifExportError::PlanRasterOverlays {
+                    frame_id: clip.id,
+                    time_us: sample_time.get(),
+                    source,
+                }
+            }
+        })?;
+        for reference in active {
+            overlay_assets
+                .entry(reference.asset_id)
+                .or_insert(reference.overlay_id);
+        }
+    }
+    for (asset_id, overlay_id) in overlay_assets {
+        ensure_not_cancelled(cancellation)?;
+        let descriptor = snapshot.manifest.assets.get(&asset_id).ok_or(
+            ProjectGifExportError::MissingOverlayAssetDescriptor {
+                overlay_id,
+                asset_id,
+            },
+        )?;
+        let (size, encoding) = match &descriptor.kind {
+            AssetKind::Frame { size, encoding }
+            | AssetKind::OverlayImage { size, encoding }
+            | AssetKind::Mask { size, encoding } => (*size, *encoding),
+            AssetKind::ImportedSource { .. } => {
+                return Err(ProjectGifExportError::InvalidOverlayAssetKind {
+                    overlay_id,
+                    asset_id,
+                    kind: descriptor.kind.clone(),
+                });
+            }
+        };
+        if encoding != RasterEncoding::Rgba8 {
+            return Err(ProjectGifExportError::UnsupportedOverlayAssetEncoding {
+                overlay_id,
+                asset_id,
+                encoding,
+            });
+        }
+        if loaded.contains_key(&asset_id) {
+            continue;
+        }
+        let asset_path = snapshot.assets.asset_path(asset_id);
+        let actual = overlay_asset_file_length(&asset_path, overlay_id, asset_id)?;
+        if actual != descriptor.byte_len {
+            return Err(ProjectGifExportError::OverlayAssetLengthMismatch {
+                overlay_id,
+                asset_id,
+                expected: descriptor.byte_len,
+                actual,
+            });
+        }
+        let required_bytes = loaded_bytes
+            .checked_add(actual)
+            .ok_or(ProjectGifExportError::RenderBufferSizeOverflow)?;
+        if required_bytes > buffer_limit_bytes {
+            return Err(ProjectGifExportError::RenderBufferLimitExceeded {
+                required_bytes,
+                limit_bytes: buffer_limit_bytes,
+            });
+        }
+        let pixels = read_overlay_asset(snapshot, overlay_id, asset_id)?;
+        let surface = RgbaSurface::new(size, pixels).map_err(|source| {
+            ProjectGifExportError::InvalidOverlayAssetSurface {
+                overlay_id,
+                asset_id,
+                source,
+            }
+        })?;
+        loaded.insert(asset_id, surface);
+        loaded_bytes = required_bytes;
+    }
     Ok((loaded, loaded_bytes))
+}
+
+fn overlay_asset_file_length(
+    path: &Path,
+    overlay_id: OverlayId,
+    asset_id: AssetId,
+) -> Result<u64, ProjectGifExportError> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            Err(ProjectGifExportError::MissingOverlayAssetFile {
+                overlay_id,
+                asset_id,
+                path: path.to_path_buf(),
+            })
+        }
+        Err(source) => Err(ProjectGifExportError::Io {
+            operation: "inspect raster overlay asset",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn read_overlay_asset(
+    snapshot: &ProjectExportSnapshot,
+    overlay_id: OverlayId,
+    asset_id: AssetId,
+) -> Result<Vec<u8>, ProjectGifExportError> {
+    match snapshot.assets.read(asset_id) {
+        Ok(pixels) => Ok(pixels),
+        Err(error) => {
+            if matches!(
+                &error,
+                ProjectError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound
+            ) {
+                return Err(ProjectGifExportError::MissingOverlayAssetFile {
+                    overlay_id,
+                    asset_id,
+                    path: snapshot.assets.asset_path(asset_id),
+                });
+            }
+            if matches!(error, ProjectError::CorruptAsset { .. }) {
+                return Err(ProjectGifExportError::CorruptOverlayAsset {
+                    overlay_id,
+                    asset_id,
+                    source: error,
+                });
+            }
+            Err(ProjectGifExportError::ReadOverlayAsset {
+                overlay_id,
+                asset_id,
+                source: error,
+            })
+        }
+    }
 }
 
 fn asset_file_length(path: &Path, clip: &FrameClip) -> Result<u64, ProjectGifExportError> {
@@ -1395,10 +1698,11 @@ mod tests {
     };
 
     use gif_from_screen_domain::{
-        AssetDescriptor, Canvas, CanvasBackground, CaptureMetadata, ClipTransform, ColorSpace,
-        DurationUs, EdgeWidths, EditCommand, Effect, FrameClip, PhysicalSize, ProjectId,
-        ProjectManifest, Rgba, SlideDirection, Transition, TransitionId, TransitionKind,
-        UnixTimeMs,
+        AssetDescriptor, BlendMode, Canvas, CanvasBackground, CaptureMetadata, ClipTransform,
+        ColorSpace, DurationUs, EdgeWidths, EditCommand, Effect, FrameClip, OverlayContent,
+        OverlayItem, OverlayTrack, PhysicalPoint, PhysicalPx, PhysicalSize, ProjectId,
+        ProjectManifest, Rgba, SlideDirection, TimelineSpan, TrackId, Transition, TransitionId,
+        TransitionKind, UnixTimeMs,
     };
     use gif_from_screen_gif::{CancellationFlag, DitherMode, PaletteMode};
     use gif_from_screen_project::LockPolicy;
@@ -1534,6 +1838,370 @@ mod tests {
             steps,
             kind,
         });
+    }
+
+    fn add_overlay_asset(
+        snapshot: &mut ProjectExportSnapshot,
+        size: PhysicalSize,
+        pixels: &[u8],
+    ) -> AssetId {
+        let asset_id = snapshot.assets.put(pixels).unwrap();
+        snapshot.manifest.assets.insert(
+            asset_id,
+            AssetDescriptor {
+                id: asset_id,
+                byte_len: u64::try_from(pixels.len()).unwrap(),
+                kind: AssetKind::OverlayImage {
+                    size,
+                    encoding: RasterEncoding::Rgba8,
+                },
+            },
+        );
+        asset_id
+    }
+
+    fn raster_overlay_track(
+        asset_id: AssetId,
+        span: TimelineSpan,
+        position: PhysicalPoint,
+        size: PhysicalSize,
+    ) -> OverlayTrack {
+        OverlayTrack {
+            id: TrackId::from_u128(1),
+            name: "watermark".to_owned(),
+            visible: true,
+            opacity: 255,
+            blend_mode: BlendMode::Normal,
+            items: vec![OverlayItem {
+                id: OverlayId::from_u128(1),
+                span,
+                z_index: 0,
+                content: OverlayContent::Raster {
+                    asset_id,
+                    position,
+                    size,
+                    opacity: 255,
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn raster_overlay_export_uses_original_half_open_frame_times_in_any_selection_order() {
+        let directory = tempdir().unwrap();
+        let blue = [0, 0, 255, 255].repeat(2);
+        let (mut snapshot, _) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(2, 1).unwrap(),
+            &[
+                TestClip::rgba(1, &blue, 10_000),
+                TestClip::rgba(2, &blue, 10_000),
+            ],
+        );
+        let overlay_asset = add_overlay_asset(
+            &mut snapshot,
+            PhysicalSize::new(1, 1).unwrap(),
+            &[255, 0, 0, 255],
+        );
+        snapshot
+            .manifest
+            .timeline
+            .overlay_tracks
+            .push(raster_overlay_track(
+                overlay_asset,
+                TimelineSpan {
+                    start: TimeUs::ZERO,
+                    duration: DurationUs::new(10_000).unwrap(),
+                },
+                PhysicalPoint {
+                    x: PhysicalPx::new(1),
+                    y: PhysicalPx::ZERO,
+                },
+                PhysicalSize::new(1, 1).unwrap(),
+            ));
+
+        let forward = directory.path().join("overlay-forward.gif");
+        export(&snapshot, &forward, &ProjectGifExportOptions::default()).unwrap();
+        assert_eq!(
+            decode_rgba(&forward),
+            [(1, vec![0, 0, 255, 255, 255, 0, 0, 255]), (1, blue.clone()),]
+        );
+
+        let reverse = directory.path().join("overlay-reverse.gif");
+        let options = ProjectGifExportOptions {
+            frames: ProjectFrameSelection::Ordered(vec![
+                FrameId::from_u128(2),
+                FrameId::from_u128(1),
+            ]),
+            ..ProjectGifExportOptions::default()
+        };
+        export(&snapshot, &reverse, &options).unwrap();
+        assert_eq!(
+            decode_rgba(&reverse),
+            [(1, blue), (1, vec![0, 0, 255, 255, 255, 0, 0, 255]),]
+        );
+
+        add_transition(&mut snapshot, 1, 2, 10_000, 1, TransitionKind::FadeToNext);
+        let transitioned = directory.path().join("overlay-transition.gif");
+        export(
+            &snapshot,
+            &transitioned,
+            &ProjectGifExportOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            decode_rgba(&transitioned),
+            [
+                (1, vec![0, 0, 255, 255, 255, 0, 0, 255]),
+                (1, vec![0, 0, 255, 255, 128, 0, 128, 255]),
+                (1, vec![0, 0, 255, 255, 0, 0, 255, 255]),
+            ]
+        );
+    }
+
+    #[test]
+    fn raster_overlay_reuses_an_identical_frame_asset_without_kind_or_memory_conflict() {
+        let directory = tempdir().unwrap();
+        let pixels = [255, 0, 0, 255, 0, 255, 0, 255];
+        let (mut snapshot, _) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(2, 1).unwrap(),
+            &[TestClip::rgba(1, &pixels, 10_000)],
+        );
+        let frame_asset = snapshot.manifest.timeline.frames[0].asset_id;
+        snapshot
+            .manifest
+            .timeline
+            .overlay_tracks
+            .push(raster_overlay_track(
+                frame_asset,
+                TimelineSpan {
+                    start: TimeUs::ZERO,
+                    duration: DurationUs::new(10_000).unwrap(),
+                },
+                PhysicalPoint {
+                    x: PhysicalPx::new(1),
+                    y: PhysicalPx::ZERO,
+                },
+                PhysicalSize::new(1, 1).unwrap(),
+            ));
+        let output = directory.path().join("same-frame-overlay.gif");
+        let options = ProjectGifExportOptions {
+            // One retained 8-byte asset plus one 8-byte rendered surface; the shared asset must
+            // not be loaded or counted twice for its overlay role.
+            render_buffer_limit_bytes: 16,
+            ..ProjectGifExportOptions::default()
+        };
+
+        export(&snapshot, &output, &options).unwrap();
+        assert_eq!(
+            decode_rgba(&output),
+            [(1, vec![255, 0, 0, 255, 255, 0, 0, 255])]
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one scenario verifies every pre-output overlay asset rejection and memory boundary"
+    )]
+    fn active_overlay_asset_validation_and_memory_fail_before_output_creation() {
+        let directory = tempdir().unwrap();
+        let blue = [0, 0, 255, 255].repeat(2);
+        let (mut snapshot, _) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(2, 1).unwrap(),
+            &[TestClip::rgba(1, &blue, 10_000)],
+        );
+        let overlay_asset = add_overlay_asset(
+            &mut snapshot,
+            PhysicalSize::new(1, 1).unwrap(),
+            &[255, 0, 0, 255],
+        );
+        snapshot
+            .manifest
+            .timeline
+            .overlay_tracks
+            .push(raster_overlay_track(
+                overlay_asset,
+                TimelineSpan {
+                    start: TimeUs::ZERO,
+                    duration: DurationUs::new(10_000).unwrap(),
+                },
+                PhysicalPoint::default(),
+                PhysicalSize::new(1, 1).unwrap(),
+            ));
+        let descriptor = snapshot.manifest.assets[&overlay_asset].clone();
+
+        let ignored_asset = AssetId::from_digest([88; 32]);
+        let mut ignored = snapshot.clone();
+        ignored.manifest.assets.insert(
+            ignored_asset,
+            AssetDescriptor {
+                id: ignored_asset,
+                byte_len: 4,
+                kind: AssetKind::OverlayImage {
+                    size: PhysicalSize::new(1, 1).unwrap(),
+                    encoding: RasterEncoding::Rgba8,
+                },
+            },
+        );
+        let OverlayContent::Raster { opacity, .. } =
+            &mut ignored.manifest.timeline.overlay_tracks[0].items[0].content
+        else {
+            unreachable!();
+        };
+        *opacity = 0;
+        ignored.manifest.timeline.overlay_tracks[0]
+            .items
+            .push(OverlayItem {
+                id: OverlayId::from_u128(3),
+                span: TimelineSpan {
+                    start: TimeUs::new(5_000),
+                    duration: DurationUs::new(5_000).unwrap(),
+                },
+                z_index: 2,
+                content: OverlayContent::Raster {
+                    asset_id: ignored_asset,
+                    position: PhysicalPoint::default(),
+                    size: PhysicalSize::new(1, 1).unwrap(),
+                    opacity: 255,
+                },
+            });
+        ignored.manifest.timeline.overlay_tracks.push(OverlayTrack {
+            id: TrackId::from_u128(2),
+            name: "hidden missing watermark".to_owned(),
+            visible: false,
+            opacity: 255,
+            blend_mode: BlendMode::Normal,
+            items: vec![OverlayItem {
+                id: OverlayId::from_u128(2),
+                span: TimelineSpan {
+                    start: TimeUs::ZERO,
+                    duration: DurationUs::new(10_000).unwrap(),
+                },
+                z_index: 1,
+                content: OverlayContent::Raster {
+                    asset_id: ignored_asset,
+                    position: PhysicalPoint::default(),
+                    size: PhysicalSize::new(1, 1).unwrap(),
+                    opacity: 255,
+                },
+            }],
+        });
+        let ignored_output = directory.path().join("ignored-overlays.gif");
+        export(
+            &ignored,
+            &ignored_output,
+            &ProjectGifExportOptions::default(),
+        )
+        .unwrap();
+        assert!(ignored_output.is_file());
+
+        let bounded = ProjectGifExportOptions {
+            render_buffer_limit_bytes: 11,
+            ..ProjectGifExportOptions::default()
+        };
+        let output = directory.path().join("overlay-bounded.gif");
+        assert!(matches!(
+            export(&snapshot, &output, &bounded),
+            Err(ProjectGifExportError::RenderBufferLimitExceeded {
+                required_bytes: 12,
+                limit_bytes: 11,
+            })
+        ));
+        assert!(!output.exists());
+
+        let joint = ProjectGifExportOptions {
+            render_buffer_limit_bytes: 19,
+            ..ProjectGifExportOptions::default()
+        };
+        let output = directory.path().join("overlay-source-plus-render.gif");
+        assert!(matches!(
+            export(&snapshot, &output, &joint),
+            Err(ProjectGifExportError::RenderBufferLimitExceeded {
+                required_bytes: 20,
+                limit_bytes: 19,
+            })
+        ));
+        assert!(!output.exists());
+
+        snapshot.manifest.assets.remove(&overlay_asset);
+        assert!(matches!(
+            export(
+                &snapshot,
+                &directory.path().join("overlay-no-descriptor.gif"),
+                &ProjectGifExportOptions::default(),
+            ),
+            Err(ProjectGifExportError::MissingOverlayAssetDescriptor {
+                overlay_id,
+                asset_id,
+            }) if overlay_id == OverlayId::from_u128(1) && asset_id == overlay_asset
+        ));
+        snapshot
+            .manifest
+            .assets
+            .insert(overlay_asset, descriptor.clone());
+
+        snapshot
+            .manifest
+            .assets
+            .get_mut(&overlay_asset)
+            .unwrap()
+            .kind = AssetKind::ImportedSource {
+            media_type: "image/png".to_owned(),
+        };
+        assert!(matches!(
+            export(
+                &snapshot,
+                &directory.path().join("overlay-wrong-kind.gif"),
+                &ProjectGifExportOptions::default(),
+            ),
+            Err(ProjectGifExportError::InvalidOverlayAssetKind { .. })
+        ));
+        snapshot
+            .manifest
+            .assets
+            .get_mut(&overlay_asset)
+            .unwrap()
+            .kind = AssetKind::Mask {
+            size: PhysicalSize::new(1, 1).unwrap(),
+            encoding: RasterEncoding::Rgba8,
+        };
+        let mask_output = directory.path().join("overlay-mask-kind.gif");
+        export(&snapshot, &mask_output, &ProjectGifExportOptions::default()).unwrap();
+        assert!(mask_output.is_file());
+        snapshot
+            .manifest
+            .assets
+            .get_mut(&overlay_asset)
+            .unwrap()
+            .kind = AssetKind::OverlayImage {
+            size: PhysicalSize::new(1, 1).unwrap(),
+            encoding: RasterEncoding::Png,
+        };
+        assert!(matches!(
+            export(
+                &snapshot,
+                &directory.path().join("overlay-encoding.gif"),
+                &ProjectGifExportOptions::default(),
+            ),
+            Err(ProjectGifExportError::UnsupportedOverlayAssetEncoding {
+                encoding: RasterEncoding::Png,
+                ..
+            })
+        ));
+        snapshot.manifest.assets.insert(overlay_asset, descriptor);
+        fs::remove_file(snapshot.assets.asset_path(overlay_asset)).unwrap();
+        assert!(matches!(
+            export(
+                &snapshot,
+                &directory.path().join("overlay-missing.gif"),
+                &ProjectGifExportOptions::default(),
+            ),
+            Err(ProjectGifExportError::MissingOverlayAssetFile { .. })
+        ));
+        assert_eq!(partial_files(directory.path()), 0);
     }
 
     #[test]
