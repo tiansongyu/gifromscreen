@@ -26,6 +26,7 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Select, keep, or delete an explicit half-open time range with variable-frame timing.
 - [x] Reduce frames, build Yoyo loops, scale delays, and remove rendered duplicates.
 - [x] Negotiate a real Wayland ScreenCast Portal session through the PipeWire FD handoff.
+- [x] Stream X11 recording frames into the recoverable project journal while capture is active.
 
 ## Delivery gates
 
@@ -43,7 +44,7 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 
 - [x] X11 monitor, window, and region recorder.
 - [x] Countdown; record, pause, resume, stop, and discard are complete.
-- [ ] Project autosave and crash recovery.
+- [x] Project autosave and crash recovery for active X11 recordings and editor changes.
 - [x] Filmstrip selection, delete, reorder, reverse, delays, undo/redo.
 - [x] Crop and resize.
 - [x] GIF colors, loop, duration, duplicate merge, progress, cancellation.
