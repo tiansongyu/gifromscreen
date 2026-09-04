@@ -1,14 +1,15 @@
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use gif_from_screen_domain::{
-    AssetDescriptor, AssetKind, Canvas, CanvasBackground, CaptureMetadata, ClipTransform,
-    DomainError, DurationUs, EditCommand, FrameClip, FrameId, PhysicalSize, ProjectId,
-    ProjectManifest, RasterEncoding, SourceProvenance, UnitError, UnixTimeMs,
+    DomainError, FrameId, ProjectId, SourceProvenance, UnitError, UnixTimeMs,
 };
 use gif_from_screen_project::{ActiveProject, ProjectError};
 use gif_from_screen_workflow::CollectedRecording;
 use thiserror::Error;
+
+use crate::rgba_project::{
+    PersistRgbaProjectError, RgbaProjectFrame, RgbaProjectOptions, persist_rgba_project,
+};
 
 /// Deterministic identifiers and user-facing metadata for a captured project.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,6 +82,17 @@ pub enum PersistRecordingError {
         actual_width: u16,
         /// Height of the rejected frame.
         actual_height: u16,
+    },
+
+    /// A frame's packed pixels do not match its declared dimensions.
+    #[error("frame {frame_index} has {actual} RGBA bytes, expected {expected}")]
+    InvalidFramePixels {
+        /// Zero-based recording frame index.
+        frame_index: usize,
+        /// Required tightly packed byte length.
+        expected: usize,
+        /// Supplied byte length.
+        actual: usize,
     },
 
     /// Frame duration could not be represented by the domain model.
@@ -157,20 +169,6 @@ pub enum PersistRecordingError {
     },
 }
 
-#[derive(Clone, Copy, Debug)]
-struct FrameFacts {
-    width: u16,
-    height: u16,
-    duration_us: u64,
-}
-
-#[derive(Debug)]
-struct ValidatedRecording {
-    canvas: PhysicalSize,
-    frame_ids: Vec<FrameId>,
-    durations: Vec<DurationUs>,
-}
-
 /// Persists a collected RGBA recording as a crash-recoverable editable project.
 ///
 /// Immutable RGBA assets are written by content digest and reused when pixels
@@ -189,156 +187,115 @@ pub fn persist_collected_recording(
     recording: CollectedRecording,
     options: RecordingProjectOptions,
 ) -> Result<ActiveProject, PersistRecordingError> {
-    let facts: Vec<_> = recording
-        .frames()
+    let recording_frames = recording.into_frames();
+    let frames: Vec<_> = recording_frames
         .iter()
-        .map(|frame| FrameFacts {
+        .map(|frame| RgbaProjectFrame {
             width: frame.width(),
             height: frame.height(),
             duration_us: frame.duration_us(),
+            pixels: frame.pixels(),
         })
         .collect();
-    let validated = validate_recording(&facts, &options)?;
-
-    let mut manifest = ProjectManifest::new(
-        options.project_id,
-        options.app_version,
-        options.created_at,
-        Canvas {
-            size: validated.canvas,
-            color_space: gif_from_screen_domain::ColorSpace::Srgb,
-            background: CanvasBackground::Transparent,
+    persist_rgba_project(
+        root,
+        &frames,
+        RgbaProjectOptions {
+            project_id: options.project_id,
+            frame_ids: options.frame_ids,
+            app_version: options.app_version,
+            created_at: options.created_at,
+            source_provenance: vec![SourceProvenance::Screen {
+                source_label: options.source_label,
+            }],
+            export_presets: BTreeMap::new(),
         },
     )
-    .map_err(|source| PersistRecordingError::InvalidManifest { source })?;
-    manifest.source_provenance.push(SourceProvenance::Screen {
-        source_label: options.source_label,
-    });
-    manifest
-        .validate()
-        .map_err(|source| PersistRecordingError::InvalidManifest { source })?;
-
-    let mut project = ActiveProject::create(root, manifest)
-        .map_err(|source| PersistRecordingError::CreateProject { source })?;
-    let frames = recording.into_frames();
-    let mut descriptors = BTreeMap::new();
-    let mut clips = Vec::with_capacity(frames.len());
-    for (frame_index, ((frame, frame_id), duration)) in frames
-        .into_iter()
-        .zip(validated.frame_ids)
-        .zip(validated.durations)
-        .enumerate()
-    {
-        let asset_id = project.assets().put(frame.pixels()).map_err(|source| {
-            PersistRecordingError::StoreAsset {
-                frame_index,
-                source,
-            }
-        })?;
-        let byte_len = u64::try_from(frame.pixels().len())
-            .map_err(|_| PersistRecordingError::AssetLengthOutOfRange { frame_index })?;
-        descriptors.entry(asset_id).or_insert(AssetDescriptor {
-            id: asset_id,
-            byte_len,
-            kind: AssetKind::Frame {
-                size: validated.canvas,
-                encoding: RasterEncoding::Rgba8,
-            },
-        });
-        clips.push(FrameClip {
-            id: frame_id,
-            asset_id,
-            duration,
-            transform: ClipTransform::default(),
-            capture_metadata: CaptureMetadata::default(),
-            effects: Vec::new(),
-        });
-    }
-
-    let mut commands: Vec<_> = descriptors
-        .into_values()
-        .map(|asset| EditCommand::RegisterAsset { asset })
-        .collect();
-    commands.push(EditCommand::InsertFrames {
-        index: 0,
-        frames: clips,
-    });
-    project
-        .commit(EditCommand::Compound { commands })
-        .map_err(|source| PersistRecordingError::CommitTimeline { source })?;
-    project
-        .checkpoint_and_compact()
-        .map_err(|source| PersistRecordingError::CheckpointAndCompact { source })?;
-    Ok(project)
+    .map_err(map_persist_error)
 }
 
-fn validate_recording(
-    frames: &[FrameFacts],
-    options: &RecordingProjectOptions,
-) -> Result<ValidatedRecording, PersistRecordingError> {
-    let Some(first) = frames.first() else {
-        return Err(PersistRecordingError::EmptyRecording);
-    };
-    if options.project_id.is_nil() {
-        return Err(PersistRecordingError::NilProjectId);
-    }
-    if options.frame_ids.len() < frames.len() {
-        return Err(PersistRecordingError::InsufficientFrameIds {
-            required: frames.len(),
-            provided: options.frame_ids.len(),
-        });
-    }
-
-    let canvas =
-        PhysicalSize::new(u32::from(first.width), u32::from(first.height)).map_err(|source| {
-            PersistRecordingError::InvalidCanvas {
-                width: first.width,
-                height: first.height,
-                source,
-            }
-        })?;
-    let mut seen = BTreeMap::new();
-    let mut frame_ids = Vec::with_capacity(frames.len());
-    let mut durations = Vec::with_capacity(frames.len());
-    for (frame_index, (frame, frame_id)) in frames
-        .iter()
-        .zip(options.frame_ids.iter().copied())
-        .enumerate()
-    {
-        if frame.width != first.width || frame.height != first.height {
-            return Err(PersistRecordingError::DimensionMismatch {
-                frame_index,
-                expected_width: first.width,
-                expected_height: first.height,
-                actual_width: frame.width,
-                actual_height: frame.height,
-            });
+fn map_persist_error(error: PersistRgbaProjectError) -> PersistRecordingError {
+    match error {
+        PersistRgbaProjectError::EmptyFrames => PersistRecordingError::EmptyRecording,
+        PersistRgbaProjectError::InsufficientFrameIds { required, provided } => {
+            PersistRecordingError::InsufficientFrameIds { required, provided }
         }
-        if frame_id.is_nil() {
-            return Err(PersistRecordingError::NilFrameId { frame_index });
+        PersistRgbaProjectError::NilProjectId => PersistRecordingError::NilProjectId,
+        PersistRgbaProjectError::NilFrameId { frame_index } => {
+            PersistRecordingError::NilFrameId { frame_index }
         }
-        if let Some(first_index) = seen.insert(frame_id, frame_index) {
-            return Err(PersistRecordingError::DuplicateFrameId {
-                frame_id,
-                first_index,
-                duplicate_index: frame_index,
-            });
+        PersistRgbaProjectError::DuplicateFrameId {
+            frame_id,
+            first_index,
+            duplicate_index,
+        } => PersistRecordingError::DuplicateFrameId {
+            frame_id,
+            first_index,
+            duplicate_index,
+        },
+        PersistRgbaProjectError::DimensionMismatch {
+            frame_index,
+            expected_width,
+            expected_height,
+            actual_width,
+            actual_height,
+        } => PersistRecordingError::DimensionMismatch {
+            frame_index,
+            expected_width,
+            expected_height,
+            actual_width,
+            actual_height,
+        },
+        PersistRgbaProjectError::InvalidFramePixels {
+            frame_index,
+            expected,
+            actual,
+        } => PersistRecordingError::InvalidFramePixels {
+            frame_index,
+            expected,
+            actual,
+        },
+        PersistRgbaProjectError::InvalidFrameDuration {
+            frame_index,
+            duration_us,
+            source,
+        } => PersistRecordingError::InvalidFrameDuration {
+            frame_index,
+            duration_us,
+            source,
+        },
+        PersistRgbaProjectError::InvalidCanvas {
+            width,
+            height,
+            source,
+        } => PersistRecordingError::InvalidCanvas {
+            width,
+            height,
+            source,
+        },
+        PersistRgbaProjectError::AssetLengthOutOfRange { frame_index } => {
+            PersistRecordingError::AssetLengthOutOfRange { frame_index }
         }
-        let duration = DurationUs::try_from(frame.duration_us).map_err(|source| {
-            PersistRecordingError::InvalidFrameDuration {
-                frame_index,
-                duration_us: frame.duration_us,
-                source,
-            }
-        })?;
-        frame_ids.push(frame_id);
-        durations.push(duration);
+        PersistRgbaProjectError::InvalidManifest { source } => {
+            PersistRecordingError::InvalidManifest { source }
+        }
+        PersistRgbaProjectError::CreateProject { source } => {
+            PersistRecordingError::CreateProject { source }
+        }
+        PersistRgbaProjectError::StoreAsset {
+            frame_index,
+            source,
+        } => PersistRecordingError::StoreAsset {
+            frame_index,
+            source,
+        },
+        PersistRgbaProjectError::CommitTimeline { source } => {
+            PersistRecordingError::CommitTimeline { source }
+        }
+        PersistRgbaProjectError::CheckpointAndCompact { source } => {
+            PersistRecordingError::CheckpointAndCompact { source }
+        }
     }
-    Ok(ValidatedRecording {
-        canvas,
-        frame_ids,
-        durations,
-    })
 }
 
 #[cfg(test)]
@@ -351,7 +308,8 @@ mod tests {
         CapturedFrame, PhysicalSize as CaptureSize, PixelFormat, SyntheticCaptureBackend,
     };
     use gif_from_screen_domain::{
-        EditCommand, FrameDurationChange, ProjectRevision, SourceProvenance,
+        DurationUs, EditCommand, FrameDurationChange, PhysicalSize, ProjectRevision,
+        SourceProvenance,
     };
     use gif_from_screen_gif::NeverCancel;
     use gif_from_screen_project::{AssetStore, LockPolicy};
@@ -361,6 +319,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::rgba_project::validate_rgba_frames;
 
     fn options(project_id: u128, frame_ids: &[u128]) -> RecordingProjectOptions {
         RecordingProjectOptions {
@@ -508,22 +467,42 @@ mod tests {
     #[test]
     fn rejects_empty_mixed_dimensions_and_invalid_durations_before_io() {
         let valid_options = options(1, &[1, 2]);
+        let validate = |frames: &[RgbaProjectFrame<'_>], options: &RecordingProjectOptions| {
+            validate_rgba_frames(
+                frames,
+                &RgbaProjectOptions {
+                    project_id: options.project_id,
+                    frame_ids: options.frame_ids.clone(),
+                    app_version: options.app_version.clone(),
+                    created_at: options.created_at,
+                    source_provenance: vec![SourceProvenance::Screen {
+                        source_label: options.source_label.clone(),
+                    }],
+                    export_presets: BTreeMap::new(),
+                },
+            )
+            .map_err(map_persist_error)
+        };
         assert!(matches!(
-            validate_recording(&[], &valid_options),
+            validate(&[], &valid_options),
             Err(PersistRecordingError::EmptyRecording)
         ));
+        let one_pixel = [1, 2, 3, 255];
+        let two_pixels = [1, 2, 3, 255, 4, 5, 6, 255];
         assert!(matches!(
-            validate_recording(
+            validate(
                 &[
-                    FrameFacts {
+                    RgbaProjectFrame {
                         width: 1,
                         height: 1,
                         duration_us: 10,
+                        pixels: &one_pixel,
                     },
-                    FrameFacts {
+                    RgbaProjectFrame {
                         width: 2,
                         height: 1,
                         duration_us: 10,
+                        pixels: &two_pixels,
                     }
                 ],
                 &valid_options
@@ -531,11 +510,12 @@ mod tests {
             Err(PersistRecordingError::DimensionMismatch { frame_index: 1, .. })
         ));
         assert!(matches!(
-            validate_recording(
-                &[FrameFacts {
+            validate(
+                &[RgbaProjectFrame {
                     width: 1,
                     height: 1,
                     duration_us: 0,
+                    pixels: &one_pixel,
                 }],
                 &options(1, &[1])
             ),

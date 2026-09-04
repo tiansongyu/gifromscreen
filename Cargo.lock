@@ -1045,6 +1045,7 @@ dependencies = [
  "gif-from-screen-capture",
  "gif-from-screen-domain",
  "gif-from-screen-gif",
+ "gif-from-screen-media",
  "gif-from-screen-project",
  "gif-from-screen-render",
  "gif-from-screen-workflow",
