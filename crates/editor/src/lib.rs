@@ -9,6 +9,28 @@ use gif_from_screen_domain::{
 };
 use thiserror::Error;
 
+/// Controls how removing frames affects the duration of the surviving timeline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReduceDelayMode {
+    /// Keep every surviving frame's duration unchanged.
+    DontAdjust,
+    /// Add each removed frame's duration to the nearest preceding retained frame.
+    Previous,
+    /// Distribute the removed duration exactly across all retained frames in the selection.
+    Evenly,
+}
+
+/// Options for reducing a consecutive frame selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReduceOptions {
+    /// Retains the first selected frame and then every Nth selected frame.
+    ///
+    /// This value must be at least two.
+    pub keep_every: usize,
+    /// Controls whether and how the duration of removed frames is preserved.
+    pub delay_mode: ReduceDelayMode,
+}
+
 /// A project plus bounded, command-based undo and redo stacks.
 #[derive(Debug)]
 pub struct EditorSession {
@@ -121,6 +143,125 @@ pub fn delete_frames(frame_ids: impl IntoIterator<Item = FrameId>) -> EditComman
     EditCommand::RemoveFrames {
         frame_ids: frame_ids.into_iter().collect(),
     }
+}
+
+/// Builds one atomic command that reduces a consecutive selection by a fixed factor.
+///
+/// The first selected frame is always retained. Subsequent selected frames are retained at
+/// offsets `keep_every`, `keep_every * 2`, and so on. Selection input order is ignored: stable
+/// [`FrameId`] values are resolved against the current timeline order.
+///
+/// [`ReduceDelayMode::DontAdjust`] shortens the timeline by exactly the removed duration. The
+/// other modes preserve the total timeline duration. When an even distribution has a remainder,
+/// one microsecond is assigned to each retained frame in timeline order until it is exhausted.
+///
+/// # Errors
+///
+/// Returns an error when `keep_every` is less than two, the selection is empty, unknown,
+/// non-consecutive, or too small to remove a frame, or when duration arithmetic overflows.
+pub fn reduce_frames(
+    project: &ProjectManifest,
+    frame_ids: impl IntoIterator<Item = FrameId>,
+    options: ReduceOptions,
+) -> Result<EditCommand, EditorError> {
+    if options.keep_every < 2 {
+        return Err(EditorError::InvalidKeepEvery);
+    }
+
+    let selected: BTreeSet<_> = frame_ids.into_iter().collect();
+    ensure_known_selection(project, &selected)?;
+
+    let selected_frames = project
+        .timeline
+        .frames
+        .iter()
+        .enumerate()
+        .filter(|(_, frame)| selected.contains(&frame.id))
+        .collect::<Vec<_>>();
+    if selected_frames
+        .windows(2)
+        .any(|pair| pair[0].0.checked_add(1) != Some(pair[1].0))
+    {
+        return Err(EditorError::NonConsecutiveSelection);
+    }
+
+    let mut retained = Vec::new();
+    let mut removed_ids = Vec::new();
+    let mut removed_duration = 0_u64;
+
+    for (selection_index, (_, frame)) in selected_frames.into_iter().enumerate() {
+        if selection_index % options.keep_every == 0 {
+            retained.push((frame.id, frame.duration.get(), frame.duration.get()));
+            continue;
+        }
+
+        removed_ids.push(frame.id);
+        removed_duration = removed_duration
+            .checked_add(frame.duration.get())
+            .ok_or(EditorError::InvalidDuration)?;
+        if options.delay_mode == ReduceDelayMode::Previous {
+            let (_, _, adjusted) = retained
+                .last_mut()
+                .ok_or(EditorError::ReductionRemovedFirstFrame)?;
+            *adjusted = adjusted
+                .checked_add(frame.duration.get())
+                .ok_or(EditorError::InvalidDuration)?;
+        }
+    }
+
+    if removed_ids.is_empty() {
+        return Err(EditorError::NoFramesReduced);
+    }
+
+    if options.delay_mode == ReduceDelayMode::Evenly {
+        let retained_count =
+            u64::try_from(retained.len()).map_err(|_| EditorError::InvalidDuration)?;
+        let share = removed_duration / retained_count;
+        let mut remainder = removed_duration % retained_count;
+        for (_, _, adjusted) in &mut retained {
+            let extra = u64::from(remainder > 0);
+            remainder = remainder.saturating_sub(extra);
+            *adjusted = adjusted
+                .checked_add(share)
+                .and_then(|value| value.checked_add(extra))
+                .ok_or(EditorError::InvalidDuration)?;
+        }
+    }
+
+    let changes = retained
+        .into_iter()
+        .filter(|(_, original, adjusted)| original != adjusted)
+        .map(|(frame_id, _, adjusted)| {
+            Ok(FrameDurationChange {
+                frame_id,
+                duration: DurationUs::new(adjusted).ok_or(EditorError::InvalidDuration)?,
+            })
+        })
+        .collect::<Result<Vec<_>, EditorError>>()?;
+
+    let removed: BTreeSet<_> = removed_ids.iter().copied().collect();
+    let transitions = project
+        .timeline
+        .transitions
+        .iter()
+        .filter(|transition| {
+            !removed.contains(&transition.from_frame) && !removed.contains(&transition.to_frame)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut commands = Vec::with_capacity(3);
+    if !changes.is_empty() {
+        commands.push(EditCommand::SetFrameDurations { changes });
+    }
+    if transitions.len() != project.timeline.transitions.len() {
+        commands.push(EditCommand::SetTransitions { transitions });
+    }
+    commands.push(EditCommand::RemoveFrames {
+        frame_ids: removed_ids,
+    });
+
+    Ok(EditCommand::Compound { commands })
 }
 
 /// Builds a stable reorder command that reverses only the selected positions.
@@ -333,6 +474,18 @@ pub enum EditorError {
     /// A duration scale must be positive.
     #[error("duration scale must be greater than zero")]
     InvalidScale,
+    /// A reduction factor must remove at least every second selected frame.
+    #[error("keep_every must be at least two")]
+    InvalidKeepEvery,
+    /// Reduce Frames operates on one uninterrupted timeline range.
+    #[error("selected frames must be consecutive")]
+    NonConsecutiveSelection,
+    /// The selected range was too small for the requested reduction factor.
+    #[error("the reduction options would not remove any selected frame")]
+    NoFramesReduced,
+    /// The reduction algorithm must always retain the first selected frame.
+    #[error("frame reduction unexpectedly attempted to remove the first selected frame")]
+    ReductionRemovedFirstFrame,
     /// An internal selection transformation produced a different item count.
     #[error("selection transformation changed the number of selected frames")]
     SelectionCardinalityMismatch,
@@ -351,6 +504,10 @@ mod tests {
     use super::*;
 
     fn project() -> ProjectManifest {
+        project_with_durations(&[10_000, 20_000, 30_000, 40_000])
+    }
+
+    fn project_with_durations(durations: &[u64]) -> ProjectManifest {
         let size = PhysicalSize::new(4, 3).unwrap();
         let asset_id = AssetId::from_digest([7; 32]);
         let mut assets = BTreeMap::new();
@@ -365,11 +522,14 @@ mod tests {
                 },
             },
         );
-        let frames = (1..=4)
-            .map(|number| FrameClip {
-                id: FrameId::from_u128(number),
+        let frames = durations
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, duration)| FrameClip {
+                id: FrameId::from_u128(u128::try_from(index).unwrap() + 1),
                 asset_id,
-                duration: DurationUs::new(u64::try_from(number).unwrap() * 10_000).unwrap(),
+                duration: DurationUs::new(duration).unwrap(),
                 transform: ClipTransform::default(),
                 capture_metadata: CaptureMetadata::default(),
                 effects: Vec::new(),
@@ -405,6 +565,28 @@ mod tests {
             .collect()
     }
 
+    fn durations(project: &ProjectManifest) -> Vec<u64> {
+        project
+            .timeline
+            .frames
+            .iter()
+            .map(|frame| frame.duration.get())
+            .collect()
+    }
+
+    fn frame_ids(project: &ProjectManifest) -> Vec<FrameId> {
+        project
+            .timeline
+            .frames
+            .iter()
+            .map(|frame| frame.id)
+            .collect()
+    }
+
+    fn total_duration(project: &ProjectManifest) -> u64 {
+        project.timeline.total_duration().unwrap().get()
+    }
+
     #[test]
     fn reverse_selected_preserves_unselected_slots() {
         let project = project();
@@ -438,6 +620,156 @@ mod tests {
         assert!(matches!(
             scale_duration(&project, [FrameId::from_u128(1)], 0),
             Err(EditorError::InvalidScale)
+        ));
+    }
+
+    #[test]
+    fn reduce_dont_adjust_handles_both_edges_and_a_non_divisible_count() {
+        let project =
+            project_with_durations(&[10_000, 20_000, 30_000, 40_000, 50_000, 60_000, 70_000]);
+        let mut selected = frame_ids(&project);
+        selected.reverse();
+        let command = reduce_frames(
+            &project,
+            selected,
+            ReduceOptions {
+                keep_every: 3,
+                delay_mode: ReduceDelayMode::DontAdjust,
+            },
+        )
+        .unwrap();
+
+        let mut session = EditorSession::new(project, 10).unwrap();
+        session.execute(&command).unwrap();
+
+        assert_eq!(order(session.project()), [1, 4, 7]);
+        assert_eq!(durations(session.project()), [10_000, 40_000, 70_000]);
+        assert_eq!(total_duration(session.project()), 120_000);
+        assert!(
+            session
+                .project()
+                .timeline
+                .frames
+                .iter()
+                .all(|frame| frame.duration.get() > 0)
+        );
+    }
+
+    #[test]
+    fn reduce_previous_preserves_total_duration_and_is_undoable() {
+        let project =
+            project_with_durations(&[10_000, 20_000, 30_000, 40_000, 50_000, 60_000, 70_000]);
+        let original_order = order(&project);
+        let original_durations = durations(&project);
+        let original_total = total_duration(&project);
+        let command = reduce_frames(
+            &project,
+            frame_ids(&project),
+            ReduceOptions {
+                keep_every: 3,
+                delay_mode: ReduceDelayMode::Previous,
+            },
+        )
+        .unwrap();
+        assert!(matches!(command, EditCommand::Compound { .. }));
+
+        let mut session = EditorSession::new(project, 10).unwrap();
+        session.execute(&command).unwrap();
+        assert_eq!(session.project().revision, ProjectRevision::new(1));
+        assert_eq!(order(session.project()), [1, 4, 7]);
+        assert_eq!(durations(session.project()), [60_000, 150_000, 70_000]);
+        assert_eq!(total_duration(session.project()), original_total);
+
+        assert!(session.undo().unwrap());
+        assert_eq!(order(session.project()), original_order);
+        assert_eq!(durations(session.project()), original_durations);
+        assert_eq!(total_duration(session.project()), original_total);
+
+        assert!(session.redo().unwrap());
+        assert_eq!(order(session.project()), [1, 4, 7]);
+        assert_eq!(durations(session.project()), [60_000, 150_000, 70_000]);
+        assert_eq!(total_duration(session.project()), original_total);
+    }
+
+    #[test]
+    fn reduce_evenly_distributes_microsecond_remainder_exactly() {
+        let project = project_with_durations(&[1, 1, 2, 1]);
+        let original_total = total_duration(&project);
+        let command = reduce_frames(
+            &project,
+            frame_ids(&project),
+            ReduceOptions {
+                keep_every: 3,
+                delay_mode: ReduceDelayMode::Evenly,
+            },
+        )
+        .unwrap();
+
+        let mut session = EditorSession::new(project, 10).unwrap();
+        session.execute(&command).unwrap();
+
+        assert_eq!(order(session.project()), [1, 4]);
+        assert_eq!(durations(session.project()), [3, 2]);
+        assert_eq!(total_duration(session.project()), original_total);
+    }
+
+    #[test]
+    fn reduce_entire_selection_with_extreme_factor_keeps_one_positive_frame() {
+        let project = project();
+        let original_total = total_duration(&project);
+        let command = reduce_frames(
+            &project,
+            frame_ids(&project),
+            ReduceOptions {
+                keep_every: usize::MAX,
+                delay_mode: ReduceDelayMode::Previous,
+            },
+        )
+        .unwrap();
+
+        let mut session = EditorSession::new(project, 10).unwrap();
+        session.execute(&command).unwrap();
+
+        assert_eq!(order(session.project()), [1]);
+        assert_eq!(durations(session.project()), [original_total]);
+        assert!(durations(session.project())[0] > 0);
+    }
+
+    #[test]
+    fn reduce_rejects_invalid_factor_non_consecutive_and_too_small_selections() {
+        let project = project();
+        assert!(matches!(
+            reduce_frames(
+                &project,
+                frame_ids(&project),
+                ReduceOptions {
+                    keep_every: 1,
+                    delay_mode: ReduceDelayMode::DontAdjust,
+                },
+            ),
+            Err(EditorError::InvalidKeepEvery)
+        ));
+        assert!(matches!(
+            reduce_frames(
+                &project,
+                [FrameId::from_u128(1), FrameId::from_u128(3)],
+                ReduceOptions {
+                    keep_every: 2,
+                    delay_mode: ReduceDelayMode::DontAdjust,
+                },
+            ),
+            Err(EditorError::NonConsecutiveSelection)
+        ));
+        assert!(matches!(
+            reduce_frames(
+                &project,
+                [FrameId::from_u128(4)],
+                ReduceOptions {
+                    keep_every: 2,
+                    delay_mode: ReduceDelayMode::DontAdjust,
+                },
+            ),
+            Err(EditorError::NoFramesReduced)
         ));
     }
 
