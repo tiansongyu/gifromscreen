@@ -12,9 +12,10 @@ Implemented now:
 - selectable Median Cut, Grayscale, Most Used, Octree, Wu, and NeuQuant
   built-in quantizers;
 - custom fixed palettes plus Web Safe 216, monochrome, and Windows 16 presets;
-- no dithering, ordered Bayer 4x4, Floyd-Steinberg, Atkinson, Burkes,
-  Sierra Lite, Two-row Sierra, full three-row Sierra, Jarvis–Judice–Ninke,
-  Stucki, and Stevenson–Arce strategies;
+- no dithering; ordered Bayer 4x4, dotted halftone, fixed blue noise, and
+  interleaved-gradient noise; plus Floyd-Steinberg, Atkinson, Burkes, Sierra
+  Lite, Two-row Sierra, full three-row Sierra, Jarvis–Judice–Ninke, Stucki, and
+  Stevenson–Arce strategies;
 - 1-bit transparency via an alpha threshold;
 - changed-rectangle encoding with disposal-to-background when opaque pixels
   become transparent;
@@ -52,6 +53,16 @@ left-to-right deterministically: `FloydSteinberg`, `Atkinson`, `Burkes`,
 receive nor emit diffusion error, and their hidden RGB values cannot alter
 neighboring opaque pixels. Every mapper cooperatively checks the export
 cancellation token while it works.
+
+The three ScreenToGif/KGySoft-style coordinate patterns are deterministic and
+use a fixed 25% strength, producing a shared sRGB channel adjustment in
+`-32..=31`. `Dotted` repeats the public 8×8 dotted-halftone matrix. `BlueNoise`
+repeats a pregenerated 64×64 tile from Bart Wronski's MIT-licensed
+BlueNoiseGenerator, with the attribution retained beside the embedded table.
+`InterleavedNoise` evaluates the nonrandom Jimenez/Wronski interleaved-gradient
+formula from integer pixel coordinates. These modes keep the same spatial
+pattern across animation frames; transparent pixels bypass both noise and
+palette lookup, so hidden RGB values cannot affect opaque results.
 
 `MedianCut` is the balanced general-purpose choice. `Grayscale` converts source
 colors to deterministic BT.601 luma values before palette reduction. `MostUsed`

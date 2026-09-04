@@ -5,7 +5,8 @@
 //! most-used-color, bounded octree, variance-minimizing Wu, and bounded-sample
 //! NeuQuant quantizers with local or global palettes, plus validated custom and
 //! predefined fixed palettes through [`FixedPaletteQuantizer`]. Palette mapping
-//! includes ordered Bayer and Floyd-Steinberg, Atkinson, Burkes, and Sierra-family,
+//! includes ordered Bayer, dotted halftone, fixed blue noise, interleaved-gradient
+//! noise, and Floyd-Steinberg, Atkinson, Burkes, Sierra-family,
 //! Jarvis–Judice–Ninke, Stucki, and Stevenson–Arce error diffusion through
 //! [`DitherMode`]. More sophisticated palette and delta-frame pipelines can be
 //! added without exposing the underlying `gif` crate.

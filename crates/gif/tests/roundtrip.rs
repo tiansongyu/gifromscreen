@@ -210,7 +210,7 @@ fn predefined_palette_strategies_encode_local_and_global_with_transparency() {
 }
 
 #[test]
-fn fixed_palette_roundtrips_local_global_bayer_and_floyd() {
+fn fixed_palette_roundtrips_local_global_dither_modes() {
     let mut first_pixels = [128, 128, 128, 255].repeat(64);
     first_pixels[3] = 0;
     let mut second_pixels = [160, 160, 160, 255].repeat(64);
@@ -221,7 +221,13 @@ fn fixed_palette_roundtrips_local_global_bayer_and_floyd() {
     ];
 
     for palette_mode in [PaletteMode::LocalPerFrame, PaletteMode::Global] {
-        for dither in [DitherMode::Bayer4x4, DitherMode::FloydSteinberg] {
+        for dither in [
+            DitherMode::Bayer4x4,
+            DitherMode::Dotted,
+            DitherMode::BlueNoise,
+            DitherMode::InterleavedNoise,
+            DitherMode::FloydSteinberg,
+        ] {
             let options = EncodeOptions {
                 max_colors: 3,
                 merge_duplicate_frames: false,

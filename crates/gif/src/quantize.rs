@@ -26,6 +26,9 @@ pub struct QuantizationSettings {
 /// Error-diffusion modes scan rows from left to right. Transparent pixels are
 /// assigned the palette's transparent entry without consuming, producing, or
 /// forwarding color error, so hidden RGB data cannot affect opaque output.
+/// The coordinate-noise modes use a fixed 25% strength (-32..=31 per sRGB
+/// channel), which is close to the existing Bayer amplitude
+/// and deterministic across frames.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum DitherMode {
     /// Map every pixel directly to its nearest palette entry.
@@ -33,6 +36,15 @@ pub enum DitherMode {
     None,
     /// Ordered 4x4 Bayer dithering with a deterministic, moderate amplitude.
     Bayer4x4,
+    /// Ordered 8x8 dotted-halftone pattern, matching the option exposed by
+    /// ScreenToGif's KGySoft encoder.
+    Dotted,
+    /// Ordered fixed 64x64 blue-noise tile, matching ScreenToGif's KGySoft
+    /// encoder option without introducing per-frame randomness.
+    BlueNoise,
+    /// Deterministic interleaved-gradient noise generated from pixel
+    /// coordinates using the Jimenez/Wronski formula.
+    InterleavedNoise,
     /// Left-to-right Floyd-Steinberg error diffusion.
     FloydSteinberg,
     /// Atkinson error diffusion, which intentionally diffuses only 3/4 of the
@@ -1494,6 +1506,16 @@ pub(crate) fn map_frame_to_palette(
             alpha_threshold,
             cancellation,
         ),
+        DitherMode::Dotted | DitherMode::BlueNoise | DitherMode::InterleavedNoise => {
+            map_with_coordinate_noise(
+                frame,
+                palette.transparent_index,
+                &opaque_colors,
+                alpha_threshold,
+                dither,
+                cancellation,
+            )
+        }
         DitherMode::FloydSteinberg => map_with_floyd_steinberg(
             frame,
             palette.transparent_index,
@@ -1712,6 +1734,84 @@ fn map_with_bayer(
         indices.push(lookup[histogram_index(adjusted[0], adjusted[1], adjusted[2])]);
     }
     Ok(indices)
+}
+
+const DOTTED_HALFTONE_8X8: [[u8; 8]; 8] = [
+    [24, 10, 12, 26, 35, 47, 49, 37],
+    [8, 0, 2, 14, 45, 59, 61, 51],
+    [22, 6, 4, 16, 43, 57, 63, 53],
+    [30, 20, 18, 28, 33, 41, 55, 39],
+    [34, 46, 48, 36, 25, 11, 13, 27],
+    [44, 58, 60, 50, 9, 1, 3, 15],
+    [42, 56, 62, 52, 23, 7, 5, 17],
+    [32, 40, 54, 38, 31, 21, 19, 29],
+];
+
+const BLUE_NOISE_64: [u8; 64 * 64] = include!("blue_noise_64.in");
+const COORDINATE_NOISE_STRENGTH_DIVISOR: i16 = 4;
+
+fn map_with_coordinate_noise(
+    frame: &RgbaFrame,
+    transparent_index: Option<u8>,
+    palette: &[(u8, [u8; 3])],
+    alpha_threshold: Option<u8>,
+    mode: DitherMode,
+    cancellation: &dyn CancellationToken,
+) -> Result<Vec<u8>, QuantizationError> {
+    let lookup = build_color_lookup(palette, cancellation)?;
+    let width = usize::from(frame.width());
+    let mut indices = Vec::with_capacity(width * usize::from(frame.height()));
+    for (pixel_index, pixel) in frame.pixels().as_chunks::<4>().0.iter().enumerate() {
+        check_cancellation(pixel_index, cancellation)?;
+        if is_transparent(pixel[3], alpha_threshold) {
+            indices.push(required_transparent_index(transparent_index)?);
+            continue;
+        }
+        let x = pixel_index % width;
+        let y = pixel_index / width;
+        let adjustment = coordinate_noise_adjustment(mode, x, y);
+        let adjusted = [
+            adjust_channel(pixel[0], adjustment),
+            adjust_channel(pixel[1], adjustment),
+            adjust_channel(pixel[2], adjustment),
+        ];
+        indices.push(lookup[histogram_index(adjusted[0], adjusted[1], adjusted[2])]);
+    }
+    Ok(indices)
+}
+
+fn coordinate_noise_adjustment(mode: DitherMode, x: usize, y: usize) -> i16 {
+    let full_offset = match mode {
+        DitherMode::Dotted => ordered_noise_offset(DOTTED_HALFTONE_8X8[y % 8][x % 8], 63),
+        DitherMode::BlueNoise => ordered_noise_offset(BLUE_NOISE_64[y % 64 * 64 + x % 64], 255),
+        DitherMode::InterleavedNoise => interleaved_gradient_offset(x, y),
+        _ => 0,
+    };
+    full_offset / COORDINATE_NOISE_STRENGTH_DIVISOR
+}
+
+fn ordered_noise_offset(value: u8, maximum: u16) -> i16 {
+    // KGySoft's OrderedDitherer maps a 0..=maximum threshold matrix into
+    // -127..=127 with two extra levels protecting absolute black and white.
+    let shades = maximum + 2;
+    i16::try_from((u16::from(value) + 1) * 255 / shades).unwrap_or(255) - 127
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the documented formula is bounded to -128..128 before truncation"
+)]
+fn interleaved_gradient_offset(x: usize, y: usize) -> i16 {
+    fn fraction(value: f64) -> f64 {
+        value - value.floor()
+    }
+
+    let x = f64::from(u32::try_from(x).unwrap_or(u32::MAX));
+    let y = f64::from(u32::try_from(y).unwrap_or(u32::MAX));
+    // Jorge Jimenez's interleaved-gradient noise formula as cited by the
+    // KGySoft implementation used by ScreenToGif. Converting to i16 truncates
+    // toward zero, matching C#'s double-to-sbyte conversion in the safe range.
+    (fraction(52.982_918_9 * fraction(0.067_110_56 * x + 0.005_837_15 * y)) * 256.0 - 128.0) as i16
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2186,6 +2286,12 @@ mod tests {
         DitherMode::JarvisJudiceNinke,
         DitherMode::Stucki,
         DitherMode::StevensonArce,
+    ];
+
+    const COORDINATE_NOISE_MODES: [DitherMode; 3] = [
+        DitherMode::Dotted,
+        DitherMode::BlueNoise,
+        DitherMode::InterleavedNoise,
     ];
 
     #[derive(Debug)]
@@ -3139,6 +3245,135 @@ mod tests {
         assert!(none.iter().all(|&index| index == none[0]));
         assert!(bayer.contains(&0) && bayer.contains(&1));
         assert_ne!(bayer, none);
+    }
+
+    #[test]
+    fn coordinate_noise_patterns_match_golden_offsets_and_indices() {
+        assert_eq!(
+            (0..8)
+                .map(|x| coordinate_noise_adjustment(DitherMode::Dotted, x, 0))
+                .collect::<Vec<_>>(),
+            [-7, -21, -19, -5, 3, 15, 17, 5]
+        );
+        assert_eq!(
+            (0..8)
+                .map(|x| coordinate_noise_adjustment(DitherMode::BlueNoise, x, 0))
+                .collect::<Vec<_>>(),
+            [-15, 29, 18, 12, -18, 5, -7, 1]
+        );
+        assert_eq!(
+            (0..8)
+                .map(|x| coordinate_noise_adjustment(DitherMode::InterleavedNoise, x, 0))
+                .collect::<Vec<_>>(),
+            [-32, 3, -24, 10, -17, 17, -10, 24]
+        );
+
+        let frame = RgbaFrame::new(8, 1, [128, 128, 128, 255].repeat(8), 10_000).unwrap();
+        let palette = ColorPalette::new(vec![0, 0, 0, 255, 255, 255], None).unwrap();
+        let expected = [
+            (DitherMode::Dotted, vec![0, 0, 0, 0, 1, 1, 1, 1]),
+            (DitherMode::BlueNoise, vec![0, 1, 1, 1, 0, 1, 0, 1]),
+            (DitherMode::InterleavedNoise, vec![0, 1, 0, 1, 0, 1, 0, 1]),
+        ];
+        for (mode, golden) in expected {
+            let first = map_frame_to_palette(&frame, &palette, None, mode, &NeverCancel).unwrap();
+            let second = map_frame_to_palette(&frame, &palette, None, mode, &NeverCancel).unwrap();
+            assert_eq!(first, golden);
+            assert_eq!(second, golden);
+        }
+    }
+
+    #[test]
+    fn ordered_noise_tiles_wrap_at_exact_boundaries() {
+        assert_eq!(
+            DOTTED_HALFTONE_8X8
+                .iter()
+                .flatten()
+                .map(|&value| u64::from(value))
+                .sum::<u64>(),
+            2_016
+        );
+        let mut dotted_values = DOTTED_HALFTONE_8X8
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        dotted_values.sort_unstable();
+        assert_eq!(dotted_values, (0_u8..64).collect::<Vec<_>>());
+
+        assert_eq!(BLUE_NOISE_64.len(), 4_096);
+        assert_eq!(
+            BLUE_NOISE_64
+                .iter()
+                .map(|&value| u64::from(value))
+                .sum::<u64>(),
+            522_240
+        );
+        let mut blue_counts = [0_u8; 256];
+        for value in BLUE_NOISE_64 {
+            blue_counts[usize::from(value)] += 1;
+        }
+        assert!(blue_counts.iter().all(|&count| count == 16));
+
+        for y in 0..70 {
+            for x in 0..70 {
+                assert_eq!(
+                    coordinate_noise_adjustment(DitherMode::Dotted, x, y),
+                    coordinate_noise_adjustment(DitherMode::Dotted, x + 8, y + 8)
+                );
+                assert_eq!(
+                    coordinate_noise_adjustment(DitherMode::BlueNoise, x, y),
+                    coordinate_noise_adjustment(DitherMode::BlueNoise, x + 64, y + 64)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coordinate_noise_is_deterministic_bounded_and_ignores_transparent_rgb() {
+        let palette = ColorPalette::new(vec![0, 0, 0, 0, 0, 0, 255, 255, 255], Some(0)).unwrap();
+        let mut first_pixels = [128, 128, 128, 255].repeat(64);
+        let mut second_pixels = first_pixels.clone();
+        first_pixels[0..4].copy_from_slice(&[1, 2, 3, 0]);
+        second_pixels[0..4].copy_from_slice(&[250, 240, 230, 0]);
+        let first = RgbaFrame::new(8, 8, first_pixels, 10_000).unwrap();
+        let second = RgbaFrame::new(8, 8, second_pixels, 10_000).unwrap();
+        let none = map_frame_to_palette(&first, &palette, Some(1), DitherMode::None, &NeverCancel)
+            .unwrap();
+
+        for mode in COORDINATE_NOISE_MODES {
+            let first_indices =
+                map_frame_to_palette(&first, &palette, Some(1), mode, &NeverCancel).unwrap();
+            let repeated =
+                map_frame_to_palette(&first, &palette, Some(1), mode, &NeverCancel).unwrap();
+            let hidden_rgb_changed =
+                map_frame_to_palette(&second, &palette, Some(1), mode, &NeverCancel).unwrap();
+            assert_eq!(first_indices, repeated);
+            assert_eq!(first_indices, hidden_rgb_changed);
+            assert_eq!(first_indices[0], 0);
+            assert!(
+                first_indices[1..]
+                    .iter()
+                    .all(|&index| matches!(index, 1 | 2))
+            );
+            assert_ne!(first_indices, none);
+        }
+    }
+
+    #[test]
+    fn every_coordinate_noise_mode_checks_cancellation_during_mapping() {
+        let frame = RgbaFrame::new(128, 64, [128, 128, 128, 255].repeat(8_192), 10_000).unwrap();
+        let palette = ColorPalette::new(vec![0, 0, 0, 255, 255, 255], None).unwrap();
+        for mode in COORDINATE_NOISE_MODES {
+            // Eight checks build the 32³ nearest-color lookup. The ninth is
+            // pixel zero, proving cancellation remains cooperative in mapping.
+            let cancellation = CancelAfterChecks::new(8);
+            assert_eq!(
+                map_frame_to_palette(&frame, &palette, None, mode, &cancellation),
+                Err(QuantizationError::Cancelled)
+            );
+            assert!(cancellation.checks.load(Ordering::Relaxed) >= 9);
+        }
     }
 
     #[test]
