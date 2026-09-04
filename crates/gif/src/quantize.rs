@@ -210,7 +210,7 @@ impl FrameQuantizer for MedianCutQuantizer {
         let mut has_transparency = settings.reserve_transparency;
         let mut visited_pixels = 0_usize;
         for frame in frames {
-            for pixel in frame.pixels().chunks_exact(4) {
+            for pixel in frame.pixels().as_chunks::<4>().0 {
                 check_cancellation(visited_pixels, cancellation)?;
                 visited_pixels = visited_pixels.wrapping_add(1);
                 if is_transparent(pixel[3], settings.alpha_threshold) {
@@ -326,7 +326,9 @@ fn histogram_points(histogram: &[HistogramBin]) -> Vec<ColorPoint> {
 fn opaque_palette_entries(palette: &ColorPalette) -> Result<Vec<(u8, [u8; 3])>, QuantizationError> {
     let entries: Vec<_> = palette
         .colors
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .enumerate()
         .filter(|(index, _)| Some(*index as u8) != palette.transparent_index)
         .map(|(index, color)| (index as u8, [color[0], color[1], color[2]]))
@@ -363,7 +365,7 @@ fn map_without_dither(
 ) -> Result<Vec<u8>, QuantizationError> {
     let lookup = build_color_lookup(palette, cancellation)?;
     let mut indices = Vec::with_capacity(usize::from(frame.width()) * usize::from(frame.height()));
-    for (pixel_index, pixel) in frame.pixels().chunks_exact(4).enumerate() {
+    for (pixel_index, pixel) in frame.pixels().as_chunks::<4>().0.iter().enumerate() {
         check_cancellation(pixel_index, cancellation)?;
         if is_transparent(pixel[3], alpha_threshold) {
             indices.push(required_transparent_index(transparent_index)?);
@@ -386,7 +388,7 @@ fn map_with_bayer(
     let lookup = build_color_lookup(palette, cancellation)?;
     let width = usize::from(frame.width());
     let mut indices = Vec::with_capacity(width * usize::from(frame.height()));
-    for (pixel_index, pixel) in frame.pixels().chunks_exact(4).enumerate() {
+    for (pixel_index, pixel) in frame.pixels().as_chunks::<4>().0.iter().enumerate() {
         check_cancellation(pixel_index, cancellation)?;
         if is_transparent(pixel[3], alpha_threshold) {
             indices.push(required_transparent_index(transparent_index)?);

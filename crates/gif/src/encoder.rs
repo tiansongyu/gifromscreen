@@ -694,8 +694,10 @@ fn changed_rectangle(previous: &[u8], current: &[u8], width: u16, height: u16) -
     let mut max_y = 0_usize;
     let mut changed = false;
     for (pixel_index, (old, new)) in previous
-        .chunks_exact(4)
-        .zip(current.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(current.as_chunks::<4>().0.iter())
         .enumerate()
     {
         if old == new {
@@ -774,7 +776,9 @@ fn frame_has_transparency(frame: &RgbaFrame, threshold: Option<u8>) -> bool {
     threshold.is_some_and(|threshold| {
         frame
             .pixels()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|pixel| pixel[3] < threshold)
     })
 }
@@ -789,8 +793,10 @@ fn transition_needs_background_clear(
     };
     current
         .pixels()
-        .chunks_exact(4)
-        .zip(next.pixels().chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(next.pixels().as_chunks::<4>().0.iter())
         .any(|(current, next)| current[3] >= threshold && next[3] < threshold)
 }
 
