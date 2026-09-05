@@ -95,7 +95,7 @@ fn parse_token(
             token: token.to_owned(),
         });
     }
-    for pair in bytes[1..].chunks_exact(2) {
+    for pair in bytes[1..].as_chunks::<2>().0 {
         let high =
             hex_nibble(pair[0]).map_err(|digit| CustomPaletteInputError::InvalidHexDigit {
                 entry,
