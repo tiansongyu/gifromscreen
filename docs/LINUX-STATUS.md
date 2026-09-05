@@ -44,6 +44,7 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Replace quadratic per-frame manifest cloning with indexed recording journal paths and a 512-frame checkpoint cadence; pass the 10,000-frame durability preflight.
 - [x] Author and remove timed line, arrow, rectangle, and ellipse overlay tracks with journal-backed undo/redo.
 - [x] Draw a bounded freehand stroke directly on the frame preview and commit it as a timed, undoable overlay track.
+- [x] Decode and author bounded raster-watermark tracks with atomic asset registration and undo/redo.
 
 ## Delivery gates
 
@@ -72,7 +73,8 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Window capture and capture-only-changes.
 - [x] Manual and periodic snapshots.
 - [x] Duplicate removal, frame reduction, Yoyo, and delay scaling.
-- [ ] Text/title and raster-watermark authoring UI.
+- [ ] Text and title-frame authoring UI.
+- [x] Raster-watermark authoring with bounded background decoding.
 - [x] Bounded free-drawing authoring on the rendered preview.
 - [x] Shape overlay authoring with bounds, stroke/fill, opacity, blend mode, and z-order.
 - [x] Border, shadow, blur, pixelate, darken, and lighten frame effects.
