@@ -340,6 +340,21 @@ pub trait CaptureSession: Send {
     /// cannot be applied in the current state.
     fn update_target(&mut self, target: CaptureTarget) -> Result<(), CaptureError>;
 
+    /// Establishes a fresh-frame boundary before a controlled manual snapshot.
+    ///
+    /// Pull-based adapters may keep the default no-op because their next
+    /// [`CaptureSession::poll_frame`] performs the actual capture. Buffered
+    /// adapters should discard frames sampled before this call, without
+    /// changing the public session state. This method does not itself consume
+    /// the snapshot frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaptureError`] when a fresh boundary cannot be established.
+    fn prepare_snapshot(&mut self) -> Result<(), CaptureError> {
+        Ok(())
+    }
+
     /// Pauses frame production.
     ///
     /// # Errors

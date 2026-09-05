@@ -1,12 +1,36 @@
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use gif_from_screen_capture::{
-    CaptureError, CaptureErrorKind, CaptureSession, CaptureSessionState, CaptureTarget,
-    RecoveryHint,
+    CaptureCadence, CaptureError, CaptureErrorKind, CaptureSession, CaptureSessionState,
+    CaptureTarget, CaptureTimestamp, CapturedFrame, RecoveryHint,
 };
+use thiserror::Error;
 
 use crate::WorkflowError;
+
+/// Maximum manual snapshot commands that may be queued or waiting for frames.
+pub const MAX_PENDING_SNAPSHOTS: usize = 64;
+
+#[derive(Debug)]
+struct SnapshotCompletion {
+    sender: Sender<Result<SnapshotReceipt, SnapshotTriggerRejection>>,
+    outstanding: Arc<AtomicUsize>,
+}
+
+impl SnapshotCompletion {
+    fn finish(self, result: Result<SnapshotReceipt, SnapshotTriggerRejection>) {
+        let _ = self.sender.send(result);
+    }
+}
+
+impl Drop for SnapshotCompletion {
+    fn drop(&mut self) {
+        self.outstanding.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Debug)]
 enum RecordingCommand {
@@ -15,6 +39,9 @@ enum RecordingCommand {
     UpdateTarget {
         target: CaptureTarget,
         completion: Sender<Result<(), CaptureError>>,
+    },
+    Snapshot {
+        completion: SnapshotCompletion,
     },
     Stop,
     Discard,
@@ -25,12 +52,115 @@ enum RecordingCommand {
 pub struct RecordingController {
     sender: Sender<RecordingCommand>,
     dispatch: Arc<Mutex<()>>,
+    outstanding_snapshots: Arc<AtomicUsize>,
 }
 
 /// The worker-side command receiver for one controlled recording.
 #[derive(Debug)]
 pub struct RecordingControl {
     receiver: Receiver<RecordingCommand>,
+    pending_snapshots: VecDeque<SnapshotCompletion>,
+}
+
+/// Receipt for one native frame accepted by a manual snapshot trigger.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SnapshotReceipt {
+    sequence: u64,
+    captured_at: CaptureTimestamp,
+    retained: bool,
+}
+
+impl SnapshotReceipt {
+    /// Native session sequence of the accepted frame.
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+
+    /// Actual session-relative capture timestamp, not the trigger dispatch time.
+    pub const fn captured_at(self) -> CaptureTimestamp {
+        self.captured_at
+    }
+
+    /// Whether frame-retention policy stored this sample in memory or the sink.
+    pub const fn retained(self) -> bool {
+        self.retained
+    }
+}
+
+/// Why a queued manual snapshot could not accept a native frame.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum SnapshotTriggerRejection {
+    /// The public burst limit was reached before this command could be queued.
+    #[error("manual snapshot queue is full (limit {limit})")]
+    QueueFull {
+        /// Maximum queued and frame-waiting snapshot commands.
+        limit: usize,
+    },
+    /// The worker could not reserve bounded acknowledgement queue storage.
+    #[error("could not allocate bounded manual snapshot acknowledgement storage")]
+    AllocationFailed,
+    /// The active request does not use [`CaptureCadence::Manual`].
+    #[error("snapshot trigger requires manual capture cadence")]
+    NonManualCadence,
+    /// The session was paused when this trigger reached the worker.
+    #[error("snapshot trigger was rejected while capture was paused")]
+    Paused,
+    /// Stop was ordered before this trigger could accept a frame.
+    #[error("snapshot trigger was cancelled by stop")]
+    Stopped,
+    /// Discard was ordered before this trigger could accept a frame.
+    #[error("snapshot trigger was cancelled by discard")]
+    Discarded,
+    /// Cooperative cancellation ended collection.
+    #[error("snapshot trigger was cancelled")]
+    Cancelled,
+    /// Native capture failed while the trigger was pending.
+    #[error("native capture failed before the snapshot: {0}")]
+    CaptureFailed(#[source] CaptureError),
+    /// A validation, resource-limit, or sink failure ended collection.
+    #[error("snapshot collection failed: {0}")]
+    CollectionFailed(String),
+    /// The stream or configured collection limit ended before a frame arrived.
+    #[error("snapshot collection ended before a frame arrived")]
+    CollectionEnded,
+}
+
+/// Current acknowledgement state of one manual snapshot trigger.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum SnapshotTriggerStatus {
+    /// The command is queued or waiting for the next native frame.
+    Pending,
+    /// One native frame was accepted for this trigger.
+    Captured(SnapshotReceipt),
+    /// Collection rejected the trigger before accepting a frame.
+    Rejected(SnapshotTriggerRejection),
+    /// The worker-side control object disappeared without an acknowledgement.
+    WorkerExited,
+}
+
+/// Queryable acknowledgement for one ordered manual snapshot command.
+#[derive(Debug)]
+pub struct SnapshotTriggerRequest {
+    receiver: Receiver<Result<SnapshotReceipt, SnapshotTriggerRejection>>,
+    status: SnapshotTriggerStatus,
+}
+
+impl SnapshotTriggerRequest {
+    /// Polls the acknowledgement without blocking and caches terminal results.
+    pub fn status(&mut self) -> SnapshotTriggerStatus {
+        if self.status != SnapshotTriggerStatus::Pending {
+            return self.status.clone();
+        }
+        match self.receiver.try_recv() {
+            Ok(Ok(receipt)) => self.status = SnapshotTriggerStatus::Captured(receipt),
+            Ok(Err(reason)) => self.status = SnapshotTriggerStatus::Rejected(reason),
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => self.status = SnapshotTriggerStatus::WorkerExited,
+        }
+        self.status.clone()
+    }
 }
 
 /// Current worker-side state of one target update request.
@@ -90,12 +220,17 @@ impl RecordingController {
     /// Creates a controller and the corresponding worker-side receiver.
     pub fn channel() -> (Self, RecordingControl) {
         let (sender, receiver) = mpsc::channel();
+        let outstanding_snapshots = Arc::new(AtomicUsize::new(0));
         (
             Self {
                 sender,
                 dispatch: Arc::new(Mutex::new(())),
+                outstanding_snapshots,
             },
-            RecordingControl { receiver },
+            RecordingControl {
+                receiver,
+                pending_snapshots: VecDeque::new(),
+            },
         )
     }
 
@@ -134,6 +269,44 @@ impl RecordingController {
         }
     }
 
+    /// Queues one snapshot in the same total order as pause, target, and
+    /// terminal commands.
+    ///
+    /// Paused and non-manual sessions reject the command through its
+    /// acknowledgement. Burst triggers are not coalesced: every accepted
+    /// command consumes exactly one subsequent native frame.
+    pub fn trigger_snapshot(&self) -> SnapshotTriggerRequest {
+        let (completion, receiver) = mpsc::channel();
+        if self
+            .outstanding_snapshots
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < MAX_PENDING_SNAPSHOTS).then_some(current + 1)
+            })
+            .is_err()
+        {
+            return SnapshotTriggerRequest {
+                receiver,
+                status: SnapshotTriggerStatus::Rejected(SnapshotTriggerRejection::QueueFull {
+                    limit: MAX_PENDING_SNAPSHOTS,
+                }),
+            };
+        }
+        let sent = self.send(RecordingCommand::Snapshot {
+            completion: SnapshotCompletion {
+                sender: completion,
+                outstanding: Arc::clone(&self.outstanding_snapshots),
+            },
+        });
+        SnapshotTriggerRequest {
+            receiver,
+            status: if sent {
+                SnapshotTriggerStatus::Pending
+            } else {
+                SnapshotTriggerStatus::WorkerExited
+            },
+        }
+    }
+
     /// Requests that capture stop and the frames already collected be encoded.
     ///
     /// Returns `false` when the recording worker has already exited.
@@ -155,6 +328,35 @@ impl RecordingController {
 }
 
 impl RecordingControl {
+    pub(crate) fn has_pending_snapshot(&self) -> bool {
+        !self.pending_snapshots.is_empty()
+    }
+
+    pub(crate) fn complete_snapshot(&mut self, frame: &CapturedFrame, retained: bool) {
+        if let Some(completion) = self.pending_snapshots.pop_front() {
+            completion.finish(Ok(SnapshotReceipt {
+                sequence: frame.sequence(),
+                captured_at: frame.captured_at(),
+                retained,
+            }));
+        }
+    }
+
+    pub(crate) fn reject_pending_snapshots(&mut self, reason: &SnapshotTriggerRejection) {
+        for completion in self.pending_snapshots.drain(..) {
+            completion.finish(Err(reason.clone()));
+        }
+    }
+
+    pub(crate) fn reject_all_snapshots(&mut self, reason: &SnapshotTriggerRejection) {
+        self.reject_pending_snapshots(reason);
+        while let Ok(command) = self.receiver.try_recv() {
+            if let RecordingCommand::Snapshot { completion } = command {
+                completion.finish(Err(reason.clone()));
+            }
+        }
+    }
+
     pub(crate) fn apply_pending(
         &mut self,
         session: &mut dyn CaptureSession,
@@ -197,6 +399,43 @@ impl RecordingControl {
                     };
                     let _ = completion.send(result);
                 }
+                RecordingCommand::Snapshot { completion } => {
+                    let rejection = match outcome {
+                        ControlOutcome::Stop => Some(SnapshotTriggerRejection::Stopped),
+                        ControlOutcome::Discard => Some(SnapshotTriggerRejection::Discarded),
+                        ControlOutcome::Continue
+                            if !matches!(session.request().cadence, CaptureCadence::Manual) =>
+                        {
+                            Some(SnapshotTriggerRejection::NonManualCadence)
+                        }
+                        ControlOutcome::Continue if session.state().is_terminal() => {
+                            Some(SnapshotTriggerRejection::CollectionEnded)
+                        }
+                        ControlOutcome::Continue
+                            if session.state() == CaptureSessionState::Paused =>
+                        {
+                            Some(SnapshotTriggerRejection::Paused)
+                        }
+                        ControlOutcome::Continue => None,
+                    };
+                    if let Some(rejection) = rejection {
+                        completion.finish(Err(rejection));
+                        continue;
+                    }
+                    if self.pending_snapshots.try_reserve(1).is_err() {
+                        completion.finish(Err(SnapshotTriggerRejection::AllocationFailed));
+                        continue;
+                    }
+                    if let Err(error) = session.prepare_snapshot() {
+                        completion
+                            .finish(Err(SnapshotTriggerRejection::CaptureFailed(error.clone())));
+                        return Err(error.into());
+                    }
+                    self.pending_snapshots.push_back(completion);
+                    // A snapshot is an ordering barrier. Later commands must
+                    // not overtake the frame promised to this trigger.
+                    return Ok(ControlOutcome::Continue);
+                }
                 RecordingCommand::Stop => {
                     if outcome == ControlOutcome::Continue && !session.state().is_terminal() {
                         session.stop()?;
@@ -204,6 +443,7 @@ impl RecordingControl {
                     if outcome != ControlOutcome::Discard {
                         outcome = ControlOutcome::Stop;
                     }
+                    self.reject_pending_snapshots(&SnapshotTriggerRejection::Stopped);
                 }
                 RecordingCommand::Discard => {
                     if !matches!(
@@ -213,6 +453,7 @@ impl RecordingControl {
                         session.discard()?;
                     }
                     outcome = ControlOutcome::Discard;
+                    self.reject_pending_snapshots(&SnapshotTriggerRejection::Discarded);
                 }
             }
         }
@@ -245,6 +486,25 @@ mod tests {
                 CaptureCadence::interval(Duration::from_millis(10)).unwrap(),
             ))
             .unwrap()
+    }
+
+    fn manual_session() -> Box<dyn CaptureSession> {
+        let backend = SyntheticCaptureBackend::new(Vec::new());
+        backend
+            .start_session(CaptureRequest::new(target(0), CaptureCadence::Manual))
+            .unwrap()
+    }
+
+    fn captured(sequence: u64, timestamp_us: u64) -> CapturedFrame {
+        CapturedFrame::new(
+            sequence,
+            CaptureTimestamp::from_micros(timestamp_us),
+            gif_from_screen_capture::PhysicalSize::new(1, 1).unwrap(),
+            4,
+            gif_from_screen_capture::PixelFormat::Rgba8,
+            vec![1, 2, 3, 255],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -406,5 +666,112 @@ mod tests {
 
         assert_eq!(update.target(), &target(10));
         assert_eq!(update.status(), TargetUpdateStatus::WorkerExited);
+    }
+
+    #[test]
+    fn manual_snapshot_acknowledges_the_exact_accepted_native_frame() {
+        let (controller, mut control) = RecordingController::channel();
+        let mut session = manual_session();
+        let mut request = controller.trigger_snapshot();
+
+        assert_eq!(request.status(), SnapshotTriggerStatus::Pending);
+        assert_eq!(
+            control.apply_pending(&mut *session).unwrap(),
+            ControlOutcome::Continue
+        );
+        assert!(control.has_pending_snapshot());
+        control.complete_snapshot(&captured(7, 42_000), true);
+
+        assert_eq!(
+            request.status(),
+            SnapshotTriggerStatus::Captured(SnapshotReceipt {
+                sequence: 7,
+                captured_at: CaptureTimestamp::from_micros(42_000),
+                retained: true,
+            })
+        );
+        assert!(!control.has_pending_snapshot());
+    }
+
+    #[test]
+    fn nonmanual_and_paused_snapshot_requests_are_explicitly_rejected() {
+        let (controller, mut control) = RecordingController::channel();
+        let mut periodic = session();
+        let mut nonmanual = controller.trigger_snapshot();
+        control.apply_pending(&mut *periodic).unwrap();
+        assert_eq!(
+            nonmanual.status(),
+            SnapshotTriggerStatus::Rejected(SnapshotTriggerRejection::NonManualCadence)
+        );
+
+        let (controller, mut control) = RecordingController::channel();
+        let mut manual = manual_session();
+        assert!(controller.pause());
+        let mut paused = controller.trigger_snapshot();
+        control.apply_pending(&mut *manual).unwrap();
+        assert_eq!(manual.state(), CaptureSessionState::Paused);
+        assert_eq!(
+            paused.status(),
+            SnapshotTriggerStatus::Rejected(SnapshotTriggerRejection::Paused)
+        );
+    }
+
+    #[test]
+    fn snapshot_burst_is_bounded_before_worker_queue_growth() {
+        let (controller, control) = RecordingController::channel();
+        let mut pending = (0..MAX_PENDING_SNAPSHOTS)
+            .map(|_| controller.trigger_snapshot())
+            .collect::<Vec<_>>();
+        assert!(
+            pending
+                .iter_mut()
+                .all(|request| request.status() == SnapshotTriggerStatus::Pending)
+        );
+        let mut overflow = controller.trigger_snapshot();
+        assert_eq!(
+            overflow.status(),
+            SnapshotTriggerStatus::Rejected(SnapshotTriggerRejection::QueueFull {
+                limit: MAX_PENDING_SNAPSHOTS,
+            })
+        );
+
+        drop(control);
+        assert!(
+            pending
+                .iter_mut()
+                .all(|request| request.status() == SnapshotTriggerStatus::WorkerExited)
+        );
+    }
+
+    #[test]
+    fn terminal_commands_reject_a_snapshot_waiting_for_its_frame() {
+        for discard in [false, true] {
+            let (controller, mut control) = RecordingController::channel();
+            let mut session = manual_session();
+            let mut snapshot = controller.trigger_snapshot();
+            control.apply_pending(&mut *session).unwrap();
+            if discard {
+                assert!(controller.discard());
+            } else {
+                assert!(controller.stop());
+            }
+            let outcome = control.apply_pending(&mut *session).unwrap();
+            assert_eq!(
+                outcome,
+                if discard {
+                    ControlOutcome::Discard
+                } else {
+                    ControlOutcome::Stop
+                }
+            );
+            assert_eq!(
+                snapshot.status(),
+                SnapshotTriggerStatus::Rejected(if discard {
+                    SnapshotTriggerRejection::Discarded
+                } else {
+                    SnapshotTriggerRejection::Stopped
+                })
+            );
+        }
     }
 }

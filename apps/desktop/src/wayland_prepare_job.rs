@@ -198,7 +198,7 @@ enum WorkerCommand {
     Cancel,
     Commit {
         crop: gif_from_screen_capture::PhysicalRect,
-        worker: RecordingWorkerRequest,
+        worker: Box<RecordingWorkerRequest>,
         control: RecordingControl,
         cancellation: CancellationFlag,
         messages: Sender<JobMessage>,
@@ -312,7 +312,7 @@ impl WaylandPrepareJob {
             .ok_or(WaylandCommitError::WorkerExited)?
             .send(WorkerCommand::Commit {
                 crop,
-                worker,
+                worker: Box::new(worker),
                 control,
                 cancellation: worker_cancellation,
                 messages,

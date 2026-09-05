@@ -29,7 +29,10 @@ deadline anchored, and a three-frame bounded channel drops late frames without
 rewriting sequence numbers or timestamps. Sequence gaps therefore expose
 backpressure to callers. Resuming first drains frames queued before the pause
 acknowledgement, so frozen-preview/setup pixels cannot leak into a later
-recording interval.
+recording interval. A manual snapshot switches the PipeWire worker to an
+explicit one-permit gate, drains every pre-trigger setup frame, and releases
+only the next post-trigger buffer; idle manual mode therefore does not keep
+feeding stale frames into the bounded channel.
 
 Monitor/window choice remains in the trusted compositor dialog. Region capture
 is a source-local crop of the selected stream, and `update_target` can move that

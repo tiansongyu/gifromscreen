@@ -116,6 +116,10 @@ impl CaptureSession for FixedCropSession {
         Ok(())
     }
 
+    fn prepare_snapshot(&mut self) -> Result<(), CaptureError> {
+        self.inner.prepare_snapshot()
+    }
+
     fn pause(&mut self) -> Result<(), CaptureError> {
         self.inner.pause()
     }
@@ -378,6 +382,7 @@ mod tests {
         stops: usize,
         discards: usize,
         inner_updates: usize,
+        snapshot_prepares: usize,
     }
 
     struct FakeSession {
@@ -397,6 +402,10 @@ mod tests {
         fn update_target(&mut self, target: CaptureTarget) -> Result<(), CaptureError> {
             self.calls.lock().unwrap().inner_updates += 1;
             self.request.target = target;
+            Ok(())
+        }
+        fn prepare_snapshot(&mut self) -> Result<(), CaptureError> {
+            self.calls.lock().unwrap().snapshot_prepares += 1;
             Ok(())
         }
         fn pause(&mut self) -> Result<(), CaptureError> {
@@ -632,6 +641,7 @@ mod tests {
     fn lifecycle_delegates_and_terminal_retarget_is_rejected() {
         let (mut session, calls) = wrapped(PixelFormat::Rgba8);
         session.resume().unwrap();
+        session.prepare_snapshot().unwrap();
         session.pause().unwrap();
         session.resume().unwrap();
         session.stop().unwrap();
@@ -650,6 +660,7 @@ mod tests {
         assert_eq!(calls.resumes, 2);
         assert_eq!(calls.pauses, 1);
         assert_eq!(calls.stops, 1);
+        assert_eq!(calls.snapshot_prepares, 1);
 
         drop(calls);
         let (mut discarded, calls) = wrapped(PixelFormat::Rgba8);

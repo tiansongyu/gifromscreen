@@ -1,7 +1,7 @@
 //! Native `PipeWire` video delivery for XDG `ScreenCast` sessions.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     io::Cursor,
     os::fd::IntoRawFd,
     ptr::NonNull,
@@ -192,6 +192,7 @@ pub struct WaylandCaptureSession {
     frames: Receiver<CapturedFrame>,
     status: Receiver<WorkerStatus>,
     worker: Option<JoinHandle<Result<(), CaptureError>>>,
+    manual_gate_active: bool,
 }
 
 impl std::fmt::Debug for WaylandCaptureSession {
@@ -288,6 +289,7 @@ impl WaylandCaptureSession {
             frames: frame_rx,
             status: status_rx,
             worker: Some(worker),
+            manual_gate_active: false,
         })
     }
 
@@ -421,6 +423,24 @@ impl CaptureSession for WaylandCaptureSession {
             reply,
         })?;
         self.request.target = target;
+        Ok(())
+    }
+
+    fn prepare_snapshot(&mut self) -> Result<(), CaptureError> {
+        if !matches!(self.request.cadence, CaptureCadence::Manual) {
+            return Err(invalid_request(
+                "fresh snapshot boundaries require manual capture cadence",
+            ));
+        }
+        if self.state != CaptureSessionState::Recording {
+            return Err(self.invalid_transition("prepare a snapshot for"));
+        }
+        if !self.manual_gate_active {
+            self.send_command(|reply| WorkerCommand::EnterManualSnapshotMode { reply })?;
+            drain_queued_frames(&self.frames);
+            self.manual_gate_active = true;
+        }
+        self.send_command(|reply| WorkerCommand::RequestManualSnapshot { reply })?;
         Ok(())
     }
 
@@ -575,6 +595,12 @@ enum WorkerCommand {
         crop: Option<PhysicalRect>,
         reply: SyncSender<Result<(), CaptureError>>,
     },
+    EnterManualSnapshotMode {
+        reply: SyncSender<Result<(), CaptureError>>,
+    },
+    RequestManualSnapshot {
+        reply: SyncSender<Result<(), CaptureError>>,
+    },
     Shutdown {
         reply: Option<SyncSender<Result<(), CaptureError>>>,
     },
@@ -706,6 +732,8 @@ struct WorkerData {
     initialized: SyncSender<Result<WorkerInitialized, CaptureError>>,
     init_sent: Arc<AtomicBool>,
     terminal: Arc<AtomicBool>,
+    manual_gate_enabled: Rc<Cell<bool>>,
+    manual_permits: Rc<Cell<u64>>,
 }
 
 fn run_pipewire_worker(
@@ -747,6 +775,8 @@ fn run_pipewire_worker(
     let cadence = Rc::new(RefCell::new(cadence));
     let init_sent = Arc::new(AtomicBool::new(false));
     let terminal = Arc::new(AtomicBool::new(false));
+    let manual_gate_enabled = Rc::new(Cell::new(false));
+    let manual_permits = Rc::new(Cell::new(0));
     // pipewire-rs 0.6 accidentally constrains its listener builder to default
     // user data even when data is supplied explicitly. Keep our real state in
     // callback-local `Rc<RefCell<_>>` storage and use the trivial `()` stream
@@ -763,6 +793,8 @@ fn run_pipewire_worker(
         initialized: initialized.clone(),
         init_sent: init_sent.clone(),
         terminal: terminal.clone(),
+        manual_gate_enabled: manual_gate_enabled.clone(),
+        manual_permits: manual_permits.clone(),
     }));
     let listener = register_stream_listener(
         &mut stream,
@@ -787,7 +819,16 @@ fn run_pipewire_worker(
         .map_err(|error| pipewire_error("connect video stream", &error))?;
 
     while !terminal.load(Ordering::Acquire) {
-        handle_worker_commands(commands, &stream, &crop, &clock, &cadence, &terminal);
+        handle_worker_commands(
+            commands,
+            &stream,
+            &crop,
+            &clock,
+            &cadence,
+            &manual_gate_enabled,
+            &manual_permits,
+            &terminal,
+        );
         if !terminal.load(Ordering::Acquire) {
             main_loop.iterate(PIPEWIRE_ITERATION);
         }
@@ -907,6 +948,10 @@ fn process_pipewire_frame(
     let Some(format) = data.negotiated else {
         return;
     };
+    let manual_gated = data.manual_gate_enabled.get();
+    if manual_gated && data.manual_permits.get() == 0 {
+        return;
+    }
     let Some(mut buffer) = stream.dequeue_buffer() else {
         return;
     };
@@ -949,11 +994,16 @@ fn process_pipewire_frame(
     };
     data.sequence = sequence;
     match result {
-        Ok(frame) => {
-            if try_deliver_frame(&data.frames, frame) == FrameDelivery::Disconnected {
-                data.terminal.store(true, Ordering::Release);
+        Ok(frame) => match try_deliver_frame(&data.frames, frame) {
+            FrameDelivery::Delivered => {
+                if manual_gated {
+                    data.manual_permits
+                        .set(data.manual_permits.get().saturating_sub(1));
+                }
             }
-        }
+            FrameDelivery::Dropped => {}
+            FrameDelivery::Disconnected => data.terminal.store(true, Ordering::Release),
+        },
         Err(error) => signal_terminal(
             &data.terminal,
             &data.init_sent,
@@ -972,12 +1022,18 @@ fn try_deliver_frame(frames: &SyncSender<CapturedFrame>, frame: CapturedFrame) -
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the native worker command boundary keeps each independently owned PipeWire state cell explicit"
+)]
 fn handle_worker_commands(
     commands: &Receiver<WorkerCommand>,
     stream: &pipewire::stream::Stream<()>,
     crop: &Rc<RefCell<Option<PhysicalRect>>>,
     clock: &Rc<RefCell<ActiveClock>>,
     cadence: &Rc<RefCell<CadenceGate>>,
+    manual_gate_enabled: &Cell<bool>,
+    manual_permits: &Cell<u64>,
     terminal: &AtomicBool,
 ) {
     loop {
@@ -1012,6 +1068,28 @@ fn handle_worker_commands(
             } => {
                 *crop.borrow_mut() = updated;
                 let _ = reply.try_send(Ok(()));
+            }
+            WorkerCommand::EnterManualSnapshotMode { reply } => {
+                manual_gate_enabled.set(true);
+                manual_permits.set(0);
+                let _ = reply.try_send(Ok(()));
+            }
+            WorkerCommand::RequestManualSnapshot { reply } => {
+                let result = if !manual_gate_enabled.get() {
+                    Err(invalid_request(
+                        "manual snapshot mode was not initialized before its request",
+                    ))
+                } else if manual_permits.get() != 0 {
+                    Err(CaptureError::new(
+                        CaptureErrorKind::InvalidStateTransition,
+                        "a Wayland manual snapshot is already waiting for a frame",
+                        RecoveryHint::None,
+                    ))
+                } else {
+                    manual_permits.set(1);
+                    Ok(())
+                };
+                let _ = reply.try_send(result);
             }
             WorkerCommand::Shutdown { reply } => {
                 // Suppress the normal Unconnected callback before requesting
@@ -1502,7 +1580,9 @@ mod tests {
             while let Ok(command) = command_rx.recv() {
                 match command {
                     WorkerCommand::SetActive { reply, .. }
-                    | WorkerCommand::UpdateCrop { reply, .. } => {
+                    | WorkerCommand::UpdateCrop { reply, .. }
+                    | WorkerCommand::EnterManualSnapshotMode { reply }
+                    | WorkerCommand::RequestManualSnapshot { reply } => {
                         let _ = reply.try_send(Ok(()));
                     }
                     WorkerCommand::Shutdown { reply } => {
@@ -1526,6 +1606,7 @@ mod tests {
             frames: frame_rx,
             status: status_rx,
             worker: Some(worker),
+            manual_gate_active: false,
         }
     }
 
@@ -1840,6 +1921,89 @@ mod tests {
     }
 
     #[test]
+    fn manual_snapshot_boundary_drops_setup_frames_before_accepting_a_fresh_frame() {
+        let source_id = CaptureSourceId::new(MONITOR_SOURCE_ID).unwrap();
+        let request = CaptureRequest::new(
+            CaptureTarget::Monitor(source_id.clone()),
+            CaptureCadence::Manual,
+        );
+        let (command_tx, command_rx) = mpsc::channel();
+        let (frame_tx, frame_rx) = mpsc::sync_channel(FRAME_CHANNEL_CAPACITY);
+        let (_status_tx, status_rx) = mpsc::channel();
+        let (observed_tx, observed_rx) = mpsc::channel();
+        for sequence in 1..=u64::try_from(FRAME_CHANNEL_CAPACITY).unwrap() {
+            frame_tx
+                .send(captured_frame(sequence, sequence * 10))
+                .unwrap();
+        }
+        let worker = thread::spawn(move || {
+            while let Ok(command) = command_rx.recv() {
+                match command {
+                    WorkerCommand::EnterManualSnapshotMode { reply } => {
+                        let _ = observed_tx.send("enter");
+                        let _ = reply.try_send(Ok(()));
+                    }
+                    WorkerCommand::RequestManualSnapshot { reply } => {
+                        let _ = observed_tx.send("request");
+                        let _ = reply.try_send(Ok(()));
+                    }
+                    WorkerCommand::SetActive { reply, .. }
+                    | WorkerCommand::UpdateCrop { reply, .. } => {
+                        let _ = reply.try_send(Ok(()));
+                    }
+                    WorkerCommand::Shutdown { reply } => {
+                        if let Some(reply) = reply {
+                            let _ = reply.try_send(Ok(()));
+                        }
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        });
+        let mut session = WaylandCaptureSession {
+            request,
+            source_id,
+            source_kind: CaptureSourceKind::Monitor,
+            source_size: PhysicalSize::new(1, 1).unwrap(),
+            output_size: PhysicalSize::new(1, 1).unwrap(),
+            state: CaptureSessionState::Recording,
+            commands: command_tx,
+            frames: frame_rx,
+            status: status_rx,
+            worker: Some(worker),
+            manual_gate_active: false,
+        };
+
+        session.prepare_snapshot().unwrap();
+        assert_eq!(observed_rx.recv().unwrap(), "enter");
+        assert_eq!(observed_rx.recv().unwrap(), "request");
+        assert!(matches!(
+            session.poll_frame(Duration::ZERO).unwrap(),
+            FramePoll::Pending
+        ));
+
+        frame_tx.send(captured_frame(9, 90)).unwrap();
+        let FramePoll::Frame(fresh) = session.poll_frame(Duration::ZERO).unwrap() else {
+            panic!("fresh post-trigger frame was not delivered");
+        };
+        assert_eq!(fresh.sequence(), 9);
+        assert_eq!(fresh.captured_at().as_micros(), 90);
+
+        session.prepare_snapshot().unwrap();
+        assert_eq!(observed_rx.recv().unwrap(), "request");
+        assert!(observed_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn snapshot_boundary_rejects_nonmanual_wayland_sessions() {
+        let mut session = fake_session(PhysicalRect::new(0, 0, 10, 10).unwrap());
+        let error = session.prepare_snapshot().unwrap_err();
+        assert_eq!(error.kind(), CaptureErrorKind::InvalidRequest);
+        assert!(!session.manual_gate_active);
+    }
+
+    #[test]
     fn active_clock_excludes_multiple_pause_intervals() {
         let started_at = Instant::now();
         let mut clock = ActiveClock {
@@ -1875,6 +2039,15 @@ mod tests {
             cadence,
             CadenceGate::Periodic { period, .. } if period == Duration::from_nanos(1)
         ));
+
+        for seconds in [1, 60, 3_600] {
+            let requested = Duration::from_secs(seconds);
+            assert!(matches!(
+                CadenceGate::from_request(CaptureCadence::interval(requested).unwrap()).unwrap(),
+                CadenceGate::Periodic { period, next_due }
+                    if period == requested && next_due == Duration::ZERO
+            ));
+        }
     }
 
     trait ExpectedAlpha {

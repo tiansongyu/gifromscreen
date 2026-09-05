@@ -19,7 +19,11 @@ pub use collect::{
     collect, collect_controlled, collect_controlled_to_sink, collect_controlled_with_sink,
     collect_prestarted_controlled_to_sink,
 };
-pub use control::{RecordingControl, RecordingController, TargetUpdateRequest, TargetUpdateStatus};
+pub use control::{
+    MAX_PENDING_SNAPSHOTS, RecordingControl, RecordingController, SnapshotReceipt,
+    SnapshotTriggerRejection, SnapshotTriggerRequest, SnapshotTriggerStatus, TargetUpdateRequest,
+    TargetUpdateStatus,
+};
 pub use error::WorkflowError;
 pub use frame_sink::{RecordingFrameSink, RecordingFrameSinkError, RecordingFrameSinkOperation};
 pub use output::{

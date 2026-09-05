@@ -17,7 +17,8 @@ use gif_from_screen_gif::{CancellationFlag, NeverCancel};
 use gif_from_screen_workflow::{
     CollectOptions, CollectionLimit, FrameRetention, NoopWorkflowProgress, RecordToGifOptions,
     RecordingController, RecordingFrameSink, RecordingFrameSinkError, RecordingFrameSinkOperation,
-    WorkflowError, WorkflowPhase, WorkflowProgress, collect, collect_controlled_to_sink,
+    SnapshotTriggerRejection, SnapshotTriggerRequest, SnapshotTriggerStatus, WorkflowError,
+    WorkflowPhase, WorkflowProgress, collect, collect_controlled, collect_controlled_to_sink,
     collect_controlled_with_sink, collect_prestarted_controlled_to_sink, partial_output_path,
     record_to_gif, record_to_gif_controlled,
 };
@@ -184,6 +185,28 @@ fn request() -> CaptureRequest {
     )
 }
 
+fn manual_request() -> CaptureRequest {
+    CaptureRequest::new(
+        CaptureTarget::Monitor(CaptureSourceId::new("synthetic:monitor:0").unwrap()),
+        CaptureCadence::Manual,
+    )
+}
+
+fn wait_for_snapshot(request: &mut SnapshotTriggerRequest) -> SnapshotTriggerStatus {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = request.status();
+        if status != SnapshotTriggerStatus::Pending {
+            return status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "manual snapshot acknowledgement timed out"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 fn frame(
     sequence: u64,
     timestamp_us: u64,
@@ -210,6 +233,181 @@ fn max_frames_options(max_frames: u64, tail_us: u64) -> CollectOptions {
         tail_frame_duration: Duration::from_micros(tail_us),
         ..CollectOptions::default()
     }
+}
+
+#[test]
+fn controlled_manual_snapshots_admit_one_fresh_frame_per_trigger() {
+    let repeated = vec![20, 30, 40, 255];
+    let backend = SyntheticCaptureBackend::new(vec![
+        frame(1, 10_000, 1, 1, 4, PixelFormat::Rgba8, repeated.clone()),
+        frame(2, 30_000, 1, 1, 4, PixelFormat::Rgba8, repeated),
+        frame(
+            3,
+            80_000,
+            1,
+            1,
+            4,
+            PixelFormat::Rgba8,
+            vec![80, 90, 100, 255],
+        ),
+    ]);
+    let (controller, mut control) = RecordingController::channel();
+    let worker = std::thread::spawn(move || {
+        collect_controlled(
+            &backend,
+            manual_request(),
+            &CollectOptions {
+                frame_retention: FrameRetention::ChangesOnly,
+                poll_interval: Duration::from_millis(1),
+                ..max_frames_options(3, 5_000)
+            },
+            &mut control,
+            &NeverCancel,
+            &mut NoopWorkflowProgress,
+        )
+    });
+
+    let mut first = controller.trigger_snapshot();
+    let mut second = controller.trigger_snapshot();
+    let mut third = controller.trigger_snapshot();
+    for (request, expected_sequence, expected_timestamp) in [
+        (&mut first, 1, 10_000),
+        (&mut second, 2, 30_000),
+        (&mut third, 3, 80_000),
+    ] {
+        let SnapshotTriggerStatus::Captured(receipt) = wait_for_snapshot(request) else {
+            panic!("manual trigger was not captured");
+        };
+        assert_eq!(receipt.sequence(), expected_sequence);
+        assert_eq!(receipt.captured_at().as_micros(), expected_timestamp);
+        assert!(receipt.retained());
+    }
+
+    let recording = worker.join().unwrap().unwrap();
+    assert_eq!(recording.frames().len(), 3);
+    assert_eq!(
+        recording
+            .frames()
+            .iter()
+            .map(gif_from_screen_gif::RgbaFrame::duration_us)
+            .collect::<Vec<_>>(),
+        [20_000, 50_000, 5_000]
+    );
+    assert_eq!(recording.summary().duration_us, 75_000);
+}
+
+#[test]
+fn burst_manual_snapshots_flow_through_the_sink_in_order() {
+    let backend = SyntheticCaptureBackend::new(vec![
+        frame(4, 5_000, 1, 1, 4, PixelFormat::Rgba8, vec![1, 0, 0, 255]),
+        frame(5, 15_000, 1, 1, 4, PixelFormat::Rgba8, vec![2, 0, 0, 255]),
+        frame(6, 35_000, 1, 1, 4, PixelFormat::Rgba8, vec![3, 0, 0, 255]),
+    ]);
+    let (controller, mut control) = RecordingController::channel();
+    let mut requests = (0..3)
+        .map(|_| controller.trigger_snapshot())
+        .collect::<Vec<_>>();
+    let worker = std::thread::spawn(move || {
+        let mut sink = TestFrameSink::default();
+        let summary = collect_controlled_to_sink(
+            &backend,
+            manual_request(),
+            &CollectOptions {
+                poll_interval: Duration::from_millis(1),
+                ..max_frames_options(3, 7_000)
+            },
+            &mut control,
+            &mut sink,
+            &NeverCancel,
+            &mut NoopWorkflowProgress,
+        )?;
+        Ok::<_, WorkflowError>((summary, sink))
+    });
+
+    for (request, sequence) in requests.iter_mut().zip(4..=6) {
+        assert!(matches!(
+            wait_for_snapshot(request),
+            SnapshotTriggerStatus::Captured(receipt) if receipt.sequence() == sequence
+        ));
+    }
+    let (summary, sink) = worker.join().unwrap().unwrap();
+    assert_eq!(summary.frames, 3);
+    assert_eq!(summary.duration_us, 37_000);
+    assert_eq!(
+        sink.events
+            .iter()
+            .filter_map(|event| match event {
+                SinkEvent::Append { pixels, .. } => Some(pixels[0]),
+                SinkEvent::Update { .. } => None,
+            })
+            .collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+}
+
+#[test]
+fn pending_manual_snapshot_reports_sink_failure_and_cancellation() {
+    let backend = SyntheticCaptureBackend::new(vec![frame(
+        1,
+        0,
+        1,
+        1,
+        4,
+        PixelFormat::Rgba8,
+        vec![1, 2, 3, 255],
+    )]);
+    let (controller, mut control) = RecordingController::channel();
+    let mut failed_request = controller.trigger_snapshot();
+    let mut sink = TestFrameSink {
+        fail: Some((RecordingFrameSinkOperation::AppendProvisionalFrame, 0)),
+        ..TestFrameSink::default()
+    };
+    assert!(matches!(
+        collect_controlled_to_sink(
+            &backend,
+            manual_request(),
+            &max_frames_options(1, 5_000),
+            &mut control,
+            &mut sink,
+            &NeverCancel,
+            &mut NoopWorkflowProgress,
+        ),
+        Err(WorkflowError::FrameSink { .. })
+    ));
+    assert!(matches!(
+        wait_for_snapshot(&mut failed_request),
+        SnapshotTriggerStatus::Rejected(SnapshotTriggerRejection::CollectionFailed(message))
+            if message.contains("injected append failure")
+    ));
+
+    let cancelled_backend = SyntheticCaptureBackend::new(vec![frame(
+        1,
+        0,
+        1,
+        1,
+        4,
+        PixelFormat::Rgba8,
+        vec![1, 2, 3, 255],
+    )]);
+    let (controller, mut control) = RecordingController::channel();
+    let mut cancelled_request = controller.trigger_snapshot();
+    let cancellation = CancellationFlag::default();
+    cancellation.cancel();
+    assert!(matches!(
+        collect_controlled(
+            &cancelled_backend,
+            manual_request(),
+            &max_frames_options(1, 5_000),
+            &mut control,
+            &cancellation,
+            &mut NoopWorkflowProgress,
+        ),
+        Err(WorkflowError::Cancelled)
+    ));
+    assert_eq!(
+        wait_for_snapshot(&mut cancelled_request),
+        SnapshotTriggerStatus::Rejected(SnapshotTriggerRejection::Cancelled)
+    );
 }
 
 #[test]

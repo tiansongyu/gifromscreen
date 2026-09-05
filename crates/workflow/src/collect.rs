@@ -8,7 +8,8 @@ use gif_from_screen_gif::{CancellationToken, RgbaFrame};
 
 use crate::{
     RecordingControl, RecordingFrameSink, RecordingFrameSinkOperation, WorkflowError,
-    WorkflowPhase, WorkflowProgress, WorkflowProgressSink, control::ControlOutcome,
+    WorkflowPhase, WorkflowProgress, WorkflowProgressSink,
+    control::{ControlOutcome, SnapshotTriggerRejection},
 };
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -163,7 +164,10 @@ struct ValidatedOptions {
 #[derive(Clone, Copy, Debug)]
 enum ValidatedLimit {
     UntilStopped,
-    Duration { duration_us: u64, deadline: Instant },
+    Duration {
+        duration_us: u64,
+        deadline: Option<Instant>,
+    },
     MaxFrames(u64),
 }
 
@@ -207,7 +211,10 @@ pub fn collect(
 /// A stop request keeps collected frames and completes normally. A discard
 /// request returns [`WorkflowError::Discarded`] and best-effort discards the
 /// native session. Control commands are observed at most one `poll_interval`
-/// after they are sent.
+/// after they are sent. With [`gif_from_screen_capture::CaptureCadence::Manual`],
+/// no native frame is admitted until [`crate::RecordingController::trigger_snapshot`]
+/// establishes a fresh-frame boundary. Each accepted trigger retains exactly
+/// one frame even when `frame_retention` is [`FrameRetention::ChangesOnly`].
 ///
 /// # Errors
 ///
@@ -287,24 +294,30 @@ pub fn collect_controlled_to_sink(
     cancellation: &dyn CancellationToken,
     progress: &mut dyn WorkflowProgressSink,
 ) -> Result<CollectionSummary, WorkflowError> {
-    let mut options = validate_options(options)?;
-    ensure_not_cancelled(cancellation)?;
-    progress.report(WorkflowProgress::capture(
-        WorkflowPhase::StartingCapture,
-        0,
-        Duration::ZERO,
-    ));
-    let mut session = backend.start_session(request)?;
-    let result = collect_prestarted_controlled_to_sink_inner(
-        &mut *session,
-        &mut options,
-        control,
-        sink,
-        cancellation,
-        progress,
-    );
-    if result.is_err() {
-        discard_best_effort(&mut *session);
+    let result = (|| {
+        let mut options = validate_options(options)?;
+        ensure_not_cancelled(cancellation)?;
+        progress.report(WorkflowProgress::capture(
+            WorkflowPhase::StartingCapture,
+            0,
+            Duration::ZERO,
+        ));
+        let mut session = backend.start_session(request)?;
+        let result = collect_prestarted_controlled_to_sink_inner(
+            &mut *session,
+            &mut options,
+            control,
+            sink,
+            cancellation,
+            progress,
+        );
+        if result.is_err() {
+            discard_best_effort(&mut *session);
+        }
+        result
+    })();
+    if let Err(error) = &result {
+        control.reject_all_snapshots(&snapshot_rejection_for_error(error));
     }
     result
 }
@@ -352,8 +365,9 @@ pub fn collect_prestarted_controlled_to_sink(
             progress,
         )
     })();
-    if result.is_err() {
+    if let Err(error) = &result {
         discard_best_effort(session);
+        control.reject_all_snapshots(&snapshot_rejection_for_error(error));
     }
     result
 }
@@ -367,7 +381,7 @@ fn collect_prestarted_controlled_to_sink_inner(
     progress: &mut dyn WorkflowProgressSink,
 ) -> Result<CollectionSummary, WorkflowError> {
     validate_prestarted_session_state(session.state())?;
-    reset_duration_deadline(&mut options.limit)?;
+    reset_duration_deadline(&mut options.limit);
     collect_session_to_sink(session, *options, control, sink, cancellation, progress)
 }
 
@@ -394,33 +408,38 @@ fn collect_internal(
     options: &CollectOptions,
     cancellation: &dyn CancellationToken,
     progress: &mut dyn WorkflowProgressSink,
-    control: Option<&mut RecordingControl>,
+    mut control: Option<&mut RecordingControl>,
     sink: Option<&mut dyn RecordingFrameSink>,
 ) -> Result<CollectedRecording, WorkflowError> {
-    let options = validate_options(options)?;
-    ensure_not_cancelled(cancellation)?;
-    progress.report(WorkflowProgress::capture(
-        WorkflowPhase::StartingCapture,
-        0,
-        Duration::ZERO,
-    ));
+    let result = (|| {
+        let options = validate_options(options)?;
+        ensure_not_cancelled(cancellation)?;
+        progress.report(WorkflowProgress::capture(
+            WorkflowPhase::StartingCapture,
+            0,
+            Duration::ZERO,
+        ));
 
-    let mut session = backend.start_session(request)?;
-    let result = collect_session(
-        &mut *session,
-        options,
-        cancellation,
-        progress,
-        control,
-        sink,
-    );
-    match result {
-        Ok(recording) => Ok(recording),
-        Err(error) => {
+        let mut session = backend.start_session(request)?;
+        let result = collect_session(
+            &mut *session,
+            options,
+            cancellation,
+            progress,
+            control.as_deref_mut(),
+            sink,
+        );
+        if result.is_err() {
             discard_best_effort(&mut *session);
-            Err(error)
         }
+        result
+    })();
+    if let Err(error) = &result
+        && let Some(control) = control
+    {
+        control.reject_all_snapshots(&snapshot_rejection_for_error(error));
     }
+    result
 }
 
 fn validate_options(options: &CollectOptions) -> Result<ValidatedOptions, WorkflowError> {
@@ -435,14 +454,9 @@ fn validate_options(options: &CollectOptions) -> Result<ValidatedOptions, Workfl
         CollectionLimit::UntilStopped => ValidatedLimit::UntilStopped,
         CollectionLimit::Duration(duration) => {
             let duration_us = duration_to_nonzero_micros(duration, "collection duration")?;
-            let deadline = Instant::now().checked_add(duration).ok_or_else(|| {
-                WorkflowError::InvalidCollectionOption(
-                    "collection duration is too large for a monotonic deadline".to_owned(),
-                )
-            })?;
             ValidatedLimit::Duration {
                 duration_us,
-                deadline,
+                deadline: None,
             }
         }
         CollectionLimit::MaxFrames(0) => {
@@ -475,6 +489,10 @@ fn duration_to_nonzero_micros(duration: Duration, name: &str) -> Result<u64, Wor
     Ok(micros)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the full-buffer collector keeps control ordering, manual admission, timing, and persistence in one auditable loop"
+)]
 fn collect_session(
     session: &mut dyn CaptureSession,
     mut options: ValidatedOptions,
@@ -491,11 +509,20 @@ fn collect_session(
     let mut last_observed_timestamp = None;
     let mut paused_at = None;
     let mut stream_index = 0_u64;
-    reset_duration_deadline(&mut options.limit)?;
+    let controlled_manual = control.is_some()
+        && matches!(
+            session.request().cadence,
+            gif_from_screen_capture::CaptureCadence::Manual
+        );
+    reset_duration_deadline(&mut options.limit);
 
     let stop_reason = loop {
         ensure_not_cancelled(cancellation)?;
-        if let Some(control) = control.as_deref_mut() {
+        let may_apply_commands = !controlled_manual
+            || control
+                .as_ref()
+                .is_some_and(|control| !control.has_pending_snapshot());
+        if may_apply_commands && let Some(control) = control.as_deref_mut() {
             match control.apply_pending(session)? {
                 ControlOutcome::Continue => {}
                 ControlOutcome::Stop => break StopReason::UserStopped,
@@ -520,6 +547,14 @@ fn collect_session(
         if duration_deadline_reached(options.limit) {
             break StopReason::DurationReached;
         }
+        if controlled_manual
+            && control
+                .as_ref()
+                .is_some_and(|control| !control.has_pending_snapshot())
+        {
+            sleep_until_control_poll(options.limit, options.poll_interval);
+            continue;
+        }
         let poll_interval = bounded_poll_interval(options.limit, options.poll_interval);
         match session.poll_frame(poll_interval)? {
             FramePoll::Frame(frame) => {
@@ -532,14 +567,19 @@ fn collect_session(
                 previous_timestamp = Some(timestamp_us);
                 previous_sequence = Some(frame.sequence());
 
+                let is_first = first_timestamp.is_none();
                 let capture_start = *first_timestamp.get_or_insert(timestamp_us);
+                if is_first {
+                    arm_duration_deadline(&mut options.limit)?;
+                }
                 if duration_span_reached(options.limit, capture_start, timestamp_us) {
                     break StopReason::DurationReached;
                 }
                 last_observed_timestamp = Some(timestamp_us);
 
                 let normalized = normalize_frame(&frame, stream_index, captures.first())?;
-                let retain = options.frame_retention == FrameRetention::All
+                let retain = controlled_manual
+                    || options.frame_retention == FrameRetention::All
                     || captures
                         .last()
                         .is_none_or(|previous| previous.pixels != normalized.pixels);
@@ -551,6 +591,9 @@ fn collect_session(
                         options,
                         &mut sink,
                     )?;
+                }
+                if controlled_manual && let Some(control) = control.as_deref_mut() {
+                    control.complete_snapshot(&frame, retain);
                 }
                 stream_index = next_stream_index;
 
@@ -569,6 +612,10 @@ fn collect_session(
             FramePoll::EndOfStream => break StopReason::EndOfStream,
         }
     };
+
+    if let Some(control) = control {
+        control.reject_all_snapshots(&snapshot_rejection_for_stop(stop_reason));
+    }
 
     finish_session_collection(
         session,
@@ -595,12 +642,18 @@ fn collect_session_to_sink(
 ) -> Result<CollectionSummary, WorkflowError> {
     let mut state = SinkOnlyCollectionState::default();
     let mut paused_at = None;
+    let controlled_manual = matches!(
+        session.request().cadence,
+        gif_from_screen_capture::CaptureCadence::Manual
+    );
     let stop_reason = loop {
         ensure_not_cancelled(cancellation)?;
-        match control.apply_pending(session)? {
-            ControlOutcome::Continue => {}
-            ControlOutcome::Stop => break StopReason::UserStopped,
-            ControlOutcome::Discard => return Err(WorkflowError::Discarded),
+        if !controlled_manual || !control.has_pending_snapshot() {
+            match control.apply_pending(session)? {
+                ControlOutcome::Continue => {}
+                ControlOutcome::Stop => break StopReason::UserStopped,
+                ControlOutcome::Discard => return Err(WorkflowError::Discarded),
+            }
         }
         if session.state() == CaptureSessionState::Paused {
             paused_at.get_or_insert_with(Instant::now);
@@ -620,11 +673,20 @@ fn collect_session_to_sink(
         if duration_deadline_reached(options.limit) {
             break StopReason::DurationReached;
         }
+        if controlled_manual && !control.has_pending_snapshot() {
+            sleep_until_control_poll(options.limit, options.poll_interval);
+            continue;
+        }
         let poll_interval = bounded_poll_interval(options.limit, options.poll_interval);
         match session.poll_frame(poll_interval)? {
             FramePoll::Frame(frame) => {
                 ensure_not_cancelled(cancellation)?;
-                match state.observe_frame(&frame, options, sink)? {
+                let (outcome, retained) =
+                    state.observe_frame(&frame, &mut options, sink, controlled_manual)?;
+                if controlled_manual && let Some(retained) = retained {
+                    control.complete_snapshot(&frame, retained);
+                }
+                match outcome {
                     SinkFrameOutcome::Continue => {}
                     SinkFrameOutcome::DurationReached => break StopReason::DurationReached,
                     SinkFrameOutcome::FrameLimitReached => break StopReason::FrameLimitReached,
@@ -641,6 +703,7 @@ fn collect_session_to_sink(
             FramePoll::EndOfStream => break StopReason::EndOfStream,
         }
     };
+    control.reject_all_snapshots(&snapshot_rejection_for_stop(stop_reason));
     state.finish(session, sink, stop_reason, options, progress)
 }
 
@@ -648,9 +711,10 @@ impl SinkOnlyCollectionState {
     fn observe_frame(
         &mut self,
         frame: &CapturedFrame,
-        options: ValidatedOptions,
+        options: &mut ValidatedOptions,
         sink: &mut dyn RecordingFrameSink,
-    ) -> Result<SinkFrameOutcome, WorkflowError> {
+        force_retain: bool,
+    ) -> Result<(SinkFrameOutcome, Option<bool>), WorkflowError> {
         let next_stream_index = self
             .stream_index
             .checked_add(1)
@@ -664,26 +728,31 @@ impl SinkOnlyCollectionState {
         let timestamp_us = frame.captured_at().as_micros();
         self.previous_timestamp = Some(timestamp_us);
         self.previous_sequence = Some(frame.sequence());
+        let is_first = self.first_timestamp.is_none();
         let capture_start = *self.first_timestamp.get_or_insert(timestamp_us);
+        if is_first {
+            arm_duration_deadline(&mut options.limit)?;
+        }
         if duration_span_reached(options.limit, capture_start, timestamp_us) {
-            return Ok(SinkFrameOutcome::DurationReached);
+            return Ok((SinkFrameOutcome::DurationReached, None));
         }
         self.last_observed_timestamp = Some(timestamp_us);
 
         let normalized = normalize_frame(frame, self.stream_index, self.last_retained.as_ref())?;
-        let retain = options.frame_retention == FrameRetention::All
+        let retain = force_retain
+            || options.frame_retention == FrameRetention::All
             || self
                 .last_retained
                 .as_ref()
                 .is_none_or(|previous| previous.pixels != normalized.pixels);
         if retain {
-            self.persist_frame(normalized, options, sink)?;
+            self.persist_frame(normalized, *options, sink)?;
         }
         self.stream_index = next_stream_index;
         if frame_limit_reached(options.limit, self.retained_frames) {
-            Ok(SinkFrameOutcome::FrameLimitReached)
+            Ok((SinkFrameOutcome::FrameLimitReached, Some(retain)))
         } else {
-            Ok(SinkFrameOutcome::Continue)
+            Ok((SinkFrameOutcome::Continue, Some(retain)))
         }
     }
 
@@ -912,10 +981,16 @@ fn update_sink_duration(
 }
 
 fn duration_deadline_reached(limit: ValidatedLimit) -> bool {
-    matches!(limit, ValidatedLimit::Duration { deadline, .. } if Instant::now() >= deadline)
+    matches!(limit, ValidatedLimit::Duration { deadline: Some(deadline), .. } if Instant::now() >= deadline)
 }
 
-fn reset_duration_deadline(limit: &mut ValidatedLimit) -> Result<(), WorkflowError> {
+fn reset_duration_deadline(limit: &mut ValidatedLimit) {
+    if let ValidatedLimit::Duration { deadline, .. } = limit {
+        *deadline = None;
+    }
+}
+
+fn arm_duration_deadline(limit: &mut ValidatedLimit) -> Result<(), WorkflowError> {
     let ValidatedLimit::Duration {
         duration_us,
         deadline,
@@ -923,13 +998,17 @@ fn reset_duration_deadline(limit: &mut ValidatedLimit) -> Result<(), WorkflowErr
     else {
         return Ok(());
     };
-    *deadline = Instant::now()
-        .checked_add(Duration::from_micros(*duration_us))
-        .ok_or_else(|| {
-            WorkflowError::InvalidCollectionOption(
-                "collection duration is too large for a monotonic deadline".to_owned(),
-            )
-        })?;
+    if deadline.is_none() {
+        *deadline = Some(
+            Instant::now()
+                .checked_add(Duration::from_micros(*duration_us))
+                .ok_or_else(|| {
+                    WorkflowError::InvalidCollectionOption(
+                        "collection duration is too large for a monotonic deadline".to_owned(),
+                    )
+                })?,
+        );
+    }
     Ok(())
 }
 
@@ -937,7 +1016,11 @@ fn extend_duration_deadline(
     limit: &mut ValidatedLimit,
     paused_for: Duration,
 ) -> Result<(), WorkflowError> {
-    let ValidatedLimit::Duration { deadline, .. } = limit else {
+    let ValidatedLimit::Duration {
+        deadline: Some(deadline),
+        ..
+    } = limit
+    else {
         return Ok(());
     };
     *deadline = deadline.checked_add(paused_for).ok_or_else(|| {
@@ -950,10 +1033,40 @@ fn extend_duration_deadline(
 
 fn bounded_poll_interval(limit: ValidatedLimit, configured: Duration) -> Duration {
     match limit {
-        ValidatedLimit::Duration { deadline, .. } => deadline
+        ValidatedLimit::Duration {
+            deadline: Some(deadline),
+            ..
+        } => deadline
             .checked_duration_since(Instant::now())
             .map_or(Duration::ZERO, |remaining| remaining.min(configured)),
-        ValidatedLimit::UntilStopped | ValidatedLimit::MaxFrames(_) => configured,
+        ValidatedLimit::Duration { deadline: None, .. }
+        | ValidatedLimit::UntilStopped
+        | ValidatedLimit::MaxFrames(_) => configured,
+    }
+}
+
+fn sleep_until_control_poll(limit: ValidatedLimit, configured: Duration) {
+    let duration = bounded_poll_interval(limit, configured);
+    if !duration.is_zero() {
+        std::thread::sleep(duration);
+    }
+}
+
+const fn snapshot_rejection_for_stop(reason: StopReason) -> SnapshotTriggerRejection {
+    match reason {
+        StopReason::UserStopped => SnapshotTriggerRejection::Stopped,
+        StopReason::DurationReached | StopReason::FrameLimitReached | StopReason::EndOfStream => {
+            SnapshotTriggerRejection::CollectionEnded
+        }
+    }
+}
+
+fn snapshot_rejection_for_error(error: &WorkflowError) -> SnapshotTriggerRejection {
+    match error {
+        WorkflowError::Capture(error) => SnapshotTriggerRejection::CaptureFailed(error.clone()),
+        WorkflowError::Cancelled => SnapshotTriggerRejection::Cancelled,
+        WorkflowError::Discarded => SnapshotTriggerRejection::Discarded,
+        _ => SnapshotTriggerRejection::CollectionFailed(error.to_string()),
     }
 }
 
