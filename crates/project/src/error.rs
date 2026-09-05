@@ -37,6 +37,10 @@ pub enum ProjectError {
         actual: u64,
     },
     InvalidJournalRecord(String),
+    RecordingIndexAllocationFailed {
+        requested: usize,
+    },
+    InvalidRecordingMutation(String),
 }
 
 impl ProjectError {
@@ -123,6 +127,16 @@ impl fmt::Display for ProjectError {
             ),
             Self::InvalidJournalRecord(reason) => {
                 write!(formatter, "invalid journal record: {reason}")
+            }
+            Self::RecordingIndexAllocationFailed { requested } => write!(
+                formatter,
+                "could not allocate the recording frame index for {requested} entries"
+            ),
+            Self::InvalidRecordingMutation(reason) => {
+                write!(
+                    formatter,
+                    "invalid incremental recording mutation: {reason}"
+                )
             }
         }
     }

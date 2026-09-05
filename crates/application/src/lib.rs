@@ -26,9 +26,10 @@ pub use project_export::{
     export_project_snapshot_to_gif,
 };
 pub use recording_project::{
-    IncrementalRecordingProject, IncrementalRecordingProjectError,
-    IncrementalRecordingProjectOptions, IncrementalRecordingSummary, PersistRecordingError,
-    RecordingProjectOptions, persist_collected_recording,
+    INCREMENTAL_RECORDING_CHECKPOINT_INTERVAL_FRAMES, IncrementalRecordingProject,
+    IncrementalRecordingProjectError, IncrementalRecordingProjectOptions,
+    IncrementalRecordingSummary, PersistRecordingError, RecordingProjectOptions,
+    persist_collected_recording,
 };
 pub use static_image_project::{
     IMPORTED_STATIC_IMAGE_PRESET_NAME, PersistStaticImageError, StaticImageProjectOptions,

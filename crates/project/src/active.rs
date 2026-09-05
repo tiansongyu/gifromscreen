@@ -1,10 +1,14 @@
 use std::{
+    collections::HashMap,
     fs::{self, File},
     io::BufReader,
     path::{Path, PathBuf},
 };
 
-use gif_from_screen_domain::{AppliedEdit, AssetId, EditCommand, ProjectManifest, ProjectRevision};
+use gif_from_screen_domain::{
+    AppliedEdit, AssetDescriptor, AssetId, AssetKind, DomainError, EditCommand, FrameClip,
+    FrameDurationChange, FrameId, ProjectManifest, ProjectRevision, RasterEncoding,
+};
 
 use crate::{
     AssetStore, JournalRecord, JournalRecoveryReport, LockPolicy, ProjectError,
@@ -100,12 +104,45 @@ pub struct ActiveProject {
     assets: AssetStore,
     journal_requires_repair: bool,
     write_requires_recovery: bool,
+    frame_positions: HashMap<FrameId, usize>,
+    timeline_duration_us: u64,
     _lock: ProjectLock,
+}
+
+struct TimelineIndex {
+    frame_positions: HashMap<FrameId, usize>,
+    duration_us: u64,
+}
+
+impl TimelineIndex {
+    fn build(manifest: &ProjectManifest) -> Result<Self, ProjectError> {
+        let requested = manifest.timeline.frames.len();
+        let mut frame_positions = HashMap::new();
+        frame_positions
+            .try_reserve(requested)
+            .map_err(|_| ProjectError::RecordingIndexAllocationFailed { requested })?;
+        let mut duration_us = 0_u64;
+        for (index, frame) in manifest.timeline.frames.iter().enumerate() {
+            frame_positions.insert(frame.id, index);
+            duration_us = duration_us
+                .checked_add(frame.duration.get())
+                .ok_or_else(|| {
+                    ProjectError::InvalidRecordingMutation(
+                        "validated timeline duration unexpectedly overflowed".to_owned(),
+                    )
+                })?;
+        }
+        Ok(Self {
+            frame_positions,
+            duration_us,
+        })
+    }
 }
 
 impl ActiveProject {
     pub fn create(root: impl AsRef<Path>, manifest: ProjectManifest) -> Result<Self, ProjectError> {
         manifest.validate()?;
+        let timeline_index = TimelineIndex::build(&manifest)?;
         let layout = ProjectLayout::at(root);
         layout.create_directories()?;
         let lock = ProjectLock::acquire(&layout.root, LockPolicy::FailIfPresent)?;
@@ -121,6 +158,8 @@ impl ActiveProject {
             assets,
             journal_requires_repair: false,
             write_requires_recovery: false,
+            frame_positions: timeline_index.frame_positions,
+            timeline_duration_us: timeline_index.duration_us,
             _lock: lock,
         })
     }
@@ -138,6 +177,7 @@ impl ActiveProject {
         let snapshot = read_manifest(&layout.manifest)?;
         let recovered = journal::recover(snapshot, &layout.journal)?;
         let journal_requires_repair = !recovered.report.is_clean();
+        let timeline_index = TimelineIndex::build(&recovered.manifest)?;
         let assets = AssetStore::open(&layout.root)?;
         let project = Self {
             layout,
@@ -145,6 +185,8 @@ impl ActiveProject {
             assets,
             journal_requires_repair,
             write_requires_recovery: false,
+            frame_positions: timeline_index.frame_positions,
+            timeline_duration_us: timeline_index.duration_us,
             _lock: lock,
         };
         let asset_issues = project.validate_assets(AssetCheck::PresenceAndLength)?;
@@ -167,26 +209,214 @@ impl ActiveProject {
         &self.assets
     }
 
+    /// Appends one raw, canvas-sized RGBA recording frame without cloning or
+    /// revalidating the complete existing timeline.
+    ///
+    /// The emitted journal command is byte-for-byte compatible with the normal
+    /// `RegisterAsset + InsertFrames` command path and remains recoverable by
+    /// the generic journal replayer. All fallible validation, cache growth,
+    /// record serialization, and durable journal append finish before the
+    /// in-memory manifest changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a read-only/recovery-required project, duplicate or
+    /// nil frame identity, incompatible asset descriptor, duration/revision
+    /// overflow, cache allocation failure, or journal failure.
+    pub fn commit_recording_append(
+        &mut self,
+        new_asset: Option<AssetDescriptor>,
+        frame: FrameClip,
+    ) -> Result<CommitReceipt, ProjectError> {
+        self.ensure_writable()?;
+        if frame.id.is_nil() {
+            return Err(ProjectError::InvalidRecordingMutation(
+                "recording frame identity must not be nil".to_owned(),
+            ));
+        }
+        if self.frame_positions.contains_key(&frame.id) {
+            return Err(DomainError::DuplicateFrameId(frame.id).into());
+        }
+        if frame.transform != Default::default() || !frame.effects.is_empty() {
+            return Err(ProjectError::InvalidRecordingMutation(
+                "fast recording append requires an untransformed frame without effects".to_owned(),
+            ));
+        }
+        let descriptor = match &new_asset {
+            Some(descriptor) => {
+                if descriptor.id != frame.asset_id {
+                    return Err(ProjectError::InvalidRecordingMutation(
+                        "new asset identity differs from the appended frame asset".to_owned(),
+                    ));
+                }
+                if self.manifest.assets.contains_key(&descriptor.id) {
+                    return Err(DomainError::DuplicateAssetId(descriptor.id).into());
+                }
+                descriptor
+            }
+            None => self
+                .manifest
+                .assets
+                .get(&frame.asset_id)
+                .ok_or(DomainError::UnknownAsset(frame.asset_id))?,
+        };
+        validate_raw_recording_asset(&self.manifest, descriptor)?;
+        let next_duration = self
+            .timeline_duration_us
+            .checked_add(frame.duration.get())
+            .ok_or_else(|| {
+                ProjectError::InvalidRecordingMutation(
+                    "recording timeline duration overflowed u64".to_owned(),
+                )
+            })?;
+        let from_revision = self.manifest.revision;
+        let to_revision = from_revision.next().ok_or(DomainError::RevisionOverflow)?;
+        let insertion_index = self.manifest.timeline.frames.len();
+        self.frame_positions.try_reserve(1).map_err(|_| {
+            ProjectError::RecordingIndexAllocationFailed {
+                requested: insertion_index.saturating_add(1),
+            }
+        })?;
+        self.manifest.timeline.frames.try_reserve(1).map_err(|_| {
+            ProjectError::RecordingIndexAllocationFailed {
+                requested: insertion_index.saturating_add(1),
+            }
+        })?;
+
+        let mut commands = Vec::with_capacity(2);
+        if let Some(asset) = &new_asset {
+            commands.push(EditCommand::RegisterAsset {
+                asset: asset.clone(),
+            });
+        }
+        commands.push(EditCommand::InsertFrames {
+            index: insertion_index,
+            frames: vec![frame.clone()],
+        });
+        let command = EditCommand::Compound { commands };
+        let mut inverse_commands = vec![EditCommand::RemoveFrames {
+            frame_ids: vec![frame.id],
+        }];
+        if let Some(asset) = &new_asset {
+            inverse_commands.push(EditCommand::UnregisterAsset { asset_id: asset.id });
+        }
+        let inverse = EditCommand::Compound {
+            commands: inverse_commands,
+        };
+        let record = JournalRecord::new(from_revision, to_revision, command)?;
+        self.append_record(&record, to_revision)?;
+
+        if let Some(asset) = new_asset {
+            self.manifest.assets.insert(asset.id, asset);
+        }
+        self.frame_positions.insert(frame.id, insertion_index);
+        self.timeline_duration_us = next_duration;
+        self.manifest.timeline.frames.push(frame);
+        self.manifest.revision = to_revision;
+        Ok(CommitReceipt {
+            from_revision,
+            to_revision,
+            inverse,
+        })
+    }
+
+    /// Updates one recording-frame duration through an indexed journal fast path.
+    ///
+    /// Projects with overlays or transitions fall back to the fully validating
+    /// generic commit because changing total time can affect their invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown frame, revision/duration overflow,
+    /// recovery-required state, or journal failure.
+    pub fn commit_recording_duration(
+        &mut self,
+        frame_id: FrameId,
+        duration: gif_from_screen_domain::DurationUs,
+    ) -> Result<CommitReceipt, ProjectError> {
+        self.ensure_writable()?;
+        if !self.manifest.timeline.transitions.is_empty()
+            || !self.manifest.timeline.overlay_tracks.is_empty()
+        {
+            return self.commit(EditCommand::SetFrameDurations {
+                changes: vec![FrameDurationChange { frame_id, duration }],
+            });
+        }
+        let index = *self
+            .frame_positions
+            .get(&frame_id)
+            .ok_or(DomainError::UnknownFrame(frame_id))?;
+        let previous = self.manifest.timeline.frames[index].duration;
+        let next_duration = self
+            .timeline_duration_us
+            .checked_sub(previous.get())
+            .and_then(|total| total.checked_add(duration.get()))
+            .ok_or_else(|| {
+                ProjectError::InvalidRecordingMutation(
+                    "recording duration update overflowed the timeline".to_owned(),
+                )
+            })?;
+        let from_revision = self.manifest.revision;
+        let to_revision = from_revision.next().ok_or(DomainError::RevisionOverflow)?;
+        let command = EditCommand::SetFrameDurations {
+            changes: vec![FrameDurationChange { frame_id, duration }],
+        };
+        let inverse = EditCommand::SetFrameDurations {
+            changes: vec![FrameDurationChange {
+                frame_id,
+                duration: previous,
+            }],
+        };
+        let record = JournalRecord::new(from_revision, to_revision, command)?;
+        self.append_record(&record, to_revision)?;
+
+        self.manifest.timeline.frames[index].duration = duration;
+        self.timeline_duration_us = next_duration;
+        self.manifest.revision = to_revision;
+        Ok(CommitReceipt {
+            from_revision,
+            to_revision,
+            inverse,
+        })
+    }
+
     pub fn commit(&mut self, command: EditCommand) -> Result<CommitReceipt, ProjectError> {
+        self.ensure_writable()?;
+
+        let mut candidate = self.manifest.clone();
+        let applied = candidate.apply_command(&command)?;
+        let timeline_index = TimelineIndex::build(&candidate)?;
+        let record = JournalRecord::new(applied.from_revision, applied.to_revision, command)?;
+        self.append_record(&record, applied.to_revision)?;
+        self.manifest = candidate;
+        self.frame_positions = timeline_index.frame_positions;
+        self.timeline_duration_us = timeline_index.duration_us;
+        Ok(applied.into())
+    }
+
+    fn ensure_writable(&self) -> Result<(), ProjectError> {
         if self.write_requires_recovery {
             return Err(ProjectError::RequiresRecovery);
         }
         if self.journal_requires_repair {
             return Err(ProjectError::RequiresJournalRepair);
         }
+        Ok(())
+    }
 
-        let mut candidate = self.manifest.clone();
-        let applied = candidate.apply_command(&command)?;
-        let record = JournalRecord::new(applied.from_revision, applied.to_revision, command)?;
-        if let Err(source) = journal::append(&self.layout.journal, &record) {
+    fn append_record(
+        &mut self,
+        record: &JournalRecord,
+        revision: ProjectRevision,
+    ) -> Result<(), ProjectError> {
+        if let Err(source) = journal::append(&self.layout.journal, record) {
             self.write_requires_recovery = true;
             return Err(ProjectError::JournalCommitFailed {
-                revision: applied.to_revision,
+                revision,
                 source: Box::new(source),
             });
         }
-        self.manifest = candidate;
-        Ok(applied.into())
+        Ok(())
     }
 
     /// Atomically persists the current in-memory revision. The journal remains
@@ -270,6 +500,39 @@ impl ActiveProject {
     }
 }
 
+fn validate_raw_recording_asset(
+    manifest: &ProjectManifest,
+    descriptor: &AssetDescriptor,
+) -> Result<(), ProjectError> {
+    let expected_byte_len = manifest
+        .canvas
+        .size
+        .area()
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| {
+            ProjectError::InvalidRecordingMutation(
+                "recording canvas RGBA byte length overflowed".to_owned(),
+            )
+        })?;
+    let AssetKind::Frame { size, encoding } = descriptor.kind else {
+        return Err(ProjectError::InvalidRecordingMutation(
+            "recording asset must be a frame raster".to_owned(),
+        ));
+    };
+    if size != manifest.canvas.size || encoding != RasterEncoding::Rgba8 {
+        return Err(ProjectError::InvalidRecordingMutation(
+            "recording asset must be canvas-sized raw RGBA8".to_owned(),
+        ));
+    }
+    if descriptor.byte_len != expected_byte_len {
+        return Err(ProjectError::InvalidRecordingMutation(format!(
+            "recording asset declares {} bytes, expected {expected_byte_len}",
+            descriptor.byte_len
+        )));
+    }
+    Ok(())
+}
+
 fn read_manifest(path: &Path) -> Result<ProjectManifest, ProjectError> {
     let file =
         File::open(path).map_err(|error| ProjectError::io("open project manifest", path, error))?;
@@ -307,8 +570,9 @@ mod tests {
     use std::{fs::OpenOptions, io::Write};
 
     use gif_from_screen_domain::{
-        AssetDescriptor, AssetKind, Canvas, CanvasBackground, ColorSpace, EditCommand,
-        PhysicalSize, ProjectId, ProjectManifest, RasterEncoding, UnixTimeMs,
+        AssetDescriptor, AssetKind, Canvas, CanvasBackground, CaptureMetadata, ClipTransform,
+        ColorSpace, DurationUs, EditCommand, FrameClip, FrameId, PhysicalSize, ProjectId,
+        ProjectManifest, RasterEncoding, UnixTimeMs,
     };
     use tempfile::tempdir;
 
@@ -338,6 +602,28 @@ mod tests {
                     encoding: RasterEncoding::Rgba8,
                 },
             },
+        }
+    }
+
+    fn recording_asset(id: AssetId) -> AssetDescriptor {
+        AssetDescriptor {
+            id,
+            byte_len: 16,
+            kind: AssetKind::Frame {
+                size: PhysicalSize::new(2, 2).unwrap(),
+                encoding: RasterEncoding::Rgba8,
+            },
+        }
+    }
+
+    fn recording_frame(id: u128, asset_id: AssetId, duration_us: u64) -> FrameClip {
+        FrameClip {
+            id: FrameId::from_u128(id),
+            asset_id,
+            duration: DurationUs::new(duration_us).unwrap(),
+            transform: ClipTransform::default(),
+            capture_metadata: CaptureMetadata::default(),
+            effects: Vec::new(),
         }
     }
 
@@ -408,6 +694,89 @@ mod tests {
         assert!(matches!(
             ActiveProject::open(directory.path(), LockPolicy::FailIfPresent),
             Err(ProjectError::AlreadyLocked { .. })
+        ));
+    }
+
+    #[test]
+    fn indexed_recording_commits_recover_and_survive_generic_edits() {
+        let directory = tempdir().unwrap();
+        let mut active = ActiveProject::create(directory.path(), manifest()).unwrap();
+        let pixels = [7_u8; 16];
+        let asset_id = active.assets().put(&pixels).unwrap();
+
+        let first = active
+            .commit_recording_append(
+                Some(recording_asset(asset_id)),
+                recording_frame(1, asset_id, 10),
+            )
+            .unwrap();
+        assert_eq!(first.from_revision, ProjectRevision::ZERO);
+        assert_eq!(first.to_revision, ProjectRevision::new(1));
+        active
+            .commit_recording_append(None, recording_frame(2, asset_id, 20))
+            .unwrap();
+        active
+            .commit_recording_duration(FrameId::from_u128(1), DurationUs::new(15).unwrap())
+            .unwrap();
+        active
+            .commit(EditCommand::RemoveFrames {
+                frame_ids: vec![FrameId::from_u128(1)],
+            })
+            .unwrap();
+        active
+            .commit_recording_append(None, recording_frame(3, asset_id, 30))
+            .unwrap();
+        assert_eq!(active.manifest().revision, ProjectRevision::new(5));
+        assert_eq!(
+            active
+                .manifest()
+                .timeline
+                .frames
+                .iter()
+                .map(|frame| (frame.id, frame.duration.get()))
+                .collect::<Vec<_>>(),
+            [(FrameId::from_u128(2), 20), (FrameId::from_u128(3), 30)]
+        );
+        drop(active);
+
+        let opened = ActiveProject::open(directory.path(), LockPolicy::FailIfPresent).unwrap();
+        assert_eq!(opened.journal_recovery.replayed_records, 5);
+        assert_eq!(opened.project.manifest().revision, ProjectRevision::new(5));
+        assert_eq!(opened.project.manifest().timeline.frames.len(), 2);
+    }
+
+    #[test]
+    fn recording_fast_path_rejects_invalid_input_and_journal_failure_atomically() {
+        let directory = tempdir().unwrap();
+        let mut active = ActiveProject::create(directory.path(), manifest()).unwrap();
+        let pixels = [9_u8; 16];
+        let asset_id = active.assets().put(&pixels).unwrap();
+        let mut wrong = recording_asset(asset_id);
+        wrong.byte_len = 15;
+        assert!(matches!(
+            active.commit_recording_append(Some(wrong), recording_frame(1, asset_id, 10)),
+            Err(ProjectError::InvalidRecordingMutation(_))
+        ));
+        assert_eq!(active.manifest().revision, ProjectRevision::ZERO);
+        assert!(active.manifest().timeline.frames.is_empty());
+
+        fs::remove_file(&active.layout().journal).unwrap();
+        fs::create_dir(&active.layout().journal).unwrap();
+        assert!(matches!(
+            active.commit_recording_append(
+                Some(recording_asset(asset_id)),
+                recording_frame(1, asset_id, 10)
+            ),
+            Err(ProjectError::JournalCommitFailed { .. })
+        ));
+        assert_eq!(active.manifest().revision, ProjectRevision::ZERO);
+        assert!(active.manifest().timeline.frames.is_empty());
+        assert!(matches!(
+            active.commit_recording_append(
+                Some(recording_asset(asset_id)),
+                recording_frame(1, asset_id, 10)
+            ),
+            Err(ProjectError::RequiresRecovery)
         ));
     }
 }

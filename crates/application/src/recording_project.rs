@@ -1,9 +1,12 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+};
 
 use gif_from_screen_domain::{
     AssetDescriptor, AssetKind, Canvas, CanvasBackground, CaptureMetadata, ClipTransform,
-    DomainError, DurationUs, EditCommand, FrameClip, FrameDurationChange, FrameId, PhysicalSize,
-    ProjectId, ProjectManifest, RasterEncoding, SourceProvenance, UnitError, UnixTimeMs,
+    DomainError, DurationUs, FrameClip, FrameId, PhysicalSize, ProjectId, ProjectManifest,
+    RasterEncoding, SourceProvenance, UnitError, UnixTimeMs,
 };
 use gif_from_screen_gif::RgbaFrame;
 use gif_from_screen_project::{ActiveProject, ProjectError};
@@ -51,6 +54,12 @@ pub struct IncrementalRecordingSummary {
     pub duration_us: u64,
 }
 
+/// Number of appended frames between automatic recording checkpoints.
+///
+/// This bounds crash-recovery replay without rewriting the complete manifest
+/// for every captured frame.
+pub const INCREMENTAL_RECORDING_CHECKPOINT_INTERVAL_FRAMES: usize = 512;
+
 /// Failure while creating, appending to, or finalizing an incremental recording project.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -71,6 +80,13 @@ pub enum IncrementalRecordingProjectError {
     DuplicateFrameId {
         /// Repeated stable identity.
         frame_id: FrameId,
+    },
+
+    /// The bounded in-memory frame lookup could not grow before persistence.
+    #[error("could not reserve the incremental recording index for frame {frame_index}")]
+    FrameIndexAllocationFailed {
+        /// Zero-based position that would have been indexed.
+        frame_index: usize,
     },
 
     /// Every recording frame must match the fixed project canvas.
@@ -167,6 +183,8 @@ pub enum IncrementalRecordingProjectError {
 pub struct IncrementalRecordingProject {
     project: ActiveProject,
     canvas: PhysicalSize,
+    frame_durations: HashMap<FrameId, DurationUs>,
+    duration_us: u64,
 }
 
 impl IncrementalRecordingProject {
@@ -202,7 +220,12 @@ impl IncrementalRecordingProject {
             .map_err(|source| IncrementalRecordingProjectError::CreateProject { source })?;
         let project = ActiveProject::create(root, manifest)
             .map_err(|source| IncrementalRecordingProjectError::CreateProject { source })?;
-        Ok(Self { project, canvas })
+        Ok(Self {
+            project,
+            canvas,
+            frame_durations: HashMap::new(),
+            duration_us: 0,
+        })
     }
 
     /// Stores and journals one complete frame at the end of the active timeline.
@@ -224,14 +247,7 @@ impl IncrementalRecordingProject {
         if frame_id.is_nil() {
             return Err(IncrementalRecordingProjectError::NilFrameId { frame_index });
         }
-        if self
-            .project
-            .manifest()
-            .timeline
-            .frames
-            .iter()
-            .any(|existing| existing.id == frame_id)
-        {
+        if self.frame_durations.contains_key(&frame_id) {
             return Err(IncrementalRecordingProjectError::DuplicateFrameId { frame_id });
         }
         if u32::from(frame.width()) != self.canvas.width.get()
@@ -251,6 +267,15 @@ impl IncrementalRecordingProject {
                 duration_us: frame.duration_us(),
             },
         )?;
+        let next_duration_us = self.duration_us.checked_add(duration.get()).ok_or(
+            IncrementalRecordingProjectError::InvalidFrameDuration {
+                frame_index,
+                duration_us: frame.duration_us(),
+            },
+        )?;
+        self.frame_durations.try_reserve(1).map_err(|_| {
+            IncrementalRecordingProjectError::FrameIndexAllocationFailed { frame_index }
+        })?;
         let byte_len = u64::try_from(frame.pixels().len())
             .map_err(|_| IncrementalRecordingProjectError::AssetLengthOutOfRange { frame_index })?;
         let asset_id = self
@@ -269,26 +294,29 @@ impl IncrementalRecordingProject {
             capture_metadata: CaptureMetadata::default(),
             effects: Vec::new(),
         };
-        let mut commands = Vec::with_capacity(2);
-        if !self.project.manifest().assets.contains_key(&asset_id) {
-            commands.push(EditCommand::RegisterAsset {
-                asset: AssetDescriptor {
-                    id: asset_id,
-                    byte_len,
-                    kind: AssetKind::Frame {
-                        size: self.canvas,
-                        encoding: RasterEncoding::Rgba8,
-                    },
+        let new_asset =
+            (!self.project.manifest().assets.contains_key(&asset_id)).then_some(AssetDescriptor {
+                id: asset_id,
+                byte_len,
+                kind: AssetKind::Frame {
+                    size: self.canvas,
+                    encoding: RasterEncoding::Rgba8,
                 },
             });
-        }
-        commands.push(EditCommand::InsertFrames {
-            index: frame_index,
-            frames: vec![clip],
-        });
         self.project
-            .commit(EditCommand::Compound { commands })
+            .commit_recording_append(new_asset, clip)
             .map_err(|source| IncrementalRecordingProjectError::Commit { source })?;
+        self.frame_durations.insert(frame_id, duration);
+        self.duration_us = next_duration_us;
+        if self
+            .frame_durations
+            .len()
+            .is_multiple_of(INCREMENTAL_RECORDING_CHECKPOINT_INTERVAL_FRAMES)
+        {
+            self.project
+                .checkpoint_and_compact()
+                .map_err(|source| IncrementalRecordingProjectError::Checkpoint { source })?;
+        }
         Ok(())
     }
 
@@ -305,24 +333,25 @@ impl IncrementalRecordingProject {
         frame_id: FrameId,
         duration: DurationUs,
     ) -> Result<bool, IncrementalRecordingProjectError> {
-        let Some(frame) = self
-            .project
-            .manifest()
-            .timeline
-            .frames
-            .iter()
-            .find(|frame| frame.id == frame_id)
-        else {
+        let Some(previous) = self.frame_durations.get(&frame_id).copied() else {
             return Err(IncrementalRecordingProjectError::UnknownFrame { frame_id });
         };
-        if frame.duration == duration {
+        if previous == duration {
             return Ok(false);
         }
+        let next_duration_us = self
+            .duration_us
+            .checked_sub(previous.get())
+            .and_then(|total| total.checked_add(duration.get()))
+            .ok_or(IncrementalRecordingProjectError::InvalidFrameDuration {
+                frame_index: self.frame_durations.len(),
+                duration_us: duration.get(),
+            })?;
         self.project
-            .commit(EditCommand::SetFrameDurations {
-                changes: vec![FrameDurationChange { frame_id, duration }],
-            })
+            .commit_recording_duration(frame_id, duration)
             .map_err(|source| IncrementalRecordingProjectError::Commit { source })?;
+        self.frame_durations.insert(frame_id, duration);
+        self.duration_us = next_duration_us;
         Ok(true)
     }
 
@@ -330,12 +359,7 @@ impl IncrementalRecordingProject {
     pub fn summary(&self) -> IncrementalRecordingSummary {
         IncrementalRecordingSummary {
             frames: self.project.manifest().timeline.frames.len(),
-            duration_us: self
-                .project
-                .manifest()
-                .timeline
-                .total_duration()
-                .map_or(u64::MAX, gif_from_screen_domain::TimeUs::get),
+            duration_us: self.duration_us,
         }
     }
 
@@ -1154,5 +1178,95 @@ mod tests {
         ));
         assert_eq!(writer.project.manifest().revision, revision);
         assert_eq!(writer.summary().frames, 1);
+    }
+
+    #[test]
+    fn incremental_checkpoint_interval_bounds_recovery_replay() {
+        let directory = tempdir().unwrap();
+        let mut writer = IncrementalRecordingProject::create(
+            directory.path(),
+            PhysicalSize::new(1, 1).unwrap(),
+            incremental_options(99),
+        )
+        .unwrap();
+        let frame = RgbaFrame::new(1, 1, vec![1, 2, 3, 255], 100).unwrap();
+        for index in 0..=INCREMENTAL_RECORDING_CHECKPOINT_INTERVAL_FRAMES {
+            writer
+                .append_frame(
+                    FrameId::from_u128(u128::try_from(index + 1).unwrap()),
+                    &frame,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            writer.summary(),
+            IncrementalRecordingSummary {
+                frames: INCREMENTAL_RECORDING_CHECKPOINT_INTERVAL_FRAMES + 1,
+                duration_us: u64::try_from(
+                    (INCREMENTAL_RECORDING_CHECKPOINT_INTERVAL_FRAMES + 1) * 100
+                )
+                .unwrap(),
+            }
+        );
+        drop(writer);
+
+        let opened = ActiveProject::open(directory.path(), LockPolicy::FailIfPresent).unwrap();
+        assert_eq!(opened.journal_recovery.replayed_records, 1);
+        assert_eq!(
+            opened.project.manifest().timeline.frames.len(),
+            INCREMENTAL_RECORDING_CHECKPOINT_INTERVAL_FRAMES + 1
+        );
+        assert_eq!(opened.project.manifest().assets.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "long-recording durability benchmark; run explicitly for release validation"]
+    fn ten_thousand_frame_incremental_recording_has_bounded_replay_tail() {
+        const FRAME_COUNT: usize = 10_000;
+        let directory = tempdir().unwrap();
+        let mut writer = IncrementalRecordingProject::create(
+            directory.path(),
+            PhysicalSize::new(1, 1).unwrap(),
+            incremental_options(100),
+        )
+        .unwrap();
+        let frame = RgbaFrame::new(1, 1, vec![9, 8, 7, 255], 100_000).unwrap();
+        let started = std::time::Instant::now();
+        for index in 0..FRAME_COUNT {
+            if index > 0 {
+                writer
+                    .set_frame_duration(
+                        FrameId::from_u128(u128::try_from(index).unwrap()),
+                        DurationUs::new(33_333).unwrap(),
+                    )
+                    .unwrap();
+            }
+            writer
+                .append_frame(
+                    FrameId::from_u128(u128::try_from(index + 1).unwrap()),
+                    &frame,
+                )
+                .unwrap();
+        }
+        writer
+            .set_frame_duration(
+                FrameId::from_u128(u128::try_from(FRAME_COUNT).unwrap()),
+                DurationUs::new(33_333).unwrap(),
+            )
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(writer.summary().frames, FRAME_COUNT);
+        drop(writer);
+
+        let opened = ActiveProject::open(directory.path(), LockPolicy::FailIfPresent).unwrap();
+        assert_eq!(opened.project.manifest().timeline.frames.len(), FRAME_COUNT);
+        assert!(
+            opened.journal_recovery.replayed_records
+                <= u64::try_from(INCREMENTAL_RECORDING_CHECKPOINT_INTERVAL_FRAMES * 2 + 1).unwrap()
+        );
+        eprintln!(
+            "persisted and duration-corrected {FRAME_COUNT} frames in {elapsed:?}; replayed {} tail records",
+            opened.journal_recovery.replayed_records
+        );
     }
 }
