@@ -42,6 +42,7 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Expose bounded Wu/custom palettes and deterministic Dotted, Blue Noise, and Interleaved Noise dithering in desktop export controls.
 - [x] Trigger bounded manual snapshots and configure continuous or second/minute/hour periodic capture from the standalone recorder.
 - [x] Replace quadratic per-frame manifest cloning with indexed recording journal paths and a 512-frame checkpoint cadence; pass the 10,000-frame durability preflight.
+- [x] Author and remove timed line, arrow, rectangle, and ellipse overlay tracks with journal-backed undo/redo.
 
 ## Delivery gates
 
@@ -70,7 +71,8 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Window capture and capture-only-changes.
 - [x] Manual and periodic snapshots.
 - [x] Duplicate removal, frame reduction, Yoyo, and delay scaling.
-- [ ] Text/title and authoring UI for drawing, shapes, and raster watermarks.
+- [ ] Text/title and authoring UI for drawing and raster watermarks.
+- [x] Shape overlay authoring with bounds, stroke/fill, opacity, blend mode, and z-order.
 - [x] Border, shadow, blur, pixelate, darken, and lighten frame effects.
 - [x] Raster watermark, shape, and pressure-drawing preview/export rendering.
 - [x] Fade and slide transitions.
