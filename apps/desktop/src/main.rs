@@ -40,7 +40,10 @@ use capture_source_job::{CaptureSourceJob, CaptureSourceJobState};
 use countdown::{CountdownStart, CountdownTick, MAX_COUNTDOWN_SECONDS, RecordingCountdown};
 use custom_palette_input::parse_custom_palette;
 use editor_preview::EditorPreviewCache;
-use editor_ui::{EditorUiAction, EditorUiResult, EditorUiState, show_editor_ui};
+use editor_ui::{
+    DrawingDraftPhase, DrawingOverlayDraft, EditorUiAction, EditorUiResult, EditorUiState,
+    show_editor_ui,
+};
 use editor_workspace::EditorWorkspace;
 use eframe::egui;
 use export_job::{ExportJob, ExportJobError, ExportJobEvent, ExportJobState};
@@ -55,7 +58,8 @@ use gif_from_screen_capture::{
 };
 use gif_from_screen_capture_linux::{LinuxDisplayServer, X11CaptureBackend};
 use gif_from_screen_domain::{
-    DurationUs, FrameId, PhysicalSize as ProjectPhysicalSize, ProjectId, Rgba, UnixTimeMs,
+    DurationUs, FrameId, PhysicalPoint as ProjectPhysicalPoint, PhysicalPx,
+    PhysicalSize as ProjectPhysicalSize, ProjectId, Rgba, StrokePoint, UnixTimeMs,
 };
 use gif_from_screen_gif::{
     CancellationFlag, CancellationToken as _, DeltaMode, DitherMode, EncodeOptions, LoopBehavior,
@@ -1375,7 +1379,12 @@ impl GifFromScreenApp {
         }
 
         ui.separator();
-        show_editor_preview_panel(ui, workspace, &mut self.editor_preview_cache);
+        show_editor_preview_panel(
+            ui,
+            workspace,
+            &mut self.editor_preview_cache,
+            &mut self.editor_ui_state,
+        );
         ui.separator();
         let selected_count = workspace.selection().len();
         let asset_issue_count = workspace.asset_issues().len();
@@ -2814,6 +2823,7 @@ fn show_editor_preview_panel(
     ui: &mut egui::Ui,
     workspace: &EditorWorkspace,
     cache: &mut EditorPreviewCache,
+    state: &mut EditorUiState,
 ) {
     ui.heading("Current frame preview");
     if !workspace.asset_issues().is_empty() {
@@ -2846,7 +2856,28 @@ fn show_editor_preview_panel(
             );
             let available_width = ui.available_width().max(1.0);
             let scale = (available_width / natural.x).min(1.0);
-            ui.image((preview.texture.id(), natural * scale));
+            let image_size = natural * scale;
+            let sense = if state.drawing_overlay.phase == DrawingDraftPhase::Capturing {
+                egui::Sense::drag()
+            } else {
+                egui::Sense::hover()
+            };
+            let response = ui.add(
+                egui::Image::new(&preview.texture)
+                    .fit_to_exact_size(image_size)
+                    .sense(sense),
+            );
+            update_drawing_draft_from_preview(
+                &response,
+                preview.rendered_size,
+                &mut state.drawing_overlay,
+            );
+            paint_drawing_draft(
+                ui.painter(),
+                response.rect,
+                preview.rendered_size,
+                &state.drawing_overlay,
+            );
             ui.weak(format!(
                 "Rendered {}×{} · preview {}×{}",
                 preview.rendered_size[0],
@@ -2861,6 +2892,109 @@ fn show_editor_preview_panel(
                 format!("Could not render preview: {error}"),
             );
         }
+    }
+}
+
+fn update_drawing_draft_from_preview(
+    response: &egui::Response,
+    rendered_size: [u32; 2],
+    draft: &mut DrawingOverlayDraft,
+) {
+    if draft.phase != DrawingDraftPhase::Capturing {
+        return;
+    }
+    if (response.drag_started() || response.dragged())
+        && let Some(position) = response.interact_pointer_pos()
+        && let Some(point) = map_drawing_preview_point(response.rect, position, rendered_size)
+    {
+        draft.push_point(StrokePoint {
+            point,
+            pressure_milli: 1_000,
+        });
+    }
+    if response.drag_stopped() {
+        draft.finish_stroke();
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "finite preview coordinates are clamped to the validated u32 rendered canvas"
+)]
+fn map_drawing_preview_point(
+    preview: egui::Rect,
+    position: egui::Pos2,
+    rendered_size: [u32; 2],
+) -> Option<ProjectPhysicalPoint> {
+    if preview.width() <= 0.0
+        || preview.height() <= 0.0
+        || rendered_size[0] == 0
+        || rendered_size[1] == 0
+        || !position.x.is_finite()
+        || !position.y.is_finite()
+    {
+        return None;
+    }
+    let position = clamp_to_rect(position, preview);
+    let normalized_x = ((position.x - preview.min.x) / preview.width()).clamp(0.0, 1.0);
+    let normalized_y = ((position.y - preview.min.y) / preview.height()).clamp(0.0, 1.0);
+    let x = (normalized_x * rendered_size[0] as f32).floor() as u32;
+    let y = (normalized_y * rendered_size[1] as f32).floor() as u32;
+    Some(ProjectPhysicalPoint {
+        x: PhysicalPx::new(x.min(rendered_size[0] - 1)),
+        y: PhysicalPx::new(y.min(rendered_size[1] - 1)),
+    })
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "drawing drafts are bounded and mapped only into the small egui preview"
+)]
+fn paint_drawing_draft(
+    painter: &egui::Painter,
+    preview: egui::Rect,
+    rendered_size: [u32; 2],
+    draft: &DrawingOverlayDraft,
+) {
+    if draft.phase == DrawingDraftPhase::Idle
+        || draft.points.is_empty()
+        || rendered_size[0] == 0
+        || rendered_size[1] == 0
+    {
+        return;
+    }
+    let points = draft
+        .points
+        .iter()
+        .map(|point| {
+            egui::pos2(
+                preview.min.x
+                    + (point.point.x.get() as f32 + 0.5) / rendered_size[0] as f32
+                        * preview.width(),
+                preview.min.y
+                    + (point.point.y.get() as f32 + 0.5) / rendered_size[1] as f32
+                        * preview.height(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let color = egui::Color32::from_rgba_unmultiplied(
+        draft.color.red,
+        draft.color.green,
+        draft.color.blue,
+        draft.color.alpha,
+    );
+    let scale =
+        (preview.width() / rendered_size[0] as f32).min(preview.height() / rendered_size[1] as f32);
+    let stroke_width = (f32::from(draft.width) * scale).max(1.0);
+    if points.len() == 1 {
+        painter.circle_filled(points[0], stroke_width / 2.0, color);
+    } else {
+        painter.add(egui::Shape::line(
+            points,
+            egui::Stroke::new(stroke_width, color),
+        ));
     }
 }
 
@@ -5317,13 +5451,13 @@ mod tests {
         default_sequence_project_path, edited_gif_path_for_import, editor_result_notice,
         export_job_is_active, export_result_notice, file_drop_block_reason, fit_dimensions,
         frame_retention, has_static_image_extension, initial_wayland_region, landing_cards_fit,
-        map_preview_selection, open_project_controls_enabled, open_project_lock_policy,
-        parse_startup_intent, prepare_file_drop_route, project_path_for_output, recording_cadence,
-        recording_project_canvas, recording_tail_frame_duration, remove_completed_project,
-        remove_recording_project_path, resize_nearest_rgba, resolve_export_selection,
-        route_file_drop, should_sync_retarget, show_editor_scroll_area,
-        static_sequence_duration_policy, static_sequence_loop_behavior, translate_source_region,
-        validate_export_output, validate_settings,
+        map_drawing_preview_point, map_preview_selection, open_project_controls_enabled,
+        open_project_lock_policy, parse_startup_intent, prepare_file_drop_route,
+        project_path_for_output, recording_cadence, recording_project_canvas,
+        recording_tail_frame_duration, remove_completed_project, remove_recording_project_path,
+        resize_nearest_rgba, resolve_export_selection, route_file_drop, should_sync_retarget,
+        show_editor_scroll_area, static_sequence_duration_policy, static_sequence_loop_behavior,
+        translate_source_region, validate_export_output, validate_settings,
     };
     use crate::blank_project_job::BlankProjectJobState;
     use crate::blank_project_ui::{BlankBackgroundChoice, BlankProjectUiState};
@@ -7213,6 +7347,21 @@ mod tests {
         let mapped = map_preview_selection(preview, selection, 1_000, 500).unwrap();
         assert_eq!((mapped.origin().x, mapped.origin().y), (100, 50));
         assert_eq!((mapped.size().width(), mapped.size().height()), (500, 200));
+    }
+
+    #[test]
+    fn drawing_preview_points_map_and_clamp_to_rendered_pixels() {
+        let preview = egui::Rect::from_min_size(egui::pos2(20.0, 10.0), egui::vec2(100.0, 50.0));
+        let center =
+            map_drawing_preview_point(preview, egui::pos2(70.0, 35.0), [1_000, 500]).unwrap();
+        assert_eq!((center.x.get(), center.y.get()), (500, 250));
+        let outside =
+            map_drawing_preview_point(preview, egui::pos2(1_000.0, -100.0), [1_000, 500]).unwrap();
+        assert_eq!((outside.x.get(), outside.y.get()), (999, 0));
+        assert!(
+            map_drawing_preview_point(preview, egui::pos2(f32::NAN, 0.0), [1_000, 500]).is_none()
+        );
+        assert!(map_drawing_preview_point(preview, preview.center(), [0, 500]).is_none());
     }
 
     #[test]

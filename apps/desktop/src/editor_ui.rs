@@ -13,7 +13,7 @@ use std::{
 use eframe::egui;
 use gif_from_screen_domain::{
     BlendMode, DurationUs, EdgeWidths, Effect, FrameId, MAX_TRANSITION_STEPS, OverlayContent,
-    PhysicalRect, PhysicalSize, Rgba, ShapeKind, SlideDirection, TimeUs, Transition,
+    PhysicalRect, PhysicalSize, Rgba, ShapeKind, SlideDirection, StrokePoint, TimeUs, Transition,
     TransitionKind,
 };
 use gif_from_screen_editor::{
@@ -29,6 +29,7 @@ const FILMSTRIP_ITEM_GAP: f64 = 8.0;
 const FILMSTRIP_ITEM_HEIGHT: f32 = 78.0;
 const FILMSTRIP_OVERSCAN: usize = 3;
 const MAX_VISIBLE_OVERLAY_TRACKS: usize = 64;
+pub(crate) const MAX_DRAWING_DRAFT_POINTS: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum EffectChoice {
@@ -104,6 +105,80 @@ impl Default for ShapeOverlayUiState {
             track_opacity: 255,
             blend_mode: BlendMode::Normal,
             z_index: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum DrawingDraftPhase {
+    #[default]
+    Idle,
+    Capturing,
+    Ready,
+}
+
+#[derive(Debug)]
+pub(crate) struct DrawingOverlayDraft {
+    pub(crate) phase: DrawingDraftPhase,
+    pub(crate) name: String,
+    pub(crate) width: u16,
+    pub(crate) color: Rgba,
+    pub(crate) track_opacity: u8,
+    pub(crate) blend_mode: BlendMode,
+    pub(crate) z_index: i32,
+    pub(crate) points: Vec<StrokePoint>,
+    pub(crate) limit_reached: bool,
+}
+
+impl Default for DrawingOverlayDraft {
+    fn default() -> Self {
+        Self {
+            phase: DrawingDraftPhase::Idle,
+            name: "Drawing".to_owned(),
+            width: 4,
+            color: Rgba {
+                red: 242,
+                green: 153,
+                blue: 74,
+                alpha: 255,
+            },
+            track_opacity: 255,
+            blend_mode: BlendMode::Normal,
+            z_index: 1,
+            points: Vec::new(),
+            limit_reached: false,
+        }
+    }
+}
+
+impl DrawingOverlayDraft {
+    pub(crate) fn begin(&mut self) {
+        self.points.clear();
+        self.limit_reached = false;
+        self.phase = DrawingDraftPhase::Capturing;
+    }
+
+    pub(crate) fn cancel(&mut self) {
+        self.points.clear();
+        self.limit_reached = false;
+        self.phase = DrawingDraftPhase::Idle;
+    }
+
+    pub(crate) fn push_point(&mut self, point: StrokePoint) {
+        if self.points.last() == Some(&point) {
+            return;
+        }
+        if self.points.len() >= MAX_DRAWING_DRAFT_POINTS {
+            self.limit_reached = true;
+            self.phase = DrawingDraftPhase::Ready;
+            return;
+        }
+        self.points.push(point);
+    }
+
+    pub(crate) fn finish_stroke(&mut self) {
+        if !self.points.is_empty() {
+            self.phase = DrawingDraftPhase::Ready;
         }
     }
 }
@@ -184,6 +259,7 @@ pub(crate) struct EditorUiState {
     /// Pre-rotation resize height input in physical pixels.
     pub(crate) resize_height_input: String,
     shape_overlay: ShapeOverlayUiState,
+    pub(crate) drawing_overlay: DrawingOverlayDraft,
     /// Monotonic playback clock when playback is active.
     pub(crate) playback: Option<PlaybackClock>,
     filmstrip_scroll_offset: f64,
@@ -241,6 +317,7 @@ impl Default for EditorUiState {
             resize_width_input: "1".into(),
             resize_height_input: "1".into(),
             shape_overlay: ShapeOverlayUiState::default(),
+            drawing_overlay: DrawingOverlayDraft::default(),
             playback: None,
             filmstrip_scroll_offset: 0.0,
             reveal_current_frame: false,
@@ -320,6 +397,7 @@ pub(crate) enum EditorUiOperation {
     ReplaceEffect,
     ClearEffects,
     AddShapeOverlay,
+    AddDrawingOverlay,
     RemoveOverlayTrack,
     SetTransition,
     DeleteTransition,
@@ -1939,6 +2017,7 @@ fn show_shape_overlay_toolbar(
                 result,
             );
         }
+        show_drawing_overlay_controls(ui, workspace, state, now, results);
         show_overlay_track_list(ui, workspace, state, now, results);
     });
 }
@@ -2001,6 +2080,136 @@ fn show_rgba_inputs(ui: &mut egui::Ui, label: &str, color: &mut Rgba) {
     ui.add(egui::DragValue::new(&mut color.green));
     ui.add(egui::DragValue::new(&mut color.blue));
     ui.add(egui::DragValue::new(&mut color.alpha));
+}
+
+fn show_drawing_overlay_controls(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    now: Instant,
+    results: &mut Vec<EditorUiResult>,
+) {
+    ui.separator();
+    ui.horizontal_wrapped(|ui| {
+        ui.strong("Free drawing");
+        ui.label("Name");
+        ui.add(egui::TextEdit::singleline(&mut state.drawing_overlay.name).desired_width(110.0));
+        ui.label("Width");
+        ui.add(egui::DragValue::new(&mut state.drawing_overlay.width).range(1..=u16::MAX));
+        show_rgba_inputs(ui, "RGBA", &mut state.drawing_overlay.color);
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Z");
+        ui.add(egui::DragValue::new(&mut state.drawing_overlay.z_index));
+        ui.label("Track opacity");
+        ui.add(egui::DragValue::new(&mut state.drawing_overlay.track_opacity).range(1..=u8::MAX));
+        ui.label("Blend");
+        egui::ComboBox::from_id_salt("drawing_overlay_blend")
+            .selected_text(blend_mode_label(state.drawing_overlay.blend_mode))
+            .show_ui(ui, |ui| {
+                for blend in [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen] {
+                    ui.selectable_value(
+                        &mut state.drawing_overlay.blend_mode,
+                        blend,
+                        blend_mode_label(blend),
+                    );
+                }
+            });
+        match state.drawing_overlay.phase {
+            DrawingDraftPhase::Idle => {
+                if ui
+                    .add_enabled(
+                        !workspace.selection().is_empty(),
+                        egui::Button::new("Draw one stroke on preview"),
+                    )
+                    .clicked()
+                {
+                    state.drawing_overlay.begin();
+                }
+            }
+            DrawingDraftPhase::Capturing => {
+                ui.strong("Drag once across the current preview.");
+                if ui.button("Cancel stroke").clicked() {
+                    state.drawing_overlay.cancel();
+                }
+            }
+            DrawingDraftPhase::Ready => {
+                ui.label(format!("{} point(s)", state.drawing_overlay.points.len()));
+                if ui.button("Commit drawing overlay").clicked() {
+                    commit_drawing_overlay(workspace, state, now, results);
+                }
+                if ui.button("Cancel stroke").clicked() {
+                    state.drawing_overlay.cancel();
+                }
+            }
+        }
+    });
+    if state.drawing_overlay.limit_reached {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            format!("Stroke stopped at the {MAX_DRAWING_DRAFT_POINTS}-point safety limit."),
+        );
+    }
+}
+
+fn commit_drawing_overlay(
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    now: Instant,
+    results: &mut Vec<EditorUiResult>,
+) {
+    let result = build_drawing_overlay(&state.drawing_overlay).and_then(|content| {
+        workspace
+            .add_overlay_for_selection(
+                state.drawing_overlay.name.trim().to_owned(),
+                content,
+                state.drawing_overlay.z_index,
+                state.drawing_overlay.track_opacity,
+                state.drawing_overlay.blend_mode,
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    });
+    if result.is_ok() {
+        state.drawing_overlay.cancel();
+    }
+    record_project_result(
+        workspace,
+        state,
+        now,
+        results,
+        EditorUiOperation::AddDrawingOverlay,
+        result,
+    );
+}
+
+fn build_drawing_overlay(draft: &DrawingOverlayDraft) -> Result<OverlayContent, String> {
+    if draft.name.trim().is_empty() {
+        return Err("Drawing overlay name is required.".to_owned());
+    }
+    if draft.width == 0 || draft.color.alpha == 0 || draft.track_opacity == 0 {
+        return Err("Drawing width, color alpha, and track opacity must be visible.".to_owned());
+    }
+    if draft.points.is_empty() {
+        return Err("Draw at least one point on the preview before committing.".to_owned());
+    }
+    if draft.points.len() > MAX_DRAWING_DRAFT_POINTS {
+        return Err(format!(
+            "Drawing contains more than {MAX_DRAWING_DRAFT_POINTS} points."
+        ));
+    }
+    if draft
+        .points
+        .iter()
+        .any(|point| point.pressure_milli > 1_000)
+    {
+        return Err("Drawing pressure must stay in 0..=1000.".to_owned());
+    }
+    Ok(OverlayContent::Drawing {
+        points: draft.points.clone(),
+        width: draft.width,
+        color: draft.color,
+    })
 }
 
 fn show_overlay_track_list(
@@ -2605,17 +2814,19 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use gif_from_screen_domain::{
-        BlendMode, DurationUs, Effect, FrameId, MAX_TRANSITION_STEPS, OverlayContent, PhysicalRect,
-        PhysicalSize, Rgba, ShapeKind, SlideDirection, TimeUs, TransitionKind,
+        BlendMode, DurationUs, Effect, FrameId, MAX_TRANSITION_STEPS, OverlayContent,
+        PhysicalPoint, PhysicalPx, PhysicalRect, PhysicalSize, Rgba, ShapeKind, SlideDirection,
+        StrokePoint, TimeUs, TransitionKind,
     };
     use gif_from_screen_editor::{
         DuplicateDelayMode, DuplicateFrameRetention, ReduceDelayMode, YoyoScope,
     };
 
     use super::{
-        EditorUiAction, EditorUiOperation, EditorUiState, EffectChoice, FILMSTRIP_ITEM_WIDTH,
-        OrientationControl, PlaybackClock, ShapeOverlayChoice, ShapeOverlayUiState,
-        TransitionChoice, build_effect, build_shape_overlay, build_transition_settings,
+        DrawingDraftPhase, DrawingOverlayDraft, EditorUiAction, EditorUiOperation, EditorUiState,
+        EffectChoice, FILMSTRIP_ITEM_WIDTH, MAX_DRAWING_DRAFT_POINTS, OrientationControl,
+        PlaybackClock, ShapeOverlayChoice, ShapeOverlayUiState, TransitionChoice,
+        build_drawing_overlay, build_effect, build_shape_overlay, build_transition_settings,
         duplicate_delay_label, duplicate_retention_label, effect_choice_label, format_duration_us,
         format_optional_duration, frame_click_operation, orientation_operation, parse_crop,
         parse_duration_us, parse_effect_index, parse_keep_every, parse_output_size,
@@ -2726,6 +2937,74 @@ mod tests {
             ..ShapeOverlayUiState::default()
         };
         assert!(build_shape_overlay(&filled, canvas).is_ok());
+    }
+
+    #[test]
+    fn drawing_draft_is_bounded_deduplicated_and_builds_pressure_content() {
+        let mut draft = DrawingOverlayDraft::default();
+        draft.begin();
+        assert_eq!(draft.phase, DrawingDraftPhase::Capturing);
+        let first = StrokePoint {
+            point: PhysicalPoint {
+                x: PhysicalPx::new(1),
+                y: PhysicalPx::new(2),
+            },
+            pressure_milli: 1_000,
+        };
+        draft.push_point(first.clone());
+        draft.push_point(first);
+        assert_eq!(draft.points.len(), 1);
+        draft.finish_stroke();
+        assert_eq!(draft.phase, DrawingDraftPhase::Ready);
+        assert!(matches!(
+            build_drawing_overlay(&draft).unwrap(),
+            OverlayContent::Drawing { points, width: 4, .. } if points.len() == 1
+        ));
+
+        draft.begin();
+        for index in 0..=MAX_DRAWING_DRAFT_POINTS {
+            draft.push_point(StrokePoint {
+                point: PhysicalPoint {
+                    x: PhysicalPx::new(u32::try_from(index).unwrap()),
+                    y: PhysicalPx::ZERO,
+                },
+                pressure_milli: 1_000,
+            });
+        }
+        assert_eq!(draft.points.len(), MAX_DRAWING_DRAFT_POINTS);
+        assert!(draft.limit_reached);
+        assert_eq!(draft.phase, DrawingDraftPhase::Ready);
+        draft.cancel();
+        assert!(draft.points.is_empty());
+        assert_eq!(draft.phase, DrawingDraftPhase::Idle);
+
+        for invalid in [
+            DrawingOverlayDraft {
+                name: String::new(),
+                points: vec![StrokePoint {
+                    point: PhysicalPoint::default(),
+                    pressure_milli: 1_000,
+                }],
+                ..DrawingOverlayDraft::default()
+            },
+            DrawingOverlayDraft {
+                width: 0,
+                points: vec![StrokePoint {
+                    point: PhysicalPoint::default(),
+                    pressure_milli: 1_000,
+                }],
+                ..DrawingOverlayDraft::default()
+            },
+            DrawingOverlayDraft {
+                points: vec![StrokePoint {
+                    point: PhysicalPoint::default(),
+                    pressure_milli: 1_001,
+                }],
+                ..DrawingOverlayDraft::default()
+            },
+        ] {
+            assert!(build_drawing_overlay(&invalid).is_err());
+        }
     }
 
     #[test]
