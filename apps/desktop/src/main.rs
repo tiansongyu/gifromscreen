@@ -18,6 +18,8 @@ mod import_static_sequence_job;
 mod open_project_job;
 mod retarget;
 mod static_sequence_ui;
+mod watermark_decode_job;
+mod watermark_ui;
 mod wayland_prepare_job;
 
 use std::{
@@ -92,6 +94,8 @@ use static_sequence_ui::{
     StaticSequenceUiState, show_static_sequence_ui,
 };
 use uuid::Uuid;
+use watermark_decode_job::{WatermarkDecodeEvent, WatermarkDecodeJob, WatermarkDecodeJobState};
+use watermark_ui::{WatermarkUiAction, WatermarkUiState, build_raster_edit, show_watermark_ui};
 use wayland_prepare_job::{
     FrozenSourcePreview, WaylandPrepareJob, WaylandPrepareJobEvent, WaylandPrepareJobState,
     WaylandPrepareOutcome,
@@ -161,6 +165,7 @@ enum FileDropActivity {
     ImageImport,
     ImageSequenceImport,
     BlankCreation,
+    WatermarkDecode,
     Export,
 }
 
@@ -659,6 +664,8 @@ struct GifFromScreenApp {
     import_sequence_job: ImportStaticSequenceJob,
     blank_project_ui: BlankProjectUiState,
     blank_project_job: BlankProjectJob,
+    watermark_ui: WatermarkUiState,
+    watermark_job: WatermarkDecodeJob,
     editor_workspace: Option<EditorWorkspace>,
     editor_ui_state: EditorUiState,
     editor_preview_cache: EditorPreviewCache,
@@ -698,6 +705,8 @@ impl Default for GifFromScreenApp {
             import_sequence_job: ImportStaticSequenceJob::default(),
             blank_project_ui: BlankProjectUiState::default(),
             blank_project_job: BlankProjectJob::default(),
+            watermark_ui: WatermarkUiState::default(),
+            watermark_job: WatermarkDecodeJob::default(),
             editor_workspace: None,
             editor_ui_state: EditorUiState::default(),
             editor_preview_cache: EditorPreviewCache::new(),
@@ -727,6 +736,7 @@ impl eframe::App for GifFromScreenApp {
         self.receive_import_image_messages();
         self.receive_import_sequence_messages();
         self.receive_blank_project_messages();
+        self.receive_watermark_messages();
         let dropped_paths = context.input(|input| {
             input
                 .raw
@@ -770,6 +780,7 @@ impl eframe::App for GifFromScreenApp {
             || self.import_image_job.state() == ImportStaticImageJobState::Running
             || self.import_sequence_job.state() == ImportStaticSequenceJobState::Running
             || self.blank_project_job.state() == BlankProjectJobState::Running
+            || self.watermark_job.state() == WatermarkDecodeJobState::Running
             || self.source_catalog_job.state() == CaptureSourceJobState::Loading
             || self.wayland_prepare_job.is_active()
         {
@@ -778,14 +789,15 @@ impl eframe::App for GifFromScreenApp {
 
         egui::TopBottomPanel::top("app_header").show(context, |ui| {
             ui.horizontal(|ui| {
-                let back_enabled = can_navigate_back(
-                    self.view,
-                    self.open_project_job.state(),
-                    self.import_gif_job.state(),
-                    self.import_image_job.state(),
-                    self.import_sequence_job.state(),
-                    self.blank_project_job.state(),
-                );
+                let back_enabled = self.watermark_job.state() != WatermarkDecodeJobState::Running
+                    && can_navigate_back(
+                        self.view,
+                        self.open_project_job.state(),
+                        self.import_gif_job.state(),
+                        self.import_image_job.state(),
+                        self.import_sequence_job.state(),
+                        self.blank_project_job.state(),
+                    );
                 if self.view != AppView::Landing
                     && ui
                         .add_enabled(back_enabled, egui::Button::new("Back"))
@@ -861,6 +873,8 @@ impl GifFromScreenApp {
             FileDropActivity::ImageSequenceImport
         } else if self.blank_project_job.state() != BlankProjectJobState::Idle {
             FileDropActivity::BlankCreation
+        } else if self.watermark_job.state() != WatermarkDecodeJobState::Idle {
+            FileDropActivity::WatermarkDecode
         } else if self.export_job.state() != ExportJobState::Idle {
             FileDropActivity::Export
         } else {
@@ -1371,10 +1385,29 @@ impl GifFromScreenApp {
             ui.label("No active editor project.");
             return;
         };
-        let results = show_editor_ui(ui, workspace, &mut self.editor_ui_state);
+        let watermark_running = self.watermark_job.state() == WatermarkDecodeJobState::Running;
+        let results = ui
+            .add_enabled_ui(!watermark_running, |ui| {
+                show_editor_ui(ui, workspace, &mut self.editor_ui_state)
+            })
+            .inner;
         for result in results {
             if let Some(notice) = editor_result_notice(result) {
                 self.notice = Some(notice);
+            }
+        }
+
+        let watermark_action = show_watermark_ui(
+            ui,
+            &mut self.watermark_ui,
+            self.watermark_job.state(),
+            !workspace.selection().is_empty(),
+        );
+        if watermark_action == WatermarkUiAction::Start {
+            let path = PathBuf::from(self.watermark_ui.path.trim());
+            match self.watermark_job.start(path) {
+                Ok(()) => self.notice = Some("Decoding watermark in the background…".to_owned()),
+                Err(error) => self.notice = Some(format!("Could not decode watermark: {error}")),
             }
         }
 
@@ -1395,6 +1428,7 @@ impl GifFromScreenApp {
             &self.export_job,
             selected_count,
             asset_issue_count,
+            watermark_running,
         );
         match export_action {
             EditorExportAction::None => {}
@@ -2735,6 +2769,50 @@ impl GifFromScreenApp {
         });
     }
 
+    fn receive_watermark_messages(&mut self) {
+        let finished = self
+            .watermark_job
+            .drain()
+            .into_iter()
+            .any(|event| event == WatermarkDecodeEvent::Finished);
+        if !finished {
+            return;
+        }
+        let result = self.watermark_job.take_result();
+        self.watermark_job = WatermarkDecodeJob::default();
+        self.notice = Some(match result {
+            Some(Ok(decoded)) => {
+                let source_path = decoded.source_path.clone();
+                let source_size = decoded.size;
+                match self
+                    .editor_workspace
+                    .as_mut()
+                    .ok_or_else(|| "the editor project was closed while decoding".to_owned())
+                    .and_then(|workspace| {
+                        let edit = build_raster_edit(&self.watermark_ui, &decoded)?;
+                        workspace
+                            .add_raster_overlay_for_selection(edit, &decoded.rgba)
+                            .map_err(|error| error.to_string())?;
+                        Ok(())
+                    }) {
+                    Ok(()) => format!(
+                        "Added {}×{} watermark {} to the selected frame span.",
+                        source_size.width.get(),
+                        source_size.height.get(),
+                        source_path.display()
+                    ),
+                    Err(error) => format!(
+                        "Watermark decoded but could not be added: {error}. Adjust the form and retry."
+                    ),
+                }
+            }
+            Some(Err(error)) => {
+                format!("Could not decode watermark: {error}. Adjust the form and retry.")
+            }
+            None => "Watermark decoder finished without a result; retry safely.".to_owned(),
+        });
+    }
+
     fn activate_blank_project(&mut self, project: ActiveProject) -> Result<String, String> {
         let output = project.layout().root.with_extension("gif");
         let output_exists = output.exists();
@@ -3005,12 +3083,16 @@ fn show_export_panel(
     job: &ExportJob,
     selected_count: usize,
     asset_issue_count: usize,
+    editor_mutation_active: bool,
 ) -> EditorExportAction {
     ui.heading("Export GIF");
     let active = export_job_is_active(job.state());
-    ui.add_enabled_ui(!active, |ui| {
+    ui.add_enabled_ui(!active && !editor_mutation_active, |ui| {
         show_export_configuration(ui, output, settings, selected_count);
     });
+    if editor_mutation_active {
+        ui.weak("Finish the active editor asset job before exporting.");
+    }
     if asset_issue_count > 0 {
         ui.colored_label(
             ui.visuals().error_fg_color,
@@ -3021,7 +3103,10 @@ fn show_export_panel(
     match job.state() {
         ExportJobState::Idle => {
             if ui
-                .add_enabled(asset_issue_count == 0, egui::Button::new("Export GIF"))
+                .add_enabled(
+                    asset_issue_count == 0 && !editor_mutation_active,
+                    egui::Button::new("Export GIF"),
+                )
                 .clicked()
             {
                 EditorExportAction::Start
@@ -5180,6 +5265,7 @@ const fn file_drop_block_reason(activity: FileDropActivity) -> Option<&'static s
         FileDropActivity::ImageImport => Some("an image import is active"),
         FileDropActivity::ImageSequenceImport => Some("an image-sequence import is active"),
         FileDropActivity::BlankCreation => Some("blank-project creation is active"),
+        FileDropActivity::WatermarkDecode => Some("a watermark decode is active"),
         FileDropActivity::Export => Some("a GIF export is active"),
     }
 }
@@ -5471,6 +5557,7 @@ mod tests {
     use crate::static_sequence_ui::{
         StaticSequenceLoopChoice, StaticSequenceTimingChoice, StaticSequenceUiState,
     };
+    use crate::watermark_decode_job::WatermarkDecodeJobState;
     use gif_from_screen_workflow::{CollectionLimit, FrameRetention};
 
     #[test]
@@ -6381,6 +6468,15 @@ mod tests {
         }
     }
 
+    fn drain_watermark_job(app: &mut GifFromScreenApp) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.watermark_job.state() == WatermarkDecodeJobState::Running {
+            app.receive_watermark_messages();
+            assert!(Instant::now() < deadline, "watermark decode job timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn drain_import_sequence_job(app: &mut GifFromScreenApp) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while app.import_sequence_job.state() == ImportStaticSequenceJobState::Running {
@@ -6418,6 +6514,45 @@ mod tests {
             default_gif_path_for_project(Path::new("/tmp/demo.project")),
             PathBuf::from("/tmp/demo.gif")
         );
+    }
+
+    #[test]
+    fn decoded_watermark_is_committed_to_preview_and_can_be_undone() {
+        let directory = tempdir().unwrap();
+        let project_root = directory.path().join("watermark-project.gfsproj");
+        let watermark_path = directory.path().join("logo.png");
+        write_import_png(&watermark_path);
+        let project = single_frame_project(&project_root);
+        let mut app = GifFromScreenApp::default();
+        activate_editor(&mut app.view, &mut app.editor_workspace, project).unwrap();
+        app.watermark_ui.path = watermark_path.to_string_lossy().into_owned();
+        app.watermark_ui.name = "Test logo".to_owned();
+        app.watermark_ui.width = 1;
+        app.watermark_ui.height = 1;
+        app.watermark_job.start(watermark_path.clone()).unwrap();
+
+        drain_watermark_job(&mut app);
+
+        assert_eq!(app.watermark_job.state(), WatermarkDecodeJobState::Idle);
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("Added 2×1 watermark")
+        );
+        let workspace = app.editor_workspace.as_mut().unwrap();
+        assert_eq!(workspace.manifest().timeline.overlay_tracks.len(), 1);
+        assert_eq!(workspace.manifest().assets.len(), 2);
+        let rendered = crate::editor_preview::render_frame_surface(
+            workspace.active_project(),
+            FrameId::from_u128(7),
+            1024,
+        )
+        .unwrap();
+        assert_ne!(rendered.pixels(), &[12, 34, 56, 255]);
+        assert!(workspace.undo().unwrap());
+        assert!(workspace.manifest().timeline.overlay_tracks.is_empty());
+        assert_eq!(workspace.manifest().assets.len(), 1);
     }
 
     #[test]
