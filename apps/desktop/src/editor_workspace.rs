@@ -9,7 +9,8 @@ use std::{
 };
 
 use gif_from_screen_domain::{
-    DurationUs, EditCommand, Effect, FrameId, PhysicalRect, PhysicalSize, ProjectManifest, TimeUs,
+    BlendMode, DurationUs, EditCommand, Effect, FrameId, OverlayContent, OverlayId, OverlayItem,
+    OverlayTrack, PhysicalRect, PhysicalSize, ProjectManifest, TimeUs, TimelineSpan, TrackId,
     Transition,
 };
 use gif_from_screen_editor::{
@@ -229,6 +230,47 @@ impl EditorWorkspace {
     /// Clears all session-local clipboard snapshots.
     pub(crate) fn clear_clipboard_history(&mut self) {
         self.clipboard.clear();
+    }
+
+    /// Adds one visible overlay track spanning the earliest through latest selected frame.
+    pub(crate) fn add_overlay_for_selection(
+        &mut self,
+        name: String,
+        content: OverlayContent,
+        z_index: i32,
+        track_opacity: u8,
+        blend_mode: BlendMode,
+    ) -> Result<TrackId, EditorWorkspaceError> {
+        if name.trim().is_empty() {
+            return Err(EditorWorkspaceError::EmptyOverlayName);
+        }
+        let span = self.selected_timeline_span()?;
+        let track_id = TrackId::from_u128(Uuid::new_v4().as_u128());
+        let overlay_id = OverlayId::from_u128(Uuid::new_v4().as_u128());
+        self.execute(EditCommand::UpsertOverlayTrack {
+            track: OverlayTrack {
+                id: track_id,
+                name,
+                visible: true,
+                opacity: track_opacity,
+                blend_mode,
+                items: vec![OverlayItem {
+                    id: overlay_id,
+                    span,
+                    z_index,
+                    content,
+                }],
+            },
+        })?;
+        Ok(track_id)
+    }
+
+    /// Removes one complete overlay track as a journal-backed edit.
+    pub(crate) fn remove_overlay_track(
+        &mut self,
+        track_id: TrackId,
+    ) -> Result<(), EditorWorkspaceError> {
+        self.execute(EditCommand::RemoveOverlayTrack { track_id })
     }
 
     /// Projects current timeline, selection, delay, canvas, and asset statistics.
@@ -790,6 +832,34 @@ impl EditorWorkspace {
         Ok(frame_ids)
     }
 
+    fn selected_timeline_span(&self) -> Result<TimelineSpan, EditorWorkspaceError> {
+        let selected = self.selected_frame_ids()?;
+        let selected = selected.into_iter().collect::<BTreeSet<_>>();
+        let mut cursor = 0_u64;
+        let mut start = None;
+        let mut end = None;
+        for frame in &self.project.manifest().timeline.frames {
+            let frame_end = cursor
+                .checked_add(frame.duration.get())
+                .ok_or(EditorWorkspaceError::OverlayTimelineDurationOverflow)?;
+            if selected.contains(&frame.id) {
+                start.get_or_insert(cursor);
+                end = Some(frame_end);
+            }
+            cursor = frame_end;
+        }
+        let start = start.ok_or(EditorWorkspaceError::EmptyOverlaySelection)?;
+        let end = end.ok_or(EditorWorkspaceError::EmptyOverlaySelection)?;
+        let duration = end
+            .checked_sub(start)
+            .and_then(DurationUs::new)
+            .ok_or(EditorWorkspaceError::OverlayTimelineDurationOverflow)?;
+        Ok(TimelineSpan {
+            start: TimeUs::new(start),
+            duration,
+        })
+    }
+
     fn execute_selection_effect(
         &mut self,
         edit: &FrameEffectEdit,
@@ -975,6 +1045,15 @@ pub(crate) enum EditorWorkspaceError {
     /// Paste was requested before a successful Copy or Cut.
     #[error("application frame clipboard is empty; copy or cut frames first")]
     EmptyClipboard,
+    /// Overlay authoring requires visible track text.
+    #[error("overlay track name must not be empty")]
+    EmptyOverlayName,
+    /// Overlay authoring requires at least one selected frame.
+    #[error("select at least one frame before adding an overlay")]
+    EmptyOverlaySelection,
+    /// The selected overlay span could not be represented safely.
+    #[error("selected overlay timeline span overflowed")]
+    OverlayTimelineDurationOverflow,
     /// Session history must retain at least one entry.
     #[error("editor history limit must be greater than zero")]
     ZeroHistoryLimit,
@@ -985,10 +1064,10 @@ mod tests {
     use std::{collections::BTreeMap, io::Write};
 
     use gif_from_screen_domain::{
-        AssetDescriptor, AssetId, AssetKind, Canvas, CanvasBackground, CaptureMetadata,
-        ClipTransform, ColorSpace, FrameClip, PhysicalSize, ProjectId, ProjectManifest,
-        ProjectRevision, QuarterTurn, RasterEncoding, Rgba, SlideDirection, Timeline,
-        TransitionKind, UnixTimeMs,
+        AssetDescriptor, AssetId, AssetKind, BlendMode, Canvas, CanvasBackground, CaptureMetadata,
+        ClipTransform, ColorSpace, FrameClip, OverlayContent, PhysicalRect, PhysicalSize,
+        ProjectId, ProjectManifest, ProjectRevision, QuarterTurn, RasterEncoding, Rgba, ShapeKind,
+        SlideDirection, Timeline, TransitionKind, UnixTimeMs,
     };
     use tempfile::TempDir;
 
@@ -2074,6 +2153,73 @@ mod tests {
         assert_eq!(transition.duration, DurationUs::new(9).unwrap());
         assert_eq!(transition.steps, 3);
         assert_eq!(reopened.manifest().revision, ProjectRevision::new(6));
+    }
+
+    #[test]
+    fn shape_overlay_tracks_span_selection_and_are_journaled_undoable_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = create_workspace(&directory, &[10, 20, 30], 8);
+        workspace.select_only(frame_id(1)).unwrap();
+        workspace.toggle_selection(frame_id(3)).unwrap();
+        let content = OverlayContent::Shape {
+            kind: ShapeKind::Rectangle,
+            bounds: PhysicalRect::new(0, 0, 2, 2).unwrap(),
+            stroke_width: 1,
+            stroke: Rgba {
+                red: 255,
+                green: 0,
+                blue: 0,
+                alpha: 255,
+            },
+            fill: None,
+        };
+
+        let track_id = workspace
+            .add_overlay_for_selection("Callout".to_owned(), content, 7, 200, BlendMode::Screen)
+            .unwrap();
+        let track = &workspace.manifest().timeline.overlay_tracks[0];
+        assert_eq!(track.id, track_id);
+        assert_eq!(track.name, "Callout");
+        assert_eq!(track.opacity, 200);
+        assert_eq!(track.blend_mode, BlendMode::Screen);
+        assert_eq!(track.items[0].span.start, TimeUs::ZERO);
+        assert_eq!(track.items[0].span.duration, DurationUs::new(60).unwrap());
+        assert_eq!(track.items[0].z_index, 7);
+
+        assert!(workspace.undo().unwrap());
+        assert!(workspace.manifest().timeline.overlay_tracks.is_empty());
+        assert!(workspace.redo().unwrap());
+        assert_eq!(workspace.manifest().timeline.overlay_tracks[0].id, track_id);
+        workspace.remove_overlay_track(track_id).unwrap();
+        assert!(workspace.manifest().timeline.overlay_tracks.is_empty());
+        assert!(workspace.undo().unwrap());
+        assert_eq!(workspace.manifest().timeline.overlay_tracks[0].id, track_id);
+
+        let revision = workspace.manifest().revision;
+        workspace.clear_selection();
+        assert!(
+            workspace
+                .add_overlay_for_selection(
+                    "Shape".to_owned(),
+                    OverlayContent::Shape {
+                        kind: ShapeKind::Line,
+                        bounds: PhysicalRect::new(0, 0, 1, 1).unwrap(),
+                        stroke_width: 1,
+                        stroke: Rgba {
+                            red: 0,
+                            green: 0,
+                            blue: 0,
+                            alpha: 255,
+                        },
+                        fill: None,
+                    },
+                    0,
+                    255,
+                    BlendMode::Normal,
+                )
+                .is_err()
+        );
+        assert_eq!(workspace.manifest().revision, revision);
     }
 
     #[test]

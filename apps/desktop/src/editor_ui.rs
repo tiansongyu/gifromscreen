@@ -12,8 +12,9 @@ use std::{
 
 use eframe::egui;
 use gif_from_screen_domain::{
-    DurationUs, EdgeWidths, Effect, FrameId, MAX_TRANSITION_STEPS, PhysicalRect, PhysicalSize,
-    Rgba, SlideDirection, TimeUs, Transition, TransitionKind,
+    BlendMode, DurationUs, EdgeWidths, Effect, FrameId, MAX_TRANSITION_STEPS, OverlayContent,
+    PhysicalRect, PhysicalSize, Rgba, ShapeKind, SlideDirection, TimeUs, Transition,
+    TransitionKind,
 };
 use gif_from_screen_editor::{
     DuplicateDelayMode, DuplicateFrameRetention, FrameTransitionSettings,
@@ -27,6 +28,7 @@ const FILMSTRIP_ITEM_WIDTH: f64 = 112.0;
 const FILMSTRIP_ITEM_GAP: f64 = 8.0;
 const FILMSTRIP_ITEM_HEIGHT: f32 = 78.0;
 const FILMSTRIP_OVERSCAN: usize = 3;
+const MAX_VISIBLE_OVERLAY_TRACKS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum EffectChoice {
@@ -48,6 +50,62 @@ pub(crate) enum TransitionChoice {
     SlideRight,
     SlideUp,
     SlideDown,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ShapeOverlayChoice {
+    Line,
+    Arrow,
+    #[default]
+    Rectangle,
+    Ellipse,
+}
+
+#[derive(Debug)]
+struct ShapeOverlayUiState {
+    name: String,
+    kind: ShapeOverlayChoice,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    stroke_width: u16,
+    stroke: Rgba,
+    fill_enabled: bool,
+    fill: Rgba,
+    track_opacity: u8,
+    blend_mode: BlendMode,
+    z_index: i32,
+}
+
+impl Default for ShapeOverlayUiState {
+    fn default() -> Self {
+        Self {
+            name: "Shape".to_owned(),
+            kind: ShapeOverlayChoice::Rectangle,
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 80,
+            stroke_width: 2,
+            stroke: Rgba {
+                red: 242,
+                green: 153,
+                blue: 74,
+                alpha: 255,
+            },
+            fill_enabled: false,
+            fill: Rgba {
+                red: 242,
+                green: 153,
+                blue: 74,
+                alpha: 96,
+            },
+            track_opacity: 255,
+            blend_mode: BlendMode::Normal,
+            z_index: 0,
+        }
+    }
 }
 
 /// Ephemeral editor controls and playback state retained between egui frames.
@@ -125,6 +183,7 @@ pub(crate) struct EditorUiState {
     pub(crate) resize_width_input: String,
     /// Pre-rotation resize height input in physical pixels.
     pub(crate) resize_height_input: String,
+    shape_overlay: ShapeOverlayUiState,
     /// Monotonic playback clock when playback is active.
     pub(crate) playback: Option<PlaybackClock>,
     filmstrip_scroll_offset: f64,
@@ -181,6 +240,7 @@ impl Default for EditorUiState {
             crop_height_input: "1".into(),
             resize_width_input: "1".into(),
             resize_height_input: "1".into(),
+            shape_overlay: ShapeOverlayUiState::default(),
             playback: None,
             filmstrip_scroll_offset: 0.0,
             reveal_current_frame: false,
@@ -259,6 +319,8 @@ pub(crate) enum EditorUiOperation {
     AddEffect,
     ReplaceEffect,
     ClearEffects,
+    AddShapeOverlay,
+    RemoveOverlayTrack,
     SetTransition,
     DeleteTransition,
     SaveCheckpoint,
@@ -331,6 +393,7 @@ pub(crate) fn show_editor_ui(
     show_transition_toolbar(ui, workspace, state, now, &mut results);
     show_transform_toolbar(ui, workspace, state, now, &mut results);
     show_effect_toolbar(ui, workspace, state, now, &mut results);
+    show_shape_overlay_toolbar(ui, workspace, state, now, &mut results);
     ui.separator();
     show_virtual_filmstrip(ui, workspace, state, now, &mut results);
 
@@ -1839,6 +1902,246 @@ fn parse_effect_index(state: &EditorUiState) -> Result<usize, String> {
         .ok_or_else(|| "effect number is 1-based and must be positive".to_owned())
 }
 
+fn show_shape_overlay_toolbar(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    now: Instant,
+    results: &mut Vec<EditorUiResult>,
+) {
+    ui.group(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Shape overlays");
+            ui.weak("The new track spans the earliest through latest selected frame.");
+        });
+        show_shape_overlay_inputs(ui, &mut state.shape_overlay);
+        if ui.button("Add shape overlay").clicked() {
+            let result =
+                build_shape_overlay(&state.shape_overlay, workspace.manifest().canvas.size)
+                    .and_then(|content| {
+                        workspace
+                            .add_overlay_for_selection(
+                                state.shape_overlay.name.trim().to_owned(),
+                                content,
+                                state.shape_overlay.z_index,
+                                state.shape_overlay.track_opacity,
+                                state.shape_overlay.blend_mode,
+                            )
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    });
+            record_project_result(
+                workspace,
+                state,
+                now,
+                results,
+                EditorUiOperation::AddShapeOverlay,
+                result,
+            );
+        }
+        show_overlay_track_list(ui, workspace, state, now, results);
+    });
+}
+
+fn show_shape_overlay_inputs(ui: &mut egui::Ui, state: &mut ShapeOverlayUiState) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Name");
+        ui.add(egui::TextEdit::singleline(&mut state.name).desired_width(120.0));
+        ui.label("Kind");
+        egui::ComboBox::from_id_salt("shape_overlay_kind")
+            .selected_text(shape_overlay_choice_label(state.kind))
+            .show_ui(ui, |ui| {
+                for choice in [
+                    ShapeOverlayChoice::Line,
+                    ShapeOverlayChoice::Arrow,
+                    ShapeOverlayChoice::Rectangle,
+                    ShapeOverlayChoice::Ellipse,
+                ] {
+                    ui.selectable_value(
+                        &mut state.kind,
+                        choice,
+                        shape_overlay_choice_label(choice),
+                    );
+                }
+            });
+        ui.label("Z");
+        ui.add(egui::DragValue::new(&mut state.z_index));
+        ui.label("Track opacity");
+        ui.add(egui::DragValue::new(&mut state.track_opacity).range(1..=u8::MAX));
+        ui.label("Blend");
+        egui::ComboBox::from_id_salt("shape_overlay_blend")
+            .selected_text(blend_mode_label(state.blend_mode))
+            .show_ui(ui, |ui| {
+                for blend in [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen] {
+                    ui.selectable_value(&mut state.blend_mode, blend, blend_mode_label(blend));
+                }
+            });
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Bounds X/Y/W/H");
+        ui.add(egui::DragValue::new(&mut state.x));
+        ui.add(egui::DragValue::new(&mut state.y));
+        ui.add(egui::DragValue::new(&mut state.width).range(1..=u32::MAX));
+        ui.add(egui::DragValue::new(&mut state.height).range(1..=u32::MAX));
+        ui.label("Stroke width");
+        ui.add(egui::DragValue::new(&mut state.stroke_width));
+    });
+    ui.horizontal_wrapped(|ui| {
+        show_rgba_inputs(ui, "Stroke RGBA", &mut state.stroke);
+        ui.checkbox(&mut state.fill_enabled, "Fill");
+        ui.add_enabled_ui(state.fill_enabled, |ui| {
+            show_rgba_inputs(ui, "Fill RGBA", &mut state.fill);
+        });
+    });
+}
+
+fn show_rgba_inputs(ui: &mut egui::Ui, label: &str, color: &mut Rgba) {
+    ui.label(label);
+    ui.add(egui::DragValue::new(&mut color.red));
+    ui.add(egui::DragValue::new(&mut color.green));
+    ui.add(egui::DragValue::new(&mut color.blue));
+    ui.add(egui::DragValue::new(&mut color.alpha));
+}
+
+fn show_overlay_track_list(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    now: Instant,
+    results: &mut Vec<EditorUiResult>,
+) {
+    let tracks = workspace
+        .manifest()
+        .timeline
+        .overlay_tracks
+        .iter()
+        .take(MAX_VISIBLE_OVERLAY_TRACKS)
+        .map(|track| {
+            (
+                track.id,
+                track.name.clone(),
+                track
+                    .items
+                    .first()
+                    .map(|item| overlay_content_label(&item.content)),
+                track.items.len(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if tracks.is_empty() {
+        return;
+    }
+    ui.separator();
+    ui.label(format!(
+        "Overlay tracks: {}{}",
+        workspace.manifest().timeline.overlay_tracks.len(),
+        if workspace.manifest().timeline.overlay_tracks.len() > MAX_VISIBLE_OVERLAY_TRACKS {
+            " (showing first 64)"
+        } else {
+            ""
+        }
+    ));
+    let mut remove = None;
+    for (track_id, name, kind, item_count) in tracks {
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "{name} · {} · {item_count} item(s)",
+                kind.unwrap_or("Empty")
+            ));
+            if ui.small_button("Remove track").clicked() {
+                remove = Some(track_id);
+            }
+        });
+    }
+    if let Some(track_id) = remove {
+        let result = workspace.remove_overlay_track(track_id);
+        record_project_result(
+            workspace,
+            state,
+            now,
+            results,
+            EditorUiOperation::RemoveOverlayTrack,
+            result,
+        );
+    }
+}
+
+fn build_shape_overlay(
+    state: &ShapeOverlayUiState,
+    canvas: PhysicalSize,
+) -> Result<OverlayContent, String> {
+    if state.name.trim().is_empty() {
+        return Err("Shape overlay name is required.".to_owned());
+    }
+    if state.track_opacity == 0 {
+        return Err("Shape track opacity must be greater than zero.".to_owned());
+    }
+    let bounds = PhysicalRect::new(state.x, state.y, state.width, state.height)
+        .map_err(|error| format!("Invalid shape bounds: {error}"))?;
+    if !bounds.fits_within(canvas) {
+        return Err("Shape bounds must stay inside the rendered canvas.".to_owned());
+    }
+    let kind = shape_kind(state.kind);
+    let fill = state.fill_enabled.then_some(state.fill);
+    if matches!(kind, ShapeKind::Line | ShapeKind::Arrow)
+        && (state.stroke_width == 0 || state.stroke.alpha == 0)
+    {
+        return Err("Line and arrow overlays require a visible positive-width stroke.".to_owned());
+    }
+    if matches!(kind, ShapeKind::Rectangle | ShapeKind::Ellipse)
+        && (state.stroke_width == 0 || state.stroke.alpha == 0)
+        && fill.is_none_or(|color| color.alpha == 0)
+    {
+        return Err("Rectangle and ellipse overlays require a visible stroke or fill.".to_owned());
+    }
+    Ok(OverlayContent::Shape {
+        kind,
+        bounds,
+        stroke_width: state.stroke_width,
+        stroke: state.stroke,
+        fill,
+    })
+}
+
+const fn shape_kind(choice: ShapeOverlayChoice) -> ShapeKind {
+    match choice {
+        ShapeOverlayChoice::Line => ShapeKind::Line,
+        ShapeOverlayChoice::Arrow => ShapeKind::Arrow,
+        ShapeOverlayChoice::Rectangle => ShapeKind::Rectangle,
+        ShapeOverlayChoice::Ellipse => ShapeKind::Ellipse,
+    }
+}
+
+const fn shape_overlay_choice_label(choice: ShapeOverlayChoice) -> &'static str {
+    match choice {
+        ShapeOverlayChoice::Line => "Line",
+        ShapeOverlayChoice::Arrow => "Arrow",
+        ShapeOverlayChoice::Rectangle => "Rectangle",
+        ShapeOverlayChoice::Ellipse => "Ellipse",
+    }
+}
+
+const fn blend_mode_label(mode: BlendMode) -> &'static str {
+    match mode {
+        BlendMode::Normal => "Normal",
+        BlendMode::Multiply => "Multiply",
+        BlendMode::Screen => "Screen",
+    }
+}
+
+const fn overlay_content_label(content: &OverlayContent) -> &'static str {
+    match content {
+        OverlayContent::Raster { .. } => "Raster",
+        OverlayContent::Text { .. } => "Text",
+        OverlayContent::Shape { .. } => "Shape",
+        OverlayContent::Drawing { .. } => "Drawing",
+        OverlayContent::KeyStroke { .. } => "Key stroke",
+        OverlayContent::Cursor { .. } => "Cursor",
+        OverlayContent::MouseClick { .. } => "Mouse click",
+        OverlayContent::Progress { .. } => "Progress",
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "virtual range calculation and its only widget loop are intentionally co-located"
@@ -2302,8 +2605,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use gif_from_screen_domain::{
-        DurationUs, Effect, FrameId, MAX_TRANSITION_STEPS, PhysicalRect, PhysicalSize, Rgba,
-        SlideDirection, TimeUs, TransitionKind,
+        BlendMode, DurationUs, Effect, FrameId, MAX_TRANSITION_STEPS, OverlayContent, PhysicalRect,
+        PhysicalSize, Rgba, ShapeKind, SlideDirection, TimeUs, TransitionKind,
     };
     use gif_from_screen_editor::{
         DuplicateDelayMode, DuplicateFrameRetention, ReduceDelayMode, YoyoScope,
@@ -2311,13 +2614,14 @@ mod tests {
 
     use super::{
         EditorUiAction, EditorUiOperation, EditorUiState, EffectChoice, FILMSTRIP_ITEM_WIDTH,
-        OrientationControl, PlaybackClock, TransitionChoice, build_effect,
-        build_transition_settings, duplicate_delay_label, duplicate_retention_label,
-        effect_choice_label, format_duration_us, format_optional_duration, frame_click_operation,
-        orientation_operation, parse_crop, parse_duration_us, parse_effect_index, parse_keep_every,
-        parse_output_size, parse_similarity_threshold, parse_time_ms, parse_time_range,
-        push_notice, reduce_delay_label, repair_journal_notice, to_ui_points,
-        transition_choice_label, visible_widget_range, yoyo_scope_label,
+        OrientationControl, PlaybackClock, ShapeOverlayChoice, ShapeOverlayUiState,
+        TransitionChoice, build_effect, build_shape_overlay, build_transition_settings,
+        duplicate_delay_label, duplicate_retention_label, effect_choice_label, format_duration_us,
+        format_optional_duration, frame_click_operation, orientation_operation, parse_crop,
+        parse_duration_us, parse_effect_index, parse_keep_every, parse_output_size,
+        parse_similarity_threshold, parse_time_ms, parse_time_range, push_notice,
+        reduce_delay_label, repair_journal_notice, to_ui_points, transition_choice_label,
+        visible_widget_range, yoyo_scope_label,
     };
 
     #[test]
@@ -2358,6 +2662,70 @@ mod tests {
         assert_eq!(state.resize_width_input, "1");
         assert_eq!(state.resize_height_input, "1");
         assert!(state.playback.is_none());
+    }
+
+    #[test]
+    fn shape_overlay_inputs_build_every_kind_and_reject_invisible_or_outside_geometry() {
+        let canvas = PhysicalSize::new(200, 160).unwrap();
+        for (choice, expected) in [
+            (ShapeOverlayChoice::Line, ShapeKind::Line),
+            (ShapeOverlayChoice::Arrow, ShapeKind::Arrow),
+            (ShapeOverlayChoice::Rectangle, ShapeKind::Rectangle),
+            (ShapeOverlayChoice::Ellipse, ShapeKind::Ellipse),
+        ] {
+            let state = ShapeOverlayUiState {
+                kind: choice,
+                blend_mode: BlendMode::Multiply,
+                ..ShapeOverlayUiState::default()
+            };
+            assert!(matches!(
+                build_shape_overlay(&state, canvas).unwrap(),
+                OverlayContent::Shape { kind, .. } if kind == expected
+            ));
+        }
+
+        for state in [
+            ShapeOverlayUiState {
+                name: "  ".to_owned(),
+                ..ShapeOverlayUiState::default()
+            },
+            ShapeOverlayUiState {
+                x: 190,
+                width: 20,
+                ..ShapeOverlayUiState::default()
+            },
+            ShapeOverlayUiState {
+                track_opacity: 0,
+                ..ShapeOverlayUiState::default()
+            },
+            ShapeOverlayUiState {
+                kind: ShapeOverlayChoice::Line,
+                stroke_width: 0,
+                ..ShapeOverlayUiState::default()
+            },
+            ShapeOverlayUiState {
+                stroke_width: 0,
+                stroke: Rgba::TRANSPARENT,
+                fill_enabled: false,
+                ..ShapeOverlayUiState::default()
+            },
+        ] {
+            assert!(build_shape_overlay(&state, canvas).is_err());
+        }
+
+        let filled = ShapeOverlayUiState {
+            stroke_width: 0,
+            stroke: Rgba::TRANSPARENT,
+            fill_enabled: true,
+            fill: Rgba {
+                red: 1,
+                green: 2,
+                blue: 3,
+                alpha: 255,
+            },
+            ..ShapeOverlayUiState::default()
+        };
+        assert!(build_shape_overlay(&filled, canvas).is_ok());
     }
 
     #[test]
