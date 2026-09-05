@@ -141,8 +141,6 @@ pub(crate) enum WaylandPrepareJobError {
     Initialize(#[source] CaptureError),
     #[error("the selected source kind cannot be prepared through the Wayland portal")]
     UnsupportedSource,
-    #[error("could not create capture cadence: {0}")]
-    Cadence(#[source] CaptureError),
     #[error("Wayland system selection or PipeWire startup failed: {0}")]
     StartSession(#[source] CaptureError),
     #[error("could not poll the selected Wayland source: {0}")]
@@ -224,9 +222,9 @@ impl WaylandPrepareJob {
     pub(crate) fn start(
         &mut self,
         source: CaptureSource,
-        fps: u32,
+        cadence: CaptureCadence,
     ) -> Result<(), WaylandPrepareJobStartError> {
-        self.start_with(source, fps, || {
+        self.start_with(source, cadence, || {
             WaylandCaptureBackend::connect()
                 .map(|backend| Box::new(backend) as Box<dyn CaptureBackend>)
                 .map_err(WaylandPrepareJobError::Initialize)
@@ -236,7 +234,7 @@ impl WaylandPrepareJob {
     fn start_with<F>(
         &mut self,
         source: CaptureSource,
-        fps: u32,
+        cadence: CaptureCadence,
         backend_factory: F,
     ) -> Result<(), WaylandPrepareJobStartError>
     where
@@ -254,7 +252,7 @@ impl WaylandPrepareJob {
             .spawn(move || {
                 prepare_worker(
                     &source,
-                    fps,
+                    cadence,
                     backend_factory,
                     &command_receiver,
                     &event_sender,
@@ -330,6 +328,7 @@ impl WaylandPrepareJob {
             paused: false,
             terminal_requested: false,
             retarget: Some(RecordingRetarget::new(source, crop)),
+            snapshot_requests: std::collections::VecDeque::new(),
         })
     }
 
@@ -399,14 +398,14 @@ impl Drop for WaylandPrepareJob {
 
 fn prepare_worker<F>(
     source: &CaptureSource,
-    fps: u32,
+    cadence: CaptureCadence,
     backend_factory: F,
     commands: &Receiver<WorkerCommand>,
     events: &Sender<WorkerMessage>,
 ) where
     F: FnOnce() -> Result<Box<dyn CaptureBackend>, WaylandPrepareJobError>,
 {
-    let result = prepare_worker_inner(source, fps, backend_factory, commands, events);
+    let result = prepare_worker_inner(source, cadence, backend_factory, commands, events);
     if let Some(result) = result {
         let _ = events.send(WorkerMessage::Finished(result));
     }
@@ -415,7 +414,7 @@ fn prepare_worker<F>(
 /// `None` means the UI receiver disappeared, so there is nobody to notify.
 fn prepare_worker_inner<F>(
     source: &CaptureSource,
-    fps: u32,
+    cadence: CaptureCadence,
     backend_factory: F,
     commands: &Receiver<WorkerCommand>,
     events: &Sender<WorkerMessage>,
@@ -445,7 +444,7 @@ where
     {
         return None;
     }
-    let mut session = match start_full_source_session(&*backend, source, fps) {
+    let mut session = match start_full_source_session(&*backend, source, cadence) {
         Ok(session) => session,
         Err(WaylandPrepareJobError::StartSession(error))
             if error.kind() == gif_from_screen_capture::CaptureErrorKind::PermissionRequired =>
@@ -590,14 +589,13 @@ fn run_committed_recording(
 fn start_full_source_session(
     backend: &dyn CaptureBackend,
     source: &CaptureSource,
-    fps: u32,
+    cadence: CaptureCadence,
 ) -> Result<Box<dyn CaptureSession>, WaylandPrepareJobError> {
     let target = match source.kind() {
         CaptureSourceKind::Monitor => CaptureTarget::Monitor(source.id().clone()),
         CaptureSourceKind::Window => CaptureTarget::Window(source.id().clone()),
         _ => return Err(WaylandPrepareJobError::UnsupportedSource),
     };
-    let cadence = CaptureCadence::fixed_fps(fps).map_err(WaylandPrepareJobError::Cadence)?;
     let mut request = CaptureRequest::new(target, cadence);
     request.cursor = CursorCaptureMode::Automatic;
     backend
@@ -678,6 +676,7 @@ mod tests {
         pause_thread: Option<ThreadId>,
         discard_thread: Option<ThreadId>,
         start_calls: usize,
+        started_cadence: Option<CaptureCadence>,
     }
 
     struct FakeSession {
@@ -777,6 +776,7 @@ mod tests {
             let mut signals = self.signals.lock().unwrap();
             signals.start_thread = Some(thread::current().id());
             signals.start_calls += 1;
+            signals.started_cadence = Some(request.cadence);
             drop(signals);
             if let Some(gate) = self.start_gate.lock().unwrap().take() {
                 let _ = gate.recv();
@@ -862,8 +862,12 @@ mod tests {
             discarded_tx,
             Some(release_rx),
         );
-        job.start_with(source_without_geometry(), 30, move || Ok(backend))
-            .unwrap();
+        job.start_with(
+            source_without_geometry(),
+            CaptureCadence::fixed_fps(30).unwrap(),
+            move || Ok(backend),
+        )
+        .unwrap();
         let _ = job.drain();
 
         for _ in 0..500 {
@@ -896,14 +900,19 @@ mod tests {
             discarded_tx,
             None,
         );
-        job.start_with(source_without_geometry(), 30, move || Ok(backend))
-            .unwrap();
+        job.start_with(
+            source_without_geometry(),
+            CaptureCadence::Manual,
+            move || Ok(backend),
+        )
+        .unwrap();
 
         let preview = wait_for_preview(&mut job);
         assert_eq!(preview.size(), PhysicalSize::new(2, 1).unwrap());
         assert_eq!(job.state(), WaylandPrepareJobState::Prepared);
         let worker_threads = signals.lock().unwrap();
         assert!(worker_threads.paused);
+        assert_eq!(worker_threads.started_cadence, Some(CaptureCadence::Manual));
         assert_eq!(worker_threads.start_thread, worker_threads.pause_thread);
         assert_ne!(worker_threads.start_thread, Some(thread::current().id()));
         drop(worker_threads);
@@ -927,8 +936,12 @@ mod tests {
             discarded_tx,
             None,
         );
-        job.start_with(source_without_geometry(), 30, move || Ok(backend))
-            .unwrap();
+        job.start_with(
+            source_without_geometry(),
+            CaptureCadence::fixed_fps(30).unwrap(),
+            move || Ok(backend),
+        )
+        .unwrap();
         let _ = wait_for_preview(&mut job);
 
         drop(job);
@@ -937,6 +950,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the test keeps countdown, prepared-session handoff, manual triggers, crop persistence, and acknowledgements in one lifecycle"
+    )]
     fn nonzero_countdown_commits_the_same_session_and_persists_cropped_frames() {
         use crate::RecordingSettings;
         use crate::countdown::{CountdownStart, CountdownTick, RecordingCountdown};
@@ -971,7 +988,11 @@ mod tests {
         let backend = backend(frames, signals.clone(), discarded_tx, None);
         let mut preparation = WaylandPrepareJob::default();
         preparation
-            .start_with(source_without_geometry(), 30, move || Ok(backend))
+            .start_with(
+                source_without_geometry(),
+                CaptureCadence::Manual,
+                move || Ok(backend),
+            )
             .unwrap();
         let _ = wait_for_preview(&mut preparation);
 
@@ -991,7 +1012,11 @@ mod tests {
             settings: RecordingSettings {
                 output: output.to_string_lossy().into_owned(),
                 duration_ms: 100,
+                cadence: crate::RecordingCadenceChoice::Manual,
                 fps: 30,
+                interval_count: 1,
+                interval_unit: crate::RecordingIntervalUnit::Seconds,
+                manual_frame_duration_ms: 100,
                 countdown_seconds: 2,
                 changes_only: false,
                 region_enabled: true,
@@ -1007,6 +1032,8 @@ mod tests {
             canvas: ProjectSize::new(1, 1).unwrap(),
         };
         let recording = preparation.commit_crop(crop, worker).unwrap();
+        let mut first_snapshot = recording.controller.trigger_snapshot();
+        let mut boundary_snapshot = recording.controller.trigger_snapshot();
         let completion = loop {
             match recording
                 .receiver
@@ -1021,6 +1048,17 @@ mod tests {
             panic!("prepared recording did not complete successfully");
         };
         assert_eq!(signals.lock().unwrap().start_calls, 1);
+        assert!(matches!(
+            first_snapshot.status(),
+            gif_from_screen_workflow::SnapshotTriggerStatus::Captured(receipt)
+                if receipt.sequence() == 1 && receipt.captured_at().as_micros() == 100
+        ));
+        assert_eq!(
+            boundary_snapshot.status(),
+            gif_from_screen_workflow::SnapshotTriggerStatus::Rejected(
+                gif_from_screen_workflow::SnapshotTriggerRejection::CollectionEnded
+            )
+        );
         assert_eq!(
             project.manifest().canvas.size,
             ProjectSize::new(1, 1).unwrap()

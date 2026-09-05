@@ -21,7 +21,7 @@ mod static_sequence_ui;
 mod wayland_prepare_job;
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     ffi::{OsStr, OsString},
     fs, io,
     num::NonZeroU64,
@@ -67,9 +67,9 @@ use gif_from_screen_media::{
 use gif_from_screen_project::{ActiveProject, LockPolicy, OpenedProject, ProjectError};
 use gif_from_screen_workflow::{
     CollectOptions, CollectionLimit, FrameRetention, RecordingControl, RecordingController,
-    RecordingFrameSink, RecordingFrameSinkError, TargetUpdateRequest, TargetUpdateStatus,
-    WorkflowError, WorkflowProgress, collect_controlled_to_sink,
-    collect_prestarted_controlled_to_sink,
+    RecordingFrameSink, RecordingFrameSinkError, SnapshotTriggerRequest, SnapshotTriggerStatus,
+    TargetUpdateRequest, TargetUpdateStatus, WorkflowError, WorkflowProgress,
+    collect_controlled_to_sink, collect_prestarted_controlled_to_sink,
 };
 use import_gif_job::{ImportGifJob, ImportGifJobEvent, ImportGifJobState};
 use import_static_image_job::{
@@ -160,11 +160,31 @@ enum FileDropActivity {
     Export,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum RecordingCadenceChoice {
+    #[default]
+    FixedFps,
+    Periodic,
+    Manual,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum RecordingIntervalUnit {
+    #[default]
+    Seconds,
+    Minutes,
+    Hours,
+}
+
 #[derive(Clone, Debug)]
 struct RecordingSettings {
     output: String,
     duration_ms: u64,
+    cadence: RecordingCadenceChoice,
     fps: u32,
+    interval_count: u32,
+    interval_unit: RecordingIntervalUnit,
+    manual_frame_duration_ms: u64,
     countdown_seconds: u8,
     changes_only: bool,
     region_enabled: bool,
@@ -184,7 +204,11 @@ impl Default for RecordingSettings {
         Self {
             output,
             duration_ms: 0,
+            cadence: RecordingCadenceChoice::FixedFps,
             fps: 10,
+            interval_count: 1,
+            interval_unit: RecordingIntervalUnit::Seconds,
+            manual_frame_duration_ms: 100,
             countdown_seconds: 3,
             changes_only: false,
             region_enabled: true,
@@ -387,6 +411,7 @@ struct RecordingJob {
     paused: bool,
     terminal_requested: bool,
     retarget: Option<RecordingRetarget>,
+    snapshot_requests: VecDeque<SnapshotTriggerRequest>,
 }
 
 struct RecordingRetarget {
@@ -472,6 +497,45 @@ impl RecordingJob {
             retarget.disable();
         }
     }
+
+    fn trigger_snapshot(&mut self) {
+        if !self.terminal_requested {
+            self.snapshot_requests
+                .push_back(self.controller.trigger_snapshot());
+        }
+    }
+
+    fn poll_snapshots(&mut self) -> Option<String> {
+        let request_count = self.snapshot_requests.len();
+        let mut notice = None;
+        for _ in 0..request_count {
+            let Some(mut request) = self.snapshot_requests.pop_front() else {
+                break;
+            };
+            match request.status() {
+                SnapshotTriggerStatus::Pending => self.snapshot_requests.push_back(request),
+                SnapshotTriggerStatus::Captured(receipt) => {
+                    notice = Some(format!(
+                        "Snapshot captured from native frame {} at {:.3}s.",
+                        receipt.sequence(),
+                        Duration::from_micros(receipt.captured_at().as_micros()).as_secs_f64()
+                    ));
+                }
+                SnapshotTriggerStatus::Rejected(reason) => {
+                    notice = Some(format!("Snapshot was not captured: {reason}"));
+                }
+                SnapshotTriggerStatus::WorkerExited => {
+                    notice = Some(
+                        "Snapshot was not captured because the recording worker exited.".to_owned(),
+                    );
+                }
+                _ => {
+                    self.snapshot_requests.push_back(request);
+                }
+            }
+        }
+        notice
+    }
 }
 
 struct RegionPicker {
@@ -522,6 +586,7 @@ enum RecorderOverlayAction {
     CancelCountdown,
     Pause,
     Resume,
+    Snapshot,
     Stop,
     Discard,
     Close,
@@ -1381,15 +1446,8 @@ impl GifFromScreenApp {
                         .range(0..=MAX_RECORDING_DURATION_MS),
                 );
                 ui.end_row();
-                ui.label("Frames per second");
-                ui.add(egui::DragValue::new(&mut self.settings.fps).range(1..=60));
-                ui.end_row();
-                ui.label("Frame retention");
-                ui.checkbox(
-                    &mut self.settings.changes_only,
-                    "Store only frames whose pixels changed",
-                );
-                ui.end_row();
+                show_recording_cadence_settings(ui, &mut self.settings);
+                show_frame_retention_setting(ui, &mut self.settings);
                 ui.label("Start countdown (seconds)");
                 ui.add(
                     egui::DragValue::new(&mut self.settings.countdown_seconds)
@@ -1675,6 +1733,9 @@ impl GifFromScreenApp {
         if retarget_notice.is_some() {
             self.notice = retarget_notice;
         }
+        if let Some(snapshot_notice) = self.job.as_mut().and_then(RecordingJob::poll_snapshots) {
+            self.notice = Some(snapshot_notice);
+        }
         let mut builder = egui::ViewportBuilder::default()
             .with_title("GifFromScreen recorder")
             .with_transparent(true)
@@ -1693,11 +1754,18 @@ impl GifFromScreenApp {
         }
         let progress = self.progress;
         let source_geometry = overlay.source_geometry;
+        let manual_snapshots = self.settings.cadence == RecordingCadenceChoice::Manual;
         let frame = context.show_viewport_immediate(
             recorder_viewport_id(),
             builder,
             |viewport_context, _class| {
-                draw_recorder_overlay(viewport_context, stage, progress, source_geometry)
+                draw_recorder_overlay(
+                    viewport_context,
+                    stage,
+                    progress,
+                    source_geometry,
+                    manual_snapshots,
+                )
             },
         );
         if let Some(overlay) = &mut self.recorder_overlay {
@@ -1766,6 +1834,13 @@ impl GifFromScreenApp {
                     && job.controller.resume()
                 {
                     job.paused = false;
+                }
+            }
+            RecorderOverlayAction::Snapshot => {
+                if let Some(job) = &mut self.job {
+                    job.trigger_snapshot();
+                    self.notice = Some("Manual snapshot requested…".to_owned());
+                    context.request_repaint();
                 }
             }
             RecorderOverlayAction::Stop => {
@@ -1910,6 +1985,7 @@ impl GifFromScreenApp {
             paused: false,
             terminal_requested: false,
             retarget,
+            snapshot_requests: VecDeque::new(),
         });
         Ok(())
     }
@@ -2008,8 +2084,9 @@ impl GifFromScreenApp {
             .cloned()
             .ok_or_else(|| "No Wayland portal source is selected.".to_owned())?;
         self.wayland_frozen_preview = None;
+        let cadence = recording_cadence(&self.settings)?;
         self.wayland_prepare_job
-            .start(source, self.settings.fps)
+            .start(source, cadence)
             .map_err(|error| error.to_string())?;
         self.notice = Some(
             "Opening the Wayland system chooser in the background. Select a screen or window to prepare its frozen preview."
@@ -2223,10 +2300,14 @@ impl GifFromScreenApp {
         if retarget_notice.is_some() {
             self.notice = retarget_notice;
         }
+        if let Some(snapshot_notice) = self.job.as_mut().and_then(RecordingJob::poll_snapshots) {
+            self.notice = Some(snapshot_notice);
+        }
         let Some(mut controller) = self.wayland_crop_controller.take() else {
             return;
         };
         let progress = self.progress;
+        let manual_snapshots = self.settings.cadence == RecordingCadenceChoice::Manual;
         let frame = context.show_viewport_immediate(
             recorder_viewport_id(),
             egui::ViewportBuilder::default()
@@ -2238,7 +2319,13 @@ impl GifFromScreenApp {
                 .with_always_on_top()
                 .with_taskbar(false),
             |viewport_context, _class| {
-                draw_wayland_crop_controller(viewport_context, stage, progress, &mut controller)
+                draw_wayland_crop_controller(
+                    viewport_context,
+                    stage,
+                    progress,
+                    &mut controller,
+                    manual_snapshots,
+                )
             },
         );
         let region = frame.region.unwrap_or(controller.region);
@@ -2282,6 +2369,13 @@ impl GifFromScreenApp {
                     && job.controller.resume()
                 {
                     job.paused = false;
+                }
+            }
+            RecorderOverlayAction::Snapshot => {
+                if let Some(job) = &mut self.job {
+                    job.trigger_snapshot();
+                    self.notice = Some("Manual snapshot requested…".to_owned());
+                    context.request_repaint();
                 }
             }
             RecorderOverlayAction::Stop => {
@@ -3058,8 +3152,10 @@ fn draw_wayland_crop_controller(
     stage: RecorderStage,
     progress: Option<WorkflowProgress>,
     controller: &mut WaylandCropController,
+    manual_snapshots: bool,
 ) -> RecorderOverlayFrame {
-    let mut action = draw_wayland_controller_toolbar(context, stage, progress, controller);
+    let mut action =
+        draw_wayland_controller_toolbar(context, stage, progress, controller, manual_snapshots);
     let region = egui::CentralPanel::default()
         .frame(egui::Frame::new().fill(egui::Color32::from_rgb(16, 18, 22)))
         .show(context, |ui| {
@@ -3089,6 +3185,7 @@ fn draw_wayland_controller_toolbar(
     stage: RecorderStage,
     progress: Option<WorkflowProgress>,
     controller: &mut WaylandCropController,
+    manual_snapshots: bool,
 ) -> RecorderOverlayAction {
     let mut action = RecorderOverlayAction::None;
     egui::TopBottomPanel::bottom("wayland_crop_controls")
@@ -3127,6 +3224,9 @@ fn draw_wayland_controller_toolbar(
                 }
                 RecorderStage::Recording => {
                     show_overlay_progress(ui, progress);
+                    if manual_snapshots && ui.button("Take snapshot").clicked() {
+                        action = RecorderOverlayAction::Snapshot;
+                    }
                     if ui.button("Pause").clicked() {
                         action = RecorderOverlayAction::Pause;
                     }
@@ -3330,8 +3430,9 @@ fn draw_recorder_overlay(
     stage: RecorderStage,
     progress: Option<WorkflowProgress>,
     source_geometry: PhysicalRect,
+    manual_snapshots: bool,
 ) -> RecorderOverlayFrame {
-    let mut action = draw_recorder_toolbar(context, stage, progress);
+    let mut action = draw_recorder_toolbar(context, stage, progress, manual_snapshots);
     let central = egui::CentralPanel::default()
         .frame(
             egui::Frame::new()
@@ -3381,6 +3482,7 @@ fn draw_recorder_toolbar(
     context: &egui::Context,
     stage: RecorderStage,
     progress: Option<WorkflowProgress>,
+    manual_snapshots: bool,
 ) -> RecorderOverlayAction {
     let mut action = RecorderOverlayAction::None;
     egui::TopBottomPanel::bottom("recorder_controls")
@@ -3408,6 +3510,9 @@ fn draw_recorder_toolbar(
             RecorderStage::Recording => {
                 ui.horizontal_centered(|ui| {
                     show_overlay_progress(ui, progress);
+                    if manual_snapshots && ui.button("Take snapshot").clicked() {
+                        action = RecorderOverlayAction::Snapshot;
+                    }
                     if ui.button("Pause").clicked() {
                         action = RecorderOverlayAction::Pause;
                     }
@@ -4497,9 +4602,8 @@ fn validate_settings(settings: &RecordingSettings) -> Result<(), String> {
             "Maximum duration must be 0 (manual stop) or at most {MAX_RECORDING_DURATION_MS} ms."
         ));
     }
-    if !(1..=60).contains(&settings.fps) {
-        return Err("FPS must be between 1 and 60.".into());
-    }
+    let _ = recording_cadence(settings)?;
+    let _ = recording_tail_frame_duration(settings)?;
     if settings.countdown_seconds > MAX_COUNTDOWN_SECONDS {
         return Err(format!(
             "Countdown must be between 0 and {MAX_COUNTDOWN_SECONDS} seconds."
@@ -4530,6 +4634,150 @@ fn validate_settings(settings: &RecordingSettings) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+const fn recording_cadence_label(choice: RecordingCadenceChoice) -> &'static str {
+    match choice {
+        RecordingCadenceChoice::FixedFps => "Continuous FPS",
+        RecordingCadenceChoice::Periodic => "Periodic snapshots",
+        RecordingCadenceChoice::Manual => "Manual snapshots",
+    }
+}
+
+const fn recording_interval_unit_label(unit: RecordingIntervalUnit) -> &'static str {
+    match unit {
+        RecordingIntervalUnit::Seconds => "seconds",
+        RecordingIntervalUnit::Minutes => "minutes",
+        RecordingIntervalUnit::Hours => "hours",
+    }
+}
+
+fn show_recording_cadence_settings(ui: &mut egui::Ui, settings: &mut RecordingSettings) {
+    ui.label("Capture frequency");
+    egui::ComboBox::from_id_salt("recording_cadence")
+        .selected_text(recording_cadence_label(settings.cadence))
+        .show_ui(ui, |ui| {
+            for choice in [
+                RecordingCadenceChoice::FixedFps,
+                RecordingCadenceChoice::Periodic,
+                RecordingCadenceChoice::Manual,
+            ] {
+                ui.selectable_value(
+                    &mut settings.cadence,
+                    choice,
+                    recording_cadence_label(choice),
+                );
+            }
+        });
+    ui.end_row();
+    match settings.cadence {
+        RecordingCadenceChoice::FixedFps => {
+            ui.label("Frames per second");
+            ui.add(egui::DragValue::new(&mut settings.fps).range(1..=60));
+            ui.end_row();
+        }
+        RecordingCadenceChoice::Periodic => {
+            ui.label("Periodic snapshot interval");
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut settings.interval_count).range(1..=10_000));
+                egui::ComboBox::from_id_salt("recording_interval_unit")
+                    .selected_text(recording_interval_unit_label(settings.interval_unit))
+                    .show_ui(ui, |ui| {
+                        for unit in [
+                            RecordingIntervalUnit::Seconds,
+                            RecordingIntervalUnit::Minutes,
+                            RecordingIntervalUnit::Hours,
+                        ] {
+                            ui.selectable_value(
+                                &mut settings.interval_unit,
+                                unit,
+                                recording_interval_unit_label(unit),
+                            );
+                        }
+                    });
+            });
+            ui.end_row();
+        }
+        RecordingCadenceChoice::Manual => {
+            ui.label("Final manual frame duration (ms)");
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut settings.manual_frame_duration_ms)
+                        .range(1..=MAX_RECORDING_DURATION_MS),
+                );
+                ui.weak("Earlier frame durations follow the time between snapshot clicks.");
+            });
+            ui.end_row();
+        }
+    }
+}
+
+fn show_frame_retention_setting(ui: &mut egui::Ui, settings: &mut RecordingSettings) {
+    ui.label("Frame retention");
+    ui.horizontal_wrapped(|ui| {
+        ui.add_enabled_ui(settings.cadence != RecordingCadenceChoice::Manual, |ui| {
+            ui.checkbox(
+                &mut settings.changes_only,
+                "Store only frames whose pixels changed",
+            );
+        });
+        if settings.cadence == RecordingCadenceChoice::Manual {
+            ui.weak("Every manual trigger is retained, including identical pixels.");
+        }
+    });
+    ui.end_row();
+}
+
+fn recording_period(settings: &RecordingSettings) -> Result<Duration, String> {
+    if settings.interval_count == 0 {
+        return Err("Periodic snapshot interval must be at least one unit.".to_owned());
+    }
+    let seconds_per_unit = match settings.interval_unit {
+        RecordingIntervalUnit::Seconds => 1_u64,
+        RecordingIntervalUnit::Minutes => 60,
+        RecordingIntervalUnit::Hours => 3_600,
+    };
+    let seconds = u64::from(settings.interval_count)
+        .checked_mul(seconds_per_unit)
+        .ok_or_else(|| "Periodic snapshot interval is too large.".to_owned())?;
+    Ok(Duration::from_secs(seconds))
+}
+
+fn recording_cadence(settings: &RecordingSettings) -> Result<CaptureCadence, String> {
+    match settings.cadence {
+        RecordingCadenceChoice::FixedFps => {
+            if !(1..=60).contains(&settings.fps) {
+                return Err("FPS must be between 1 and 60.".to_owned());
+            }
+            CaptureCadence::fixed_fps(settings.fps).map_err(|error| error.to_string())
+        }
+        RecordingCadenceChoice::Periodic => {
+            CaptureCadence::interval(recording_period(settings)?).map_err(|error| error.to_string())
+        }
+        RecordingCadenceChoice::Manual => Ok(CaptureCadence::Manual),
+    }
+}
+
+fn recording_tail_frame_duration(settings: &RecordingSettings) -> Result<Duration, String> {
+    match settings.cadence {
+        RecordingCadenceChoice::FixedFps => {
+            if !(1..=60).contains(&settings.fps) {
+                return Err("FPS must be between 1 and 60.".to_owned());
+            }
+            Ok(Duration::from_micros(1_000_000 / u64::from(settings.fps)))
+        }
+        RecordingCadenceChoice::Periodic => recording_period(settings),
+        RecordingCadenceChoice::Manual => {
+            if settings.manual_frame_duration_ms == 0
+                || settings.manual_frame_duration_ms > MAX_RECORDING_DURATION_MS
+            {
+                return Err(format!(
+                    "Final manual frame duration must be between 1 and {MAX_RECORDING_DURATION_MS} ms."
+                ));
+            }
+            Ok(Duration::from_millis(settings.manual_frame_duration_ms))
+        }
+    }
 }
 
 fn run_incremental_x11_recording(
@@ -4611,13 +4859,23 @@ fn run_incremental_prestarted_recording(
         }
     };
     let mut sink = IncrementalProjectFrameSink::new(project);
+    let options = match collection_options(&worker.settings) {
+        Ok(options) => options,
+        Err(error) => {
+            let _ = session.discard();
+            return RecordingCompletion::Failed {
+                error,
+                recovery_path: Some(sink.root().to_path_buf()),
+            };
+        }
+    };
     let collection = session
         .resume()
         .map_err(WorkflowError::from)
         .and_then(|()| {
             collect_prestarted_controlled_to_sink(
                 session,
-                &collection_options(&worker.settings),
+                &options,
                 control,
                 &mut sink,
                 cancellation,
@@ -4717,12 +4975,16 @@ fn collect_x11_recording(
             }
         }
     };
-    let mut request = CaptureRequest::new(target, CaptureCadence::fixed_fps(worker.settings.fps)?);
+    let cadence = recording_cadence(&worker.settings)
+        .map_err(gif_from_screen_capture::CaptureError::invalid_request)?;
+    let mut request = CaptureRequest::new(target, cadence);
     request.cursor = CursorCaptureMode::Embedded;
+    let options = collection_options(&worker.settings)
+        .map_err(gif_from_screen_capture::CaptureError::invalid_request)?;
     collect_controlled_to_sink(
         &backend,
         request,
-        &collection_options(&worker.settings),
+        &options,
         control,
         sink,
         cancellation,
@@ -4731,13 +4993,13 @@ fn collect_x11_recording(
     .map(|_| ())
 }
 
-fn collection_options(settings: &RecordingSettings) -> CollectOptions {
-    CollectOptions {
+fn collection_options(settings: &RecordingSettings) -> Result<CollectOptions, String> {
+    Ok(CollectOptions {
         limit: collection_limit(settings.duration_ms),
         frame_retention: frame_retention(settings.changes_only),
-        tail_frame_duration: Duration::from_micros(1_000_000 / u64::from(settings.fps)),
+        tail_frame_duration: recording_tail_frame_duration(settings)?,
         ..CollectOptions::default()
-    }
+    })
 }
 
 fn collection_limit(duration_ms: u64) -> CollectionLimit {
@@ -5022,7 +5284,9 @@ mod tests {
         DEFAULT_BLANK_FRAME_LIMIT_BYTES, IncrementalRecordingProject,
         IncrementalRecordingProjectOptions, ProjectFrameSelection, ProjectGifExportReport,
     };
-    use gif_from_screen_capture::{CaptureSourceId, CaptureSourceKind, PhysicalRect};
+    use gif_from_screen_capture::{
+        CaptureCadence, CaptureSourceId, CaptureSourceKind, PhysicalRect,
+    };
     use gif_from_screen_domain::{
         AssetDescriptor, AssetKind, Canvas, CanvasBackground, CaptureMetadata, ClipTransform,
         ColorSpace, DurationUs, EditCommand, FrameClip, FrameId, PhysicalSize as DomainSize,
@@ -5045,16 +5309,17 @@ mod tests {
         ExportFrameScope, ExportLoopChoice, ExportPaletteChoice, ExportQuantizerChoice,
         FileDropActivity, FileDropCandidate, FileDropRoute, GifFromScreenApp,
         IncrementalProjectFrameSink, MAX_COUNTDOWN_SECONDS, MAX_RECORDING_DURATION_MS,
-        RecorderOverlayAction, RecorderStage, RecordingSettings, RecordingWorkerRequest,
-        StartupIntent, activate_editor, apply_overlay_region, build_blank_project_request,
-        build_project_export_options, build_static_sequence_request, can_navigate_back,
-        collection_limit, collection_options, create_incremental_recording_project,
-        default_gif_path_for_project, default_sequence_project_path, edited_gif_path_for_import,
-        editor_result_notice, export_job_is_active, export_result_notice, file_drop_block_reason,
-        fit_dimensions, frame_retention, has_static_image_extension, initial_wayland_region,
-        landing_cards_fit, map_preview_selection, open_project_controls_enabled,
-        open_project_lock_policy, parse_startup_intent, prepare_file_drop_route,
-        project_path_for_output, recording_project_canvas, remove_completed_project,
+        RecorderOverlayAction, RecorderStage, RecordingCadenceChoice, RecordingIntervalUnit,
+        RecordingSettings, RecordingWorkerRequest, StartupIntent, activate_editor,
+        apply_overlay_region, build_blank_project_request, build_project_export_options,
+        build_static_sequence_request, can_navigate_back, collection_limit, collection_options,
+        create_incremental_recording_project, default_gif_path_for_project,
+        default_sequence_project_path, edited_gif_path_for_import, editor_result_notice,
+        export_job_is_active, export_result_notice, file_drop_block_reason, fit_dimensions,
+        frame_retention, has_static_image_extension, initial_wayland_region, landing_cards_fit,
+        map_preview_selection, open_project_controls_enabled, open_project_lock_policy,
+        parse_startup_intent, prepare_file_drop_route, project_path_for_output, recording_cadence,
+        recording_project_canvas, recording_tail_frame_duration, remove_completed_project,
         remove_recording_project_path, resize_nearest_rgba, resolve_export_selection,
         route_file_drop, should_sync_retarget, show_editor_scroll_area,
         static_sequence_duration_policy, static_sequence_loop_behavior, translate_source_region,
@@ -5100,6 +5365,17 @@ mod tests {
         assert!(validate_settings(&settings).is_ok());
         settings.fps = 0;
         assert!(validate_settings(&settings).is_err());
+        settings.cadence = RecordingCadenceChoice::Manual;
+        assert!(validate_settings(&settings).is_ok());
+        settings.manual_frame_duration_ms = 0;
+        assert!(validate_settings(&settings).is_err());
+        settings.manual_frame_duration_ms = 100;
+        settings.cadence = RecordingCadenceChoice::Periodic;
+        settings.interval_count = 0;
+        assert!(validate_settings(&settings).is_err());
+        settings.interval_count = 1;
+        assert!(validate_settings(&settings).is_ok());
+        settings.cadence = RecordingCadenceChoice::FixedFps;
         settings.fps = 10;
         settings.output = "capture.mp4".into();
         assert!(validate_settings(&settings).is_err());
@@ -5434,10 +5710,75 @@ mod tests {
             changes_only: true,
             ..RecordingSettings::default()
         };
-        let options = collection_options(&settings);
+        let options = collection_options(&settings).unwrap();
         assert!(matches!(options.limit, CollectionLimit::UntilStopped));
         assert_eq!(options.frame_retention, FrameRetention::ChangesOnly);
         assert_eq!(options.tail_frame_duration, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn recording_cadence_and_tail_cover_fps_periodic_and_manual_modes() {
+        let fixed = RecordingSettings {
+            fps: 25,
+            ..RecordingSettings::default()
+        };
+        assert!(matches!(
+            recording_cadence(&fixed).unwrap(),
+            CaptureCadence::FixedFps(fps) if fps.get() == 25
+        ));
+        assert_eq!(
+            recording_tail_frame_duration(&fixed).unwrap(),
+            Duration::from_millis(40)
+        );
+
+        for (unit, count, expected) in [
+            (RecordingIntervalUnit::Seconds, 2, Duration::from_secs(2)),
+            (RecordingIntervalUnit::Minutes, 3, Duration::from_secs(180)),
+            (RecordingIntervalUnit::Hours, 4, Duration::from_secs(14_400)),
+        ] {
+            let periodic = RecordingSettings {
+                cadence: RecordingCadenceChoice::Periodic,
+                interval_count: count,
+                interval_unit: unit,
+                ..RecordingSettings::default()
+            };
+            assert_eq!(
+                recording_cadence(&periodic).unwrap(),
+                CaptureCadence::Interval(expected)
+            );
+            assert_eq!(recording_tail_frame_duration(&periodic).unwrap(), expected);
+            assert_eq!(
+                collection_options(&periodic).unwrap().tail_frame_duration,
+                expected
+            );
+        }
+
+        let manual = RecordingSettings {
+            cadence: RecordingCadenceChoice::Manual,
+            manual_frame_duration_ms: 250,
+            fps: 0,
+            ..RecordingSettings::default()
+        };
+        assert_eq!(recording_cadence(&manual).unwrap(), CaptureCadence::Manual);
+        assert_eq!(
+            recording_tail_frame_duration(&manual).unwrap(),
+            Duration::from_millis(250)
+        );
+
+        for invalid in [
+            RecordingSettings {
+                cadence: RecordingCadenceChoice::Periodic,
+                interval_count: 0,
+                ..RecordingSettings::default()
+            },
+            RecordingSettings {
+                cadence: RecordingCadenceChoice::Manual,
+                manual_frame_duration_ms: 0,
+                ..RecordingSettings::default()
+            },
+        ] {
+            assert!(recording_cadence(&invalid).is_err() || collection_options(&invalid).is_err());
+        }
     }
 
     #[test]
@@ -7000,6 +7341,10 @@ mod tests {
         assert!(should_sync_retarget(
             RecorderStage::Paused,
             RecorderOverlayAction::Resume
+        ));
+        assert!(should_sync_retarget(
+            RecorderStage::Recording,
+            RecorderOverlayAction::Snapshot
         ));
         for action in [
             RecorderOverlayAction::Stop,
