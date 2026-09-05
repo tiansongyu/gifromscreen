@@ -9,9 +9,9 @@ use std::{
 };
 
 use gif_from_screen_domain::{
-    BlendMode, DurationUs, EditCommand, Effect, FrameId, OverlayContent, OverlayId, OverlayItem,
-    OverlayTrack, PhysicalRect, PhysicalSize, ProjectManifest, TimeUs, TimelineSpan, TrackId,
-    Transition,
+    AssetDescriptor, AssetKind, BlendMode, DurationUs, EditCommand, Effect, FrameId,
+    OverlayContent, OverlayId, OverlayItem, OverlayTrack, PhysicalPoint, PhysicalRect,
+    PhysicalSize, ProjectManifest, RasterEncoding, TimeUs, TimelineSpan, TrackId, Transition,
 };
 use gif_from_screen_editor::{
     ClipTransformEdit, DuplicateDelayMode, DuplicateFrameRetention, EditorError, EditorStatistics,
@@ -27,8 +27,8 @@ use gif_from_screen_editor::{
     set_transition_after, yoyo_frames,
 };
 use gif_from_screen_project::{
-    ActiveProject, AssetIssue, CommitReceipt, JournalRecoveryReport, LockPolicy, OpenedProject,
-    ProjectError,
+    ActiveProject, AssetIssue, AssetStore, CommitReceipt, JournalRecoveryReport, LockPolicy,
+    OpenedProject, ProjectError,
 };
 use gif_from_screen_render::RgbaSurface;
 use thiserror::Error;
@@ -38,6 +38,17 @@ use crate::editor_preview::{EditorPreviewError, render_frame_surface};
 
 const MAX_SYNCHRONOUS_DUPLICATE_SCAN_FRAMES: usize = 256;
 const DUPLICATE_RENDER_SURFACE_LIMIT_BYTES: usize = 128 * 1024 * 1024;
+
+pub(crate) struct RasterOverlayEdit {
+    pub(crate) name: String,
+    pub(crate) source_size: PhysicalSize,
+    pub(crate) position: PhysicalPoint,
+    pub(crate) display_size: PhysicalSize,
+    pub(crate) item_opacity: u8,
+    pub(crate) track_opacity: u8,
+    pub(crate) blend_mode: BlendMode,
+    pub(crate) z_index: i32,
+}
 
 /// Durable editor state owned by the desktop application.
 ///
@@ -271,6 +282,97 @@ impl EditorWorkspace {
         track_id: TrackId,
     ) -> Result<(), EditorWorkspaceError> {
         self.execute(EditCommand::RemoveOverlayTrack { track_id })
+    }
+
+    pub(crate) fn add_raster_overlay_for_selection(
+        &mut self,
+        edit: RasterOverlayEdit,
+        rgba: &[u8],
+    ) -> Result<TrackId, EditorWorkspaceError> {
+        if edit.name.trim().is_empty() {
+            return Err(EditorWorkspaceError::EmptyOverlayName);
+        }
+        if edit.item_opacity == 0 || edit.track_opacity == 0 {
+            return Err(EditorWorkspaceError::InvisibleRasterOverlay);
+        }
+        let placement = PhysicalRect {
+            origin: edit.position,
+            size: edit.display_size,
+        };
+        if !placement.fits_within(self.project.manifest().canvas.size) {
+            return Err(EditorWorkspaceError::RasterOverlayOutsideCanvas);
+        }
+        let expected = edit
+            .source_size
+            .area()
+            .and_then(|pixels| pixels.checked_mul(4))
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or(EditorWorkspaceError::RasterOverlayByteLengthOverflow)?;
+        if rgba.len() != expected {
+            return Err(EditorWorkspaceError::RasterOverlayByteLengthMismatch {
+                expected,
+                actual: rgba.len(),
+            });
+        }
+        let asset_id = AssetStore::id_for_bytes(rgba);
+        let existing = self.project.manifest().assets.get(&asset_id);
+        let asset_registered = existing.is_some();
+        if let Some(descriptor) = existing {
+            let compatible = matches!(
+                descriptor.kind,
+                AssetKind::Frame { size, encoding }
+                    | AssetKind::OverlayImage { size, encoding }
+                    | AssetKind::Mask { size, encoding }
+                    if size == edit.source_size && encoding == RasterEncoding::Rgba8
+            ) && descriptor.byte_len
+                == u64::try_from(expected).unwrap_or(u64::MAX);
+            if !compatible {
+                return Err(EditorWorkspaceError::RasterOverlayAssetCollision { asset_id });
+            }
+        }
+        let stored_id = self.project.assets().put(rgba)?;
+        debug_assert_eq!(stored_id, asset_id);
+        let span = self.selected_timeline_span()?;
+        let track_id = TrackId::from_u128(Uuid::new_v4().as_u128());
+        let overlay_id = OverlayId::from_u128(Uuid::new_v4().as_u128());
+        let mut commands = Vec::with_capacity(2);
+        if !asset_registered {
+            commands.push(EditCommand::RegisterAsset {
+                asset: AssetDescriptor {
+                    id: asset_id,
+                    byte_len: u64::try_from(expected)
+                        .map_err(|_| EditorWorkspaceError::RasterOverlayByteLengthOverflow)?,
+                    kind: AssetKind::OverlayImage {
+                        size: edit.source_size,
+                        encoding: RasterEncoding::Rgba8,
+                    },
+                },
+            });
+        }
+        commands.push(EditCommand::UpsertOverlayTrack {
+            track: OverlayTrack {
+                id: track_id,
+                name: edit.name,
+                visible: true,
+                opacity: edit.track_opacity,
+                blend_mode: edit.blend_mode,
+                items: vec![OverlayItem {
+                    id: overlay_id,
+                    span,
+                    z_index: edit.z_index,
+                    content: OverlayContent::Raster {
+                        asset_id,
+                        position: edit.position,
+                        size: edit.display_size,
+                        opacity: edit.item_opacity,
+                    },
+                }],
+            },
+        });
+        self.execute(EditCommand::Compound { commands })?;
+        self.asset_issues
+            .retain(|issue| asset_issue_id(issue) != asset_id);
+        Ok(track_id)
     }
 
     /// Projects current timeline, selection, delay, canvas, and asset statistics.
@@ -971,6 +1073,14 @@ fn selection_for_frame_ids(
     Ok(selection)
 }
 
+const fn asset_issue_id(issue: &AssetIssue) -> gif_from_screen_domain::AssetId {
+    match issue {
+        AssetIssue::Missing { asset_id }
+        | AssetIssue::LengthMismatch { asset_id, .. }
+        | AssetIssue::DigestMismatch { asset_id } => *asset_id,
+    }
+}
+
 fn push_bounded(history: &mut Vec<EditCommand>, command: EditCommand, limit: usize) {
     history.push(command);
     let excess = history.len().saturating_sub(limit);
@@ -1054,6 +1164,29 @@ pub(crate) enum EditorWorkspaceError {
     /// The selected overlay span could not be represented safely.
     #[error("selected overlay timeline span overflowed")]
     OverlayTimelineDurationOverflow,
+    /// Raster overlay opacity settings would make the new track invisible.
+    #[error("raster overlay item and track opacity must be greater than zero")]
+    InvisibleRasterOverlay,
+    /// Display placement must stay within the project canvas.
+    #[error("raster overlay placement must stay inside the project canvas")]
+    RasterOverlayOutsideCanvas,
+    /// Source dimensions cannot be represented as a raw RGBA byte length.
+    #[error("raster overlay RGBA byte length overflowed")]
+    RasterOverlayByteLengthOverflow,
+    /// Decoded bytes disagree with their declared dimensions.
+    #[error("raster overlay has {actual} RGBA bytes, expected {expected}")]
+    RasterOverlayByteLengthMismatch {
+        /// Required tightly packed RGBA byte count.
+        expected: usize,
+        /// Supplied decoded byte count.
+        actual: usize,
+    },
+    /// Content addressing found the same bytes under incompatible raster metadata.
+    #[error("raster overlay asset {asset_id} collides with incompatible raster metadata")]
+    RasterOverlayAssetCollision {
+        /// Existing content identity whose descriptor cannot represent this source.
+        asset_id: gif_from_screen_domain::AssetId,
+    },
     /// Session history must retain at least one entry.
     #[error("editor history limit must be greater than zero")]
     ZeroHistoryLimit,
@@ -1065,9 +1198,9 @@ mod tests {
 
     use gif_from_screen_domain::{
         AssetDescriptor, AssetId, AssetKind, BlendMode, Canvas, CanvasBackground, CaptureMetadata,
-        ClipTransform, ColorSpace, FrameClip, OverlayContent, PhysicalRect, PhysicalSize,
-        ProjectId, ProjectManifest, ProjectRevision, QuarterTurn, RasterEncoding, Rgba, ShapeKind,
-        SlideDirection, Timeline, TransitionKind, UnixTimeMs,
+        ClipTransform, ColorSpace, FrameClip, OverlayContent, PhysicalPoint, PhysicalPx,
+        PhysicalRect, PhysicalSize, ProjectId, ProjectManifest, ProjectRevision, QuarterTurn,
+        RasterEncoding, Rgba, ShapeKind, SlideDirection, Timeline, TransitionKind, UnixTimeMs,
     };
     use tempfile::TempDir;
 
@@ -2220,6 +2353,100 @@ mod tests {
                 .is_err()
         );
         assert_eq!(workspace.manifest().revision, revision);
+    }
+
+    #[test]
+    fn raster_overlay_import_reuses_compatible_content_and_rejects_geometry_collisions() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = create_workspace(&directory, &[10, 20], 8);
+        workspace.select_all();
+        let shared_pixels = vec![7_u8; 48];
+        let first = workspace
+            .add_raster_overlay_for_selection(
+                RasterOverlayEdit {
+                    name: "First logo".to_owned(),
+                    source_size: PhysicalSize::new(4, 3).unwrap(),
+                    position: PhysicalPoint {
+                        x: PhysicalPx::new(1),
+                        y: PhysicalPx::new(1),
+                    },
+                    display_size: PhysicalSize::new(2, 2).unwrap(),
+                    item_opacity: 220,
+                    track_opacity: 200,
+                    blend_mode: BlendMode::Multiply,
+                    z_index: 4,
+                },
+                &shared_pixels,
+            )
+            .unwrap();
+        assert_eq!(workspace.manifest().assets.len(), 2);
+        assert_eq!(workspace.manifest().timeline.overlay_tracks[0].id, first);
+        let second = workspace
+            .add_raster_overlay_for_selection(
+                RasterOverlayEdit {
+                    name: "Reused logo".to_owned(),
+                    source_size: PhysicalSize::new(4, 3).unwrap(),
+                    position: PhysicalPoint::default(),
+                    display_size: PhysicalSize::new(1, 1).unwrap(),
+                    item_opacity: 255,
+                    track_opacity: 255,
+                    blend_mode: BlendMode::Normal,
+                    z_index: 5,
+                },
+                &shared_pixels,
+            )
+            .unwrap();
+        assert_eq!(workspace.manifest().assets.len(), 2);
+        assert_eq!(workspace.manifest().timeline.overlay_tracks[1].id, second);
+
+        let revision = workspace.manifest().revision;
+        assert!(matches!(
+            workspace.add_raster_overlay_for_selection(
+                RasterOverlayEdit {
+                    name: "Collision".to_owned(),
+                    source_size: PhysicalSize::new(3, 4).unwrap(),
+                    position: PhysicalPoint::default(),
+                    display_size: PhysicalSize::new(1, 1).unwrap(),
+                    item_opacity: 255,
+                    track_opacity: 255,
+                    blend_mode: BlendMode::Normal,
+                    z_index: 0,
+                },
+                &shared_pixels,
+            ),
+            Err(EditorWorkspaceError::RasterOverlayAssetCollision { .. })
+        ));
+        assert_eq!(workspace.manifest().revision, revision);
+
+        assert!(workspace.undo().unwrap());
+        assert_eq!(workspace.manifest().assets.len(), 2);
+        assert_eq!(workspace.manifest().timeline.overlay_tracks.len(), 1);
+        assert!(workspace.undo().unwrap());
+        assert_eq!(workspace.manifest().assets.len(), 1);
+        assert!(workspace.manifest().timeline.overlay_tracks.is_empty());
+
+        let new_pixels = [255, 0, 0, 128];
+        let added = workspace
+            .add_raster_overlay_for_selection(
+                RasterOverlayEdit {
+                    name: "Logo".to_owned(),
+                    source_size: PhysicalSize::new(1, 1).unwrap(),
+                    position: PhysicalPoint::default(),
+                    display_size: PhysicalSize::new(1, 1).unwrap(),
+                    item_opacity: 255,
+                    track_opacity: 255,
+                    blend_mode: BlendMode::Normal,
+                    z_index: 5,
+                },
+                &new_pixels,
+            )
+            .unwrap();
+        assert_eq!(workspace.manifest().assets.len(), 2);
+        assert_eq!(workspace.manifest().timeline.overlay_tracks[0].id, added);
+        assert!(workspace.undo().unwrap());
+        assert_eq!(workspace.manifest().assets.len(), 1);
+        assert!(workspace.redo().unwrap());
+        assert_eq!(workspace.manifest().assets.len(), 2);
     }
 
     #[test]

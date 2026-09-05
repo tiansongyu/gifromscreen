@@ -13,6 +13,11 @@ pub struct AssetStore {
 }
 
 impl AssetStore {
+    /// Computes the stable content identity without reading or writing the store.
+    pub fn id_for_bytes(bytes: &[u8]) -> AssetId {
+        digest(bytes)
+    }
+
     pub fn open(project_root: impl AsRef<Path>) -> Result<Self, ProjectError> {
         let directory = project_root.as_ref().join("assets");
         fs::create_dir_all(&directory)
@@ -80,6 +85,7 @@ mod tests {
         let root = tempdir().unwrap();
         let store = AssetStore::open(root.path()).unwrap();
         let first = store.put(b"same pixels").unwrap();
+        assert_eq!(first, AssetStore::id_for_bytes(b"same pixels"));
         let second = store.put(b"same pixels").unwrap();
         assert_eq!(first, second);
         assert_eq!(store.read(first).unwrap(), b"same pixels");
