@@ -40,6 +40,7 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Retain, select, remove, and clear a bounded multi-entry frame clipboard history.
 - [x] Preview and export timed raster, shape, and pressure-drawing overlays through one compositor.
 - [x] Expose bounded Wu/custom palettes and deterministic Dotted, Blue Noise, and Interleaved Noise dithering in desktop export controls.
+- [x] Trigger bounded manual snapshots and configure continuous or second/minute/hour periodic capture from the standalone recorder.
 
 ## Delivery gates
 
@@ -66,7 +67,7 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 ### M2 — editor parity
 
 - [x] Window capture and capture-only-changes.
-- [ ] Manual and periodic snapshots.
+- [x] Manual and periodic snapshots.
 - [x] Duplicate removal, frame reduction, Yoyo, and delay scaling.
 - [ ] Text/title and authoring UI for drawing, shapes, and raster watermarks.
 - [x] Border, shadow, blur, pixelate, darken, and lighten frame effects.
