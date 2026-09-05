@@ -10,6 +10,7 @@ GifFromScreen 是一个使用 Rust 实现的本地 GIF 录制与逐帧编辑工�
 - [ScreenToGif 功能对照表](docs/FEATURE_MATRIX.md)
 - [ADR-0001：Rust 桌面技术栈](docs/ADR-0001-RUST-DESKTOP-STACK.md)
 - [Linux 实现状态](docs/LINUX-STATUS.md)
+- [Linux 性能证据](docs/LINUX-BENCHMARKS.md)
 
 ## 当前范围
 

@@ -41,6 +41,7 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Preview and export timed raster, shape, and pressure-drawing overlays through one compositor.
 - [x] Expose bounded Wu/custom palettes and deterministic Dotted, Blue Noise, and Interleaved Noise dithering in desktop export controls.
 - [x] Trigger bounded manual snapshots and configure continuous or second/minute/hour periodic capture from the standalone recorder.
+- [x] Replace quadratic per-frame manifest cloning with indexed recording journal paths and a 512-frame checkpoint cadence; pass the 10,000-frame durability preflight.
 
 ## Delivery gates
 
