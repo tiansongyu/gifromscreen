@@ -627,7 +627,7 @@ impl PreviewRenderPlan {
         downsample_preview(surface, max_size, preview_limit_bytes)
     }
 
-    fn render(
+    pub(crate) fn render(
         &self,
         render_surface_limit_bytes: usize,
         cancellation: &dyn CancellationToken,

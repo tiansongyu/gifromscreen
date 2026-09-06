@@ -6,6 +6,8 @@ mod appearance;
 mod background_task;
 mod blank_project_job;
 mod blank_project_ui;
+mod board_recorder_ui;
+mod camera_recorder_ui;
 mod capture_source_job;
 mod countdown;
 mod custom_palette_input;
@@ -18,9 +20,11 @@ mod fixed_crop_session;
 mod import_gif_job;
 mod import_static_image_job;
 mod import_static_sequence_job;
+mod motion_tools;
 mod open_project_job;
 mod path_picker;
 mod project_insert_ui;
+mod project_library_ui;
 mod retarget;
 mod static_sequence_ui;
 mod text_overlay_ui;
@@ -46,6 +50,8 @@ use blank_project_job::{
 use blank_project_ui::{
     BlankBackgroundChoice, BlankProjectUiAction, BlankProjectUiState, show_blank_project_ui,
 };
+use board_recorder_ui::BoardRecorderTool;
+use camera_recorder_ui::CameraRecorderUi;
 use capture_source_job::{CaptureSourceJob, CaptureSourceJobState};
 use countdown::{CountdownStart, CountdownTick, MAX_COUNTDOWN_SECONDS, RecordingCountdown};
 use custom_palette_input::parse_custom_palette;
@@ -93,11 +99,13 @@ use import_static_sequence_job::{
     ImportStaticSequenceJob, ImportStaticSequenceJobEvent, ImportStaticSequenceJobState,
     ImportStaticSequenceRequest,
 };
+use motion_tools::MotionTools;
 use open_project_job::{
     OpenProjectJob, OpenProjectJobError, OpenProjectJobEvent, OpenProjectJobState,
 };
 use path_picker::{PathKind, PathPicker};
 use project_insert_ui::ProjectInsertTool;
+use project_library_ui::ProjectLibraryTool;
 use retarget::{RegionRetargetPlan, RetargetCompletion};
 use static_sequence_ui::{
     StaticSequenceLoopChoice, StaticSequenceTimingChoice, StaticSequenceUiAction,
@@ -140,6 +148,8 @@ enum AppView {
     ImportVideo,
     NewBlankAnimation,
     ScreenRecorder,
+    CameraRecorder,
+    BoardRecorder,
     Editor,
 }
 
@@ -184,6 +194,7 @@ enum FileDropActivity {
     VideoImport,
     Recording,
     ProjectInsertion,
+    MotionEdit,
     ProjectOpen,
     GifImport,
     ImageImport,
@@ -652,6 +663,11 @@ struct GifFromScreenApp {
     import_sequence_job: ImportStaticSequenceJob,
     video_import: VideoImportTool,
     project_insert: ProjectInsertTool,
+    camera_recorder: CameraRecorderUi,
+    board_recorder: BoardRecorderTool,
+    motion_tools: MotionTools,
+    project_library: ProjectLibraryTool,
+    remembered_project: Option<(ProjectId, PathBuf)>,
     open_picker: PathPicker,
     gif_picker: PathPicker,
     image_picker: PathPicker,
@@ -701,6 +717,11 @@ impl Default for GifFromScreenApp {
             import_sequence_job: ImportStaticSequenceJob::default(),
             video_import: VideoImportTool::default(),
             project_insert: ProjectInsertTool::default(),
+            camera_recorder: CameraRecorderUi::default(),
+            board_recorder: BoardRecorderTool::default(),
+            motion_tools: MotionTools::default(),
+            project_library: ProjectLibraryTool::default(),
+            remembered_project: None,
             open_picker: PathPicker::default(),
             gif_picker: PathPicker::default(),
             image_picker: PathPicker::default(),
@@ -778,8 +799,8 @@ impl eframe::App for GifFromScreenApp {
             || self.blank_project_job.state() == BlankProjectJobState::Running
             || self.watermark_job.state() == WatermarkDecodeJobState::Running
             || self.text_overlay.is_running()
-            || self.video_import.is_running()
-            || self.project_insert.is_running()
+            || self.source_workers_active()
+            || self.project_library.is_active()
             || self.source_catalog_job.state() == CaptureSourceJobState::Loading
             || self.wayland_prepare_job.is_active()
         {
@@ -789,8 +810,7 @@ impl eframe::App for GifFromScreenApp {
         egui::TopBottomPanel::top("app_header").show(context, |ui| {
             ui.horizontal(|ui| {
                 let back_enabled = self.watermark_job.state() != WatermarkDecodeJobState::Running
-                    && !self.video_import.is_running()
-                    && !self.project_insert.is_running()
+                    && !self.source_workers_active()
                     && can_navigate_back(
                         self.view,
                         self.open_project_job.state(),
@@ -829,6 +849,8 @@ impl eframe::App for GifFromScreenApp {
             AppView::ImportVideo => self.video_import.show(ui),
             AppView::NewBlankAnimation => self.show_blank_project(ui),
             AppView::ScreenRecorder => self.show_screen_recorder(ui),
+            AppView::CameraRecorder => self.camera_recorder.show(ui),
+            AppView::BoardRecorder => self.board_recorder.show(ui),
             AppView::Editor => self.show_editor(ui),
         });
     }
@@ -863,21 +885,72 @@ impl GifFromScreenApp {
                 Err(error) => error,
             });
         }
+        if let Some(result) = self.camera_recorder.poll() {
+            self.activate_live_result(result, "Camera");
+        }
+        if let Some(result) = self.board_recorder.poll() {
+            self.activate_live_result(result, "Board");
+        }
+        if let Some(notice) = self.project_library.poll() {
+            self.notice = Some(notice);
+        }
+        if let Some(notice) = self.motion_tools.poll(&mut self.editor_workspace) {
+            self.notice = Some(notice);
+        }
+        self.remember_active_project();
+    }
+
+    fn remember_active_project(&mut self) {
+        let Some(workspace) = &self.editor_workspace else {
+            return;
+        };
+        let key = (
+            workspace.manifest().project_id,
+            workspace.project_root().to_owned(),
+        );
+        if self.remembered_project.as_ref() != Some(&key) {
+            self.project_library.remember(&key.1);
+            self.remembered_project = Some(key);
+        }
+    }
+
+    fn activate_live_result(&mut self, result: Result<ActiveProject, String>, source: &str) {
+        self.notice = Some(match result {
+            Ok(project) => match self.activate_blank_project(project) {
+                Ok(_) => format!("{source} recording saved. Edit its frames or export a GIF."),
+                Err(error) => {
+                    format!("{source} recording saved but could not open the editor: {error}")
+                }
+            },
+            Err(error) => error,
+        });
+    }
+
+    fn source_workers_active(&self) -> bool {
+        self.video_import.is_running()
+            || self.project_insert.is_running()
+            || self.camera_recorder.is_active()
+            || self.board_recorder.is_active()
+            || self.motion_tools.is_running()
     }
 
     fn handle_worker_shutdown(&mut self, context: &egui::Context) {
         if context.input(|input| input.viewport().close_requested())
-            && (self.video_import.is_running() || self.project_insert.is_running())
+            && (self.source_workers_active() || self.project_library.is_active())
         {
             self.video_import.cancel();
             self.project_insert.cancel();
+            self.camera_recorder.shutdown();
+            self.board_recorder.shutdown();
+            self.motion_tools.cancel();
             self.shutdown = ShutdownState::WaitingForWorkers;
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
-        if self.shutdown == ShutdownState::WaitingForWorkers
-            && !self.video_import.is_running()
-            && !self.project_insert.is_running()
-        {
+        if self.shutdown == ShutdownState::WaitingForWorkers && !self.source_workers_active() {
+            self.project_library.shutdown();
+            if self.project_library.is_active() {
+                return;
+            }
             self.shutdown = ShutdownState::Active;
             context.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -913,12 +986,16 @@ impl GifFromScreenApp {
             || self.wayland_prepare_job.is_active()
             || self.wayland_frozen_preview.is_some()
             || self.wayland_crop_controller.is_some()
+            || self.camera_recorder.is_active()
+            || self.board_recorder.is_active()
         {
             FileDropActivity::Recording
         } else if self.video_import.is_running() {
             FileDropActivity::VideoImport
         } else if self.project_insert.is_running() {
             FileDropActivity::ProjectInsertion
+        } else if self.motion_tools.is_running() {
+            FileDropActivity::MotionEdit
         } else if self.open_project_job.state() != OpenProjectJobState::Idle {
             FileDropActivity::ProjectOpen
         } else if self.import_gif_job.state() != ImportGifJobState::Idle {
@@ -1020,6 +1097,7 @@ impl GifFromScreenApp {
             ui.heading("Create an animated GIF");
             ui.label("Capture, edit frame by frame, and export locally.");
             self.show_resume_editor(ui);
+            if let Some(path) = self.project_library.show_recent(ui) { self.open_library_project(&path); }
             ui.add_space(28.0);
 
             ui.columns(LANDING_COLUMN_COUNT, |columns| {
@@ -1100,16 +1178,66 @@ impl GifFromScreenApp {
                 }
             });
 
-            ui.add_space(12.0);
-            if landing_action(ui, "Import video", "Trim a local video into an editable GIF project with FFmpeg.", true) {
-                self.view = AppView::ImportVideo;
-                self.notice = None;
-            }
+            self.show_additional_sources(ui);
             if let Some(notice) = &self.notice {
                 ui.add_space(24.0);
                 ui.label(notice);
             }
         });
+    }
+
+    fn show_additional_sources(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(12.0);
+        ui.columns(LANDING_COLUMN_COUNT, |columns| {
+            if landing_action(
+                &mut columns[0],
+                "Camera recorder",
+                "Preview and record a local camera. Audio is not captured.",
+                true,
+            ) {
+                self.view = AppView::CameraRecorder;
+                self.notice = None;
+            }
+            if landing_action(
+                &mut columns[1],
+                "Drawing board",
+                "Record a canvas with pen, highlighter, and eraser tools.",
+                true,
+            ) {
+                self.view = AppView::BoardRecorder;
+                self.notice = None;
+            }
+        });
+        ui.add_space(12.0);
+        if landing_action(
+            ui,
+            "Import video",
+            "Trim a local video into an editable GIF project with FFmpeg.",
+            true,
+        ) {
+            self.view = AppView::ImportVideo;
+            self.notice = None;
+        }
+    }
+
+    fn open_library_project(&mut self, path: &Path) {
+        let already_open = self.editor_workspace.as_ref().is_some_and(|workspace| {
+            workspace.project_root() == path
+                || fs::canonicalize(workspace.project_root())
+                    .ok()
+                    .zip(fs::canonicalize(path).ok())
+                    .is_some_and(|(left, right)| left == right)
+        });
+        if already_open {
+            self.resume_editor();
+            return;
+        }
+        self.view = AppView::OpenProject;
+        self.open_project_path = path.to_string_lossy().into_owned();
+        self.open_project_take_over_lock = false;
+        if let Err(error) = self.start_open_project() {
+            self.notice = Some(error);
+        }
     }
 
     fn show_resume_editor(&mut self, ui: &mut egui::Ui) {
@@ -1131,6 +1259,9 @@ impl GifFromScreenApp {
             return false;
         }
         self.view = AppView::Editor;
+        if let Some(workspace) = &self.editor_workspace {
+            self.project_library.remember(workspace.project_root());
+        }
         self.notice = None;
         true
     }
@@ -1502,15 +1633,25 @@ impl GifFromScreenApp {
     }
 
     fn show_editor(&mut self, ui: &mut egui::Ui) {
+        if self.motion_tools.is_running() {
+            self.motion_tools.show_running(ui);
+            return;
+        }
         show_editor_scroll_area(ui, |ui| self.show_editor_contents(ui));
     }
 
     fn show_editor_contents(&mut self, ui: &mut egui::Ui) {
         self.show_editor_work_area(ui);
+        let motion_enabled = !self.source_workers_active()
+            && !self.text_overlay.is_running()
+            && self.watermark_job.state() == WatermarkDecodeJobState::Idle
+            && !export_job_is_active(self.export_job.state());
         let Some(workspace) = &mut self.editor_workspace else {
             return;
         };
         self.project_insert.show(ui, workspace);
+        ui.add_enabled_ui(motion_enabled, |ui| self.motion_tools.show(ui, workspace));
+        let open_copy = self.project_library.show_save_as(ui, workspace);
         ui.separator();
         let export_action = egui::CollapsingHeader::new("Export GIF")
             .id_salt("editor-export-options")
@@ -1521,7 +1662,8 @@ impl GifFromScreenApp {
                     &mut self.editor_export_settings,
                     &self.export_job,
                     workspace,
-                    self.watermark_job.state() == WatermarkDecodeJobState::Running,
+                    self.watermark_job.state() == WatermarkDecodeJobState::Running
+                        || self.motion_tools.is_running(),
                 )
             })
             .body_returned
@@ -1542,6 +1684,9 @@ impl GifFromScreenApp {
         if let Some(notice) = &self.notice {
             ui.add_space(12.0);
             ui.label(notice);
+        }
+        if let Some(path) = open_copy {
+            self.open_library_project(&path);
         }
     }
 
@@ -5490,6 +5635,7 @@ const fn file_drop_block_reason(activity: FileDropActivity) -> Option<&'static s
         FileDropActivity::Idle => None,
         FileDropActivity::VideoImport => Some("a video import is active"),
         FileDropActivity::ProjectInsertion => Some("a project insertion is active"),
+        FileDropActivity::MotionEdit => Some("a motion edit owns the editor workspace"),
         FileDropActivity::Recording => Some("the recorder or region picker is active"),
         FileDropActivity::ProjectOpen => Some("a project-open job is active"),
         FileDropActivity::GifImport => Some("a GIF import is active"),
@@ -5580,6 +5726,12 @@ fn route_file_drop(candidate: Option<FileDropCandidate>) -> Result<FileDropRoute
         "Dropped data has no local filesystem path; save it to disk before importing.".to_owned()
     })?;
     let path = candidate.path;
+    if path.to_str().is_none() {
+        return Err(
+            "This filename is not valid UTF-8. Rename it before opening it in the desktop app."
+                .to_owned(),
+        );
+    }
     if candidate.has_project_manifest {
         return Ok(FileDropRoute::OpenProject(path));
     }
@@ -5683,6 +5835,10 @@ fn parse_startup_intent(arguments: impl IntoIterator<Item = OsString>) -> Startu
         ));
     }
     match kind {
+        _ if path.to_str().is_none() => StartupIntent::Invalid(
+            "This filename is not valid UTF-8. Rename it before opening it in the desktop app."
+                .to_owned(),
+        ),
         StartupIntentKind::Project => StartupIntent::OpenProject(path),
         StartupIntentKind::Gif => StartupIntent::ImportGif(path),
         StartupIntentKind::Image => StartupIntent::ImportImage(path),

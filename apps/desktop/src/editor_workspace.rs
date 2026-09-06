@@ -50,6 +50,10 @@ pub(crate) use insert::{
 #[path = "editor_presets.rs"]
 mod presets;
 
+#[path = "editor_motion.rs"]
+mod motion;
+pub(crate) use motion::{MotionOperation, MotionProgress};
+
 const MAX_SYNCHRONOUS_DUPLICATE_SCAN_FRAMES: usize = 256;
 const DUPLICATE_RENDER_SURFACE_LIMIT_BYTES: usize = 128 * 1024 * 1024;
 
