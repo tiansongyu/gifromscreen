@@ -41,6 +41,12 @@ use crate::editor_preview::{EditorPreviewError, render_frame_surface};
 mod text;
 pub(crate) use text::{TextOverlayDraft, TitleFrameRequest};
 
+#[path = "editor_insert.rs"]
+mod insert;
+pub(crate) use insert::{
+    PreparedProjectInsertion, ProjectInsertionTarget, prepare_project_insertion_from_path,
+};
+
 const MAX_SYNCHRONOUS_DUPLICATE_SCAN_FRAMES: usize = 256;
 const DUPLICATE_RENDER_SURFACE_LIMIT_BYTES: usize = 128 * 1024 * 1024;
 

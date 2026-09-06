@@ -7,14 +7,16 @@ use std::{
 };
 
 use eframe::egui;
+use gif_from_screen_application::{PresentationTransitionStep, transition_step_progress};
 use gif_from_screen_domain::{
     AssetDescriptor, AssetId, AssetKind, FrameClip, FrameId, OverlayId, OverlayTrack, ProjectId,
-    ProjectRevision, RasterEncoding, TimeUs,
+    ProjectRevision, RasterEncoding, TimeUs, Transition, TransitionId,
 };
 use gif_from_screen_project::{ActiveProject, AssetStore, ProjectError};
 use gif_from_screen_render::{
     AssetProviderError, CancellationToken, CpuRenderer, FrameAssetProvider, NeverCancel,
     RenderError, RenderLimits, RgbaSurface, SurfaceError, active_raster_overlay_assets,
+    render_transition,
 };
 use thiserror::Error;
 
@@ -33,6 +35,15 @@ pub(crate) struct EditorPreview {
 /// Typed failures while loading, rendering, resizing, or uploading a preview.
 #[derive(Debug, Error)]
 pub(crate) enum EditorPreviewError {
+    #[error("transition {transition_id} is no longer available for this preview")]
+    TransitionNotFound { transition_id: TransitionId },
+    #[error("could not render transition {transition_id} step {step}: {source}")]
+    TransitionRender {
+        transition_id: TransitionId,
+        step: u16,
+        #[source]
+        source: RenderError,
+    },
     #[error("preview bounds must be non-zero, got {width}x{height}")]
     InvalidPreviewBounds { width: u32, height: u32 },
     #[error("frame {frame_id} is not present in the active project")]
@@ -154,6 +165,7 @@ struct PreviewCacheKey {
     project_id: ProjectId,
     revision: ProjectRevision,
     frame_id: FrameId,
+    transition: Option<PresentationTransitionStep>,
     max_size: [u32; 2],
 }
 
@@ -232,6 +244,7 @@ impl<K: Eq, V> BoundedLru<K, V> {
 pub(crate) struct EditorPreviewCache {
     cache: BoundedLru<PreviewCacheKey, EditorPreview>,
     render_surface_limit_bytes: usize,
+    transition_endpoints: Option<CachedTransitionEndpoints>,
 }
 
 impl Default for EditorPreviewCache {
@@ -259,14 +272,29 @@ impl EditorPreviewCache {
         Self {
             cache: BoundedLru::new(max_entries, max_cached_bytes),
             render_surface_limit_bytes,
+            transition_endpoints: None,
         }
     }
 
     /// Returns a cached texture or strictly loads, renders, downsamples, and uploads it.
+    #[cfg(test)]
     pub(crate) fn preview(
         &mut self,
         project: &ActiveProject,
         frame_id: FrameId,
+        context: &egui::Context,
+        max_size: [u32; 2],
+    ) -> Result<EditorPreview, EditorPreviewError> {
+        self.presentation_preview(project, frame_id, None, context, max_size)
+    }
+
+    /// Renders only the requested original or generated intermediate. Generated
+    /// textures share the same bounded LRU as ordinary editing previews.
+    pub(crate) fn presentation_preview(
+        &mut self,
+        project: &ActiveProject,
+        frame_id: FrameId,
+        transition: Option<PresentationTransitionStep>,
         context: &egui::Context,
         max_size: [u32; 2],
     ) -> Result<EditorPreview, EditorPreviewError> {
@@ -278,31 +306,141 @@ impl EditorPreviewCache {
             project_id,
             revision,
             frame_id,
+            transition,
             max_size,
         };
         if let Some(preview) = self.cache.get(&key) {
             return Ok(preview.clone());
         }
 
-        let prepared = prepare_preview(
-            project,
-            frame_id,
-            max_size,
-            self.render_surface_limit_bytes,
-            self.cache.max_bytes,
-        )?;
+        let prepared = if let Some(step) = transition {
+            if !self
+                .transition_endpoints
+                .as_ref()
+                .is_some_and(|endpoints| endpoints.matches(project, step))
+            {
+                // Drop both previous endpoints before allocating a different pair.
+                self.transition_endpoints = None;
+                self.transition_endpoints = Some(CachedTransitionEndpoints::new(
+                    project,
+                    step,
+                    self.render_surface_limit_bytes,
+                )?);
+            }
+            let surface = self
+                .transition_endpoints
+                .as_ref()
+                .ok_or(EditorPreviewError::TransitionNotFound {
+                    transition_id: step.transition_id,
+                })?
+                .render(step)?;
+            downsample_preview(surface, max_size, self.cache.max_bytes)?
+        } else {
+            // Ordinary editing previews regain the complete per-surface budget.
+            self.transition_endpoints = None;
+            prepare_preview(
+                project,
+                frame_id,
+                max_size,
+                self.render_surface_limit_bytes,
+                self.cache.max_bytes,
+            )?
+        };
         let texture_bytes = prepared.rgba.len();
         let preview = upload_preview(
             &prepared,
             context,
             format!(
-                "editor-preview-{project_id}-{revision}-{frame_id}-{}x{}",
-                max_size[0], max_size[1]
+                "editor-preview-{project_id}-{revision}-{frame_id}-{transition:?}-{}x{}",
+                max_size[0], max_size[1],
             ),
         )?;
         self.cache.insert(key, preview.clone(), texture_bytes);
         Ok(preview)
     }
+}
+
+struct CachedTransitionEndpoints {
+    project_id: ProjectId,
+    revision: ProjectRevision,
+    transition: Transition,
+    from: RgbaSurface,
+    to: RgbaSurface,
+}
+
+impl CachedTransitionEndpoints {
+    fn matches(&self, project: &ActiveProject, step: PresentationTransitionStep) -> bool {
+        self.project_id == project.manifest().project_id
+            && self.revision == project.manifest().revision
+            && self.transition.id == step.transition_id
+            && self.transition.from_frame == step.from_frame
+            && self.transition.to_frame == step.to_frame
+    }
+
+    fn new(
+        project: &ActiveProject,
+        step: PresentationTransitionStep,
+        working_limit_bytes: usize,
+    ) -> Result<Self, EditorPreviewError> {
+        let transition = project
+            .manifest()
+            .timeline
+            .transitions
+            .iter()
+            .find(|transition| {
+                transition.id == step.transition_id
+                    && transition.from_frame == step.from_frame
+                    && transition.to_frame == step.to_frame
+            })
+            .ok_or(EditorPreviewError::TransitionNotFound {
+                transition_id: step.transition_id,
+            })?;
+        transition_step_progress(transition, step.step).map_err(|source| {
+            EditorPreviewError::TransitionRender {
+                transition_id: step.transition_id,
+                step: step.step,
+                source,
+            }
+        })?;
+        // Two final endpoints and the generated output coexist. Each endpoint
+        // provider is dropped before rendering the following surface.
+        let endpoint_limit = working_limit_bytes / 3;
+        let from = render_frame_surface(project, step.from_frame, endpoint_limit)?;
+        let to = render_frame_surface(project, step.to_frame, endpoint_limit)?;
+        Ok(Self {
+            project_id: project.manifest().project_id,
+            revision: project.manifest().revision,
+            transition: transition.clone(),
+            from,
+            to,
+        })
+    }
+
+    fn render(&self, step: PresentationTransitionStep) -> Result<RgbaSurface, EditorPreviewError> {
+        let map_error = |source| EditorPreviewError::TransitionRender {
+            transition_id: step.transition_id,
+            step: step.step,
+            source,
+        };
+        let progress = transition_step_progress(&self.transition, step.step).map_err(map_error)?;
+        render_transition(
+            &self.from,
+            &self.to,
+            &self.transition.kind,
+            progress,
+            &NeverCancel,
+        )
+        .map_err(map_error)
+    }
+}
+
+#[cfg(test)]
+fn render_transition_surface(
+    project: &ActiveProject,
+    step: PresentationTransitionStep,
+    working_limit_bytes: usize,
+) -> Result<RgbaSurface, EditorPreviewError> {
+    CachedTransitionEndpoints::new(project, step, working_limit_bytes)?.render(step)
 }
 
 pub(crate) fn upload_preview(
@@ -804,7 +942,8 @@ mod tests {
         AssetDescriptor, BlendMode, Canvas, CanvasBackground, CaptureMetadata, ClipTransform,
         ColorSpace, DurationUs, EditCommand, Effect, FrameClip, OverlayContent, OverlayId,
         OverlayItem, OverlayTrack, PhysicalPoint, PhysicalPx, PhysicalRect, PhysicalSize,
-        ProjectManifest, Rgba, ShapeKind, StrokePoint, TimelineSpan, TrackId, UnixTimeMs,
+        ProjectManifest, Rgba, ShapeKind, SlideDirection, StrokePoint, TimelineSpan, TrackId,
+        Transition, TransitionKind, UnixTimeMs,
     };
     use tempfile::{TempDir, tempdir};
 
@@ -813,6 +952,7 @@ mod tests {
             project_id: ProjectId::from_u128(project),
             revision: ProjectRevision::new(revision),
             frame_id: FrameId::from_u128(frame),
+            transition: None,
             max_size,
         }
     }
@@ -943,6 +1083,181 @@ mod tests {
             fit_preview_dimensions([0, 200], [320, 200]),
             Err(EditorPreviewError::InvalidRenderedSize { .. })
         ));
+    }
+
+    fn transition_project(
+        kind: TransitionKind,
+    ) -> (TempDir, ActiveProject, PresentationTransitionStep) {
+        let red = [255, 0, 0, 255];
+        let blue = [0, 0, 255, 255];
+        let green = [0, 255, 0, 255];
+        let size = PhysicalSize::new(2, 1).unwrap();
+        let (scratch, mut project, first, _) =
+            project_with_frame(&red.repeat(2), size, ClipTransform::default(), Vec::new());
+        let pixels = blue.repeat(2);
+        let asset_id = project.assets().put(&pixels).unwrap();
+        let second = FrameId::from_u128(2);
+        project
+            .commit(EditCommand::Compound {
+                commands: vec![
+                    EditCommand::RegisterAsset {
+                        asset: AssetDescriptor {
+                            id: asset_id,
+                            byte_len: 8,
+                            kind: AssetKind::Frame {
+                                size,
+                                encoding: RasterEncoding::Rgba8,
+                            },
+                        },
+                    },
+                    EditCommand::InsertFrames {
+                        index: 1,
+                        frames: vec![FrameClip {
+                            id: second,
+                            asset_id,
+                            duration: DurationUs::new(30_000).unwrap(),
+                            transform: ClipTransform::default(),
+                            capture_metadata: CaptureMetadata::default(),
+                            effects: Vec::new(),
+                        }],
+                    },
+                ],
+            })
+            .unwrap();
+        // Active only on the outgoing original, never on the incoming endpoint.
+        add_raster_overlay(&mut project, &green, PhysicalSize::new(1, 1).unwrap());
+        let transition_id = TransitionId::from_u128(1);
+        project
+            .commit(EditCommand::SetTransitions {
+                transitions: vec![Transition {
+                    id: transition_id,
+                    from_frame: first,
+                    to_frame: second,
+                    duration: DurationUs::new(20_000).unwrap(),
+                    steps: 1,
+                    kind,
+                }],
+            })
+            .unwrap();
+        (
+            scratch,
+            project,
+            PresentationTransitionStep {
+                transition_id,
+                from_frame: first,
+                to_frame: second,
+                step: 1,
+            },
+        )
+    }
+
+    #[test]
+    fn transition_preview_uses_final_endpoint_overlays_at_original_frame_times() {
+        for (kind, pixels) in [
+            (
+                TransitionKind::FadeToNext,
+                vec![128, 0, 128, 255, 0, 128, 128, 255],
+            ),
+            (
+                TransitionKind::Slide {
+                    direction: SlideDirection::Left,
+                },
+                vec![0, 255, 0, 255, 0, 0, 255, 255],
+            ),
+            (
+                TransitionKind::FadeToColor {
+                    color: Rgba {
+                        red: 17,
+                        green: 23,
+                        blue: 42,
+                        alpha: 255,
+                    },
+                },
+                vec![17, 23, 42, 255, 17, 23, 42, 255],
+            ),
+        ] {
+            let (_scratch, project, step) = transition_project(kind);
+            let preview = render_transition_surface(&project, step, 1024).unwrap();
+            assert_eq!(preview.pixels(), pixels);
+        }
+    }
+
+    #[test]
+    fn transition_preview_does_not_reuse_original_texture_and_obeys_working_limit() {
+        let (_scratch, project, step) = transition_project(TransitionKind::FadeToNext);
+        let context = egui::Context::default();
+        let mut cache = EditorPreviewCache::with_limits(2, 1024, 1024);
+        let original = cache
+            .preview(&project, step.from_frame, &context, [2, 1])
+            .unwrap();
+        let intermediate = cache
+            .presentation_preview(&project, step.from_frame, Some(step), &context, [2, 1])
+            .unwrap();
+        assert_ne!(original.texture.id(), intermediate.texture.id());
+        let repeated = cache
+            .presentation_preview(&project, step.from_frame, Some(step), &context, [2, 1])
+            .unwrap();
+        assert_eq!(repeated.texture.id(), intermediate.texture.id());
+        assert!(render_transition_surface(&project, step, 8).is_err());
+        assert!(matches!(
+            render_transition_surface(
+                &project,
+                PresentationTransitionStep { step: 0, ..step },
+                1024
+            ),
+            Err(EditorPreviewError::TransitionRender { .. })
+        ));
+        assert!(matches!(
+            render_transition_surface(
+                &project,
+                PresentationTransitionStep {
+                    transition_id: TransitionId::from_u128(2),
+                    ..step
+                },
+                1024
+            ),
+            Err(EditorPreviewError::TransitionNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn transition_endpoint_cache_reuses_pixels_across_steps_and_invalidates_revisions() {
+        let (_scratch, mut project, step) = transition_project(TransitionKind::FadeToNext);
+        let mut transition = project.manifest().timeline.transitions[0].clone();
+        transition.steps = 2;
+        project
+            .commit(EditCommand::SetTransitions {
+                transitions: vec![transition],
+            })
+            .unwrap();
+        let context = egui::Context::default();
+        let mut cache = EditorPreviewCache::with_limits(2, 1024, 1024);
+        cache
+            .presentation_preview(&project, step.from_frame, Some(step), &context, [2, 1])
+            .unwrap();
+        let asset = project.manifest().timeline.frames[0].asset_id;
+        fs::remove_file(project.assets().asset_path(asset)).unwrap();
+        // A different intermediate is not texture-cached, but its two endpoint
+        // surfaces are. No file access or repeated overlay rendering is needed.
+        cache
+            .presentation_preview(
+                &project,
+                step.from_frame,
+                Some(PresentationTransitionStep { step: 2, ..step }),
+                &context,
+                [2, 1],
+            )
+            .unwrap();
+        project
+            .commit(EditCommand::SetTransitions {
+                transitions: Vec::new(),
+            })
+            .unwrap();
+        assert!(matches!(
+            cache.presentation_preview(&project, step.from_frame, Some(step), &context, [2, 1]),
+            Err(EditorPreviewError::TransitionNotFound { .. })
+        ));
+        assert!(cache.transition_endpoints.is_none());
     }
 
     #[test]

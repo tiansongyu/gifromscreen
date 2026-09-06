@@ -3,6 +3,7 @@
 //! Desktop entry point for the Linux-first `GifFromScreen` application.
 
 mod appearance;
+mod background_task;
 mod blank_project_job;
 mod blank_project_ui;
 mod capture_source_job;
@@ -17,10 +18,13 @@ mod import_gif_job;
 mod import_static_image_job;
 mod import_static_sequence_job;
 mod open_project_job;
+mod path_picker;
+mod project_insert_ui;
 mod retarget;
 mod static_sequence_ui;
 mod text_overlay_ui;
 mod thumbnail_cache;
+mod video_import_ui;
 mod watermark_decode_job;
 mod watermark_ui;
 mod wayland_prepare_job;
@@ -91,6 +95,8 @@ use import_static_sequence_job::{
 use open_project_job::{
     OpenProjectJob, OpenProjectJobError, OpenProjectJobEvent, OpenProjectJobState,
 };
+use path_picker::{PathKind, PathPicker};
+use project_insert_ui::ProjectInsertTool;
 use retarget::{RegionRetargetPlan, RetargetCompletion};
 use static_sequence_ui::{
     StaticSequenceLoopChoice, StaticSequenceTimingChoice, StaticSequenceUiAction,
@@ -98,6 +104,7 @@ use static_sequence_ui::{
 };
 use text_overlay_ui::TextOverlayTool;
 use uuid::Uuid;
+use video_import_ui::VideoImportTool;
 use watermark_decode_job::{WatermarkDecodeEvent, WatermarkDecodeJob, WatermarkDecodeJobState};
 use watermark_ui::{PendingWatermark, WatermarkUiAction, WatermarkUiState, show_watermark_ui};
 use wayland_prepare_job::{
@@ -129,9 +136,17 @@ enum AppView {
     ImportGif,
     ImportImage,
     ImportImageSequence,
+    ImportVideo,
     NewBlankAnimation,
     ScreenRecorder,
     Editor,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ShutdownState {
+    #[default]
+    Active,
+    WaitingForWorkers,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -140,6 +155,7 @@ enum StartupIntent {
     OpenProject(PathBuf),
     ImportGif(PathBuf),
     ImportImage(PathBuf),
+    ImportVideo(PathBuf),
     Invalid(String),
 }
 
@@ -149,6 +165,7 @@ enum FileDropRoute {
     ImportGif(PathBuf),
     ImportImage(PathBuf),
     ImportImageSequence(Vec<PathBuf>),
+    ImportVideo(PathBuf),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -163,7 +180,9 @@ struct FileDropCandidate {
 enum FileDropActivity {
     #[default]
     Idle,
+    VideoImport,
     Recording,
+    ProjectInsertion,
     ProjectOpen,
     GifImport,
     ImageImport,
@@ -666,6 +685,12 @@ struct GifFromScreenApp {
     import_image_job: ImportStaticImageJob,
     import_sequence_ui: StaticSequenceUiState,
     import_sequence_job: ImportStaticSequenceJob,
+    video_import: VideoImportTool,
+    project_insert: ProjectInsertTool,
+    open_picker: PathPicker,
+    gif_picker: PathPicker,
+    image_picker: PathPicker,
+    shutdown: ShutdownState,
     blank_project_ui: BlankProjectUiState,
     blank_project_job: BlankProjectJob,
     watermark_ui: WatermarkUiState,
@@ -709,6 +734,12 @@ impl Default for GifFromScreenApp {
             import_image_job: ImportStaticImageJob::default(),
             import_sequence_ui: StaticSequenceUiState::default(),
             import_sequence_job: ImportStaticSequenceJob::default(),
+            video_import: VideoImportTool::default(),
+            project_insert: ProjectInsertTool::default(),
+            open_picker: PathPicker::default(),
+            gif_picker: PathPicker::default(),
+            image_picker: PathPicker::default(),
+            shutdown: ShutdownState::default(),
             blank_project_ui: BlankProjectUiState::default(),
             blank_project_job: BlankProjectJob::default(),
             watermark_ui: WatermarkUiState::default(),
@@ -735,17 +766,8 @@ impl Drop for GifFromScreenApp {
 
 impl eframe::App for GifFromScreenApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
-        self.receive_capture_source_result();
-        self.receive_wayland_prepare_messages(context);
-        self.receive_job_messages();
-        self.receive_export_messages();
-        self.receive_open_project_messages();
-        self.receive_import_gif_messages();
-        self.receive_import_image_messages();
-        self.receive_import_sequence_messages();
-        self.receive_blank_project_messages();
-        self.receive_watermark_messages();
-        self.receive_text_messages();
+        self.receive_background_messages(context);
+        self.handle_worker_shutdown(context);
         let dropped_paths = context.input(|input| {
             input
                 .raw
@@ -791,6 +813,8 @@ impl eframe::App for GifFromScreenApp {
             || self.blank_project_job.state() == BlankProjectJobState::Running
             || self.watermark_job.state() == WatermarkDecodeJobState::Running
             || self.text_overlay.is_running()
+            || self.video_import.is_running()
+            || self.project_insert.is_running()
             || self.source_catalog_job.state() == CaptureSourceJobState::Loading
             || self.wayland_prepare_job.is_active()
         {
@@ -800,6 +824,8 @@ impl eframe::App for GifFromScreenApp {
         egui::TopBottomPanel::top("app_header").show(context, |ui| {
             ui.horizontal(|ui| {
                 let back_enabled = self.watermark_job.state() != WatermarkDecodeJobState::Running
+                    && !self.video_import.is_running()
+                    && !self.project_insert.is_running()
                     && can_navigate_back(
                         self.view,
                         self.open_project_job.state(),
@@ -832,6 +858,7 @@ impl eframe::App for GifFromScreenApp {
             AppView::ImportGif => self.show_import_gif(ui),
             AppView::ImportImage => self.show_import_image(ui),
             AppView::ImportImageSequence => self.show_import_sequence(ui),
+            AppView::ImportVideo => self.video_import.show(ui),
             AppView::NewBlankAnimation => self.show_blank_project(ui),
             AppView::ScreenRecorder => self.show_screen_recorder(ui),
             AppView::Editor => self.show_editor(ui),
@@ -844,6 +871,50 @@ impl eframe::App for GifFromScreenApp {
 }
 
 impl GifFromScreenApp {
+    fn receive_background_messages(&mut self, context: &egui::Context) {
+        self.receive_capture_source_result();
+        self.receive_wayland_prepare_messages(context);
+        self.receive_job_messages();
+        self.receive_export_messages();
+        self.receive_open_project_messages();
+        self.receive_import_gif_messages();
+        self.receive_import_image_messages();
+        self.receive_import_sequence_messages();
+        self.receive_blank_project_messages();
+        self.receive_watermark_messages();
+        self.receive_text_messages();
+        if let Some(notice) = self.project_insert.poll(self.editor_workspace.as_mut()) {
+            self.notice = Some(notice);
+        }
+        if let Some(result) = self.video_import.poll() {
+            self.notice = Some(match result {
+                Ok(project) => match self.activate_blank_project(project) {
+                    Ok(_) => "Video imported into an editable project. Choose frames, add annotations, or export a GIF.".to_owned(),
+                    Err(error) => format!("Video imported, but could not open the editor: {error}"),
+                },
+                Err(error) => error,
+            });
+        }
+    }
+
+    fn handle_worker_shutdown(&mut self, context: &egui::Context) {
+        if context.input(|input| input.viewport().close_requested())
+            && (self.video_import.is_running() || self.project_insert.is_running())
+        {
+            self.video_import.cancel();
+            self.project_insert.cancel();
+            self.shutdown = ShutdownState::WaitingForWorkers;
+            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        if self.shutdown == ShutdownState::WaitingForWorkers
+            && !self.video_import.is_running()
+            && !self.project_insert.is_running()
+        {
+            self.shutdown = ShutdownState::Active;
+            context.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
     fn handle_dropped_paths(&mut self, dropped_paths: &[Option<PathBuf>]) {
         if let Some(reason) = file_drop_block_reason(self.file_drop_activity()) {
             self.notice = Some(format!(
@@ -873,6 +944,10 @@ impl GifFromScreenApp {
             || self.wayland_crop_controller.is_some()
         {
             FileDropActivity::Recording
+        } else if self.video_import.is_running() {
+            FileDropActivity::VideoImport
+        } else if self.project_insert.is_running() {
+            FileDropActivity::ProjectInsertion
         } else if self.open_project_job.state() != OpenProjectJobState::Idle {
             FileDropActivity::ProjectOpen
         } else if self.import_gif_job.state() != ImportGifJobState::Idle {
@@ -894,6 +969,12 @@ impl GifFromScreenApp {
 
     fn start_file_drop_route(&mut self, route: FileDropRoute) -> Result<(), String> {
         match route {
+            FileDropRoute::ImportVideo(path) => {
+                self.view = AppView::ImportVideo;
+                self.video_import.input = path.to_string_lossy().into_owned();
+                self.notice = None;
+                Ok(())
+            }
             FileDropRoute::OpenProject(path) => {
                 self.view = AppView::OpenProject;
                 self.open_project_path = path.to_string_lossy().into_owned();
@@ -949,10 +1030,20 @@ impl GifFromScreenApp {
                 }
             }
             StartupIntent::Invalid(message) => self.notice = Some(message),
+            StartupIntent::ImportVideo(path) => {
+                self.view = AppView::ImportVideo;
+                self.video_import.input = path.to_string_lossy().into_owned();
+            }
         }
     }
 
     fn show_landing(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("landing-page")
+            .show(ui, |ui| self.show_landing_contents(ui));
+    }
+
+    fn show_landing_contents(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
             ui.add_space(48.0);
             ui.heading("Create an animated GIF");
@@ -1037,6 +1128,11 @@ impl GifFromScreenApp {
                 }
             });
 
+            ui.add_space(12.0);
+            if landing_action(ui, "Import video", "Trim a local video into an editable GIF project with FFmpeg.", true) {
+                self.view = AppView::ImportVideo;
+                self.notice = None;
+            }
             if let Some(notice) = &self.notice {
                 ui.add_space(24.0);
                 ui.label(notice);
@@ -1058,6 +1154,14 @@ impl GifFromScreenApp {
                     .desired_width(420.0)
                     .hint_text("/path/to/animation.gfsproj"),
             );
+            ui.add_enabled_ui(controls_enabled, |ui| {
+                if let Some(notice) =
+                    self.open_picker
+                        .show(ui, &mut self.open_project_path, PathKind::Project)
+                {
+                    self.notice = Some(notice);
+                }
+            });
         });
         ui.add_space(8.0);
         ui.add_enabled_ui(controls_enabled, |ui| {
@@ -1154,6 +1258,14 @@ impl GifFromScreenApp {
                     .desired_width(420.0)
                     .hint_text("/path/to/animation.gif"),
             );
+            ui.add_enabled_ui(!running, |ui| {
+                if let Some(notice) =
+                    self.gif_picker
+                        .show(ui, &mut self.import_gif_path, PathKind::Gif)
+                {
+                    self.notice = Some(notice);
+                }
+            });
         });
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -1224,6 +1336,14 @@ impl GifFromScreenApp {
                     .desired_width(420.0)
                     .hint_text("/path/to/image.png"),
             );
+            ui.add_enabled_ui(!running, |ui| {
+                if let Some(notice) =
+                    self.image_picker
+                        .show(ui, &mut self.import_image_path, PathKind::Image)
+                {
+                    self.notice = Some(notice);
+                }
+            });
         });
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -1395,6 +1515,7 @@ impl GifFromScreenApp {
         let Some(workspace) = &self.editor_workspace else {
             return;
         };
+        self.project_insert.show(ui, workspace);
         ui.separator();
         let export_action = egui::CollapsingHeader::new("Export GIF")
             .id_salt("editor-export-options")
@@ -2992,7 +3113,12 @@ fn show_editor_preview_panel(
     state: &mut EditorUiState,
 ) {
     state.drawing_overlay.reconcile(workspace);
-    ui.heading("Current frame preview");
+    let transition = state.preview_transition(workspace);
+    ui.heading(if transition.is_some() {
+        "Transition preview"
+    } else {
+        "Current frame preview"
+    });
     if !workspace.asset_issues().is_empty() {
         ui.colored_label(
             ui.visuals().error_fg_color,
@@ -3010,9 +3136,10 @@ fn show_editor_preview_panel(
         ui.label("Select a frame to preview it.");
         return;
     };
-    match cache.preview(
+    match cache.presentation_preview(
         workspace.active_project(),
         frame_id,
+        transition,
         ui.ctx(),
         EDITOR_PREVIEW_MAX_SIZE,
     ) {
@@ -3026,7 +3153,8 @@ fn show_editor_preview_panel(
                 .min(360.0 / natural.y)
                 .min(3.0);
             let image_size = natural * scale;
-            let sense = if state.drawing_overlay.phase == DrawingDraftPhase::Capturing {
+            let editable = transition.is_none() && state.playback.is_none();
+            let sense = if editable && state.drawing_overlay.phase == DrawingDraftPhase::Capturing {
                 egui::Sense::drag()
             } else {
                 egui::Sense::hover()
@@ -3036,17 +3164,25 @@ fn show_editor_preview_panel(
                     .fit_to_exact_size(image_size)
                     .sense(sense),
             );
-            update_drawing_draft_from_preview(
-                &response,
-                preview.rendered_size,
-                &mut state.drawing_overlay,
-            );
-            paint_drawing_draft(
-                ui.painter(),
-                response.rect,
-                preview.rendered_size,
-                &state.drawing_overlay,
-            );
+            if editable {
+                update_drawing_draft_from_preview(
+                    &response,
+                    preview.rendered_size,
+                    &mut state.drawing_overlay,
+                );
+                paint_drawing_draft(
+                    ui.painter(),
+                    response.rect,
+                    preview.rendered_size,
+                    &state.drawing_overlay,
+                );
+            }
+            if let Some(step) = transition {
+                ui.weak(format!(
+                    "Transition step {} · select an original frame to edit",
+                    step.step
+                ));
+            }
             ui.weak(format!(
                 "Rendered {}×{} · preview {}×{}",
                 preview.rendered_size[0],
@@ -5350,6 +5486,8 @@ fn landing_cards_fit(available_width: f32, column_spacing: f32) -> bool {
 const fn file_drop_block_reason(activity: FileDropActivity) -> Option<&'static str> {
     match activity {
         FileDropActivity::Idle => None,
+        FileDropActivity::VideoImport => Some("a video import is active"),
+        FileDropActivity::ProjectInsertion => Some("a project insertion is active"),
         FileDropActivity::Recording => Some("the recorder or region picker is active"),
         FileDropActivity::ProjectOpen => Some("a project-open job is active"),
         FileDropActivity::GifImport => Some("a GIF import is active"),
@@ -5477,9 +5615,11 @@ fn route_file_drop(candidate: Option<FileDropCandidate>) -> Result<FileDropRoute
         Ok(FileDropRoute::ImportGif(path))
     } else if has_static_image_extension(&path) {
         Ok(FileDropRoute::ImportImage(path))
+    } else if video_import_ui::is_video_path(&path) {
+        Ok(FileDropRoute::ImportVideo(path))
     } else {
         Err(format!(
-            "Unsupported dropped file {}. Drop a .gfsproj directory, GIF, PNG, JPEG, BMP, or WebP file.",
+            "Unsupported dropped file {}. Drop a .gfsproj directory, GIF, static image, or video file.",
             path.display()
         ))
     }
@@ -5507,9 +5647,14 @@ fn parse_startup_intent(arguments: impl IntoIterator<Item = OsString>) -> Startu
             );
         };
         (StartupIntentKind::Image, PathBuf::from(path))
+    } else if first == OsStr::new("--import-video") {
+        let Some(path) = arguments.next() else {
+            return StartupIntent::Invalid("--import-video requires a local video path".to_owned());
+        };
+        (StartupIntentKind::Video, PathBuf::from(path))
     } else if first.to_string_lossy().starts_with('-') {
         return StartupIntent::Invalid(format!(
-            "Unknown desktop argument '{}'. Use --project PATH, --import-gif PATH, or --import-image PATH.",
+            "Unknown desktop argument '{}'. Use --project PATH, --import-gif PATH, --import-image PATH, or --import-video PATH.",
             first.to_string_lossy()
         ));
     } else {
@@ -5522,6 +5667,8 @@ fn parse_startup_intent(arguments: impl IntoIterator<Item = OsString>) -> Startu
             StartupIntentKind::Gif
         } else if has_static_image_extension(&path) {
             StartupIntentKind::Image
+        } else if video_import_ui::is_video_path(&path) {
+            StartupIntentKind::Video
         } else {
             StartupIntentKind::Project
         };
@@ -5537,6 +5684,7 @@ fn parse_startup_intent(arguments: impl IntoIterator<Item = OsString>) -> Startu
         StartupIntentKind::Project => StartupIntent::OpenProject(path),
         StartupIntentKind::Gif => StartupIntent::ImportGif(path),
         StartupIntentKind::Image => StartupIntent::ImportImage(path),
+        StartupIntentKind::Video => StartupIntent::ImportVideo(path),
     }
 }
 
@@ -5545,6 +5693,7 @@ enum StartupIntentKind {
     Project,
     Gif,
     Image,
+    Video,
 }
 
 fn has_static_image_extension(path: &Path) -> bool {
@@ -5796,7 +5945,7 @@ mod tests {
         assert!(route_file_drop(None).unwrap_err().contains("no local"));
         assert!(
             route_file_drop(Some(FileDropCandidate {
-                path: PathBuf::from("/tmp/movie.mp4"),
+                path: PathBuf::from("/tmp/document.txt"),
                 is_directory: false,
                 is_regular_file: true,
                 has_project_manifest: false,
@@ -7388,10 +7537,38 @@ mod tests {
     }
 
     #[test]
+    fn video_paths_open_a_reviewable_import_form_without_starting_work() {
+        for extension in ["mp4", "MKV", "webm", "avi", "mov"] {
+            let path = PathBuf::from(format!("/tmp/clip.{extension}"));
+            assert_eq!(
+                route_file_drop(Some(FileDropCandidate {
+                    path: path.clone(),
+                    is_directory: false,
+                    is_regular_file: true,
+                    has_project_manifest: false,
+                }))
+                .unwrap(),
+                FileDropRoute::ImportVideo(path.clone())
+            );
+            assert_eq!(
+                parse_startup_intent([path.clone().into_os_string()]),
+                StartupIntent::ImportVideo(path)
+            );
+        }
+        let mut app = GifFromScreenApp::default();
+        app.apply_startup_intent(parse_startup_intent(
+            ["--import-video", "/tmp/clip.mkv"].map(OsString::from),
+        ));
+        assert_eq!(app.view, AppView::ImportVideo);
+        assert!(!app.video_import.is_running());
+        assert_eq!(app.video_import.input, "/tmp/clip.mkv");
+    }
+
+    #[test]
     fn rejected_drops_keep_the_active_workspace_and_routes_unchanged() {
         let directory = tempdir().unwrap();
         let root = directory.path().join("current.gfsproj");
-        let unsupported = directory.path().join("movie.mp4");
+        let unsupported = directory.path().join("document.txt");
         let valid_gif = directory.path().join("blocked.gif");
         fs::write(&unsupported, b"unsupported").unwrap();
         write_import_gif(&valid_gif);

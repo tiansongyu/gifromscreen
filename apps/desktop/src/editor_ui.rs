@@ -11,10 +11,13 @@ use std::{
 };
 
 use eframe::egui;
+use gif_from_screen_application::{
+    PresentationPlan, PresentationSample, PresentationTransitionStep,
+};
 use gif_from_screen_domain::{
-    BlendMode, DurationUs, EdgeWidths, Effect, FrameClip, FrameId, MAX_TRANSITION_STEPS,
-    OverlayContent, PhysicalRect, PhysicalSize, Rgba, ShapeKind, SlideDirection, StrokePoint,
-    TimeUs, Transition, TransitionKind,
+    BlendMode, DurationUs, EdgeWidths, Effect, FrameId, MAX_TRANSITION_STEPS, OverlayContent,
+    PhysicalRect, PhysicalSize, ProjectId, ProjectRevision, Rgba, ShapeKind, SlideDirection,
+    StrokePoint, TimeUs, Transition, TransitionKind,
 };
 use gif_from_screen_editor::{
     DuplicateDelayMode, DuplicateFrameRetention, FrameTransitionSettings,
@@ -332,6 +335,9 @@ pub(crate) struct EditorUiState {
     pub(crate) drawing_overlay: DrawingOverlayDraft,
     /// Monotonic playback clock when playback is active.
     pub(crate) playback: Option<PlaybackClock>,
+    presentation: Option<CachedPresentation>,
+    preview_sample: Option<PresentationSample>,
+    paused_position_nanos: Option<u128>,
     /// Preview-only looping; GIF export repetition is configured separately.
     pub(crate) loop_preview: bool,
     thumbnail_cache: ThumbnailCache,
@@ -394,6 +400,9 @@ impl Default for EditorUiState {
             overlay_tool: OverlayTool::default(),
             drawing_overlay: DrawingOverlayDraft::default(),
             playback: None,
+            presentation: None,
+            preview_sample: None,
+            paused_position_nanos: None,
             loop_preview: true,
             thumbnail_cache: ThumbnailCache::default(),
             filmstrip_scroll_offset: 0.0,
@@ -407,6 +416,33 @@ impl EditorUiState {
     pub(crate) fn overlays_selected(&self) -> bool {
         self.active_tool == EditorToolTab::Overlays
     }
+
+    pub(crate) fn preview_transition(
+        &self,
+        workspace: &EditorWorkspace,
+    ) -> Option<PresentationTransitionStep> {
+        if !self.presentation.as_ref()?.matches(workspace) {
+            return None;
+        }
+        let sample = self.preview_sample?;
+        (Some(sample.frame_id) == workspace.selection().current())
+            .then_some(sample.transition)
+            .flatten()
+    }
+}
+
+#[derive(Debug)]
+struct CachedPresentation {
+    project_id: ProjectId,
+    revision: ProjectRevision,
+    plan: PresentationPlan,
+}
+
+impl CachedPresentation {
+    fn matches(&self, workspace: &EditorWorkspace) -> bool {
+        let manifest = workspace.manifest();
+        self.project_id == manifest.project_id && self.revision == manifest.revision
+    }
 }
 
 /// Monotonic timing state for the frame currently being played.
@@ -415,6 +451,7 @@ pub(crate) struct PlaybackClock {
     id: FrameId,
     started_at: Instant,
     duration: Duration,
+    presentation_start_us: u64,
 }
 
 impl PlaybackClock {
@@ -423,6 +460,7 @@ impl PlaybackClock {
             id: frame_id,
             started_at: frame_started_at,
             duration: Duration::from_micros(duration.get()),
+            presentation_start_us: 0,
         }
     }
 
@@ -435,59 +473,44 @@ impl PlaybackClock {
             .saturating_sub(now.saturating_duration_since(self.started_at))
     }
 
-    /// Resolve the wall-clock position without replaying missed frames. A long
-    /// stall costs at most two timeline scans, even across millions of loops.
+    /// Resolve absolute presentation time without replaying missed frames or
+    /// losing submicrosecond wall-clock age across loops.
     fn advance(
         self,
-        frames: &[FrameClip],
-        current_index: usize,
+        plan: &PresentationPlan,
         now: Instant,
         repeat: bool,
-    ) -> Option<(FrameId, Option<Self>)> {
-        frames.get(current_index)?;
-        let order = (current_index..frames.len()).chain(0..if repeat { current_index } else { 0 });
-        let mut elapsed = now.saturating_duration_since(self.started_at).as_nanos();
-        let mut cycle_duration = 0_u128;
-        for index in order.clone() {
-            let frame = &frames[index];
-            let duration = u128::from(frame.duration.get()) * 1_000;
-            if elapsed < duration {
-                return clock_at_frame_age(frame, elapsed, now);
-            }
-            elapsed -= duration;
-            cycle_duration = cycle_duration.checked_add(duration)?;
+    ) -> Option<(PresentationSample, Option<Self>)> {
+        let elapsed = self.position_nanos(now);
+        let cycle_duration = u128::from(plan.duration_us()) * 1_000;
+        if !repeat && elapsed >= cycle_duration {
+            return Some((plan.sample_at_us(plan.duration_us().checked_sub(1)?)?, None));
         }
-        if !repeat {
-            return Some((frames.last()?.id, None));
-        }
+        let position = elapsed % cycle_duration;
+        let sample = plan.sample_at_us(u64::try_from(position / 1_000).ok()?)?;
+        let age = position - u128::from(sample.start_us) * 1_000;
+        Some((sample, Some(clock_at_sample_age(sample, age, now)?)))
+    }
 
-        elapsed %= cycle_duration;
-        for index in order {
-            let frame = &frames[index];
-            let duration = u128::from(frame.duration.get()) * 1_000;
-            if elapsed < duration {
-                return clock_at_frame_age(frame, elapsed, now);
-            }
-            elapsed -= duration;
-        }
-        None
+    fn position_nanos(self, now: Instant) -> u128 {
+        u128::from(self.presentation_start_us) * 1_000
+            + now.saturating_duration_since(self.started_at).as_nanos()
     }
 }
 
-fn clock_at_frame_age(
-    frame: &FrameClip,
+fn clock_at_sample_age(
+    sample: PresentationSample,
     elapsed_nanos: u128,
     now: Instant,
-) -> Option<(FrameId, Option<PlaybackClock>)> {
+) -> Option<PlaybackClock> {
     let elapsed = Duration::new(
         (elapsed_nanos / 1_000_000_000).try_into().ok()?,
         (elapsed_nanos % 1_000_000_000).try_into().ok()?,
     );
     let started_at = now.checked_sub(elapsed)?;
-    Some((
-        frame.id,
-        Some(PlaybackClock::new(frame.id, started_at, frame.duration)),
-    ))
+    let mut clock = PlaybackClock::new(sample.frame_id, started_at, sample.duration);
+    clock.presentation_start_us = sample.start_us;
+    Some(clock)
 }
 
 /// User intent associated with an editor UI result.
@@ -2986,10 +3009,50 @@ fn current_frame_index(workspace: &EditorWorkspace) -> Option<usize> {
         .position(|frame| frame.id == current)
 }
 
-fn playback_clock_for_current(workspace: &EditorWorkspace, now: Instant) -> Option<PlaybackClock> {
-    let index = current_frame_index(workspace)?;
-    let frame = workspace.manifest().timeline.frames.get(index)?;
-    Some(PlaybackClock::new(frame.id, now, frame.duration))
+fn playback_clock_for_current(
+    workspace: &EditorWorkspace,
+    state: &mut EditorUiState,
+    now: Instant,
+    resume: bool,
+) -> Result<PlaybackClock, String> {
+    let index = current_frame_index(workspace).ok_or("the current frame is unavailable")?;
+    if !state
+        .presentation
+        .as_ref()
+        .is_some_and(|cached| cached.matches(workspace))
+    {
+        let manifest = workspace.manifest();
+        state.presentation = Some(CachedPresentation {
+            project_id: manifest.project_id,
+            revision: manifest.revision,
+            plan: PresentationPlan::new(manifest, &manifest.timeline.frames)
+                .map_err(|error| error.to_string())?,
+        });
+        state.paused_position_nanos = None;
+    }
+    let plan = &state
+        .presentation
+        .as_ref()
+        .ok_or("missing presentation")?
+        .plan;
+    let position = if resume {
+        state.paused_position_nanos.take()
+    } else {
+        None
+    }
+    .unwrap_or(
+        u128::from(
+            plan.frame_start_us(index)
+                .ok_or("missing presentation frame")?,
+        ) * 1_000,
+    );
+    state.paused_position_nanos = None;
+    let sample = plan
+        .sample_at_us(u64::try_from(position / 1_000).map_err(|_| "presentation time overflow")?)
+        .ok_or("presentation time is out of range")?;
+    state.preview_sample = Some(sample);
+    clock_at_sample_age(sample, position - u128::from(sample.start_us) * 1_000, now)
+        .ok_or_else(|| "playback clock is out of range".to_owned())
 }
 
 fn toggle_playback(
@@ -2999,7 +3062,8 @@ fn toggle_playback(
     now: Instant,
     results: &mut Vec<EditorUiResult>,
 ) {
-    if state.playback.take().is_some() {
+    if let Some(clock) = state.playback.take() {
+        state.paused_position_nanos = Some(clock.position_nanos(now));
         results.push(Ok(EditorUiAction::Playback { playing: false }));
         return;
     }
@@ -3014,13 +3078,12 @@ fn toggle_playback(
             }
         }
     }
-    let Some(clock) = playback_clock_for_current(workspace, now) else {
-        push_failure(
-            results,
-            EditorUiOperation::Playback,
-            "the current frame is unavailable",
-        );
-        return;
+    let clock = match playback_clock_for_current(workspace, state, now, true) {
+        Ok(clock) => clock,
+        Err(error) => {
+            push_failure(results, EditorUiOperation::Playback, error);
+            return;
+        }
     };
     state.playback = Some(clock);
     state.reveal_current_frame = true;
@@ -3038,14 +3101,26 @@ fn advance_playback(
     let Some(clock) = state.playback else {
         return;
     };
-    let Some(index) = current_frame_index(workspace) else {
+    let Some(current_id) = workspace.selection().current() else {
         state.playback = None;
         results.push(Ok(EditorUiAction::Playback { playing: false }));
         return;
     };
-    let current_id = workspace.manifest().timeline.frames[index].id;
-    if current_id != clock.id {
-        state.playback = playback_clock_for_current(workspace, now);
+    if current_id != clock.id
+        || !state
+            .presentation
+            .as_ref()
+            .is_some_and(|cached| cached.matches(workspace))
+    {
+        match playback_clock_for_current(workspace, state, now, false) {
+            Ok(clock) => state.playback = Some(clock),
+            Err(error) => {
+                state.playback = None;
+                state.preview_sample = None;
+                push_failure(results, EditorUiOperation::PlaybackStep, error);
+                results.push(Ok(EditorUiAction::Playback { playing: false }));
+            }
+        }
         schedule_playback_repaint(context, state, now);
         return;
     }
@@ -3053,12 +3128,11 @@ fn advance_playback(
         schedule_playback_repaint(context, state, now);
         return;
     }
-    let Some((frame_id, next_clock)) = clock.advance(
-        &workspace.manifest().timeline.frames,
-        index,
-        now,
-        state.loop_preview,
-    ) else {
+    let advanced = state
+        .presentation
+        .as_ref()
+        .and_then(|cached| clock.advance(&cached.plan, now, state.loop_preview));
+    let Some((sample, next_clock)) = advanced else {
         state.playback = None;
         push_failure(
             results,
@@ -3068,6 +3142,7 @@ fn advance_playback(
         results.push(Ok(EditorUiAction::Playback { playing: false }));
         return;
     };
+    let frame_id = sample.frame_id;
     if frame_id != current_id {
         if let Err(error) = workspace.select_only(frame_id) {
             state.playback = None;
@@ -3081,6 +3156,7 @@ fn advance_playback(
         state.reveal_current_frame = true;
     }
     state.playback = next_clock;
+    state.preview_sample = Some(sample);
     if next_clock.is_none() {
         results.push(Ok(EditorUiAction::Playback { playing: false }));
     }
@@ -3093,10 +3169,18 @@ fn synchronize_playback_after_selection(
     now: Instant,
     results: &mut Vec<EditorUiResult>,
 ) {
+    state.preview_sample = None;
+    state.paused_position_nanos = None;
     if state.playback.is_none() {
         return;
     }
-    state.playback = playback_clock_for_current(workspace, now);
+    state.playback = match playback_clock_for_current(workspace, state, now, false) {
+        Ok(clock) => Some(clock),
+        Err(error) => {
+            push_failure(results, EditorUiOperation::PlaybackStep, error);
+            None
+        }
+    };
     if state.playback.is_none() {
         results.push(Ok(EditorUiAction::Playback { playing: false }));
     }
@@ -3677,16 +3761,47 @@ mod tests {
             .collect()
     }
 
+    fn playback_plan(frames: &[FrameClip]) -> gif_from_screen_application::PresentationPlan {
+        use gif_from_screen_domain::{
+            Canvas, CanvasBackground, ColorSpace, ProjectId, ProjectManifest, UnixTimeMs,
+        };
+        let mut manifest = ProjectManifest::new(
+            ProjectId::from_u128(1),
+            "playback-test",
+            UnixTimeMs::new(0),
+            Canvas {
+                size: PhysicalSize::new(1, 1).unwrap(),
+                color_space: ColorSpace::Srgb,
+                background: CanvasBackground::Transparent,
+            },
+        )
+        .unwrap();
+        manifest.timeline.frames = frames.to_vec();
+        gif_from_screen_application::PresentationPlan::new(&manifest, frames).unwrap()
+    }
+
+    fn playback_clock(
+        plan: &gif_from_screen_application::PresentationPlan,
+        index: usize,
+        now: Instant,
+    ) -> PlaybackClock {
+        let sample = plan
+            .sample_at_us(plan.frame_start_us(index).unwrap())
+            .unwrap();
+        super::clock_at_sample_age(sample, 0, now).unwrap()
+    }
+
     #[test]
     fn playback_skips_late_frames_and_keeps_original_deadlines_after_wrapping() {
         let frames = playback_frames(&[10_000, 30_000, 20_000]);
+        let plan = playback_plan(&frames);
         let start = Instant::now();
-        let clock = PlaybackClock::new(frames[0].id, start, frames[0].duration);
+        let clock = playback_clock(&plan, 0, start);
 
         let (id, clock) = clock
-            .advance(&frames, 0, start + Duration::from_millis(45), true)
+            .advance(&plan, start + Duration::from_millis(45), true)
             .unwrap();
-        assert_eq!(id, frames[2].id);
+        assert_eq!(id.frame_id, frames[2].id);
         let clock = clock.unwrap();
         assert_eq!(clock.started_at, start + Duration::from_millis(40));
         assert_eq!(
@@ -3695,38 +3810,40 @@ mod tests {
         );
 
         let (id, clock) = clock
-            .advance(&frames, 2, start + Duration::from_millis(60), true)
+            .advance(&plan, start + Duration::from_millis(60), true)
             .unwrap();
-        assert_eq!(id, frames[0].id);
+        assert_eq!(id.frame_id, frames[0].id);
         let clock = clock.unwrap();
         assert_eq!(clock.started_at, start + Duration::from_millis(60));
         let (id, clock) = clock
-            .advance(&frames, 0, start + Duration::from_millis(72), true)
+            .advance(&plan, start + Duration::from_millis(72), true)
             .unwrap();
-        assert_eq!(id, frames[1].id);
+        assert_eq!(id.frame_id, frames[1].id);
         assert_eq!(clock.unwrap().started_at, start + Duration::from_millis(70));
     }
 
     #[test]
     fn playback_skips_millions_of_complete_loops_and_retains_submicrosecond_age() {
         let frames = playback_frames(&[1, 2, 3]);
+        let plan = playback_plan(&frames);
         let start = Instant::now();
-        let clock = PlaybackClock::new(frames[1].id, start, frames[1].duration);
+        let clock = playback_clock(&plan, 1, start);
         let now = start + Duration::from_nanos(6_000_000_003_500);
-        let (id, clock) = clock.advance(&frames, 1, now, true).unwrap();
-        assert_eq!(id, frames[2].id);
+        let (id, clock) = clock.advance(&plan, now, true).unwrap();
+        assert_eq!(id.frame_id, frames[2].id);
         assert_eq!(clock.unwrap().remaining(now), Duration::from_nanos(1_500));
     }
 
     #[test]
     fn one_shot_playback_holds_the_last_frame_after_a_long_stall() {
         let frames = playback_frames(&[10_000, 30_000, 20_000]);
+        let plan = playback_plan(&frames);
         let start = Instant::now();
-        let clock = PlaybackClock::new(frames[0].id, start, frames[0].duration);
+        let clock = playback_clock(&plan, 0, start);
         let (id, next) = clock
-            .advance(&frames, 0, start + Duration::from_secs(2), false)
+            .advance(&plan, start + Duration::from_secs(2), false)
             .unwrap();
-        assert_eq!(id, frames[2].id);
+        assert_eq!(id.frame_id, frames[2].id);
         assert!(next.is_none());
         assert!(EditorUiState::default().loop_preview);
     }
@@ -3734,14 +3851,138 @@ mod tests {
     #[test]
     fn single_frame_preview_repeats_or_stops_at_its_exact_boundary() {
         let frames = playback_frames(&[1_000]);
+        let plan = playback_plan(&frames);
         let start = Instant::now();
         let now = start + Duration::from_millis(1);
-        let clock = PlaybackClock::new(frames[0].id, start, frames[0].duration);
-        let (id, next) = clock.advance(&frames, 0, now, true).unwrap();
-        assert_eq!(id, frames[0].id);
+        let clock = playback_clock(&plan, 0, start);
+        let (id, next) = clock.advance(&plan, now, true).unwrap();
+        assert_eq!(id.frame_id, frames[0].id);
         assert_eq!(next.unwrap().started_at, now);
-        assert!(clock.advance(&frames, 0, now, false).unwrap().1.is_none());
-        assert!(clock.advance(&[], 0, now, true).is_none());
+        assert!(clock.advance(&plan, now, false).unwrap().1.is_none());
+    }
+
+    fn transition_workspace() -> (tempfile::TempDir, crate::editor_workspace::EditorWorkspace) {
+        use gif_from_screen_application::{
+            BlankAnimationProjectOptions, create_blank_animation_project,
+        };
+        use gif_from_screen_domain::{
+            EditCommand, ProjectId, Transition, TransitionId, UnixTimeMs,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let mut project = create_blank_animation_project(
+            directory.path().join("playback.gfsproj"),
+            BlankAnimationProjectOptions {
+                project_id: ProjectId::from_u128(1),
+                frame_id: FrameId::from_u128(1),
+                app_version: "playback-test".into(),
+                created_at: UnixTimeMs::new(0),
+                canvas: PhysicalSize::new(1, 1).unwrap(),
+                background: Rgba {
+                    red: 0,
+                    green: 0,
+                    blue: 0,
+                    alpha: 255,
+                },
+                frame_duration: DurationUs::new(10_000).unwrap(),
+                frame_limit_bytes: 4,
+            },
+        )
+        .unwrap();
+        let mut second = project.manifest().timeline.frames[0].clone();
+        second.id = FrameId::from_u128(2);
+        second.duration = DurationUs::new(30_000).unwrap();
+        project
+            .commit(EditCommand::Compound {
+                commands: vec![
+                    EditCommand::InsertFrames {
+                        index: 1,
+                        frames: vec![second],
+                    },
+                    EditCommand::SetTransitions {
+                        transitions: vec![Transition {
+                            id: TransitionId::from_u128(1),
+                            from_frame: FrameId::from_u128(1),
+                            to_frame: FrameId::from_u128(2),
+                            duration: DurationUs::new(20_000).unwrap(),
+                            steps: 2,
+                            kind: TransitionKind::FadeToNext,
+                        }],
+                    },
+                ],
+            })
+            .unwrap();
+        let mut workspace =
+            crate::editor_workspace::EditorWorkspace::from_active(project, 10).unwrap();
+        workspace.select_first().unwrap();
+        (directory, workspace)
+    }
+
+    #[test]
+    fn playback_includes_transition_steps_and_pause_resumes_the_exact_step_age() {
+        let (_directory, mut workspace) = transition_workspace();
+        let context = eframe::egui::Context::default();
+        let mut state = EditorUiState {
+            loop_preview: false,
+            ..EditorUiState::default()
+        };
+        let mut results = Vec::new();
+        let start = Instant::now();
+        super::toggle_playback(&context, &mut workspace, &mut state, start, &mut results);
+        let pause = start + Duration::from_nanos(15_000_500);
+        super::advance_playback(&context, &mut workspace, &mut state, pause, &mut results);
+        assert_eq!(state.preview_transition(&workspace).unwrap().step, 1);
+        assert_eq!(workspace.selection().current(), Some(FrameId::from_u128(1)));
+        super::toggle_playback(&context, &mut workspace, &mut state, pause, &mut results);
+        assert!(state.playback.is_none());
+        assert_eq!(state.preview_transition(&workspace).unwrap().step, 1);
+        let resume = start + Duration::from_secs(5);
+        super::toggle_playback(&context, &mut workspace, &mut state, resume, &mut results);
+        assert_eq!(
+            state.playback.unwrap().remaining(resume),
+            Duration::from_nanos(4_999_500)
+        );
+        let step_two = resume + Duration::from_nanos(4_999_500);
+        super::advance_playback(&context, &mut workspace, &mut state, step_two, &mut results);
+        assert_eq!(state.preview_transition(&workspace).unwrap().step, 2);
+        let second = step_two + Duration::from_millis(10);
+        super::advance_playback(&context, &mut workspace, &mut state, second, &mut results);
+        assert!(state.preview_transition(&workspace).is_none());
+        assert_eq!(workspace.selection().current(), Some(FrameId::from_u128(2)));
+        super::advance_playback(
+            &context,
+            &mut workspace,
+            &mut state,
+            second + Duration::from_millis(30),
+            &mut results,
+        );
+        assert!(state.playback.is_none());
+        assert!(results.iter().all(Result::is_ok));
+    }
+
+    #[test]
+    fn selection_or_revision_changes_drop_stale_transition_preview_and_clock() {
+        let (_directory, mut workspace) = transition_workspace();
+        let context = eframe::egui::Context::default();
+        let mut state = EditorUiState::default();
+        let mut results = Vec::new();
+        let start = Instant::now();
+        super::toggle_playback(&context, &mut workspace, &mut state, start, &mut results);
+        let middle = start + Duration::from_millis(15);
+        super::advance_playback(&context, &mut workspace, &mut state, middle, &mut results);
+        assert!(state.preview_transition(&workspace).is_some());
+        workspace.remove_current_transition().unwrap();
+        assert!(state.preview_transition(&workspace).is_none());
+        super::advance_playback(&context, &mut workspace, &mut state, middle, &mut results);
+        assert_eq!(
+            state.playback.unwrap().remaining(middle),
+            Duration::from_millis(10)
+        );
+        super::toggle_playback(&context, &mut workspace, &mut state, middle, &mut results);
+        workspace.select_last().unwrap();
+        super::synchronize_playback_after_selection(&workspace, &mut state, middle, &mut results);
+        assert!(state.paused_position_nanos.is_none());
+        assert!(state.preview_sample.is_none());
+        assert!(results.iter().all(Result::is_ok));
     }
 
     #[test]

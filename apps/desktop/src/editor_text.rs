@@ -298,7 +298,7 @@ fn text_content(
     }
 }
 
-fn exclude_inserted_title(
+pub(super) fn exclude_inserted_title(
     items: &[OverlayItem],
     start: u64,
     duration: DurationUs,
