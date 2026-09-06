@@ -50,7 +50,21 @@ The final workspace regression run passed **850 tests**, with four opt-in tests 
 
 All four opt-in cases were run separately: native isolated-X11 input lifecycle, 10,000-frame incremental durability, 1,000 distinct 720p frame persistence/recovery, and installed-font Chinese/Arabic shaping. Native input passed ten repeated CI-shaped runs; the camera preview/record/pause/resume test passed twenty consecutive runs after correctly accounting for bounded writer backpressure. See [performance measurements](LINUX-BENCHMARKS.md). These tests do not substitute for physical hardware or complete user-interface parity.
 
-The new X11 lifecycle check now runs in Linux CI on its own Xvfb server. Both remote Linux CI and portable-package jobs passed at `dae7ba3`; later commits have their own workflow results and must not inherit that success without running.
+The new X11 lifecycle check now runs in Linux CI on its own Xvfb server. Both remote Linux CI and portable-package jobs passed at `dae7ba3`; Linux CI also passed for the final source baseline [`7f1b5c7`](https://github.com/tiansongyu/gifromscreen/actions/runs/34038953495). The portable checks below were run locally; they do not claim success for a later remote workflow that is still running.
+
+## Portable artifact verification
+
+Built from clean source `7f1b5c7d9a4f21f17f23124b1e51873dad02288d` with Rust 1.88.0:
+
+- Local archive: `target/package-annotations-20260906/gifromscreen-0.1.0-linux-x86_64.tar.gz`.
+- Size: `11,757,616` bytes; SHA-256: `7a04f7cb4eafdbe8bf1c23688f15d2bb2d0879a3351e19cd42c7cb45a6612e5d`.
+- Build receipt: source and package trees clean; 316 dependency inventory entries; desktop ELF requires at most GLIBC 2.35 (CLI 2.34).
+- All 12 archive/install/uninstall tests passed. Independent repackaging was byte-identical.
+- Packaged desktop launched successfully on a fresh Xvfb server, then passed five more fresh-server runs. The original reused display also passed a retry.
+
+The first packaged launch on the reused long-lived display failed once with `XOpenDisplayFailed`. The display was subsequently reachable; the failure did not reproduce in the tests above. Its cause is not established, and no application change or automatic retry was used to label it fixed. CI uses a dedicated fresh display. The root-owned long-lived Xvfb was stopped after verification; the synthetic QA images/projects and the two package archives remain available locally.
+
+This is a development preview artifact with the explicit remaining issues below, not a stable release or complete parity declaration.
 
 ## Remaining gates
 
@@ -62,3 +76,4 @@ Specific follow-up acceptance cases retained from the source audit:
 - Mouse annotations still need held-button/drag tracking, independent extra-button colors and continuous pointer highlighting; a sampled click marker is not equivalent to those modes.
 - Progress still needs centered growth, numbering offsets and the upstream date/time-format options. A manually written literal token format is not a full format editor.
 - Cinemagraph baking resets frame transforms but currently retains original capture metadata. Re-authoring recorded spatial annotations after a transformed/baked frame can therefore use stale coordinates or duplicate a baked pointer. The next correction must preserve original metadata for recovery while explicitly retiring or mapping coordinates for the baked output; do not treat current bake-plus-reannotation behavior as validated.
+- The same bake path removes selected spans from hidden/zero-opacity overlay tracks even though they did not contribute pixels. Preserve those editable tracks when fixing the bake boundary.
