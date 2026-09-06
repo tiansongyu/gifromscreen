@@ -68,6 +68,151 @@ fn equal_except_revision(actual: &ProjectManifest, expected: &ProjectManifest) {
     assert_eq!(*actual, expected);
 }
 
+fn loop_workspace(root: &std::path::Path, levels: &[u8]) -> EditorWorkspace {
+    let mut writer = IncrementalRecordingProject::create(
+        root,
+        PhysicalSize::new(4, 1).unwrap(),
+        IncrementalRecordingProjectOptions {
+            project_id: ProjectId::from_u128(908),
+            app_version: "loop-search-test".to_owned(),
+            created_at: UnixTimeMs::new(0),
+            source_label: None,
+        },
+    )
+    .unwrap();
+    for (index, level) in levels.iter().enumerate() {
+        let mut rgba = [20, 30, 40, 255].repeat(4);
+        rgba[0] = *level;
+        writer
+            .append_frame(
+                FrameId::from_u128(index as u128 + 1),
+                &RgbaFrame::new(4, 1, rgba, (index as u64 + 1) * 10_000).unwrap(),
+            )
+            .unwrap();
+    }
+    let mut workspace = EditorWorkspace::from_active(writer.finish().unwrap(), 32).unwrap();
+    workspace.select_first().unwrap();
+    workspace
+}
+
+#[test]
+fn loop_search_obeys_direction_skip_and_exact_pixel_percentage() {
+    let directory = tempfile::tempdir().unwrap();
+    for (name, from_end, expected_removed, expected_len) in [
+        ("forward.gfsproj", false, 3, 3),
+        ("reverse.gfsproj", true, 1, 5),
+    ] {
+        let mut workspace = loop_workspace(&directory.path().join(name), &[20, 21, 20, 22, 20, 23]);
+        let before = workspace.manifest().clone();
+        let result = workspace
+            .apply_motion_edit(
+                &workspace.project_edit_anchor(),
+                MotionOperation::FindSmoothLoop {
+                    skip_first: 1,
+                    similarity_tenths: 1000,
+                    from_end,
+                },
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(result, MotionOutcome::TrimmedTail(expected_removed));
+        assert_eq!(workspace.manifest().timeline.frames.len(), expected_len);
+        assert_eq!(workspace.manifest().assets, before.assets);
+        workspace.undo().unwrap();
+        equal_except_revision(workspace.manifest(), &before);
+        workspace.redo().unwrap();
+        assert_eq!(workspace.manifest().timeline.frames.len(), expected_len);
+    }
+    let mut workspace = loop_workspace(&directory.path().join("threshold.gfsproj"), &[20, 21, 22]);
+    let anchor = workspace.project_edit_anchor();
+    // Only one channel of one pixel differs. Mean-color rounding is nearly 100%, but
+    // the reference behavior is exactly 75% equal pixels, inclusive at that boundary.
+    assert_eq!(
+        workspace
+            .apply_motion_edit(
+                &anchor,
+                MotionOperation::FindSmoothLoop {
+                    skip_first: 1,
+                    similarity_tenths: 751,
+                    from_end: false
+                },
+                &AtomicBool::new(false),
+                |_| {}
+            )
+            .unwrap(),
+        MotionOutcome::NoMatchingEnd
+    );
+    assert_eq!(
+        workspace
+            .apply_motion_edit(
+                &anchor,
+                MotionOperation::FindSmoothLoop {
+                    skip_first: 1,
+                    similarity_tenths: 750,
+                    from_end: false
+                },
+                &AtomicBool::new(false),
+                |_| {}
+            )
+            .unwrap(),
+        MotionOutcome::TrimmedTail(1)
+    );
+}
+
+#[test]
+fn loop_search_noop_invalid_and_cancelled_runs_do_not_write_a_revision() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut workspace = loop_workspace(&directory.path().join("noop.gfsproj"), &[20, 21, 20]);
+    let before = workspace.manifest().clone();
+    let operation = MotionOperation::FindSmoothLoop {
+        skip_first: 1,
+        similarity_tenths: 1000,
+        from_end: true,
+    };
+    assert_eq!(
+        workspace
+            .apply_motion_edit(
+                &workspace.project_edit_anchor(),
+                operation,
+                &AtomicBool::new(false),
+                |_| {}
+            )
+            .unwrap(),
+        MotionOutcome::AlreadySmooth
+    );
+    assert_eq!(workspace.manifest(), &before);
+    let cancelled = AtomicBool::new(false);
+    assert!(
+        workspace
+            .apply_motion_edit(
+                &workspace.project_edit_anchor(),
+                operation,
+                &cancelled,
+                |_| cancelled.store(true, Ordering::Release)
+            )
+            .is_err()
+    );
+    assert_eq!(workspace.manifest(), &before);
+    for (skip_first, similarity_tenths) in [(0, 1000), (3, 1000), (1, 0), (1, 1001)] {
+        assert!(
+            workspace
+                .apply_motion_edit(
+                    &workspace.project_edit_anchor(),
+                    MotionOperation::FindSmoothLoop {
+                        skip_first,
+                        similarity_tenths,
+                        from_end: true
+                    },
+                    &AtomicBool::new(false),
+                    |_| {}
+                )
+                .is_err()
+        );
+        assert_eq!(workspace.manifest(), &before);
+    }
+}
+
 fn add_overlay(workspace: &mut EditorWorkspace) {
     workspace.select_all();
     workspace
@@ -175,7 +320,7 @@ fn smooth_loop_appends_exact_duration_and_first_endpoint_without_overlay_double_
     let count = workspace
         .apply_motion_edit(
             &anchor,
-            MotionOperation::SmoothLoop {
+            MotionOperation::LoopCrossfade {
                 frames: 3,
                 duration_us: 33_334,
             },
@@ -183,7 +328,7 @@ fn smooth_loop_appends_exact_duration_and_first_endpoint_without_overlay_double_
             |_| {},
         )
         .unwrap();
-    assert_eq!(count, 3);
+    assert_eq!(count, MotionOutcome::Edited(3));
     assert_eq!(
         &workspace.manifest().timeline.frames[..3],
         &before.timeline.frames
@@ -242,7 +387,7 @@ fn motion_rejects_stale_selection_invalid_rectangles_canvas_mismatch_and_limits(
         workspace
             .apply_motion_edit(
                 &stale,
-                MotionOperation::SmoothLoop {
+                MotionOperation::LoopCrossfade {
                     frames: 3,
                     duration_us: 30_000
                 },
@@ -253,11 +398,11 @@ fn motion_rejects_stale_selection_invalid_rectangles_canvas_mismatch_and_limits(
     );
     equal_except_revision(workspace.manifest(), &before);
     for operation in [
-        MotionOperation::SmoothLoop {
+        MotionOperation::LoopCrossfade {
             frames: 121,
             duration_us: 30_000,
         },
-        MotionOperation::SmoothLoop {
+        MotionOperation::LoopCrossfade {
             frames: 3,
             duration_us: 2,
         },
@@ -297,7 +442,7 @@ fn motion_rejects_stale_selection_invalid_rectangles_canvas_mismatch_and_limits(
         workspace
             .apply_motion_edit(
                 &anchor,
-                MotionOperation::SmoothLoop {
+                MotionOperation::LoopCrossfade {
                     frames: 3,
                     duration_us: 30_000
                 },
@@ -319,7 +464,7 @@ fn cancelling_after_pixel_preparation_preserves_timeline_and_undo_history() {
     let error = workspace
         .apply_motion_edit(
             &anchor,
-            MotionOperation::SmoothLoop {
+            MotionOperation::LoopCrossfade {
                 frames: 8,
                 duration_us: 400_000,
             },
@@ -364,7 +509,7 @@ fn smooth_loop_duration_overflow_is_rejected_before_storing_any_new_pixels() {
     let error = workspace
         .apply_motion_edit(
             &anchor,
-            MotionOperation::SmoothLoop {
+            MotionOperation::LoopCrossfade {
                 frames: 3,
                 duration_us: 30_000,
             },

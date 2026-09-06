@@ -31,16 +31,31 @@ pub(crate) enum MotionOperation {
     /// Preserve current-frame pixels outside the rectangle; invert freezes inside instead.
     Cinemagraph { region: PhysicalRect, invert: bool },
     /// Append fully rendered cross-fade frames from the last original to the first original.
-    SmoothLoop { frames: u16, duration_us: u64 },
+    LoopCrossfade { frames: u16, duration_us: u64 },
+    /// Find a frame matching the first and remove frames after that match.
+    FindSmoothLoop {
+        skip_first: usize,
+        similarity_tenths: u16,
+        from_end: bool,
+    },
 }
 
 impl MotionOperation {
     pub(crate) const fn label(&self) -> &'static str {
         match self {
             Self::Cinemagraph { .. } => "Rectangular cinemagraph",
-            Self::SmoothLoop { .. } => "Smooth loop",
+            Self::LoopCrossfade { .. } => "Loop crossfade",
+            Self::FindSmoothLoop { .. } => "Smooth loop search",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MotionOutcome {
+    Edited(usize),
+    TrimmedTail(usize),
+    AlreadySmooth,
+    NoMatchingEnd,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -65,7 +80,7 @@ impl EditorWorkspace {
         operation: MotionOperation,
         cancellation: &AtomicBool,
         mut progress: impl FnMut(MotionProgress),
-    ) -> Result<usize, String> {
+    ) -> Result<MotionOutcome, String> {
         check_cancelled(cancellation)?;
         if !anchor.matches(self) {
             return Err(
@@ -77,15 +92,98 @@ impl EditorWorkspace {
             MotionOperation::Cinemagraph { region, invert } => {
                 self.cinemagraph_command(region, invert, cancellation, &mut progress)?
             }
-            MotionOperation::SmoothLoop {
+            MotionOperation::LoopCrossfade {
                 frames,
                 duration_us,
-            } => self.smooth_loop_command(frames, duration_us, cancellation, &mut progress)?,
+            } => self.loop_crossfade_command(frames, duration_us, cancellation, &mut progress)?,
+            MotionOperation::FindSmoothLoop {
+                skip_first,
+                similarity_tenths,
+                from_end,
+            } => {
+                return self.find_smooth_loop(
+                    skip_first,
+                    similarity_tenths,
+                    from_end,
+                    cancellation,
+                    &mut progress,
+                );
+            }
         };
         check_cancelled(cancellation)?;
         // This includes fsync and undo history updates, exclusively on the worker.
         self.execute(command).map_err(|error| error.to_string())?;
-        Ok(count)
+        Ok(MotionOutcome::Edited(count))
+    }
+
+    fn find_smooth_loop(
+        &mut self,
+        skip_first: usize,
+        similarity_tenths: u16,
+        from_end: bool,
+        cancellation: &AtomicBool,
+        progress: &mut impl FnMut(MotionProgress),
+    ) -> Result<MotionOutcome, String> {
+        let frames = &self.manifest().timeline.frames;
+        if frames.len() > MAX_RESULTING_FRAMES || skip_first == 0 || skip_first >= frames.len() {
+            return Err("Choose a positive number of initial frames to skip, smaller than the timeline length (at most 100,000 frames).".to_owned());
+        }
+        if !(1..=1000).contains(&similarity_tenths) {
+            return Err("Similarity must be between 0.1% and 100%.".to_owned());
+        }
+        let project = self.active_project();
+        let mut starts = Vec::with_capacity(frames.len());
+        let mut cursor = TimeUs::ZERO;
+        for frame in frames {
+            starts.push(cursor);
+            cursor = TimeUs::new(
+                cursor
+                    .get()
+                    .checked_add(frame.duration.get())
+                    .ok_or("Frame clock overflow")?,
+            );
+        }
+        let reference = PreviewRenderPlan::new(project, &frames[0], TimeUs::ZERO)
+            .map_err(|error| error.to_string())?
+            .render(MAX_SURFACE_BYTES, &Cancellation(cancellation))
+            .map_err(|error| error.to_string())?;
+        let total = frames.len() - skip_first;
+        let mut found = None;
+        for examined in 0..total {
+            check_cancelled(cancellation)?;
+            let index = if from_end {
+                frames.len() - 1 - examined
+            } else {
+                skip_first + examined
+            };
+            let candidate = PreviewRenderPlan::new(project, &frames[index], starts[index])
+                .map_err(|error| error.to_string())?
+                .render(MAX_SURFACE_BYTES, &Cancellation(cancellation))
+                .map_err(|error| error.to_string())?;
+            let qualifies =
+                matching_pixels_at_least(&reference, &candidate, similarity_tenths, cancellation)?;
+            progress(MotionProgress {
+                completed: examined + 1,
+                total,
+            });
+            if qualifies {
+                found = Some(index);
+                break;
+            }
+        }
+        check_cancelled(cancellation)?;
+        let Some(index) = found else {
+            return Ok(MotionOutcome::NoMatchingEnd);
+        };
+        if index == frames.len() - 1 {
+            return Ok(MotionOutcome::AlreadySmooth);
+        }
+        let removed = frames.len() - 1 - index;
+        let command =
+            gif_from_screen_editor::delete_frames_after(self.manifest(), [frames[index].id])
+                .map_err(|error| error.to_string())?;
+        self.execute(command).map_err(|error| error.to_string())?;
+        Ok(MotionOutcome::TrimmedTail(removed))
     }
 
     fn cinemagraph_command(
@@ -145,7 +243,7 @@ impl EditorWorkspace {
             };
             commands.push(EditCommand::ReplaceFrame {
                 frame_id: original.id,
-                replacement,
+                replacement: Box::new(replacement),
             });
             progress(MotionProgress {
                 completed: index + 1,
@@ -155,7 +253,7 @@ impl EditorWorkspace {
         Ok((EditCommand::Compound { commands }, selected.len()))
     }
 
-    fn smooth_loop_command(
+    fn loop_crossfade_command(
         &self,
         count: u16,
         duration_us: u64,
@@ -253,6 +351,35 @@ impl EditorWorkspace {
         );
         Ok((EditCommand::Compound { commands }, usize::from(count)))
     }
+}
+
+/// `ScreenToGif` loop search counts equal ARGB pixels, not average color distance.
+/// Integer cross multiplication preserves inclusive decimal thresholds without rounding up.
+fn matching_pixels_at_least(
+    first: &RgbaSurface,
+    second: &RgbaSurface,
+    similarity_tenths: u16,
+    cancellation: &AtomicBool,
+) -> Result<bool, String> {
+    if first.size() != second.size() {
+        return Err(
+            "Loop search requires matching rendered dimensions. Normalize frame sizes first."
+                .to_owned(),
+        );
+    }
+    let mut equal = 0_u64;
+    let pixels = first.pixels().as_chunks::<4>().0;
+    for (index, (left, right)) in pixels
+        .iter()
+        .zip(second.pixels().as_chunks::<4>().0)
+        .enumerate()
+    {
+        if index.is_multiple_of(1024) {
+            check_cancelled(cancellation)?;
+        }
+        equal += u64::from(left == right);
+    }
+    Ok(u128::from(equal) * 1000 >= pixels.len() as u128 * u128::from(similarity_tenths))
 }
 
 fn validate_budget(canvas: PhysicalSize, frames: usize) -> Result<(), String> {

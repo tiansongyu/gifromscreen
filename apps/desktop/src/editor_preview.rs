@@ -597,6 +597,7 @@ impl PreviewRenderPlan {
                     .cloned()
                     .collect();
                 (!items.is_empty()).then(|| OverlayTrack {
+                    annotation: None,
                     id: track.id,
                     name: String::new(),
                     visible: track.visible,
@@ -1016,6 +1017,7 @@ mod tests {
     ) -> (AssetId, OverlayTrack) {
         let asset_id = project.assets().put(pixels).unwrap();
         let track = OverlayTrack {
+            annotation: None,
             id: TrackId::from_u128(1),
             name: "preview watermark".to_owned(),
             visible: true,
@@ -1472,6 +1474,7 @@ mod tests {
             Vec::new(),
         );
         let track = OverlayTrack {
+            annotation: None,
             id: TrackId::from_u128(1),
             name: "shared asset watermark".to_owned(),
             visible: true,
@@ -1583,6 +1586,7 @@ mod tests {
         project
             .commit(EditCommand::UpsertOverlayTrack {
                 track: OverlayTrack {
+                    annotation: None,
                     id: TrackId::from_u128(1),
                     name: "vector preview".to_owned(),
                     visible: true,

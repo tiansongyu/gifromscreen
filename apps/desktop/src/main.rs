@@ -2,7 +2,10 @@
 
 //! Desktop entry point for the Linux-first `GifFromScreen` application.
 
+mod annotation_engine;
+mod annotation_tools;
 mod appearance;
+mod auto_tasks;
 mod background_task;
 mod blank_project_job;
 mod blank_project_ui;
@@ -44,6 +47,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use annotation_tools::AnnotationTools;
+use auto_tasks::AutoTasks;
 use blank_project_job::{
     BlankProjectJob, BlankProjectJobEvent, BlankProjectJobState, BlankProjectRequest,
 };
@@ -85,6 +90,7 @@ use gif_from_screen_media::{
     DecodeLimits, LoopBehavior as ImportedLoopBehavior, StaticImageSequenceDurationPolicy,
 };
 use gif_from_screen_project::{ActiveProject, LockPolicy, OpenedProject, ProjectError};
+use gif_from_screen_workflow::WorkflowPhase;
 use gif_from_screen_workflow::{
     CollectOptions, CollectionLimit, FrameRetention, RecordingControl, RecordingController,
     RecordingFrameSink, RecordingFrameSinkError, SnapshotTriggerRequest, SnapshotTriggerStatus,
@@ -150,6 +156,7 @@ enum AppView {
     ScreenRecorder,
     CameraRecorder,
     BoardRecorder,
+    Automation,
     Editor,
 }
 
@@ -231,11 +238,31 @@ struct RecordingSettings {
     manual_frame_duration_ms: u64,
     countdown_seconds: u8,
     changes_only: bool,
+    input_events: bool,
+    cursor: RecordingCursor,
     region_enabled: bool,
     region_x: i32,
     region_y: i32,
     region_width: u32,
     region_height: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum RecordingCursor {
+    #[default]
+    Embedded,
+    Hidden,
+    Editable,
+}
+
+impl RecordingCursor {
+    const fn capture_mode(self) -> CursorCaptureMode {
+        match self {
+            Self::Embedded => CursorCaptureMode::Embedded,
+            Self::Hidden => CursorCaptureMode::Hidden,
+            Self::Editable => CursorCaptureMode::Metadata,
+        }
+    }
 }
 
 impl Default for RecordingSettings {
@@ -255,6 +282,8 @@ impl Default for RecordingSettings {
             manual_frame_duration_ms: 100,
             countdown_seconds: 3,
             changes_only: false,
+            input_events: false,
+            cursor: RecordingCursor::default(),
             region_enabled: true,
             region_x: 0,
             region_y: 0,
@@ -329,6 +358,26 @@ impl RecordingFrameSink for IncrementalProjectFrameSink {
         }
         let frame_id = FrameId::from_u128(Uuid::new_v4().as_u128());
         self.project.append_frame(frame_id, frame)?;
+        self.frame_ids.push(frame_id);
+        Ok(())
+    }
+
+    fn append_provisional_frame_with_metadata(
+        &mut self,
+        frame_index: u64,
+        frame: &gif_from_screen_gif::RgbaFrame,
+        metadata: &gif_from_screen_workflow::RecordingMetadata,
+    ) -> Result<(), RecordingFrameSinkError> {
+        let expected = u64::try_from(self.frame_ids.len()).unwrap_or(u64::MAX);
+        if frame_index != expected {
+            return Err(io::Error::other(format!(
+                "incremental frame index {frame_index} does not follow {expected}"
+            ))
+            .into());
+        }
+        let frame_id = FrameId::from_u128(Uuid::new_v4().as_u128());
+        self.project
+            .append_frame_with_metadata(frame_id, frame, Some(metadata))?;
         self.frame_ids.push(frame_id);
         Ok(())
     }
@@ -417,6 +466,7 @@ struct RecordingJob {
     cancellation: CancellationFlag,
     controller: RecordingController,
     paused: bool,
+    pause_requested: Option<bool>,
     terminal_requested: bool,
     retarget: Option<RecordingRetarget>,
     snapshot_requests: VecDeque<SnapshotTriggerRequest>,
@@ -484,6 +534,40 @@ impl RecordingRetarget {
 }
 
 impl RecordingJob {
+    fn request_pause(&mut self, paused: bool) -> bool {
+        if self.pause_requested.is_some() {
+            return false;
+        }
+        let queued = if paused {
+            self.controller.pause()
+        } else {
+            self.controller.resume()
+        };
+        if queued {
+            self.pause_requested = Some(paused);
+            // Never show a privacy-safe paused state once resumption has been requested.
+            if !paused {
+                self.paused = false;
+            }
+        }
+        queued
+    }
+
+    fn acknowledge_phase(&mut self, phase: WorkflowPhase) {
+        let paused = match phase {
+            WorkflowPhase::Paused => true,
+            WorkflowPhase::Capturing => false,
+            _ => return,
+        };
+        if self
+            .pause_requested
+            .is_some_and(|requested| requested != paused)
+        {
+            return;
+        }
+        self.paused = paused;
+        self.pause_requested = None;
+    }
     fn observe_target(&mut self, candidate: PhysicalRect) {
         if self.terminal_requested {
             return;
@@ -666,6 +750,8 @@ struct GifFromScreenApp {
     camera_recorder: CameraRecorderUi,
     board_recorder: BoardRecorderTool,
     motion_tools: MotionTools,
+    annotation_tools: AnnotationTools,
+    auto_tasks: AutoTasks,
     project_library: ProjectLibraryTool,
     remembered_project: Option<(ProjectId, PathBuf)>,
     open_picker: PathPicker,
@@ -720,6 +806,8 @@ impl Default for GifFromScreenApp {
             camera_recorder: CameraRecorderUi::default(),
             board_recorder: BoardRecorderTool::default(),
             motion_tools: MotionTools::default(),
+            annotation_tools: AnnotationTools::default(),
+            auto_tasks: AutoTasks::default(),
             project_library: ProjectLibraryTool::default(),
             remembered_project: None,
             open_picker: PathPicker::default(),
@@ -801,12 +889,44 @@ impl eframe::App for GifFromScreenApp {
             || self.text_overlay.is_running()
             || self.source_workers_active()
             || self.project_library.is_active()
+            || self.auto_tasks.is_loading()
             || self.source_catalog_job.state() == CaptureSourceJobState::Loading
             || self.wayland_prepare_job.is_active()
         {
             context.request_repaint_after(Duration::from_millis(33));
         }
 
+        self.show_app_header(context);
+
+        egui::CentralPanel::default().show(context, |ui| match self.view {
+            AppView::Landing => self.show_landing(ui),
+            AppView::OpenProject => self.show_open_project(ui),
+            AppView::ImportGif => self.show_import_gif(ui),
+            AppView::ImportImage => self.show_import_image(ui),
+            AppView::ImportImageSequence => self.show_import_sequence(ui),
+            AppView::ImportVideo => self.video_import.show(ui),
+            AppView::NewBlankAnimation => self.show_blank_project(ui),
+            AppView::ScreenRecorder => self.show_screen_recorder(ui),
+            AppView::CameraRecorder => self.camera_recorder.show(ui),
+            AppView::BoardRecorder => self.board_recorder.show(ui),
+            AppView::Automation => {
+                if self.auto_tasks.is_running() {
+                    self.auto_tasks.show_running(ui);
+                } else {
+                    self.auto_tasks.show(ui, self.editor_workspace.as_ref());
+                }
+            }
+            AppView::Editor => self.show_editor(ui),
+        });
+    }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+}
+
+impl GifFromScreenApp {
+    fn show_app_header(&mut self, context: &egui::Context) {
         egui::TopBottomPanel::top("app_header").show(context, |ui| {
             ui.horizontal(|ui| {
                 let back_enabled = self.watermark_job.state() != WatermarkDecodeJobState::Running
@@ -839,28 +959,8 @@ impl eframe::App for GifFromScreenApp {
                 ui.label("Linux capture preview");
             });
         });
-
-        egui::CentralPanel::default().show(context, |ui| match self.view {
-            AppView::Landing => self.show_landing(ui),
-            AppView::OpenProject => self.show_open_project(ui),
-            AppView::ImportGif => self.show_import_gif(ui),
-            AppView::ImportImage => self.show_import_image(ui),
-            AppView::ImportImageSequence => self.show_import_sequence(ui),
-            AppView::ImportVideo => self.video_import.show(ui),
-            AppView::NewBlankAnimation => self.show_blank_project(ui),
-            AppView::ScreenRecorder => self.show_screen_recorder(ui),
-            AppView::CameraRecorder => self.camera_recorder.show(ui),
-            AppView::BoardRecorder => self.board_recorder.show(ui),
-            AppView::Editor => self.show_editor(ui),
-        });
     }
 
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0, 0.0, 0.0, 0.0]
-    }
-}
-
-impl GifFromScreenApp {
     fn receive_background_messages(&mut self, context: &egui::Context) {
         self.receive_capture_source_result();
         self.receive_wayland_prepare_messages(context);
@@ -895,6 +995,12 @@ impl GifFromScreenApp {
             self.notice = Some(notice);
         }
         if let Some(notice) = self.motion_tools.poll(&mut self.editor_workspace) {
+            self.notice = Some(notice);
+        }
+        if let Some(notice) = self.annotation_tools.poll(&mut self.editor_workspace) {
+            self.notice = Some(notice);
+        }
+        if let Some(notice) = self.auto_tasks.poll(&mut self.editor_workspace) {
             self.notice = Some(notice);
         }
         self.remember_active_project();
@@ -932,6 +1038,8 @@ impl GifFromScreenApp {
             || self.camera_recorder.is_active()
             || self.board_recorder.is_active()
             || self.motion_tools.is_running()
+            || self.annotation_tools.is_running()
+            || self.auto_tasks.is_running()
     }
 
     fn handle_worker_shutdown(&mut self, context: &egui::Context) {
@@ -943,6 +1051,8 @@ impl GifFromScreenApp {
             self.camera_recorder.shutdown();
             self.board_recorder.shutdown();
             self.motion_tools.cancel();
+            self.annotation_tools.cancel();
+            self.auto_tasks.cancel();
             self.shutdown = ShutdownState::WaitingForWorkers;
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
@@ -994,7 +1104,10 @@ impl GifFromScreenApp {
             FileDropActivity::VideoImport
         } else if self.project_insert.is_running() {
             FileDropActivity::ProjectInsertion
-        } else if self.motion_tools.is_running() {
+        } else if self.motion_tools.is_running()
+            || self.annotation_tools.is_running()
+            || self.auto_tasks.is_running()
+        {
             FileDropActivity::MotionEdit
         } else if self.open_project_job.state() != OpenProjectJobState::Idle {
             FileDropActivity::ProjectOpen
@@ -1241,6 +1354,9 @@ impl GifFromScreenApp {
     }
 
     fn show_resume_editor(&mut self, ui: &mut egui::Ui) {
+        if ui.button("Automatic editing tasks…").clicked() {
+            self.view = AppView::Automation;
+        }
         let Some(workspace) = &self.editor_workspace else {
             return;
         };
@@ -1633,6 +1749,14 @@ impl GifFromScreenApp {
     }
 
     fn show_editor(&mut self, ui: &mut egui::Ui) {
+        if self.auto_tasks.is_running() {
+            self.auto_tasks.show_running(ui);
+            return;
+        }
+        if self.annotation_tools.is_running() {
+            self.annotation_tools.show_running(ui);
+            return;
+        }
         if self.motion_tools.is_running() {
             self.motion_tools.show_running(ui);
             return;
@@ -1651,6 +1775,9 @@ impl GifFromScreenApp {
         };
         self.project_insert.show(ui, workspace);
         ui.add_enabled_ui(motion_enabled, |ui| self.motion_tools.show(ui, workspace));
+        ui.add_enabled_ui(motion_enabled && !self.motion_tools.is_running(), |ui| {
+            self.annotation_tools.show(ui, workspace);
+        });
         let open_copy = self.project_library.show_save_as(ui, workspace);
         ui.separator();
         let export_action = egui::CollapsingHeader::new("Export GIF")
@@ -1663,7 +1790,8 @@ impl GifFromScreenApp {
                     &self.export_job,
                     workspace,
                     self.watermark_job.state() == WatermarkDecodeJobState::Running
-                        || self.motion_tools.is_running(),
+                        || self.motion_tools.is_running()
+                        || self.annotation_tools.is_running(),
                 )
             })
             .body_returned
@@ -1687,6 +1815,16 @@ impl GifFromScreenApp {
         }
         if let Some(path) = open_copy {
             self.open_library_project(&path);
+        }
+        if ui
+            .add_enabled(
+                !self.source_workers_active(),
+                egui::Button::new("Editing task presets…"),
+            )
+            .clicked()
+        {
+            self.editor_ui_state.pause_preview();
+            self.view = AppView::Automation;
         }
     }
 
@@ -1796,6 +1934,11 @@ impl GifFromScreenApp {
                 ui.end_row();
                 show_recording_cadence_settings(ui, &mut self.settings);
                 show_frame_retention_setting(ui, &mut self.settings);
+                show_recording_annotations_setting(
+                    ui,
+                    &mut self.settings,
+                    self.display_server == Some(LinuxDisplayServer::X11),
+                );
                 ui.label("Start countdown (seconds)");
                 ui.add(
                     egui::DragValue::new(&mut self.settings.countdown_seconds)
@@ -2172,16 +2315,16 @@ impl GifFromScreenApp {
             }
             RecorderOverlayAction::Pause => {
                 if let Some(job) = &mut self.job
-                    && job.controller.pause()
+                    && job.request_pause(true)
                 {
-                    job.paused = true;
+                    self.notice = Some("Pause requested. Wait for the paused state before typing sensitive information.".to_owned());
                 }
             }
             RecorderOverlayAction::Resume => {
                 if let Some(job) = &mut self.job
-                    && job.controller.resume()
+                    && job.request_pause(false)
                 {
-                    job.paused = false;
+                    self.notice = Some("Resume requested.".to_owned());
                 }
             }
             RecorderOverlayAction::Snapshot => {
@@ -2331,6 +2474,7 @@ impl GifFromScreenApp {
             cancellation,
             controller,
             paused: false,
+            pause_requested: None,
             terminal_requested: false,
             retarget,
             snapshot_requests: VecDeque::new(),
@@ -2340,6 +2484,9 @@ impl GifFromScreenApp {
 
     fn start_wayland_recording(&mut self) -> Result<(), String> {
         validate_settings(&self.settings)?;
+        if self.settings.input_events || self.settings.cursor == RecordingCursor::Editable {
+            return Err("Wayland supports hidden or embedded cursors, not editable cursor metadata or global input events. Disable X11-only options first.".to_owned());
+        }
         if self.job.is_some() {
             return Ok(());
         }
@@ -2423,6 +2570,9 @@ impl GifFromScreenApp {
     }
 
     fn begin_wayland_preparation(&mut self) -> Result<(), String> {
+        if self.settings.input_events || self.settings.cursor == RecordingCursor::Editable {
+            return Err("Choose a hidden/embedded cursor and disable X11 input events before opening the Wayland source chooser.".to_owned());
+        }
         if self.wayland_prepare_job.is_active() {
             return Ok(());
         }
@@ -2434,7 +2584,7 @@ impl GifFromScreenApp {
         self.wayland_frozen_preview = None;
         let cadence = recording_cadence(&self.settings)?;
         self.wayland_prepare_job
-            .start(source, cadence)
+            .start(source, cadence, self.settings.cursor.capture_mode())
             .map_err(|error| error.to_string())?;
         self.notice = Some(
             "Opening the Wayland system chooser in the background. Select a screen or window to prepare its frozen preview."
@@ -2707,16 +2857,16 @@ impl GifFromScreenApp {
             }
             RecorderOverlayAction::Pause => {
                 if let Some(job) = &mut self.job
-                    && job.controller.pause()
+                    && job.request_pause(true)
                 {
-                    job.paused = true;
+                    self.notice = Some("Pause requested. Wait for the paused state before typing sensitive information.".to_owned());
                 }
             }
             RecorderOverlayAction::Resume => {
                 if let Some(job) = &mut self.job
-                    && job.controller.resume()
+                    && job.request_pause(false)
                 {
-                    job.paused = false;
+                    self.notice = Some("Resume requested.".to_owned());
                 }
             }
             RecorderOverlayAction::Snapshot => {
@@ -2776,7 +2926,12 @@ impl GifFromScreenApp {
         let messages: Vec<_> = job.receiver.try_iter().collect();
         for message in messages {
             match message {
-                JobMessage::Progress(progress) => self.progress = Some(progress),
+                JobMessage::Progress(progress) => {
+                    if let Some(job) = &mut self.job {
+                        job.acknowledge_phase(progress.phase);
+                    }
+                    self.progress = Some(progress);
+                }
                 JobMessage::Persisting => {
                     if let Some(job) = &mut self.job {
                         job.stop_retargeting();
@@ -2801,6 +2956,7 @@ impl GifFromScreenApp {
                                 *project,
                             ) {
                                 Ok(summary) => {
+                                    self.queue_created_tasks();
                                     self.editor_ui_state = EditorUiState::default();
                                     self.editor_preview_cache = EditorPreviewCache::new();
                                     self.editor_export_settings = EditorExportSettings::default();
@@ -2941,6 +3097,7 @@ impl GifFromScreenApp {
         let source = Path::new(self.import_gif_path.trim());
         let output = edited_gif_path_for_import(source)?;
         let summary = activate_editor(&mut self.view, &mut self.editor_workspace, project)?;
+        self.queue_created_tasks();
         self.editor_ui_state = EditorUiState::default();
         self.editor_preview_cache = EditorPreviewCache::new();
         self.editor_export_settings = EditorExportSettings::default();
@@ -2984,6 +3141,7 @@ impl GifFromScreenApp {
         let output = source.with_extension("gif");
         let output_exists = output.exists();
         let summary = activate_editor(&mut self.view, &mut self.editor_workspace, project)?;
+        self.queue_created_tasks();
         self.editor_ui_state = EditorUiState::default();
         self.editor_preview_cache = EditorPreviewCache::new();
         self.editor_export_settings = EditorExportSettings::default();
@@ -3030,6 +3188,7 @@ impl GifFromScreenApp {
         let output = project.layout().root.with_extension("gif");
         let output_exists = output.exists();
         let summary = activate_editor(&mut self.view, &mut self.editor_workspace, project)?;
+        self.queue_created_tasks();
         self.editor_ui_state = EditorUiState::default();
         self.editor_preview_cache = EditorPreviewCache::new();
         self.editor_export_settings = EditorExportSettings::default();
@@ -3129,6 +3288,7 @@ impl GifFromScreenApp {
         let output = project.layout().root.with_extension("gif");
         let output_exists = output.exists();
         let summary = activate_editor(&mut self.view, &mut self.editor_workspace, project)?;
+        self.queue_created_tasks();
         self.editor_ui_state = EditorUiState::default();
         self.editor_preview_cache = EditorPreviewCache::new();
         self.editor_export_settings = EditorExportSettings::default();
@@ -3146,6 +3306,23 @@ impl GifFromScreenApp {
             Duration::from_micros(summary.duration_us).as_secs_f64(),
             output.display()
         ))
+    }
+
+    fn queue_created_tasks(&mut self) {
+        use gif_from_screen_domain::{EditTaskTrigger, SourceProvenance};
+        let Some(workspace) = &self.editor_workspace else {
+            return;
+        };
+        let trigger = match workspace.manifest().source_provenance.last() {
+            Some(SourceProvenance::Screen { .. }) => EditTaskTrigger::ScreenRecording,
+            Some(SourceProvenance::Camera { .. }) => EditTaskTrigger::CameraRecording,
+            Some(SourceProvenance::Board) => EditTaskTrigger::BoardRecording,
+            Some(SourceProvenance::Imported { .. }) => EditTaskTrigger::Import,
+            None => return,
+        };
+        if let Err(error) = self.auto_tasks.queue_created(workspace, trigger) {
+            self.notice = Some(error);
+        }
     }
 
     fn activate_opened_project(&mut self, opened: OpenedProject) -> Result<String, String> {
@@ -5305,6 +5482,35 @@ fn show_recording_cadence_settings(ui: &mut egui::Ui, settings: &mut RecordingSe
     }
 }
 
+fn show_recording_annotations_setting(
+    ui: &mut egui::Ui,
+    settings: &mut RecordingSettings,
+    x11: bool,
+) {
+    ui.label("Cursor and input annotations");
+    ui.vertical(|ui| {
+        egui::ComboBox::from_id_salt("recording-cursor-mode").selected_text(match settings.cursor {
+            RecordingCursor::Embedded => "Cursor in recording pixels",
+            RecordingCursor::Hidden => "Hide cursor", RecordingCursor::Editable => "Editable cursor metadata",
+        }).show_ui(ui, |ui| {
+            ui.selectable_value(&mut settings.cursor, RecordingCursor::Embedded, "Cursor in recording pixels");
+            ui.selectable_value(&mut settings.cursor, RecordingCursor::Hidden, "Hide cursor");
+            ui.add_enabled_ui(x11, |ui| {
+                ui.selectable_value(&mut settings.cursor, RecordingCursor::Editable, "Editable cursor metadata");
+            });
+        });
+        ui.add_enabled_ui(x11 || settings.input_events, |ui| {
+            ui.checkbox(&mut settings.input_events, "Record key and mouse-button events (X11)");
+        });
+        if settings.input_events {
+            ui.colored_label(ui.visuals().warn_fg_color, "Keys can include passwords or private messages. Enabled only while recording; pause before typing sensitive information.");
+        }
+        if !x11 { ui.weak("Wayland cannot record global key/click events; manual annotations remain available. Cursor mode is chosen before portal preparation."); }
+        ui.weak("Editable mode leaves the cursor out of pixels; add its captured cursor annotation in the editor. Physical key transitions are captured, not IME text or server-generated auto-repeat.");
+    });
+    ui.end_row();
+}
+
 fn show_frame_retention_setting(ui: &mut egui::Ui, settings: &mut RecordingSettings) {
     ui.label("Frame retention");
     ui.horizontal_wrapped(|ui| {
@@ -5571,7 +5777,8 @@ fn collect_x11_recording(
     let cadence = recording_cadence(&worker.settings)
         .map_err(gif_from_screen_capture::CaptureError::invalid_request)?;
     let mut request = CaptureRequest::new(target, cadence);
-    request.cursor = CursorCaptureMode::Embedded;
+    request.cursor = worker.settings.cursor.capture_mode();
+    request.input_events = worker.settings.input_events;
     let options = collection_options(&worker.settings)
         .map_err(gif_from_screen_capture::CaptureError::invalid_request)?;
     collect_controlled_to_sink(
@@ -6856,6 +7063,7 @@ mod tests {
             assert!(Instant::now() < deadline, "GIF import job timed out");
             std::thread::sleep(Duration::from_millis(1));
         }
+        drain_created_tasks(app);
     }
 
     fn drain_import_image_job(app: &mut GifFromScreenApp) {
@@ -6865,6 +7073,50 @@ mod tests {
             assert!(Instant::now() < deadline, "image import job timed out");
             std::thread::sleep(Duration::from_millis(1));
         }
+        drain_created_tasks(app);
+    }
+
+    fn drain_created_tasks(app: &mut GifFromScreenApp) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.auto_tasks.is_running() || app.auto_tasks.is_loading() {
+            if let Some(notice) = app.auto_tasks.poll(&mut app.editor_workspace) {
+                app.notice = Some(notice);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "automatic editing tasks timed out"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn paused_indicator_waits_for_capture_acknowledgement_and_rejects_stale_messages() {
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let (controller, _control) = gif_from_screen_workflow::RecordingController::channel();
+        let mut job = super::RecordingJob {
+            receiver,
+            controller,
+            cancellation: gif_from_screen_gif::CancellationFlag::default(),
+            paused: false,
+            pause_requested: None,
+            terminal_requested: false,
+            retarget: None,
+            snapshot_requests: std::collections::VecDeque::new(),
+        };
+        assert!(job.request_pause(true));
+        assert!(!job.paused);
+        assert!(!job.request_pause(true));
+        job.acknowledge_phase(gif_from_screen_workflow::WorkflowPhase::Capturing);
+        assert!(!job.paused);
+        job.acknowledge_phase(gif_from_screen_workflow::WorkflowPhase::Paused);
+        assert!(job.paused);
+        assert!(job.request_pause(false));
+        assert!(!job.paused);
+        job.acknowledge_phase(gif_from_screen_workflow::WorkflowPhase::Paused);
+        assert!(!job.paused);
+        job.acknowledge_phase(gif_from_screen_workflow::WorkflowPhase::Capturing);
+        assert_eq!(job.pause_requested, None);
     }
 
     fn drain_watermark_job(app: &mut GifFromScreenApp) {

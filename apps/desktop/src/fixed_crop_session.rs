@@ -256,6 +256,21 @@ fn copy_cropped_metadata(
     if let Some(cursor) = source.cursor() {
         cropped = cropped.with_cursor(crop_cursor(cursor, crop));
     }
+    if let Some(image) = source.cursor_image() {
+        cropped = cropped.with_cursor_image(image.clone(), source.cursor_embedded());
+    }
+    cropped = cropped.with_dropped_input_events(source.dropped_input_events());
+    let source_origin = source.capture_origin().unwrap_or_default();
+    cropped = cropped.with_capture_origin(PhysicalPosition {
+        x: source_origin
+            .x
+            .checked_add(crop.origin().x)
+            .ok_or_else(|| CaptureError::invalid_frame("cropped capture origin x overflows"))?,
+        y: source_origin
+            .y
+            .checked_add(crop.origin().y)
+            .ok_or_else(|| CaptureError::invalid_frame("cropped capture origin y overflows"))?,
+    });
     Ok(cropped.with_input_events(
         source
             .input_events()
@@ -540,6 +555,8 @@ mod tests {
                     native_code: 42,
                     text: Some("x".to_owned()),
                     state: KeyState::Pressed,
+                    repeat: false,
+                    modifiers: 0,
                 },
                 InputEvent::PointerButton {
                     at: CaptureTimestamp::from_micros(110),

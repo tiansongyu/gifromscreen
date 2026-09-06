@@ -445,6 +445,11 @@ fn remap_frames(
         };
         by_source.insert(frame.id, id);
         frame.id = id;
+        // Native events and captured_at share the original recording clock.
+        // Insertion changes the owning clip's timeline position, not that clock.
+        if frame.capture_metadata.captured_at.is_some() {
+            continue;
+        }
         for key in &mut frame.capture_metadata.key_strokes {
             key.at = TimeUs::new(
                 key.at
@@ -609,6 +614,42 @@ mod tests {
 
     fn frame_id(number: u128) -> FrameId {
         FrameId::from_u128(number)
+    }
+
+    #[test]
+    fn insertion_keeps_native_event_clocks_paired_with_capture_timestamps() {
+        use gif_from_screen_domain::{KeyStroke, MouseButton, MouseInputEvent};
+        let directory = tempfile::tempdir().unwrap();
+        let source = workspace(directory.path(), 1, [255, 0, 0, 255]);
+        let mut timeline = source.manifest().timeline.clone();
+        let metadata = &mut timeline.frames[0].capture_metadata;
+        metadata.captured_at = Some(TimeUs::new(20_000));
+        metadata.key_strokes.push(KeyStroke {
+            physical_key: "x11:38".into(),
+            display_text: Some("a".into()),
+            pressed: true,
+            at: TimeUs::new(19_000),
+            repeat: false,
+            modifiers: 0,
+        });
+        metadata.mouse_events.push(MouseInputEvent {
+            at: TimeUs::new(19_500),
+            button: MouseButton::Left,
+            pressed: true,
+            position: Some(PhysicalPoint::default()),
+        });
+        let remapped = remap_frames(&Timeline::default(), &timeline, 500_000).unwrap();
+        assert_eq!(
+            remapped.frames[0].capture_metadata,
+            timeline.frames[0].capture_metadata
+        );
+        timeline.frames[0].capture_metadata.captured_at = None;
+        timeline.frames[0].capture_metadata.mouse_events.clear();
+        let legacy = remap_frames(&Timeline::default(), &timeline, 500_000).unwrap();
+        assert_eq!(
+            legacy.frames[0].capture_metadata.key_strokes[0].at,
+            TimeUs::new(519_000)
+        );
     }
 
     fn workspace(root: &Path, frames: usize, color: [u8; 4]) -> EditorWorkspace {
@@ -1035,7 +1076,7 @@ mod tests {
             });
         commands.push(EditCommand::ReplaceFrame {
             frame_id: replacement.id,
-            replacement,
+            replacement: Box::new(replacement),
         });
         source.execute(EditCommand::Compound { commands }).unwrap();
         dest.insert_prepared_project(prepare(&dest, &source, None))

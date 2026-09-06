@@ -52,7 +52,10 @@ mod presets;
 
 #[path = "editor_motion.rs"]
 mod motion;
-pub(crate) use motion::{MotionOperation, MotionProgress};
+pub(crate) use motion::{MotionOperation, MotionOutcome, MotionProgress};
+
+#[path = "editor_annotations.rs"]
+mod annotations;
 
 const MAX_SYNCHRONOUS_DUPLICATE_SCAN_FRAMES: usize = 256;
 const DUPLICATE_RENDER_SURFACE_LIMIT_BYTES: usize = 128 * 1024 * 1024;
@@ -313,6 +316,7 @@ impl EditorWorkspace {
         let track_id = TrackId::from_u128(Uuid::new_v4().as_u128());
         self.execute(EditCommand::UpsertOverlayTrack {
             track: OverlayTrack {
+                annotation: None,
                 id: track_id,
                 name,
                 visible: true,
@@ -378,6 +382,7 @@ impl EditorWorkspace {
             &[(asset.clone(), rgba)],
             vec![EditCommand::UpsertOverlayTrack {
                 track: OverlayTrack {
+                    annotation: None,
                     id: track_id,
                     name: edit.name,
                     visible: true,
@@ -1383,6 +1388,7 @@ mod tests {
             },
             assets,
             export_presets: BTreeMap::new(),
+            task_runs: Vec::new(),
             source_provenance: Vec::new(),
         }
     }

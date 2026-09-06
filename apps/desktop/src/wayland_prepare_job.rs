@@ -219,22 +219,44 @@ pub(crate) struct WaylandPrepareJob {
 }
 
 impl WaylandPrepareJob {
+    /// Freezes cadence and cursor mode for one portal session. Committing the
+    /// prepared crop reuses that session; unsupported cursor modes are errors.
     pub(crate) fn start(
         &mut self,
         source: CaptureSource,
         cadence: CaptureCadence,
+        cursor: CursorCaptureMode,
     ) -> Result<(), WaylandPrepareJobStartError> {
-        self.start_with(source, cadence, || {
+        self.start_with_cursor(source, cadence, cursor, || {
             WaylandCaptureBackend::connect()
                 .map(|backend| Box::new(backend) as Box<dyn CaptureBackend>)
                 .map_err(WaylandPrepareJobError::Initialize)
         })
     }
 
+    #[cfg(test)]
     fn start_with<F>(
         &mut self,
         source: CaptureSource,
         cadence: CaptureCadence,
+        backend_factory: F,
+    ) -> Result<(), WaylandPrepareJobStartError>
+    where
+        F: FnOnce() -> Result<Box<dyn CaptureBackend>, WaylandPrepareJobError> + Send + 'static,
+    {
+        self.start_with_cursor(
+            source,
+            cadence,
+            CursorCaptureMode::Automatic,
+            backend_factory,
+        )
+    }
+
+    fn start_with_cursor<F>(
+        &mut self,
+        source: CaptureSource,
+        cadence: CaptureCadence,
+        cursor: CursorCaptureMode,
         backend_factory: F,
     ) -> Result<(), WaylandPrepareJobStartError>
     where
@@ -253,6 +275,7 @@ impl WaylandPrepareJob {
                 prepare_worker(
                     &source,
                     cadence,
+                    cursor,
                     backend_factory,
                     &command_receiver,
                     &event_sender,
@@ -326,6 +349,7 @@ impl WaylandPrepareJob {
             cancellation,
             controller,
             paused: false,
+            pause_requested: None,
             terminal_requested: false,
             retarget: Some(RecordingRetarget::new(source, crop)),
             snapshot_requests: std::collections::VecDeque::new(),
@@ -399,13 +423,14 @@ impl Drop for WaylandPrepareJob {
 fn prepare_worker<F>(
     source: &CaptureSource,
     cadence: CaptureCadence,
+    cursor: CursorCaptureMode,
     backend_factory: F,
     commands: &Receiver<WorkerCommand>,
     events: &Sender<WorkerMessage>,
 ) where
     F: FnOnce() -> Result<Box<dyn CaptureBackend>, WaylandPrepareJobError>,
 {
-    let result = prepare_worker_inner(source, cadence, backend_factory, commands, events);
+    let result = prepare_worker_inner(source, cadence, cursor, backend_factory, commands, events);
     if let Some(result) = result {
         let _ = events.send(WorkerMessage::Finished(result));
     }
@@ -415,6 +440,7 @@ fn prepare_worker<F>(
 fn prepare_worker_inner<F>(
     source: &CaptureSource,
     cadence: CaptureCadence,
+    cursor: CursorCaptureMode,
     backend_factory: F,
     commands: &Receiver<WorkerCommand>,
     events: &Sender<WorkerMessage>,
@@ -444,7 +470,7 @@ where
     {
         return None;
     }
-    let mut session = match start_full_source_session(&*backend, source, cadence) {
+    let mut session = match start_full_source_session(&*backend, source, cadence, cursor) {
         Ok(session) => session,
         Err(WaylandPrepareJobError::StartSession(error))
             if error.kind() == gif_from_screen_capture::CaptureErrorKind::PermissionRequired =>
@@ -590,6 +616,7 @@ fn start_full_source_session(
     backend: &dyn CaptureBackend,
     source: &CaptureSource,
     cadence: CaptureCadence,
+    cursor: CursorCaptureMode,
 ) -> Result<Box<dyn CaptureSession>, WaylandPrepareJobError> {
     let target = match source.kind() {
         CaptureSourceKind::Monitor => CaptureTarget::Monitor(source.id().clone()),
@@ -597,7 +624,7 @@ fn start_full_source_session(
         _ => return Err(WaylandPrepareJobError::UnsupportedSource),
     };
     let mut request = CaptureRequest::new(target, cadence);
-    request.cursor = CursorCaptureMode::Automatic;
+    request.cursor = cursor;
     backend
         .start_session(request)
         .map_err(WaylandPrepareJobError::StartSession)
@@ -677,6 +704,7 @@ mod tests {
         discard_thread: Option<ThreadId>,
         start_calls: usize,
         started_cadence: Option<CaptureCadence>,
+        started_cursor: Option<CursorCaptureMode>,
     }
 
     struct FakeSession {
@@ -777,7 +805,15 @@ mod tests {
             signals.start_thread = Some(thread::current().id());
             signals.start_calls += 1;
             signals.started_cadence = Some(request.cadence);
+            signals.started_cursor = Some(request.cursor);
             drop(signals);
+            if request.cursor == CursorCaptureMode::Metadata {
+                return Err(CaptureError::new(
+                    CaptureErrorKind::UnsupportedCapability,
+                    "fake portal consumer does not decode cursor metadata",
+                    RecoveryHint::None,
+                ));
+            }
             if let Some(gate) = self.start_gate.lock().unwrap().take() {
                 let _ = gate.recv();
             }
@@ -848,6 +884,81 @@ mod tests {
         .unwrap();
         assert_eq!(preview.size(), PhysicalSize::new(2, 1).unwrap());
         assert_eq!(preview.rgba(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    fn assert_explicit_cursor_is_frozen(cursor: CursorCaptureMode) {
+        let signals = Arc::new(Mutex::new(FakeSignals::default()));
+        let (discarded_tx, discarded_rx) = mpsc::channel();
+        let native = backend(
+            [frame(
+                PixelFormat::Rgba8,
+                8,
+                vec![1, 2, 3, 255, 4, 5, 6, 255],
+            )],
+            signals.clone(),
+            discarded_tx,
+            None,
+        );
+        let mut job = WaylandPrepareJob::default();
+        job.start_with_cursor(
+            source_without_geometry(),
+            CaptureCadence::Manual,
+            cursor,
+            move || Ok(native),
+        )
+        .unwrap();
+        let _ = wait_for_preview(&mut job);
+        assert_eq!(signals.lock().unwrap().started_cursor, Some(cursor));
+        assert!(matches!(
+            job.start_with_cursor(
+                source_without_geometry(),
+                CaptureCadence::Manual,
+                CursorCaptureMode::Automatic,
+                || panic!("a prepared source must never open a second portal")
+            ),
+            Err(WaylandPrepareJobStartError::AlreadyStarted {
+                state: WaylandPrepareJobState::Prepared
+            })
+        ));
+        assert!(job.cancel());
+        discarded_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        wait_for_finish(&mut job);
+        let signals = signals.lock().unwrap();
+        assert_eq!(signals.start_calls, 1);
+        assert_eq!(signals.started_cursor, Some(cursor));
+    }
+
+    #[test]
+    fn hidden_cursor_reaches_the_frozen_native_capture_request() {
+        assert_explicit_cursor_is_frozen(CursorCaptureMode::Hidden);
+    }
+
+    #[test]
+    fn embedded_cursor_reaches_the_frozen_native_capture_request() {
+        assert_explicit_cursor_is_frozen(CursorCaptureMode::Embedded);
+    }
+
+    #[test]
+    fn unsupported_metadata_is_reported_without_reopening_or_falling_back() {
+        let signals = Arc::new(Mutex::new(FakeSignals::default()));
+        let (discarded_tx, _) = mpsc::channel();
+        let native = backend([], signals.clone(), discarded_tx, None);
+        let mut job = WaylandPrepareJob::default();
+        job.start_with_cursor(
+            source_without_geometry(),
+            CaptureCadence::Manual,
+            CursorCaptureMode::Metadata,
+            move || Ok(native),
+        )
+        .unwrap();
+        wait_for_finish(&mut job);
+        assert!(
+            matches!(job.take_result().unwrap(), Err(WaylandPrepareJobError::StartSession(error)) if error.kind() == CaptureErrorKind::UnsupportedCapability)
+        );
+        let signals = signals.lock().unwrap();
+        assert_eq!(signals.started_cursor, Some(CursorCaptureMode::Metadata));
+        assert_eq!(signals.start_calls, 1);
+        assert!(!signals.paused);
     }
 
     #[test]
@@ -988,9 +1099,10 @@ mod tests {
         let backend = backend(frames, signals.clone(), discarded_tx, None);
         let mut preparation = WaylandPrepareJob::default();
         preparation
-            .start_with(
+            .start_with_cursor(
                 source_without_geometry(),
                 CaptureCadence::Manual,
+                CursorCaptureMode::Hidden,
                 move || Ok(backend),
             )
             .unwrap();
@@ -1019,6 +1131,8 @@ mod tests {
                 manual_frame_duration_ms: 100,
                 countdown_seconds: 2,
                 changes_only: false,
+                input_events: false,
+                cursor: crate::RecordingCursor::Embedded,
                 region_enabled: true,
                 region_x: 1,
                 region_y: 0,
@@ -1048,6 +1162,10 @@ mod tests {
             panic!("prepared recording did not complete successfully");
         };
         assert_eq!(signals.lock().unwrap().start_calls, 1);
+        assert_eq!(
+            signals.lock().unwrap().started_cursor,
+            Some(CursorCaptureMode::Hidden)
+        );
         assert!(matches!(
             first_snapshot.status(),
             gif_from_screen_workflow::SnapshotTriggerStatus::Captured(receipt)

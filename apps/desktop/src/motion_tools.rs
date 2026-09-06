@@ -13,7 +13,9 @@ use gif_from_screen_domain::{PhysicalPoint, PhysicalPx, PhysicalRect, PhysicalSi
 
 use crate::{
     background_task::BackgroundTask,
-    editor_workspace::{EditorWorkspace, MotionOperation, MotionProgress, OverlaySelectionAnchor},
+    editor_workspace::{
+        EditorWorkspace, MotionOperation, MotionOutcome, MotionProgress, OverlaySelectionAnchor,
+    },
 };
 
 type WorkspaceLoan = Arc<Mutex<Option<EditorWorkspace>>>;
@@ -23,6 +25,7 @@ enum Mode {
     #[default]
     Cinemagraph,
     SmoothLoop,
+    LoopCrossfade,
 }
 
 struct PendingEdit {
@@ -40,12 +43,15 @@ pub(crate) struct MotionTools {
     invert: bool,
     frames: u16,
     duration_ms: u64,
+    skip_first: usize,
+    similarity_tenths: u16,
+    search_from_end: bool,
     pending: Option<PendingEdit>,
     loan: Option<WorkspaceLoan>,
-    completed: Option<Result<usize, String>>,
+    completed: Option<Result<MotionOutcome, String>>,
     label: &'static str,
     cancel_pending: AtomicBool,
-    task: BackgroundTask<usize, MotionProgress>,
+    task: BackgroundTask<MotionOutcome, MotionProgress>,
     notice: Option<String>,
 }
 
@@ -61,6 +67,9 @@ impl Default for MotionTools {
             invert: false,
             frames: 8,
             duration_ms: 400,
+            skip_first: 1,
+            similarity_tenths: 1000,
+            search_from_end: true,
             pending: None,
             loan: None,
             completed: None,
@@ -86,9 +95,10 @@ impl MotionTools {
         egui::CollapsingHeader::new("Motion tools").id_salt("motion-tools").show(ui, |ui| {
             self.sync_canvas(workspace);
             ui.add_enabled_ui(!self.is_running(), |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.selectable_value(&mut self.mode, Mode::Cinemagraph, "Cinemagraph");
                     ui.selectable_value(&mut self.mode, Mode::SmoothLoop, "Smooth loop");
+                    ui.selectable_value(&mut self.mode, Mode::LoopCrossfade, "Loop crossfade");
                 });
                 match self.mode {
                     Mode::Cinemagraph => {
@@ -104,6 +114,22 @@ impl MotionTools {
                         ui.weak("Selected frames and their visible overlays are baked into pixels. Gaps in the selection stay untouched. Rectangles only, not freeform masks.");
                     }
                     Mode::SmoothLoop => {
+                        ui.label("Find an ending frame similar to the first frame, then remove everything after the match.");
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Matching pixels");
+                            ui.add(egui::DragValue::new(&mut self.similarity_tenths).range(1..=1000)
+                                .custom_formatter(|value, _| format!("{:.1}%", value / 10.0))
+                                .custom_parser(|text| text.trim_end_matches('%').trim().parse::<f64>().ok().map(|value| value * 10.0)));
+                            ui.add(egui::DragValue::new(&mut self.skip_first).prefix("Skip initial frames ")
+                                .range(1..=workspace.manifest().timeline.frames.len().saturating_sub(1).max(1)));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut self.search_from_end, true, "Search from end");
+                            ui.radio_value(&mut self.search_from_end, false, "Search from start");
+                        });
+                        ui.weak("The matching frame is retained. No match or an already-matching final frame leaves the project unchanged. Uses the whole timeline and final rendered pixels.");
+                    }
+                    Mode::LoopCrossfade => {
                         ui.label("Append a cross-fade from the last frame back to the first frame of the whole timeline.");
                         ui.horizontal_wrapped(|ui| {
                             ui.add(egui::DragValue::new(&mut self.frames).prefix("Added frames ").range(1..=120));
@@ -151,10 +177,13 @@ impl MotionTools {
             *workspace = loan.lock().unwrap_or_else(PoisonError::into_inner).take();
             let result = self.completed.take()?;
             let notice = match result {
-                Ok(count) => format!(
+                Ok(MotionOutcome::Edited(count)) => format!(
                     "{} applied to {count} frames. Undo restores the original timeline.",
                     self.label
                 ),
+                Ok(MotionOutcome::AlreadySmooth) => "The final frame already meets the similarity threshold. No frames were removed.".to_owned(),
+                Ok(MotionOutcome::TrimmedTail(count)) => format!("Removed {count} trailing frames after the matching loop endpoint. Undo restores them."),
+                Ok(MotionOutcome::NoMatchingEnd) => "No matching end frame was found at this threshold. The project is unchanged.".to_owned(),
                 Err(error) => format!(
                     "{} did not complete: {error} The project and its history were restored; verified unreferenced pixel assets may remain.",
                     self.label
@@ -218,7 +247,12 @@ impl MotionTools {
                     invert: self.invert,
                 }
             }
-            Mode::SmoothLoop => MotionOperation::SmoothLoop {
+            Mode::SmoothLoop => MotionOperation::FindSmoothLoop {
+                skip_first: self.skip_first,
+                similarity_tenths: self.similarity_tenths,
+                from_end: self.search_from_end,
+            },
+            Mode::LoopCrossfade => MotionOperation::LoopCrossfade {
                 frames: self.frames,
                 duration_us: self.duration_ms.saturating_mul(1000),
             },
