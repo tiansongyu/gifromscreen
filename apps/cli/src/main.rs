@@ -129,6 +129,7 @@ fn write_demo_project(
             },
         };
         let clip = FrameClip {
+            capture_binding: gif_from_screen_domain::CaptureBinding::Original,
             id: FrameId::from_u128(unique_u128()),
             asset_id,
             duration: DurationUs::new(frame.duration_us()).ok_or("zero frame duration")?,
@@ -457,6 +458,7 @@ mod tests {
         Timeline {
             frames: (1..=count)
                 .map(|number| FrameClip {
+                    capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                     id: FrameId::from_u128(u128::from(number)),
                     asset_id: gif_from_screen_domain::AssetId::from_digest([number; 32]),
                     duration: DurationUs::new(10_000).unwrap(),

@@ -396,6 +396,7 @@ mod tests {
                     EditCommand::InsertFrames {
                         index: 0,
                         frames: vec![FrameClip {
+                            capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                             id: FrameId::from_u128(1),
                             asset_id: id,
                             duration: DurationUs::new(100_000).unwrap(),

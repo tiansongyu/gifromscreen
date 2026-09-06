@@ -57,6 +57,9 @@ pub(crate) use motion::{MotionOperation, MotionOutcome, MotionProgress};
 #[path = "editor_annotations.rs"]
 mod annotations;
 
+#[path = "editor_capture_binding.rs"]
+mod capture_binding;
+
 const MAX_SYNCHRONOUS_DUPLICATE_SCAN_FRAMES: usize = 256;
 const DUPLICATE_RENDER_SURFACE_LIMIT_BYTES: usize = 128 * 1024 * 1024;
 
@@ -82,10 +85,13 @@ pub(crate) struct OverlaySelectionAnchor {
 
 impl OverlaySelectionAnchor {
     pub(crate) fn matches(&self, workspace: &EditorWorkspace) -> bool {
+        self.matches_project(workspace) && self.selection == workspace.selection
+    }
+
+    pub(crate) fn matches_project(&self, workspace: &EditorWorkspace) -> bool {
         self.project_root == workspace.project.layout().root
             && self.project_id == workspace.manifest().project_id
             && self.revision == workspace.manifest().revision
-            && self.selection == workspace.selection
     }
 }
 
@@ -317,6 +323,7 @@ impl EditorWorkspace {
         self.execute(EditCommand::UpsertOverlayTrack {
             track: OverlayTrack {
                 annotation: None,
+                annotation_scope: None,
                 id: track_id,
                 name,
                 visible: true,
@@ -383,6 +390,7 @@ impl EditorWorkspace {
             vec![EditCommand::UpsertOverlayTrack {
                 track: OverlayTrack {
                     annotation: None,
+                    annotation_scope: None,
                     id: track_id,
                     name: edit.name,
                     visible: true,
@@ -1363,6 +1371,7 @@ mod tests {
             .copied()
             .enumerate()
             .map(|(index, duration)| FrameClip {
+                capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: frame_id(u128::try_from(index).unwrap() + 1),
                 asset_id,
                 duration: DurationUs::new(duration).unwrap(),
@@ -1435,6 +1444,7 @@ mod tests {
                 },
             });
             frames.push(FrameClip {
+                capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: frame_id(u128::try_from(index).unwrap() + 1),
                 asset_id,
                 duration: DurationUs::new(10 * (u64::try_from(index).unwrap() + 1)).unwrap(),

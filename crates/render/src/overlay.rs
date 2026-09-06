@@ -959,6 +959,7 @@ mod tests {
 
     fn clip(asset_id: AssetId) -> FrameClip {
         FrameClip {
+            capture_binding: gif_from_screen_domain::CaptureBinding::Original,
             id: gif_from_screen_domain::FrameId::from_u128(1),
             asset_id,
             duration: DurationUs::new(10).unwrap(),
@@ -1004,6 +1005,7 @@ mod tests {
     ) -> OverlayTrack {
         OverlayTrack {
             annotation: None,
+            annotation_scope: None,
             id: TrackId::from_u128(number),
             name: format!("track {number}"),
             visible,

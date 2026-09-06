@@ -177,6 +177,7 @@ mod tests {
         let frames = [1, 2, 3]
             .into_iter()
             .map(|number| FrameClip {
+                capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: id(number),
                 asset_id,
                 duration: DurationUs::new(10).unwrap(),

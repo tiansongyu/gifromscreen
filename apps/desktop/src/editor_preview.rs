@@ -598,6 +598,7 @@ impl PreviewRenderPlan {
                     .collect();
                 (!items.is_empty()).then(|| OverlayTrack {
                     annotation: None,
+                    annotation_scope: None,
                     id: track.id,
                     name: String::new(),
                     visible: track.visible,
@@ -996,6 +997,7 @@ mod tests {
                     EditCommand::InsertFrames {
                         index: 0,
                         frames: vec![FrameClip {
+                            capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                             id: frame_id,
                             asset_id,
                             duration: DurationUs::new(10_000).unwrap(),
@@ -1018,6 +1020,7 @@ mod tests {
         let asset_id = project.assets().put(pixels).unwrap();
         let track = OverlayTrack {
             annotation: None,
+            annotation_scope: None,
             id: TrackId::from_u128(1),
             name: "preview watermark".to_owned(),
             visible: true,
@@ -1115,6 +1118,7 @@ mod tests {
                     EditCommand::InsertFrames {
                         index: 1,
                         frames: vec![FrameClip {
+                            capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                             id: second,
                             asset_id,
                             duration: DurationUs::new(30_000).unwrap(),
@@ -1475,6 +1479,7 @@ mod tests {
         );
         let track = OverlayTrack {
             annotation: None,
+            annotation_scope: None,
             id: TrackId::from_u128(1),
             name: "shared asset watermark".to_owned(),
             visible: true,
@@ -1587,6 +1592,7 @@ mod tests {
             .commit(EditCommand::UpsertOverlayTrack {
                 track: OverlayTrack {
                     annotation: None,
+                    annotation_scope: None,
                     id: TrackId::from_u128(1),
                     name: "vector preview".to_owned(),
                     visible: true,

@@ -1695,6 +1695,7 @@ mod tests {
                 },
             });
             clips.push(FrameClip {
+                capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: spec.id,
                 asset_id,
                 duration: DurationUs::new(spec.duration_us).unwrap(),
@@ -1798,6 +1799,7 @@ mod tests {
     ) -> OverlayTrack {
         OverlayTrack {
             annotation: None,
+            annotation_scope: None,
             id: TrackId::from_u128(1),
             name: "watermark".to_owned(),
             visible: true,
@@ -2060,6 +2062,7 @@ mod tests {
             .overlay_tracks
             .push(OverlayTrack {
                 annotation: None,
+                annotation_scope: None,
                 id: TrackId::from_u128(1),
                 name: "vector watermark".to_owned(),
                 visible: true,
@@ -2186,6 +2189,7 @@ mod tests {
             });
         ignored.manifest.timeline.overlay_tracks.push(OverlayTrack {
             annotation: None,
+            annotation_scope: None,
             id: TrackId::from_u128(2),
             name: "hidden missing watermark".to_owned(),
             visible: false,
@@ -3055,6 +3059,7 @@ mod tests {
         let first = snapshot.manifest.timeline.frames[0].clone();
         for index in 2..=151 {
             snapshot.manifest.timeline.frames.push(FrameClip {
+                capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: FrameId::from_u128(index),
                 ..first.clone()
             });
@@ -3099,6 +3104,7 @@ mod tests {
         let source_frames = snapshot.manifest.timeline.frames.clone();
         for index in 2..151 {
             snapshot.manifest.timeline.frames.push(FrameClip {
+                capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: FrameId::from_u128(index as u128 + 1),
                 ..source_frames[index % 2].clone()
             });

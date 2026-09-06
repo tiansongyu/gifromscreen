@@ -7,6 +7,8 @@
 #![forbid(unsafe_code)]
 
 mod annotation_options;
+mod annotation_scope;
+mod capture_binding;
 mod command;
 mod editing_task;
 mod error;
@@ -19,6 +21,12 @@ mod task_run;
 mod units;
 
 pub use annotation_options::*;
+pub use annotation_scope::*;
+pub use capture_binding::{
+    CaptureBinding, CaptureBindingSummary, CaptureReplayBlock, FrameCaptureBindingChange,
+    capture_binding_summary, has_recorded_input, recorded_annotation_barrier,
+    recorded_annotation_block,
+};
 pub use command::{AppliedEdit, EditCommand, FrameDurationChange, IndexedFrame};
 pub use editing_task::*;
 pub use error::{DomainError, IdParseError, UnitError, ValidationIssue};

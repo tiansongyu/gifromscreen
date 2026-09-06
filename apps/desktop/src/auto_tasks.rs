@@ -67,6 +67,7 @@ struct TaskProgress {
 pub(crate) struct TaskSummary {
     pub completed: Vec<String>,
     pub skipped: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 pub(crate) struct AutoTasks {
@@ -249,7 +250,7 @@ impl AutoTasks {
             *workspace = loan.lock().unwrap_or_else(PoisonError::into_inner).take();
             let message = match self.completed.take()? {
                 Ok(summary) if summary.completed.is_empty() && summary.skipped.is_empty() => "No automatic editing tasks apply to this source; the original project is ready.".to_owned(),
-                Ok(summary) => format!("Editing tasks complete: {} applied, {} skipped. One undo restores the original project.{}", summary.completed.len(), summary.skipped.len(), if summary.skipped.is_empty() { String::new() } else { format!(" Skipped: {}.", summary.skipped.join(", ")) }),
+                Ok(summary) => format!("Editing tasks complete: {} applied, {} skipped. One undo restores the original project.{} {}", summary.completed.len(), summary.skipped.len(), if summary.skipped.is_empty() { String::new() } else { format!(" Skipped: {}.", summary.skipped.join(", ")) }, summary.warnings.join(" ")),
                 Err(error) => format!("Editing tasks stopped: {error} The workspace and undo history were returned. If the journal could not be saved, reopen the project to confirm its recovered state. Verified unreferenced pixel assets may remain."),
             };
             self.notice = Some(message.clone());
@@ -360,6 +361,14 @@ fn apply_task_chain(
             load_task_asset(&staged, workspace.active_project(), &assets, id)
         })
         .map_err(|error| format!("Task {} ({}): {error}", index + 1, task.name))?;
+        if !prepared.replay_skips.is_empty() {
+            summary.warnings.push(format!(
+                "Task {} ({}): {}",
+                index + 1,
+                task.name,
+                prepared.replay_skips.message()
+            ));
+        }
         for (_, bytes) in &prepared.assets {
             asset_bytes = asset_bytes.checked_add(bytes.len())
                 .filter(|bytes| *bytes <= 256 * 1024 * 1024)
@@ -424,6 +433,7 @@ fn apply_task_chain(
 struct PreparedTask {
     command: Option<EditCommand>,
     assets: Vec<(AssetDescriptor, Vec<u8>)>,
+    replay_skips: crate::annotation_engine::AnnotationReplaySkips,
 }
 
 fn prepare_task(
@@ -502,12 +512,14 @@ fn prepare_task(
                     commands: prepared.commands,
                 }),
                 assets: prepared.assets,
+                replay_skips: prepared.replay_skips,
             });
         }
     };
     Ok(PreparedTask {
         command: Some(command),
         assets: Vec::new(),
+        replay_skips: crate::annotation_engine::AnnotationReplaySkips::default(),
     })
 }
 

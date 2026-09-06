@@ -196,6 +196,7 @@ mod tests {
             .copied()
             .enumerate()
             .map(|(index, duration)| FrameClip {
+                capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: FrameId::from_u128(u128::try_from(index).unwrap() + 1),
                 asset_id: first_asset,
                 duration: DurationUs::new(duration).unwrap(),

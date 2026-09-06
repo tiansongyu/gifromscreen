@@ -30,6 +30,39 @@ mod cursor;
 mod keys;
 use keys::KeyLabelHistory;
 
+#[path = "annotation_scope_plan.rs"]
+mod scope;
+use scope::ScopePlan;
+
+#[cfg(test)]
+#[path = "annotation_scope_tests.rs"]
+mod scope_tests;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AnnotationReplaySkips {
+    pub(crate) legacy_unknown: usize,
+    pub(crate) archived_after_composite: usize,
+    pub(crate) not_recorded: usize,
+}
+
+impl AnnotationReplaySkips {
+    pub(crate) fn is_empty(self) -> bool {
+        self.legacy_unknown == 0 && self.archived_after_composite == 0 && self.not_recorded == 0
+    }
+    pub(crate) fn message(self) -> String {
+        format!(
+            "Recorded input skipped on {} frame(s) with unverified legacy coordinates, {} frame(s) with archived composite input, and {} non-recorded frame(s). Raw events are preserved; use original recordings or manual annotations.",
+            self.legacy_unknown, self.archived_after_composite, self.not_recorded
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AnnotationEditReport {
+    pub(crate) frames: usize,
+    pub(crate) replay_skips: AnnotationReplaySkips,
+}
+
 #[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct AnnotationProgress {
     pub(crate) completed: usize,
@@ -42,6 +75,7 @@ pub(crate) struct PreparedAnnotations {
     pub(crate) commands: Vec<EditCommand>,
     pub(crate) assets: Vec<(AssetDescriptor, Vec<u8>)>,
     pub(crate) frames: usize,
+    pub(crate) replay_skips: AnnotationReplaySkips,
 }
 
 struct Labels<'a> {
@@ -260,30 +294,65 @@ pub(crate) fn prepare_annotations_with_assets(
     selected: &BTreeSet<FrameId>,
     request: &AnnotationRequest,
     cancellation: &AtomicBool,
-    mut progress: impl FnMut(AnnotationProgress),
+    progress: impl FnMut(AnnotationProgress),
     provider: &dyn Fn(gif_from_screen_domain::AssetId) -> Result<RgbaSurface, String>,
 ) -> Result<PreparedAnnotations, String> {
     check_cancelled(cancellation)?;
     manifest.validate().map_err(|error| error.to_string())?;
-    request.validate_settings()?;
     validate_selection(manifest, selected)?;
-    if no_recorded_candidates(manifest, selected, &request.mode, cancellation)? {
+    let plan = ScopePlan::from_selection(manifest, selected)?;
+    prepare_annotation_plan(manifest, &plan, request, cancellation, progress, provider)
+}
+
+pub(crate) fn prepare_annotations_in_scope(
+    manifest: &ProjectManifest,
+    scope: &[TimelineSpan],
+    request: &AnnotationRequest,
+    cancellation: &AtomicBool,
+    progress: impl FnMut(AnnotationProgress),
+    provider: &dyn Fn(gif_from_screen_domain::AssetId) -> Result<RgbaSurface, String>,
+) -> Result<PreparedAnnotations, String> {
+    check_cancelled(cancellation)?;
+    manifest.validate().map_err(|error| error.to_string())?;
+    let plan = ScopePlan::new(manifest, scope)?;
+    if plan.selected.len() > MAX_FRAMES {
+        return Err("Annotation scope intersects more than 10,000 frames.".to_owned());
+    }
+    if manifest.timeline.frames.iter().any(|frame| {
+        plan.selected.contains(&frame.id)
+            && gif_from_screen_domain::recorded_annotation_barrier(frame, &request.mode)
+    }) {
+        return Err("This group's authoring scope includes frames without verified original input coordinates. The whole group is unchanged: confirm eligible legacy coordinates, undo the composite, or use manual annotations.".to_owned());
+    }
+    prepare_annotation_plan(manifest, &plan, request, cancellation, progress, provider)
+}
+
+fn prepare_annotation_plan(
+    manifest: &ProjectManifest,
+    plan: &ScopePlan,
+    request: &AnnotationRequest,
+    cancellation: &AtomicBool,
+    mut progress: impl FnMut(AnnotationProgress),
+    provider: &dyn Fn(gif_from_screen_domain::AssetId) -> Result<RgbaSurface, String>,
+) -> Result<PreparedAnnotations, String> {
+    request.validate_settings()?;
+    let (blocked, replay_skips) = replay_filter(manifest, &plan.selected, &request.mode);
+    let replayable = plan.selected.difference(&blocked).copied().collect();
+    if plan.selected.is_empty()
+        || no_recorded_candidates(manifest, &replayable, &request.mode, cancellation)?
+    {
         progress(AnnotationProgress {
-            completed: selected.len(),
-            total: selected.len(),
+            completed: plan.selected.len(),
+            total: plan.selected.len(),
         });
         return Ok(PreparedAnnotations {
             commands: Vec::new(),
             assets: Vec::new(),
             frames: 0,
+            replay_skips,
         });
     }
     request.validate(manifest.canvas.size)?;
-    let total_us = manifest
-        .timeline
-        .total_duration()
-        .ok_or_else(|| "Timeline duration overflow.".to_owned())?
-        .get();
     let mut labels = Labels {
         manifest,
         request,
@@ -295,72 +364,126 @@ pub(crate) fn prepare_annotations_with_assets(
         cancellation,
         cursor_cache: BTreeMap::new(),
     };
+    let (items, affected) = render_scope_samples(&mut labels, plan, &blocked, &mut progress)?;
+    check_cancelled(cancellation)?;
+    let excluded: Vec<_> = plan
+        .samples
+        .iter()
+        .filter(|sample| blocked.contains(&manifest.timeline.frames[sample.index].id))
+        .map(|sample| sample.span)
+        .collect();
+    let scope = gif_from_screen_domain::subtract_annotation_scope(&plan.scope, &excluded)?;
+    finish_annotations(labels, items, affected, scope, replay_skips)
+}
+
+fn replay_filter(
+    manifest: &ProjectManifest,
+    selected: &BTreeSet<FrameId>,
+    mode: &AnnotationMode,
+) -> (BTreeSet<FrameId>, AnnotationReplaySkips) {
+    use gif_from_screen_domain::{
+        CaptureReplayBlock, recorded_annotation_barrier, recorded_annotation_block,
+    };
+    let mut blocked = BTreeSet::new();
+    let mut skips = AnnotationReplaySkips::default();
+    if !matches!(
+        mode,
+        AnnotationMode::RecordedKeys
+            | AnnotationMode::RecordedClicks
+            | AnnotationMode::RecordedCursor
+    ) {
+        return (blocked, skips);
+    }
+    for frame in manifest
+        .timeline
+        .frames
+        .iter()
+        .filter(|frame| selected.contains(&frame.id))
+    {
+        if recorded_annotation_barrier(frame, mode) {
+            blocked.insert(frame.id);
+        }
+        match recorded_annotation_block(frame, mode) {
+            Some(CaptureReplayBlock::LegacyUnknown) => skips.legacy_unknown += 1,
+            Some(CaptureReplayBlock::ArchivedAfterComposite) => skips.archived_after_composite += 1,
+            Some(CaptureReplayBlock::NotRecorded) => skips.not_recorded += 1,
+            None => {}
+        }
+    }
+    (blocked, skips)
+}
+
+fn render_scope_samples(
+    labels: &mut Labels<'_>,
+    plan: &ScopePlan,
+    blocked: &BTreeSet<FrameId>,
+    progress: &mut impl FnMut(AnnotationProgress),
+) -> Result<(Vec<OverlayItem>, usize), String> {
+    let manifest = labels.manifest;
+    let request = labels.request;
+    let total_us = manifest
+        .timeline
+        .total_duration()
+        .ok_or("Timeline duration overflow.")?
+        .get();
     let mut items = Vec::new();
-    let mut start = 0_u64;
-    let mut completed = 0;
-    let mut affected = 0;
+    let mut completed = BTreeSet::new();
+    let mut affected = BTreeSet::new();
     let mut recent_keys = KeyLabelHistory::default();
     let mut recent_clicks: Vec<(u64, MouseButton, PhysicalPoint, Option<CaptureOrigin>)> =
         Vec::new();
     let mut previous_clock = None;
-    let mut was_selected = false;
-    for (index, frame) in manifest.timeline.frames.iter().enumerate() {
-        check_cancelled(cancellation)?;
-        let end = start
-            .checked_add(frame.duration.get())
-            .ok_or_else(|| "Timeline duration overflow.".to_owned())?;
-        let is_selected = selected.contains(&frame.id);
+    let mut previous_run = None;
+    for planned in &plan.samples {
+        check_cancelled(labels.cancellation)?;
+        let frame = &manifest.timeline.frames[planned.index];
         let clock = frame
             .capture_metadata
             .captured_at
-            .map_or(start, TimeUs::get);
+            .map_or(planned.frame_start, TimeUs::get);
         // Never carry an event across a selection gap or a backwards/repeated capture clock.
-        if !is_selected || !was_selected || previous_clock.is_some_and(|previous| clock <= previous)
+        if blocked.contains(&frame.id)
+            || previous_run != Some(planned.run)
+            || previous_clock.is_some_and(|previous| clock <= previous)
         {
             recent_keys.clear();
             recent_clicks.clear();
         }
         previous_clock = Some(clock);
-        was_selected = is_selected;
-        if !is_selected {
-            start = end;
+        previous_run = Some(planned.run);
+        completed.insert(frame.id);
+        progress(AnnotationProgress {
+            completed: completed.len(),
+            total: plan.selected.len(),
+        });
+        if blocked.contains(&frame.id) {
+            previous_run = None;
             continue;
         }
-        let span = TimelineSpan {
-            start: TimeUs::new(start),
-            duration: frame.duration,
-        };
         let sample = AnnotationFrame {
             frame,
-            index,
-            end,
+            index: planned.index,
+            end: planned.frame_end,
             total_us,
             clock,
         };
-        let contents = prepare_frame(&mut labels, &sample, &mut recent_keys, &mut recent_clicks)?;
+        let contents = prepare_frame(labels, &sample, &mut recent_keys, &mut recent_clicks)?;
         if items.len().saturating_add(contents.len()) > MAX_ITEMS {
             return Err("Annotations exceed 40,000 items; select fewer frames or shorten the event hold time.".to_owned());
         }
         if !contents.is_empty() {
-            affected += 1;
+            affected.insert(frame.id);
         }
         for content in contents {
             items.push(OverlayItem {
                 id: OverlayId::from_u128(Uuid::new_v4().as_u128()),
-                span,
+                span: planned.span,
                 z_index: request.z_index,
                 content,
             });
         }
-        completed += 1;
-        progress(AnnotationProgress {
-            completed,
-            total: selected.len(),
-        });
-        start = end;
     }
-    check_cancelled(cancellation)?;
-    finish_annotations(labels, items, affected)
+    Ok((items, affected.len()))
 }
 
 fn validate_selection(
@@ -442,6 +565,8 @@ fn finish_annotations(
     labels: Labels<'_>,
     items: Vec<OverlayItem>,
     affected: usize,
+    scope: Vec<TimelineSpan>,
+    replay_skips: AnnotationReplaySkips,
 ) -> Result<PreparedAnnotations, String> {
     let manifest = labels.manifest;
     let request = labels.request;
@@ -450,6 +575,7 @@ fn finish_annotations(
             commands: Vec::new(),
             assets: Vec::new(),
             frames: 0,
+            replay_skips,
         });
     }
     let mut commands: Vec<_> = labels
@@ -463,6 +589,7 @@ fn finish_annotations(
     commands.push(EditCommand::UpsertOverlayTrack {
         track: OverlayTrack {
             annotation: Some(request.clone()),
+            annotation_scope: Some(scope),
             id: TrackId::from_u128(Uuid::new_v4().as_u128()),
             name: annotation_name(&request.mode).to_owned(),
             visible: true,
@@ -479,6 +606,7 @@ fn finish_annotations(
         commands,
         assets: labels.assets,
         frames: affected,
+        replay_skips,
     })
 }
 
@@ -877,7 +1005,7 @@ mod tests {
         KeyStroke, MouseInputEvent, PhysicalSize, ProjectId, UnixTimeMs,
     };
 
-    fn manifest() -> ProjectManifest {
+    pub(super) fn manifest() -> ProjectManifest {
         let size = PhysicalSize::new(240, 40).unwrap();
         let mut manifest = ProjectManifest::new(
             ProjectId::from_u128(1),
@@ -904,6 +1032,7 @@ mod tests {
         );
         for index in 0_u64..3 {
             manifest.timeline.frames.push(FrameClip {
+                capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: FrameId::from_u128(u128::from(index) + 1),
                 asset_id: id,
                 duration: DurationUs::new((index + 1) * 100_000).unwrap(),
@@ -937,7 +1066,7 @@ mod tests {
         .unwrap()
     }
 
-    fn track(prepared: &PreparedAnnotations) -> &OverlayTrack {
+    pub(super) fn track(prepared: &PreparedAnnotations) -> &OverlayTrack {
         let EditCommand::UpsertOverlayTrack { track } = prepared.commands.last().unwrap() else {
             panic!("last command must be a track")
         };

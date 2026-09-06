@@ -3758,6 +3758,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, duration)| FrameClip {
+                capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: FrameId::from_u128(index as u128 + 1),
                 asset_id: AssetId::from_digest([1; 32]),
                 duration: DurationUs::new(*duration).unwrap(),
@@ -4034,6 +4035,7 @@ mod tests {
         let first = project.manifest().timeline.frames[0].clone();
         let frames = (2..=36)
             .map(|id| FrameClip {
+                capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: FrameId::from_u128(id),
                 ..first.clone()
             })

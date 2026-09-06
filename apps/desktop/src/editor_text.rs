@@ -154,6 +154,7 @@ impl EditorWorkspace {
         let text_asset = self.raster_asset_descriptor(image.size, &image.rgba)?;
         let frame_id = FrameId::from_u128(Uuid::new_v4().as_u128());
         let frame = FrameClip {
+            capture_binding: gif_from_screen_domain::CaptureBinding::NotRecorded,
             id: frame_id,
             asset_id: frame_asset.id,
             duration: request.duration,
@@ -168,6 +169,7 @@ impl EditorWorkspace {
         commands.push(EditCommand::UpsertOverlayTrack {
             track: OverlayTrack {
                 annotation: None,
+                annotation_scope: None,
                 id: TrackId::from_u128(Uuid::new_v4().as_u128()),
                 name: "Title".to_owned(),
                 visible: true,
@@ -269,6 +271,14 @@ impl EditorWorkspace {
         for track in &timeline.overlay_tracks {
             let mut shifted = track.clone();
             shifted.items = exclude_inserted_title(&track.items, start, duration)?;
+            if let Some(scope) = &track.annotation_scope {
+                shifted.annotation_scope = Some(
+                    gif_from_screen_domain::shift_annotation_scope_for_insert(
+                        scope, start, duration,
+                    )
+                    .map_err(|_| EditorWorkspaceError::TitleDurationOverflow)?,
+                );
+            }
             if shifted != *track {
                 commands.push(EditCommand::UpsertOverlayTrack { track: shifted });
             }
@@ -576,6 +586,76 @@ mod tests {
                 .count();
             assert_eq!(title_frames, 1);
         }
+    }
+
+    #[test]
+    fn title_insertion_splits_persistent_authoring_scope_without_covering_title_pixels() {
+        use gif_from_screen_domain::{AnnotationMode, AnnotationRequest, ProgressOptions};
+        let dir = tempfile::tempdir().unwrap();
+        let mut workspace = create_rendered_duplicate_workspace(&dir);
+        workspace.select_all();
+        let annotation = AnnotationRequest {
+            size: workspace.manifest().canvas.size,
+            mode: AnnotationMode::Progress(ProgressOptions {
+                format: String::new(),
+                ..ProgressOptions::default()
+            }),
+            ..AnnotationRequest::default()
+        };
+        workspace
+            .apply_annotation_edit(
+                &workspace.project_edit_anchor(),
+                &annotation,
+                &std::sync::atomic::AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        let total = workspace
+            .manifest()
+            .timeline
+            .total_duration()
+            .unwrap()
+            .get();
+        let insertion = workspace.manifest().timeline.frames[0].duration.get();
+        let mut original = workspace.manifest().timeline.overlay_tracks[0].clone();
+        original.annotation_scope = Some(vec![TimelineSpan {
+            start: TimeUs::ZERO,
+            duration: DurationUs::new(total).unwrap(),
+        }]);
+        workspace
+            .execute(EditCommand::UpsertOverlayTrack {
+                track: original.clone(),
+            })
+            .unwrap();
+        let (text, image) = text("Title", BLUE);
+        workspace
+            .insert_title_frame(
+                &TitleFrameRequest {
+                    after: Some(frame_id(1)),
+                    duration: DurationUs::new(50).unwrap(),
+                    background: BLACK,
+                    text,
+                    position: PhysicalPoint::default(),
+                },
+                &image,
+            )
+            .unwrap();
+        let scope = workspace.manifest().timeline.overlay_tracks[0]
+            .annotation_scope
+            .as_ref()
+            .unwrap();
+        assert_eq!(scope.len(), 2);
+        assert_eq!(scope[0].start, TimeUs::ZERO);
+        assert_eq!(scope[0].end().unwrap().get(), insertion);
+        assert_eq!(scope[1].start.get(), insertion + 50);
+        assert_eq!(scope[1].end().unwrap().get(), total + 50);
+        workspace.undo().unwrap();
+        assert_eq!(workspace.manifest().timeline.overlay_tracks[0], original);
+        workspace.redo().unwrap();
+        let updated = workspace.manifest().timeline.overlay_tracks.clone();
+        drop(workspace);
+        let reopened = EditorWorkspace::open(dir.path(), LockPolicy::FailIfPresent, 16).unwrap();
+        assert_eq!(reopened.manifest().timeline.overlay_tracks, updated);
     }
 
     #[test]

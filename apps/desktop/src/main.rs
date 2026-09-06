@@ -11,6 +11,7 @@ mod blank_project_job;
 mod blank_project_ui;
 mod board_recorder_ui;
 mod camera_recorder_ui;
+mod capture_binding_ui;
 mod capture_source_job;
 mod countdown;
 mod custom_palette_input;
@@ -57,6 +58,7 @@ use blank_project_ui::{
 };
 use board_recorder_ui::BoardRecorderTool;
 use camera_recorder_ui::CameraRecorderUi;
+use capture_binding_ui::CaptureBindingUi;
 use capture_source_job::{CaptureSourceJob, CaptureSourceJobState};
 use countdown::{CountdownStart, CountdownTick, MAX_COUNTDOWN_SECONDS, RecordingCountdown};
 use custom_palette_input::parse_custom_palette;
@@ -751,6 +753,7 @@ struct GifFromScreenApp {
     board_recorder: BoardRecorderTool,
     motion_tools: MotionTools,
     annotation_tools: AnnotationTools,
+    capture_binding_ui: CaptureBindingUi,
     auto_tasks: AutoTasks,
     project_library: ProjectLibraryTool,
     remembered_project: Option<(ProjectId, PathBuf)>,
@@ -807,6 +810,7 @@ impl Default for GifFromScreenApp {
             board_recorder: BoardRecorderTool::default(),
             motion_tools: MotionTools::default(),
             annotation_tools: AnnotationTools::default(),
+            capture_binding_ui: CaptureBindingUi::default(),
             auto_tasks: AutoTasks::default(),
             project_library: ProjectLibraryTool::default(),
             remembered_project: None,
@@ -906,7 +910,11 @@ impl eframe::App for GifFromScreenApp {
             AppView::ImportImageSequence => self.show_import_sequence(ui),
             AppView::ImportVideo => self.video_import.show(ui),
             AppView::NewBlankAnimation => self.show_blank_project(ui),
-            AppView::ScreenRecorder => self.show_screen_recorder(ui),
+            AppView::ScreenRecorder => {
+                egui::ScrollArea::vertical()
+                    .id_salt("screen-recorder-page")
+                    .show(ui, |ui| self.show_screen_recorder(ui));
+            }
             AppView::CameraRecorder => self.camera_recorder.show(ui),
             AppView::BoardRecorder => self.board_recorder.show(ui),
             AppView::Automation => {
@@ -1787,6 +1795,18 @@ impl GifFromScreenApp {
         ui.add_enabled_ui(motion_enabled && !self.motion_tools.is_running(), |ui| {
             self.annotation_tools.show(ui, workspace);
         });
+        ui.add_enabled_ui(
+            motion_enabled
+                && !self.motion_tools.is_running()
+                && !self.annotation_tools.is_running(),
+            |ui| {
+                if self.capture_binding_ui.show(ui, workspace)
+                    && let Err(error) = self.annotation_tools.queue_binding_confirmation(workspace)
+                {
+                    self.notice = Some(error);
+                }
+            },
+        );
         let open_copy = self.project_library.show_save_as(ui, workspace);
         ui.separator();
         let export_action = egui::CollapsingHeader::new("Export GIF")
@@ -7021,6 +7041,7 @@ mod tests {
                     EditCommand::InsertFrames {
                         index: 0,
                         frames: vec![FrameClip {
+                            capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                             id: FrameId::from_u128(7),
                             asset_id,
                             duration: DurationUs::new(10_000).unwrap(),

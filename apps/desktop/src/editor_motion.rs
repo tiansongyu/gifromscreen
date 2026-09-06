@@ -239,6 +239,7 @@ impl EditorWorkspace {
                 asset_id,
                 transform: ClipTransform::default(),
                 effects: Vec::new(),
+                capture_binding: gif_from_screen_domain::CaptureBinding::ArchivedAfterComposite,
                 ..original.clone()
             };
             commands.push(EditCommand::ReplaceFrame {
@@ -321,6 +322,7 @@ impl EditorWorkspace {
             let start = u64::from(index) * duration_us / u64::from(count);
             let end = (u64::from(index) + 1) * duration_us / u64::from(count);
             frames.push(FrameClip {
+                capture_binding: gif_from_screen_domain::CaptureBinding::ArchivedAfterComposite,
                 id: FrameId::from_u128(Uuid::new_v4().as_u128()),
                 asset_id,
                 duration: DurationUs::new(end - start)
@@ -502,9 +504,24 @@ fn remove_baked_overlay_spans(
     let mut commands = Vec::new();
     let mut total_fragments = 0_usize;
     for track in tracks {
+        if !track.visible || track.opacity == 0 {
+            continue;
+        }
         let mut replacement = track.clone();
+        if let Some(scope) = &track.annotation_scope {
+            replacement.annotation_scope = Some(gif_from_screen_domain::subtract_annotation_scope(
+                scope, selected,
+            )?);
+        }
         replacement.items.clear();
         for item in &track.items {
+            if matches!(
+                item.content,
+                gif_from_screen_domain::OverlayContent::Raster { opacity: 0, .. }
+            ) {
+                replacement.items.push(item.clone());
+                continue;
+            }
             for (index, span) in subtract_spans(item.span, selected)?.into_iter().enumerate() {
                 total_fragments += 1;
                 if total_fragments > MAX_OVERLAY_FRAGMENTS {
@@ -524,11 +541,18 @@ fn remove_baked_overlay_spans(
             }
         }
         if replacement != *track {
-            commands.push(if replacement.items.is_empty() {
-                EditCommand::RemoveOverlayTrack { track_id: track.id }
-            } else {
-                EditCommand::UpsertOverlayTrack { track: replacement }
-            });
+            commands.push(
+                if replacement.items.is_empty()
+                    && replacement
+                        .annotation_scope
+                        .as_ref()
+                        .is_none_or(Vec::is_empty)
+                {
+                    EditCommand::RemoveOverlayTrack { track_id: track.id }
+                } else {
+                    EditCommand::UpsertOverlayTrack { track: replacement }
+                },
+            );
         }
     }
     Ok(commands)

@@ -111,6 +111,7 @@ impl MotionTools {
                             ui.add(egui::DragValue::new(&mut self.height).prefix("Height ").range(1..=size.height.get().saturating_sub(self.y).max(1)));
                         });
                         ui.checkbox(&mut self.invert, "Invert: freeze inside the rectangle");
+                        ui.weak("Composite frames retain original input as archival data. Add recorded-input annotations before this edit; afterwards use manual annotations or Undo. Hidden overlays are preserved.");
                         ui.weak("Selected frames and their visible overlays are baked into pixels. Gaps in the selection stay untouched. Rectangles only, not freeform masks.");
                     }
                     Mode::SmoothLoop => {

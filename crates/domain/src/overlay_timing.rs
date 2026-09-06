@@ -58,7 +58,7 @@ impl FrameTimingMap {
         Ok(Self { intervals })
     }
 
-    pub(crate) fn retime(&self, tracks: &mut [OverlayTrack]) {
+    pub(crate) fn retime(&self, tracks: &mut [OverlayTrack]) -> Result<(), DomainError> {
         for track in tracks {
             track.items.retain_mut(|item| {
                 let Some(old_end) = item.span.end() else {
@@ -81,7 +81,50 @@ impl FrameTimingMap {
                 };
                 true
             });
+            if let Some(scope) = &track.annotation_scope {
+                track.annotation_scope = Some(self.map_scope(scope).map_err(|reason| {
+                    DomainError::InvalidManifest(vec![ValidationIssue::InvalidAnnotationScope {
+                        track_id: track.id,
+                        reason,
+                    }])
+                })?);
+            }
         }
+        Ok(())
+    }
+
+    fn map_scope(&self, scope: &[TimelineSpan]) -> Result<Vec<TimelineSpan>, String> {
+        let mut output = Vec::new();
+        for span in scope {
+            let Some(end) = span.end().map(TimeUs::get) else {
+                return Ok(scope.to_vec());
+            };
+            if end > self.intervals.last().map_or(0, |interval| interval.old_end) {
+                return Ok(scope.to_vec());
+            }
+            let first = self
+                .intervals
+                .partition_point(|interval| interval.old_end <= span.start.get());
+            for interval in self.intervals[first..]
+                .iter()
+                .take_while(|interval| interval.old_start < end)
+            {
+                if interval.new_duration == 0 {
+                    continue;
+                }
+                let left = span.start.get().max(interval.old_start);
+                let right = end.min(interval.old_end);
+                let start = map_interval_time(interval, left, false)
+                    .ok_or("Annotation scope start overflows time.")?;
+                let end = map_interval_time(interval, right, true)
+                    .ok_or("Annotation scope end overflows time.")?;
+                if start < end {
+                    crate::annotation_scope::push_scope_span(&mut output, start, end)?;
+                }
+            }
+        }
+        // Outward rounding can make sub-microsecond gaps overlap after scaling.
+        crate::normalize_annotation_scope(&output)
     }
 
     fn map_time(&self, time: u64, end_boundary: bool) -> Option<u64> {
@@ -93,17 +136,21 @@ impl FrameTimingMap {
             }
         });
         let interval = self.intervals.get(index)?;
-        let offset = time.checked_sub(interval.old_start)?;
-        let scaled = u128::from(offset) * u128::from(interval.new_duration);
-        let old_duration = u128::from(interval.old_end - interval.old_start);
-        // Round outward so a short overlay on a retained frame does not vanish.
-        let scaled = if end_boundary {
-            scaled.div_ceil(old_duration)
-        } else {
-            scaled / old_duration
-        };
-        interval.new_start.checked_add(u64::try_from(scaled).ok()?)
+        map_interval_time(interval, time, end_boundary)
     }
+}
+
+fn map_interval_time(interval: &FrameInterval, time: u64, end_boundary: bool) -> Option<u64> {
+    let offset = time.checked_sub(interval.old_start)?;
+    let scaled = u128::from(offset) * u128::from(interval.new_duration);
+    let old_duration = u128::from(interval.old_end - interval.old_start);
+    // Round outward so a short overlay on a retained frame does not vanish.
+    let scaled = if end_boundary {
+        scaled.div_ceil(old_duration)
+    } else {
+        scaled / old_duration
+    };
+    interval.new_start.checked_add(u64::try_from(scaled).ok()?)
 }
 
 #[cfg(test)]
@@ -131,6 +178,7 @@ mod tests {
             .collect();
         project.timeline.overlay_tracks.push(OverlayTrack {
             annotation: None,
+            annotation_scope: None,
             id: TrackId::from_u128(1),
             name: "Watermarks".to_owned(),
             visible: true,
@@ -204,6 +252,103 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn scope_span(start: u64, end: u64) -> TimelineSpan {
+        TimelineSpan {
+            start: TimeUs::new(start),
+            duration: DurationUs::new(end - start).unwrap(),
+        }
+    }
+
+    #[test]
+    fn authoring_scope_retimes_unmarked_frames_and_excludes_inserted_frames_inside_a_span() {
+        let mut project = project(&[10, 10, 10], &[(2, 5)]);
+        project.timeline.overlay_tracks[0].annotation = Some(crate::AnnotationRequest::default());
+        project.timeline.overlay_tracks[0].annotation_scope = Some(vec![scope_span(2, 28)]);
+        let before = project.clone();
+        let mut inserted = frame(9, project.timeline.frames[0].asset_id);
+        inserted.duration = DurationUs::new(7).unwrap();
+        let applied = project
+            .apply_command(&EditCommand::InsertFrames {
+                index: 1,
+                frames: vec![inserted],
+            })
+            .unwrap();
+        assert_eq!(
+            project.timeline.overlay_tracks[0]
+                .annotation_scope
+                .as_deref(),
+            Some([scope_span(2, 10), scope_span(17, 27), scope_span(27, 35)].as_slice())
+        );
+        project.apply_command(&applied.inverse).unwrap();
+        project.revision = before.revision;
+        assert_eq!(project, before);
+    }
+
+    #[test]
+    fn partial_authoring_scope_scales_outward_deletes_and_restores_exactly() {
+        let mut project = project(&[10, 10, 10], &[(1, 2)]);
+        project.timeline.overlay_tracks[0].annotation = Some(crate::AnnotationRequest::default());
+        project.timeline.overlay_tracks[0].annotation_scope =
+            Some(vec![scope_span(1, 2), scope_span(21, 29)]);
+        let before = project.clone();
+        let applied = project
+            .apply_command(&EditCommand::Compound {
+                commands: vec![
+                    EditCommand::SetFrameDurations {
+                        changes: vec![FrameDurationChange {
+                            frame_id: project.timeline.frames[2].id,
+                            duration: DurationUs::new(3).unwrap(),
+                        }],
+                    },
+                    EditCommand::RemoveFrames {
+                        frame_ids: vec![project.timeline.frames[0].id],
+                    },
+                ],
+            })
+            .unwrap();
+        assert_eq!(
+            project.timeline.overlay_tracks[0].annotation_scope,
+            Some(vec![scope_span(10, 13)])
+        );
+        assert!(project.timeline.overlay_tracks[0].items.is_empty());
+        let serialized = serde_json::to_vec(&applied.inverse).unwrap();
+        project
+            .apply_command(&serde_json::from_slice(&serialized).unwrap())
+            .unwrap();
+        project.revision = before.revision;
+        assert_eq!(project, before);
+    }
+
+    #[test]
+    fn reordering_preserves_time_anchors_and_all_deleted_scope_is_explicitly_empty() {
+        let mut project = project(&[10, 20, 30], &[(2, 8)]);
+        project.timeline.overlay_tracks[0].annotation = Some(crate::AnnotationRequest::default());
+        project.timeline.overlay_tracks[0].annotation_scope =
+            Some(vec![scope_span(2, 8), scope_span(35, 50)]);
+        let original = project.timeline.overlay_tracks.clone();
+        let ids: Vec<_> = project
+            .timeline
+            .frames
+            .iter()
+            .map(|frame| frame.id)
+            .collect();
+        project
+            .apply_command(&EditCommand::ReorderFrames {
+                order: ids.iter().rev().copied().collect(),
+            })
+            .unwrap();
+        assert_eq!(project.timeline.overlay_tracks, original);
+        let removed = project
+            .apply_command(&EditCommand::RemoveFrames { frame_ids: ids })
+            .unwrap();
+        assert_eq!(
+            project.timeline.overlay_tracks[0].annotation_scope,
+            Some(Vec::new())
+        );
+        project.apply_command(&removed.inverse).unwrap();
+        assert_eq!(project.timeline.overlay_tracks, original);
     }
 
     fn remove(ids: &[u128]) -> EditCommand {

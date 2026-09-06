@@ -401,6 +401,7 @@ fn all_six_reference_task_classes_share_one_journal_edit_and_frozen_assets() {
     let mut current = workspace(&dir.path().join("project"));
     let mut frame = current.manifest().timeline.frames[0].clone();
     frame.capture_metadata.captured_at = Some(TimeUs::ZERO);
+    frame.capture_binding = gif_from_screen_domain::CaptureBinding::Original;
     frame.capture_metadata.key_strokes.push(KeyStroke {
         physical_key: "KeyA".into(),
         display_text: Some("A".into()),
@@ -569,6 +570,7 @@ fn automatic_recorded_cursor_uses_stored_pixels_and_follows_resize_and_rotation(
     };
     let mut frame = current.manifest().timeline.frames[0].clone();
     frame.capture_metadata.cursor_visible = true;
+    frame.capture_binding = gif_from_screen_domain::CaptureBinding::Original;
     frame.capture_metadata.cursor_asset = Some(id);
     frame.capture_metadata.cursor_position = Some(PhysicalPoint {
         x: PhysicalPx::new(1),

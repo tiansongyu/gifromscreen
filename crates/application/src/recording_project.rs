@@ -318,6 +318,11 @@ impl IncrementalRecordingProject {
         let (capture_metadata, new_cursor_asset) =
             self.store_cursor_metadata(metadata, asset_id, frame_index)?;
         let clip = FrameClip {
+            capture_binding: if metadata.is_some() {
+                gif_from_screen_domain::CaptureBinding::Original
+            } else {
+                gif_from_screen_domain::CaptureBinding::NotRecorded
+            },
             id: frame_id,
             asset_id,
             duration,
@@ -954,6 +959,47 @@ mod tests {
                 .read(metadata.cursor_asset.unwrap())
                 .unwrap(),
             cursor.pixels()
+        );
+    }
+
+    #[test]
+    fn empty_native_metadata_is_still_original_but_metadata_free_frames_are_not_recorded() {
+        use gif_from_screen_domain::{CaptureBinding, TimeUs};
+        let dir = tempdir().unwrap();
+        let mut writer = IncrementalRecordingProject::create(
+            dir.path(),
+            PhysicalSize::new(1, 1).unwrap(),
+            incremental_options(77),
+        )
+        .unwrap();
+        let pixels = RgbaFrame::new(1, 1, vec![0, 0, 0, 255], 10_000).unwrap();
+        writer.append_frame(FrameId::from_u128(1), &pixels).unwrap();
+        let metadata = RecordingMetadata {
+            captured_at: gif_from_screen_capture::CaptureTimestamp::from_micros(10_000),
+            capture_origin: None,
+            cursor: None,
+            cursor_image: None,
+            cursor_embedded: false,
+            input_events: Vec::new(),
+            dropped_input_events: 0,
+        };
+        writer
+            .append_frame_with_metadata(FrameId::from_u128(2), &pixels, Some(&metadata))
+            .unwrap();
+        let project = writer.finish().unwrap();
+        assert_eq!(
+            project.manifest().timeline.frames[0].capture_binding,
+            CaptureBinding::NotRecorded
+        );
+        assert_eq!(
+            project.manifest().timeline.frames[1].capture_binding,
+            CaptureBinding::Original
+        );
+        assert_eq!(
+            project.manifest().timeline.frames[1]
+                .capture_metadata
+                .captured_at,
+            Some(TimeUs::new(10_000))
         );
     }
 

@@ -246,6 +246,7 @@ mod tests {
         );
         let frames = (1..=2)
             .map(|number| FrameClip {
+                capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: FrameId::from_u128(number),
                 asset_id,
                 duration: DurationUs::new(10_000 * u64::try_from(number).unwrap()).unwrap(),

@@ -263,6 +263,9 @@ pub struct FrameClip {
     pub duration: DurationUs,
     pub transform: ClipTransform,
     pub capture_metadata: CaptureMetadata,
+    /// Input remains immutable when pixel edits detach it from the current frame geometry.
+    #[serde(default)]
+    pub capture_binding: crate::CaptureBinding,
     pub effects: Vec<Effect>,
 }
 
@@ -452,6 +455,11 @@ pub struct OverlayTrack {
     /// Optional authoring recipe for a regenerable annotation group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotation: Option<crate::AnnotationRequest>,
+    /// Complete original authoring coverage, including frames with no visible marks.
+    /// None is a legacy group whose original selection is unknown; Some([]) is
+    /// an explicitly empty scope after all authored time has been removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotation_scope: Option<Vec<TimelineSpan>>,
     pub name: String,
     pub visible: bool,
     pub opacity: u8,
@@ -734,6 +742,19 @@ impl ProjectManifest {
             if track.name.trim().is_empty() {
                 issues.push(ValidationIssue::EmptyTrackName { track_id: track.id });
             }
+            if let Some(scope) = &track.annotation_scope {
+                let result = if track.annotation.is_none() {
+                    Err("Only an annotation group can own authoring scope.".to_owned())
+                } else {
+                    crate::validate_annotation_scope(scope, timeline_duration)
+                };
+                if let Err(reason) = result {
+                    issues.push(ValidationIssue::InvalidAnnotationScope {
+                        track_id: track.id,
+                        reason,
+                    });
+                }
+            }
             for overlay in &track.items {
                 if overlay.id.is_nil() {
                     issues.push(ValidationIssue::NilOverlayId);
@@ -899,6 +920,7 @@ pub(crate) mod test_fixtures {
 
     pub fn frame(number: u8, asset_id: AssetId) -> FrameClip {
         FrameClip {
+            capture_binding: crate::CaptureBinding::Original,
             id: FrameId::from_u128(u128::from(number)),
             asset_id,
             duration: DurationUs::new(100_000).unwrap(),

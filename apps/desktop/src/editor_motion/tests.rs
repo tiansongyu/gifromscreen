@@ -3,8 +3,9 @@ use gif_from_screen_application::{
     IncrementalRecordingProject, IncrementalRecordingProjectOptions,
 };
 use gif_from_screen_domain::{
-    BlendMode, OverlayContent, PhysicalPoint, PhysicalPx, ProjectId, ProjectManifest, Rgba,
-    ShapeKind, UnixTimeMs,
+    AnnotationMode, AnnotationRequest, BlendMode, CaptureBinding, CaptureMetadata, KeyStroke,
+    MouseButton, MouseInputEvent, OverlayContent, PhysicalPoint, PhysicalPx, ProjectId,
+    ProjectManifest, Rgba, ShapeKind, UnixTimeMs,
 };
 use gif_from_screen_gif::RgbaFrame;
 use gif_from_screen_project::LockPolicy;
@@ -39,6 +40,351 @@ fn workspace(root: &std::path::Path) -> EditorWorkspace {
     let mut workspace = EditorWorkspace::from_active(writer.finish().unwrap(), 32).unwrap();
     workspace.select_first().unwrap();
     workspace
+}
+
+fn add_raw_input(workspace: &mut EditorWorkspace) {
+    let rgba = [200, 200, 200, 255];
+    let id = workspace.active_project().assets().put(&rgba).unwrap();
+    let mut replacement = workspace.manifest().timeline.frames[0].clone();
+    replacement.capture_binding = CaptureBinding::Original;
+    replacement.transform = ClipTransform {
+        crop: Some(PhysicalRect::new(1, 0, 1, 1).unwrap()),
+        output_size: Some(PhysicalSize::new(2, 1).unwrap()),
+        ..ClipTransform::default()
+    };
+    replacement.capture_metadata = CaptureMetadata {
+        captured_at: Some(TimeUs::ZERO),
+        cursor_position: Some(PhysicalPoint {
+            x: PhysicalPx::new(1),
+            y: PhysicalPx::ZERO,
+        }),
+        cursor_asset: Some(id),
+        cursor_visible: true,
+        cursor_embedded: false,
+        key_strokes: vec![KeyStroke {
+            physical_key: "C".to_owned(),
+            display_text: Some("Ctrl+C".to_owned()),
+            pressed: true,
+            at: TimeUs::ZERO,
+            repeat: false,
+            modifiers: 2,
+        }],
+        mouse_events: vec![MouseInputEvent {
+            at: TimeUs::ZERO,
+            button: MouseButton::Left,
+            pressed: true,
+            position: Some(PhysicalPoint {
+                x: PhysicalPx::new(1),
+                y: PhysicalPx::ZERO,
+            }),
+        }],
+        ..CaptureMetadata::default()
+    };
+    workspace
+        .execute(EditCommand::Compound {
+            commands: vec![
+                EditCommand::RegisterAsset {
+                    asset: AssetDescriptor {
+                        id,
+                        byte_len: 4,
+                        kind: AssetKind::OverlayImage {
+                            size: PhysicalSize::new(1, 1).unwrap(),
+                            encoding: RasterEncoding::Rgba8,
+                        },
+                    },
+                },
+                EditCommand::ReplaceFrame {
+                    frame_id: replacement.id,
+                    replacement: Box::new(replacement),
+                },
+            ],
+        })
+        .unwrap();
+}
+
+#[test]
+fn transformed_cinemagraph_archives_input_without_duplicate_replay_and_undo_restores_it() {
+    use crate::annotation_engine::{load_annotation_asset, prepare_annotations_with_assets};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("bound.gfsproj");
+    let mut workspace = workspace(&root);
+    add_raw_input(&mut workspace);
+    let request = AnnotationRequest {
+        mode: AnnotationMode::RecordedCursor,
+        ..AnnotationRequest::default()
+    };
+    workspace
+        .apply_annotation_edit(
+            &workspace.project_edit_anchor(),
+            &request,
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+    let before = workspace.manifest().clone();
+    let raw = serde_json::to_vec(&before.timeline.frames[0].capture_metadata).unwrap();
+    let visible = pixels(&workspace, 1);
+    workspace
+        .apply_motion_edit(
+            &workspace.project_edit_anchor(),
+            MotionOperation::Cinemagraph {
+                region: rect(),
+                invert: false,
+            },
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+    let frame = &workspace.manifest().timeline.frames[0];
+    assert_eq!(
+        frame.capture_binding,
+        CaptureBinding::ArchivedAfterComposite
+    );
+    assert_eq!(serde_json::to_vec(&frame.capture_metadata).unwrap(), raw);
+    assert!(!frame.capture_metadata.cursor_embedded);
+    assert_eq!(pixels(&workspace, 1), visible);
+    assert_archived_replay_is_blocked(&workspace);
+    let manual = prepare_annotations_with_assets(
+        workspace.manifest(),
+        workspace.selection().selected(),
+        &AnnotationRequest {
+            mode: AnnotationMode::BuiltinCursor,
+            ..AnnotationRequest::default()
+        },
+        &AtomicBool::new(false),
+        |_| {},
+        &|_| panic!("manual pointer uses no source assets"),
+    )
+    .unwrap();
+    assert!(!manual.commands.is_empty());
+    workspace.undo().unwrap();
+    equal_except_revision(workspace.manifest(), &before);
+    let restored = prepare_annotations_with_assets(
+        workspace.manifest(),
+        workspace.selection().selected(),
+        &request,
+        &AtomicBool::new(false),
+        |_| {},
+        &|id| {
+            load_annotation_asset(
+                workspace.manifest(),
+                workspace.active_project().assets(),
+                id,
+            )
+        },
+    )
+    .unwrap();
+    assert!(!restored.commands.is_empty());
+    assert!(restored.replay_skips.is_empty());
+    workspace.redo().unwrap();
+    workspace.checkpoint().unwrap();
+    drop(workspace);
+    let reopened = EditorWorkspace::open(root, LockPolicy::FailIfPresent, 32).unwrap();
+    assert_eq!(
+        reopened.manifest().timeline.frames[0].capture_binding,
+        CaptureBinding::ArchivedAfterComposite
+    );
+    assert_eq!(
+        serde_json::to_vec(&reopened.manifest().timeline.frames[0].capture_metadata).unwrap(),
+        raw
+    );
+    assert_eq!(pixels(&reopened, 1), visible);
+}
+
+fn assert_archived_replay_is_blocked(workspace: &EditorWorkspace) {
+    use crate::annotation_engine::prepare_annotations_with_assets;
+    for mode in [
+        AnnotationMode::RecordedCursor,
+        AnnotationMode::RecordedClicks,
+        AnnotationMode::RecordedKeys,
+    ] {
+        let prepared = prepare_annotations_with_assets(
+            workspace.manifest(),
+            workspace.selection().selected(),
+            &AnnotationRequest {
+                mode,
+                ..AnnotationRequest::default()
+            },
+            &AtomicBool::new(false),
+            |_| {},
+            &|_| panic!("archived coordinates must not be replayed"),
+        )
+        .unwrap();
+        assert!(prepared.commands.is_empty());
+        assert_eq!(prepared.replay_skips.archived_after_composite, 1);
+    }
+}
+
+#[test]
+fn baked_binding_and_raw_input_survive_clipboard_and_project_insertion() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_root = dir.path().join("source.gfsproj");
+    let mut source = workspace(&source_root);
+    add_raw_input(&mut source);
+    source
+        .apply_motion_edit(
+            &source.project_edit_anchor(),
+            MotionOperation::Cinemagraph {
+                region: rect(),
+                invert: false,
+            },
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+    let original = source.manifest().timeline.frames[0].clone();
+    source.copy_selection().unwrap();
+    source.paste_after_current().unwrap();
+    let copy = &source.manifest().timeline.frames[1];
+    assert_ne!(copy.id, original.id);
+    assert_eq!(copy.capture_metadata, original.capture_metadata);
+    assert_eq!(copy.capture_binding, original.capture_binding);
+    let expected: Vec<_> = source
+        .manifest()
+        .timeline
+        .frames
+        .iter()
+        .map(|frame| (frame.capture_binding, frame.capture_metadata.clone()))
+        .collect();
+    let target_manifest = ProjectManifest::new(
+        ProjectId::from_u128(999),
+        "binding-test",
+        UnixTimeMs::new(0),
+        source.manifest().canvas.clone(),
+    )
+    .unwrap();
+    source.checkpoint().unwrap();
+    drop(source);
+    let mut target = EditorWorkspace::from_active(
+        gif_from_screen_project::ActiveProject::create(
+            dir.path().join("target.gfsproj"),
+            target_manifest,
+        )
+        .unwrap(),
+        32,
+    )
+    .unwrap();
+    let prepared = crate::editor_workspace::prepare_project_insertion_from_path(
+        target.project_insertion_target(None).unwrap(),
+        &source_root,
+        &gif_from_screen_gif::NeverCancel,
+    )
+    .unwrap();
+    target.insert_prepared_project(prepared).unwrap();
+    assert_eq!(
+        target
+            .manifest()
+            .timeline
+            .frames
+            .iter()
+            .map(|frame| (frame.capture_binding, frame.capture_metadata.clone()))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    target.undo().unwrap();
+    assert!(target.manifest().timeline.frames.is_empty());
+}
+
+#[test]
+fn cinemagraph_preserves_hidden_zero_opacity_and_remaining_authoring_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut workspace = workspace(&dir.path().join("hidden.gfsproj"));
+    add_overlay(&mut workspace);
+    let mut hidden = workspace.manifest().timeline.overlay_tracks[0].clone();
+    hidden.visible = false;
+    workspace
+        .execute(EditCommand::UpsertOverlayTrack {
+            track: hidden.clone(),
+        })
+        .unwrap();
+    let mut zero = hidden.clone();
+    zero.id = gif_from_screen_domain::TrackId::from_u128(901);
+    zero.visible = true;
+    zero.opacity = 0;
+    for item in &mut zero.items {
+        item.id = OverlayId::from_u128(uuid::Uuid::new_v4().as_u128());
+    }
+    workspace
+        .execute(EditCommand::UpsertOverlayTrack {
+            track: zero.clone(),
+        })
+        .unwrap();
+    let mut authored = hidden.clone();
+    authored.id = gif_from_screen_domain::TrackId::from_u128(902);
+    authored.visible = true;
+    authored.items.clear();
+    authored.annotation = Some(AnnotationRequest::default());
+    authored.annotation_scope = Some(vec![
+        TimelineSpan {
+            start: TimeUs::ZERO,
+            duration: DurationUs::new(10_000).unwrap(),
+        },
+        TimelineSpan {
+            start: TimeUs::new(20_000),
+            duration: DurationUs::new(10_000).unwrap(),
+        },
+    ]);
+    workspace
+        .execute(EditCommand::UpsertOverlayTrack {
+            track: authored.clone(),
+        })
+        .unwrap();
+    let mut zero_item = hidden.clone();
+    zero_item.id = gif_from_screen_domain::TrackId::from_u128(903);
+    zero_item.visible = true;
+    for item in &mut zero_item.items {
+        item.id = OverlayId::from_u128(uuid::Uuid::new_v4().as_u128());
+        item.content = OverlayContent::Raster {
+            asset_id: workspace.manifest().timeline.frames[0].asset_id,
+            position: PhysicalPoint::default(),
+            size: PhysicalSize::new(2, 1).unwrap(),
+            opacity: 0,
+        };
+    }
+    workspace
+        .execute(EditCommand::UpsertOverlayTrack {
+            track: zero_item.clone(),
+        })
+        .unwrap();
+    workspace.select_only(FrameId::from_u128(1)).unwrap();
+    let untouched_binding = workspace.manifest().timeline.frames[1].capture_binding;
+    workspace
+        .apply_motion_edit(
+            &workspace.project_edit_anchor(),
+            MotionOperation::Cinemagraph {
+                region: rect(),
+                invert: false,
+            },
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+    let tracks = &workspace.manifest().timeline.overlay_tracks;
+    assert_eq!(
+        tracks.iter().find(|track| track.id == hidden.id).unwrap(),
+        &hidden
+    );
+    assert_eq!(
+        tracks.iter().find(|track| track.id == zero.id).unwrap(),
+        &zero
+    );
+    assert_eq!(
+        tracks
+            .iter()
+            .find(|track| track.id == zero_item.id)
+            .unwrap(),
+        &zero_item
+    );
+    let kept = tracks.iter().find(|track| track.id == authored.id).unwrap();
+    assert!(kept.items.is_empty());
+    assert_eq!(
+        kept.annotation_scope.as_ref().unwrap(),
+        &authored.annotation_scope.unwrap()[1..]
+    );
+    assert_eq!(
+        workspace.manifest().timeline.frames[1].capture_binding,
+        untouched_binding
+    );
 }
 
 fn rect() -> PhysicalRect {
@@ -338,6 +684,7 @@ fn smooth_loop_appends_exact_duration_and_first_endpoint_without_overlay_double_
         before.timeline.overlay_tracks
     );
     let appended = &workspace.manifest().timeline.frames[3..];
+    assert_mixed_loop_frames_cannot_replay_input(appended);
     assert_eq!(
         appended
             .iter()
@@ -374,6 +721,20 @@ fn smooth_loop_appends_exact_duration_and_first_endpoint_without_overlay_double_
         .pixels(),
         first
     );
+}
+
+fn assert_mixed_loop_frames_cannot_replay_input(frames: &[gif_from_screen_domain::FrameClip]) {
+    for frame in frames {
+        assert_eq!(
+            frame.capture_binding,
+            CaptureBinding::ArchivedAfterComposite
+        );
+        assert!(!frame.has_recorded_annotation_input());
+        assert!(gif_from_screen_domain::recorded_annotation_barrier(
+            frame,
+            &AnnotationMode::RecordedKeys
+        ));
+    }
 }
 
 #[test]

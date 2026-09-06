@@ -184,6 +184,11 @@ pub(crate) fn persist_rgba_project_with_metadata(
             frame_index,
         )?;
         clips.push(FrameClip {
+            capture_binding: if metadata.get(frame_index).is_some() {
+                gif_from_screen_domain::CaptureBinding::Original
+            } else {
+                gif_from_screen_domain::CaptureBinding::NotRecorded
+            },
             id: frame_id,
             asset_id,
             duration,

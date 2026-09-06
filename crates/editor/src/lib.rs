@@ -906,6 +906,7 @@ mod tests {
             .copied()
             .enumerate()
             .map(|(index, duration)| FrameClip {
+                capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: FrameId::from_u128(u128::try_from(index).unwrap() + 1),
                 asset_id,
                 duration: DurationUs::new(duration).unwrap(),
@@ -1366,6 +1367,7 @@ mod tests {
             let asset_id = project.timeline.frames[0].asset_id;
             project.timeline.overlay_tracks.push(OverlayTrack {
                 annotation: None,
+                annotation_scope: None,
                 id: TrackId::from_u128(1),
                 name: "Selected frame watermarks".to_owned(),
                 visible: true,

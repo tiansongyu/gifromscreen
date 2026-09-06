@@ -209,6 +209,7 @@ pub fn create_blank_animation_project(
         },
     };
     let frame = FrameClip {
+        capture_binding: gif_from_screen_domain::CaptureBinding::NotRecorded,
         id: options.frame_id,
         asset_id,
         duration: options.frame_duration,

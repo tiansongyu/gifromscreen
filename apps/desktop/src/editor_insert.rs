@@ -346,6 +346,12 @@ fn insertion_command(
     for track in &timeline.overlay_tracks {
         let mut shifted = track.clone();
         shifted.items = super::text::exclude_inserted_title(&track.items, start, duration)?;
+        if let Some(scope) = &track.annotation_scope {
+            shifted.annotation_scope = Some(
+                gif_from_screen_domain::shift_annotation_scope_for_insert(scope, start, duration)
+                    .map_err(|_| ProjectInsertionError::DurationOverflow)?,
+            );
+        }
         commands.push(EditCommand::UpsertOverlayTrack { track: shifted });
     }
     append_source_tracks(&mut commands, timeline, &source.timeline, start)?;
@@ -392,6 +398,16 @@ fn append_source_tracks(
         .collect::<BTreeSet<_>>();
     for track in &source.overlay_tracks {
         let mut imported = track.clone();
+        if let Some(scope) = &mut imported.annotation_scope {
+            for span in scope {
+                span.start = TimeUs::new(
+                    span.start
+                        .get()
+                        .checked_add(start)
+                        .ok_or(ProjectInsertionError::DurationOverflow)?,
+                );
+            }
+        }
         imported.id = loop {
             let id = TrackId::from_u128(Uuid::new_v4().as_u128());
             if used_tracks.insert(id) {
@@ -685,6 +701,7 @@ mod tests {
                         index: 0,
                         frames: (0..frames)
                             .map(|index| FrameClip {
+                                capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                                 id: frame_id(index as u128 + 1),
                                 asset_id,
                                 duration: DurationUs::new(100_000).unwrap(),
@@ -892,6 +909,82 @@ mod tests {
             520_000
         );
         assert_eq!(&decoded.frames()[1].rgba()[..4], &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn whole_project_insertion_offsets_source_scope_and_excludes_it_from_destination_scope() {
+        use gif_from_screen_domain::{
+            AnnotationMode, AnnotationRequest, ProgressOptions, TimelineSpan,
+        };
+        let dest_root = tempfile::tempdir().unwrap();
+        let source_root = tempfile::tempdir().unwrap();
+        let mut dest = workspace(dest_root.path(), 3, [255, 0, 0, 255]);
+        let mut source = workspace(source_root.path(), 2, [0, 0, 0, 255]);
+        for current in [&mut dest, &mut source] {
+            current.select_all();
+            let request = AnnotationRequest {
+                size: current.manifest().canvas.size,
+                mode: AnnotationMode::Progress(ProgressOptions {
+                    format: String::new(),
+                    ..ProgressOptions::default()
+                }),
+                ..AnnotationRequest::default()
+            };
+            current
+                .apply_annotation_edit(
+                    &current.project_edit_anchor(),
+                    &request,
+                    &std::sync::atomic::AtomicBool::new(false),
+                    |_| {},
+                )
+                .unwrap();
+            let mut track = current.manifest().timeline.overlay_tracks[0].clone();
+            track.annotation_scope = Some(vec![TimelineSpan {
+                start: TimeUs::ZERO,
+                duration: DurationUs::new(
+                    current.manifest().timeline.total_duration().unwrap().get(),
+                )
+                .unwrap(),
+            }]);
+            current
+                .execute(EditCommand::UpsertOverlayTrack { track })
+                .unwrap();
+        }
+        let before = dest.manifest().clone();
+        let prepared = prepare(&dest, &source, Some(frame_id(1)));
+        dest.insert_prepared_project(prepared).unwrap();
+        let scopes: Vec<_> = dest
+            .manifest()
+            .timeline
+            .overlay_tracks
+            .iter()
+            .map(|track| {
+                track
+                    .annotation_scope
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .map(|span| (span.start.get(), span.end().unwrap().get()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            scopes,
+            [
+                vec![(0, 100_000), (300_000, 500_000)],
+                vec![(100_000, 300_000)]
+            ]
+        );
+        let updated = dest.manifest().clone();
+        dest.undo().unwrap();
+        same_content(dest.manifest(), &before);
+        dest.redo().unwrap();
+        same_content(dest.manifest(), &updated);
+        let saved = dest.manifest().clone();
+        drop(dest);
+        let reopened =
+            EditorWorkspace::open(dest_root.path(), LockPolicy::FailIfPresent, 32).unwrap();
+        assert_eq!(reopened.manifest(), &saved);
     }
 
     #[test]

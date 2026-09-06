@@ -56,6 +56,10 @@ pub enum EditCommand {
     SetFrameDurations {
         changes: Vec<FrameDurationChange>,
     },
+    /// Changes only source-input associations in one bounded identity list.
+    SetCaptureBindings {
+        changes: Vec<crate::FrameCaptureBindingChange>,
+    },
     ReorderFrames {
         order: Vec<FrameId>,
     },
@@ -178,7 +182,7 @@ impl EditCommand {
         let inverse = self.apply_without_retiming(project)?;
         let timing = crate::overlay_timing::FrameTimingMap::new(&before, &project.timeline.frames)?;
         let previous = project.timeline.overlay_tracks.clone();
-        timing.retime(&mut project.timeline.overlay_tracks);
+        timing.retime(&mut project.timeline.overlay_tracks)?;
         if project.timeline.overlay_tracks == previous {
             Ok(inverse)
         } else {
@@ -305,6 +309,36 @@ impl EditCommand {
                 Ok(Self::RemoveFrames {
                     frame_ids: ordered.iter().map(|entry| entry.frame.id).collect(),
                 })
+            }
+            Self::SetCaptureBindings { changes } => {
+                ensure_unique_frame_command(changes.iter().map(|change| change.frame_id))?;
+                let requested: BTreeMap<_, _> = changes
+                    .iter()
+                    .map(|change| (change.frame_id, change.binding))
+                    .collect();
+                let existing: BTreeSet<_> = project
+                    .timeline
+                    .frames
+                    .iter()
+                    .map(|frame| frame.id)
+                    .collect();
+                if let Some(change) = changes
+                    .iter()
+                    .find(|change| !existing.contains(&change.frame_id))
+                {
+                    return Err(DomainError::UnknownFrame(change.frame_id));
+                }
+                let mut inverse = Vec::with_capacity(changes.len());
+                for frame in &mut project.timeline.frames {
+                    if let Some(binding) = requested.get(&frame.id) {
+                        inverse.push(crate::FrameCaptureBindingChange {
+                            frame_id: frame.id,
+                            binding: frame.capture_binding,
+                        });
+                        frame.capture_binding = *binding;
+                    }
+                }
+                Ok(Self::SetCaptureBindings { changes: inverse })
             }
             Self::ReplaceFrame {
                 frame_id,
@@ -492,6 +526,107 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn binding_edits_preserve_input_and_reject_duplicate_or_unknown_ids_atomically() {
+        use crate::{CaptureBinding, FrameCaptureBindingChange, KeyStroke, TimeUs};
+        let mut project = manifest();
+        let asset = asset(1);
+        project.assets.insert(asset.id, asset.clone());
+        let mut first = frame(1, asset.id);
+        first.capture_binding = CaptureBinding::LegacyUnknown;
+        first.capture_metadata.key_strokes.push(KeyStroke {
+            physical_key: "PRIVATE_RETAINED_INPUT".to_owned(),
+            display_text: None,
+            pressed: true,
+            at: TimeUs::ZERO,
+            repeat: false,
+            modifiers: 0,
+        });
+        project.timeline.frames = vec![first.clone(), frame(2, asset.id)];
+        let original = project.clone();
+        let change = FrameCaptureBindingChange {
+            frame_id: first.id,
+            binding: CaptureBinding::Original,
+        };
+        for changes in [
+            vec![change, change],
+            vec![FrameCaptureBindingChange {
+                frame_id: crate::FrameId::from_u128(99),
+                binding: CaptureBinding::Original,
+            }],
+        ] {
+            assert!(
+                project
+                    .apply_command(&EditCommand::SetCaptureBindings { changes })
+                    .is_err()
+            );
+            assert_eq!(project, original);
+        }
+        let command = EditCommand::SetCaptureBindings {
+            changes: vec![change],
+        };
+        let applied = project.apply_command(&command).unwrap();
+        assert_eq!(
+            project.timeline.frames[0].capture_metadata,
+            first.capture_metadata
+        );
+        for edit in [&command, &applied.inverse] {
+            assert!(
+                !serde_json::to_string(edit)
+                    .unwrap()
+                    .contains("PRIVATE_RETAINED_INPUT")
+            );
+        }
+        project.apply_command(&applied.inverse).unwrap();
+        project.revision = original.revision;
+        assert_eq!(project, original);
+    }
+
+    #[test]
+    fn bulk_binding_edit_handles_one_hundred_thousand_frames_without_nested_commands() {
+        use crate::{CaptureBinding, FrameCaptureBindingChange};
+        let mut project = manifest();
+        let asset = asset(1);
+        project.assets.insert(asset.id, asset.clone());
+        project.timeline.frames = (1..=100_000_u128)
+            .map(|id| FrameClip {
+                id: FrameId::from_u128(id),
+                capture_binding: CaptureBinding::LegacyUnknown,
+                ..frame(1, asset.id)
+            })
+            .collect();
+        let changes = project
+            .timeline
+            .frames
+            .iter()
+            .map(|frame| FrameCaptureBindingChange {
+                frame_id: frame.id,
+                binding: CaptureBinding::Original,
+            })
+            .collect();
+        let command = EditCommand::SetCaptureBindings { changes };
+        assert!(serde_json::to_vec(&command).unwrap().len() < 16 * 1024 * 1024);
+        let inverse = project.apply_command(&command).unwrap().inverse;
+        assert!(
+            project
+                .timeline
+                .frames
+                .iter()
+                .all(|frame| frame.capture_binding == CaptureBinding::Original)
+        );
+        assert!(
+            matches!(inverse,EditCommand::SetCaptureBindings{ref changes} if changes.len()==100_000)
+        );
+        project.apply_command(&inverse).unwrap();
+        assert!(
+            project
+                .timeline
+                .frames
+                .iter()
+                .all(|frame| frame.capture_binding == CaptureBinding::LegacyUnknown)
+        );
+    }
 
     #[test]
     fn compound_asset_and_frame_insert_is_atomic_and_invertible() {

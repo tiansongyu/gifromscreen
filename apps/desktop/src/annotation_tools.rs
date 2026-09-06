@@ -1,7 +1,9 @@
 //! Annotation authoring with bounded background preparation and a recoverable workspace loan.
 
 use crate::{
-    annotation_engine::{AnnotationProgress, annotation_name},
+    annotation_engine::{
+        AnnotationEditReport, AnnotationProgress, AnnotationReplaySkips, annotation_name,
+    },
     background_task::BackgroundTask,
     editor_workspace::{EditorWorkspace, OverlaySelectionAnchor},
 };
@@ -20,20 +22,63 @@ use std::{
 
 type WorkspaceLoan = Arc<Mutex<Option<EditorWorkspace>>>;
 
+enum PendingAnnotation {
+    Apply {
+        anchor: OverlaySelectionAnchor,
+        request: AnnotationRequest,
+        replacing: Option<TrackId>,
+    },
+    ConfirmBinding {
+        anchor: OverlaySelectionAnchor,
+    },
+}
+
+impl PendingAnnotation {
+    fn matches(&self, workspace: &EditorWorkspace) -> bool {
+        match self {
+            Self::Apply {
+                anchor,
+                replacing: Some(_),
+                ..
+            } => anchor.matches_project(workspace),
+            Self::Apply { anchor, .. } | Self::ConfirmBinding { anchor } => {
+                anchor.matches(workspace)
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct AnnotationTools {
     request: AnnotationRequest,
     project_id: Option<ProjectId>,
-    pending: Option<(OverlaySelectionAnchor, AnnotationRequest, Option<TrackId>)>,
+    pending: Option<PendingAnnotation>,
     replacing: Option<TrackId>,
     loan: Option<WorkspaceLoan>,
-    completed: Option<Result<usize, String>>,
-    task: BackgroundTask<usize, AnnotationProgress>,
+    completed: Option<Result<AnnotationEditReport, String>>,
+    task: BackgroundTask<AnnotationEditReport, AnnotationProgress>,
+    confirming: bool,
     cancel_pending: AtomicBool,
     notice: Option<String>,
 }
 
 impl AnnotationTools {
+    pub(crate) fn queue_binding_confirmation(
+        &mut self,
+        workspace: &EditorWorkspace,
+    ) -> Result<(), String> {
+        if self.is_running() {
+            return Err("Another annotation operation is already running.".to_owned());
+        }
+        let anchor = workspace
+            .overlay_selection_anchor()
+            .map_err(|error| error.to_string())?;
+        self.pending = Some(PendingAnnotation::ConfirmBinding { anchor });
+        self.confirming = true;
+        self.cancel_pending.store(false, Ordering::Release);
+        self.notice = None;
+        Ok(())
+    }
     pub(crate) fn is_running(&self) -> bool {
         self.pending.is_some() || self.loan.is_some() || self.task.is_running()
     }
@@ -63,11 +108,11 @@ impl AnnotationTools {
                 ui.weak("Applies to selected frames only. Gaps stay untouched. Labels use original timeline frame numbers and frame-end times; transition in-betweens are not numbered separately.");
                 ui.weak("Recorded events are sampled per frame. Captured cursor pixels follow crop, resize, rotation and flips exactly. Events cannot cross selection gaps.");
                 ui.weak("Annotations are frozen at authoring time. Duration edits ripple their spans; reordering keeps their timeline times. Update the group to regenerate numbers or event positions.");
-                if self.replacing.is_some(){ui.weak("Updating preserves the group's exact time coverage and visibility, independent of the frame selection. Values regenerate from the current timeline.");}
+                if self.replacing.is_some(){ui.weak("Updating uses the saved authoring scope, including unmarked frames, independently of the current selection. Legacy groups without a saved scope remain limited to their existing marker coverage.");}
                 if ui.button(if self.replacing.is_some(){"Update annotation group"}else{"Add annotations to selection"}).clicked() {
                     let result = self.request.validate(workspace.manifest().canvas.size).and_then(|()| if self.replacing.is_some(){Ok(workspace.project_edit_anchor())}else{workspace.overlay_selection_anchor().map_err(|e| e.to_string())});
                     match result {
-                        Ok(anchor) => {self.pending=Some((anchor,self.request.clone(),self.replacing));self.cancel_pending.store(false,Ordering::Release);self.notice=None;}
+                        Ok(anchor) => {self.pending=Some(PendingAnnotation::Apply {anchor,request:self.request.clone(),replacing:self.replacing});self.confirming=false;self.cancel_pending.store(false,Ordering::Release);self.notice=None;}
                         Err(error) => self.notice=Some(error),
                     }
                 }
@@ -80,7 +125,11 @@ impl AnnotationTools {
     pub(crate) fn show_running(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.spinner();
-            ui.label("Preparing and saving annotations…");
+            ui.label(if self.confirming {
+                "Confirming original input coordinates…"
+            } else {
+                "Preparing and saving annotations…"
+            });
         });
         if let Some(progress) = self.task.progress() {
             ui.label(format!(
@@ -105,8 +154,18 @@ impl AnnotationTools {
             let loan = self.loan.take()?;
             *workspace = loan.lock().unwrap_or_else(PoisonError::into_inner).take();
             let notice = match self.completed.take()? {
-                Ok(count) => format!(
-                    "Annotations saved across {count} frames. One undo restores the previous group."
+                Ok(report) if self.confirming => format!(
+                    "Confirmed original input coordinates on {} frames; no annotations were added. One undo restores the previous binding.",
+                    report.frames
+                ),
+                Ok(report) => format!(
+                    "Annotations saved across {} frames. One undo restores the previous group. {}",
+                    report.frames,
+                    if report.replay_skips.is_empty() {
+                        String::new()
+                    } else {
+                        report.replay_skips.message()
+                    }
                 ),
                 Err(error) => format!(
                     "Annotation operation reported: {error} The workspace has been returned. If journal recovery is required, reopen before editing; verified unreferenced pixel assets may remain."
@@ -115,31 +174,45 @@ impl AnnotationTools {
             self.notice = Some(notice.clone());
             return Some(notice);
         }
-        let (anchor, request, replacing) = self.pending.take()?;
+        let pending = self.pending.take()?;
         if self.cancel_pending.load(Ordering::Acquire) {
             return Some("Annotations cancelled before preparation.".to_owned());
         }
         let Some(current) = workspace.as_ref() else {
             return Some("Open a project before adding annotations.".to_owned());
         };
-        if !anchor.matches(current) {
+        if !pending.matches(current) {
             return Some(
                 "The annotation project or selection changed before preparation.".to_owned(),
             );
         }
         let loan = Arc::new(Mutex::new(workspace.take()));
         let worker = Arc::clone(&loan);
+        self.confirming = matches!(pending, PendingAnnotation::ConfirmBinding { .. });
         if let Err(error) = self.task.start("gfs-annotations", move |context| {
             let mut slot = worker.lock().unwrap_or_else(PoisonError::into_inner);
-            slot.as_mut()
-                .ok_or_else(|| "Annotation workspace is unavailable.".to_owned())?
-                .apply_annotation_group(
+            let workspace = slot
+                .as_mut()
+                .ok_or_else(|| "Annotation workspace is unavailable.".to_owned())?;
+            match pending {
+                PendingAnnotation::Apply {
+                    anchor,
+                    request,
+                    replacing,
+                } => workspace.apply_annotation_group(
                     &anchor,
                     &request,
                     replacing,
                     context.cancellation(),
                     |progress| context.report(progress),
-                )
+                ),
+                PendingAnnotation::ConfirmBinding { anchor } => workspace
+                    .confirm_original_capture_binding(&anchor, context.cancellation())
+                    .map(|frames| AnnotationEditReport {
+                        frames,
+                        replay_skips: AnnotationReplaySkips::default(),
+                    }),
+            }
         }) {
             *workspace = loan.lock().unwrap_or_else(PoisonError::into_inner).take();
             return Some(error);
@@ -192,17 +265,17 @@ pub(crate) fn show_annotation_options(ui: &mut egui::Ui, request: &mut Annotatio
             });
             egui::ComboBox::from_id_salt("progress-direction")
                 .selected_text(match options.direction {
-                    ProgressDirection::LeftToRight => "Left → right",
-                    ProgressDirection::RightToLeft => "Right → left",
-                    ProgressDirection::TopToBottom => "Top → bottom",
-                    ProgressDirection::BottomToTop => "Bottom → top",
+                    ProgressDirection::LeftToRight => "Left to right",
+                    ProgressDirection::RightToLeft => "Right to left",
+                    ProgressDirection::TopToBottom => "Top to bottom",
+                    ProgressDirection::BottomToTop => "Bottom to top",
                 })
                 .show_ui(ui, |ui| {
                     for (direction, name) in [
-                        (ProgressDirection::LeftToRight, "Left → right"),
-                        (ProgressDirection::RightToLeft, "Right → left"),
-                        (ProgressDirection::TopToBottom, "Top → bottom"),
-                        (ProgressDirection::BottomToTop, "Bottom → top"),
+                        (ProgressDirection::LeftToRight, "Left to right"),
+                        (ProgressDirection::RightToLeft, "Right to left"),
+                        (ProgressDirection::TopToBottom, "Top to bottom"),
+                        (ProgressDirection::BottomToTop, "Bottom to top"),
                     ] {
                         ui.selectable_value(&mut options.direction, direction, name);
                     }
@@ -377,6 +450,122 @@ mod tests {
         EditorWorkspace::from_active(ActiveProject::create(root, manifest).unwrap(), 16).unwrap()
     }
 
+    fn legacy_workspace(root: &std::path::Path) -> EditorWorkspace {
+        use gif_from_screen_domain::{
+            AssetDescriptor, AssetKind, CaptureBinding, CaptureMetadata, ClipTransform, DurationUs,
+            EditCommand, FrameClip, FrameId, KeyStroke, RasterEncoding, TimeUs,
+        };
+        let mut workspace = empty_workspace(root, 19);
+        let size = workspace.manifest().canvas.size;
+        let bytes = vec![0; 240 * 40 * 4];
+        let asset_id = workspace.active_project().assets().put(&bytes).unwrap();
+        let frame = FrameClip {
+            id: FrameId::from_u128(1),
+            asset_id,
+            capture_binding: CaptureBinding::LegacyUnknown,
+            duration: DurationUs::new(100_000).unwrap(),
+            transform: ClipTransform::default(),
+            effects: Vec::new(),
+            capture_metadata: CaptureMetadata {
+                key_strokes: vec![KeyStroke {
+                    physical_key: "C".to_owned(),
+                    display_text: Some("Ctrl+C".to_owned()),
+                    pressed: true,
+                    at: TimeUs::ZERO,
+                    repeat: false,
+                    modifiers: 2,
+                }],
+                ..CaptureMetadata::default()
+            },
+        };
+        workspace
+            .execute(EditCommand::Compound {
+                commands: vec![
+                    EditCommand::RegisterAsset {
+                        asset: AssetDescriptor {
+                            id: asset_id,
+                            byte_len: bytes.len() as u64,
+                            kind: AssetKind::Frame {
+                                size,
+                                encoding: RasterEncoding::Rgba8,
+                            },
+                        },
+                    },
+                    EditCommand::InsertFrames {
+                        index: 0,
+                        frames: vec![frame],
+                    },
+                ],
+            })
+            .unwrap();
+        workspace.select_first().unwrap();
+        workspace
+    }
+
+    #[test]
+    fn explicit_legacy_confirmation_reuses_the_loan_and_never_adds_annotations() {
+        use gif_from_screen_domain::CaptureBinding;
+        let dir = tempfile::tempdir().unwrap();
+        let mut workspace = Some(legacy_workspace(&dir.path().join("confirm.gfsproj")));
+        let original = workspace.as_ref().unwrap().manifest().timeline.frames[0]
+            .capture_metadata
+            .clone();
+        let mut tool = AnnotationTools::default();
+        tool.queue_binding_confirmation(workspace.as_ref().unwrap())
+            .unwrap();
+        assert!(tool.is_running());
+        assert!(
+            tool.queue_binding_confirmation(workspace.as_ref().unwrap())
+                .is_err()
+        );
+        assert!(tool.poll(&mut workspace).is_none());
+        assert!(workspace.is_none());
+        let notice = finish(&mut tool, &mut workspace);
+        assert!(notice.contains("Confirmed original input coordinates on 1"));
+        assert!(notice.contains("no annotations were added"));
+        let workspace = workspace.as_mut().unwrap();
+        assert_eq!(
+            workspace.manifest().timeline.frames[0].capture_binding,
+            CaptureBinding::Original
+        );
+        assert_eq!(
+            workspace.manifest().timeline.frames[0].capture_metadata,
+            original
+        );
+        assert!(workspace.manifest().timeline.overlay_tracks.is_empty());
+        workspace.undo().unwrap();
+        assert_eq!(
+            workspace.manifest().timeline.frames[0].capture_binding,
+            CaptureBinding::LegacyUnknown
+        );
+    }
+
+    #[test]
+    fn confirmation_cancellation_and_selection_changes_cannot_weaken_the_binding_guard() {
+        use gif_from_screen_domain::{CaptureBinding, FrameId};
+        let dir = tempfile::tempdir().unwrap();
+        let mut workspace = Some(legacy_workspace(&dir.path().join("cancel-confirm.gfsproj")));
+        let before = workspace.as_ref().unwrap().manifest().clone();
+        let mut tool = AnnotationTools::default();
+        tool.queue_binding_confirmation(workspace.as_ref().unwrap())
+            .unwrap();
+        tool.cancel();
+        assert!(tool.poll(&mut workspace).unwrap().contains("cancelled"));
+        assert_eq!(workspace.as_ref().unwrap().manifest(), &before);
+        tool.queue_binding_confirmation(workspace.as_ref().unwrap())
+            .unwrap();
+        workspace
+            .as_mut()
+            .unwrap()
+            .toggle_selection(FrameId::from_u128(1))
+            .unwrap();
+        assert!(tool.poll(&mut workspace).unwrap().contains("changed"));
+        assert_eq!(
+            workspace.as_ref().unwrap().manifest().timeline.frames[0].capture_binding,
+            CaptureBinding::LegacyUnknown
+        );
+    }
+
     fn finish(tool: &mut AnnotationTools, workspace: &mut Option<EditorWorkspace>) -> String {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -397,11 +586,11 @@ mod tests {
         let mut workspace = Some(empty_workspace(&dir.path().join("error.gfsproj"), 1));
         let before = workspace.as_ref().unwrap().manifest().clone();
         let mut tool = AnnotationTools {
-            pending: Some((
-                workspace.as_ref().unwrap().project_edit_anchor(),
-                AnnotationRequest::default(),
-                None,
-            )),
+            pending: Some(PendingAnnotation::Apply {
+                anchor: workspace.as_ref().unwrap().project_edit_anchor(),
+                request: AnnotationRequest::default(),
+                replacing: None,
+            }),
             ..AnnotationTools::default()
         };
         assert!(tool.poll(&mut workspace).is_none());
@@ -409,11 +598,11 @@ mod tests {
         assert!(finish(&mut tool, &mut workspace).contains("operation reported"));
         assert_eq!(workspace.as_ref().unwrap().manifest(), &before);
         assert!(!tool.is_running());
-        tool.pending = Some((
-            workspace.as_ref().unwrap().project_edit_anchor(),
-            AnnotationRequest::default(),
-            None,
-        ));
+        tool.pending = Some(PendingAnnotation::Apply {
+            anchor: workspace.as_ref().unwrap().project_edit_anchor(),
+            request: AnnotationRequest::default(),
+            replacing: None,
+        });
         tool.cancel();
         assert!(tool.poll(&mut workspace).unwrap().contains("cancelled"));
         assert_eq!(workspace.as_ref().unwrap().manifest(), &before);
@@ -450,7 +639,10 @@ mod tests {
         let original = empty_workspace(&dir.path().join("held.gfsproj"), 1);
         let mut tool = AnnotationTools {
             loan: Some(Arc::new(Mutex::new(Some(original)))),
-            completed: Some(Ok(1)),
+            completed: Some(Ok(AnnotationEditReport {
+                frames: 1,
+                replay_skips: AnnotationReplaySkips::default(),
+            })),
             ..AnnotationTools::default()
         };
         let mut other = Some(empty_workspace(&dir.path().join("other.gfsproj"), 2));

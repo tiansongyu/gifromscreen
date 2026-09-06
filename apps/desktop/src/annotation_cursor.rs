@@ -219,6 +219,7 @@ mod tests {
                         ..CaptureMetadata::default()
                     };
                     let clip = FrameClip {
+                        capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                         id: FrameId::from_u128(1),
                         asset_id: AssetId::from_digest([1; 32]),
                         duration: DurationUs::new(1000).unwrap(),

@@ -56,6 +56,10 @@ impl Error for UnitError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ValidationIssue {
+    InvalidAnnotationScope {
+        track_id: TrackId,
+        reason: String,
+    },
     MissingCursorAsset {
         frame_id: FrameId,
         asset_id: AssetId,

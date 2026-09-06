@@ -2,11 +2,10 @@
 
 use super::{EditorWorkspace, OverlaySelectionAnchor};
 use crate::annotation_engine::{
-    AnnotationProgress, check_cancelled, load_annotation_asset, prepare_annotations_with_assets,
+    AnnotationEditReport, AnnotationProgress, check_cancelled, load_annotation_asset,
+    prepare_annotations_in_scope, prepare_annotations_with_assets,
 };
-use gif_from_screen_domain::{
-    AnnotationRequest, DurationUs, EditCommand, OverlayId, TimeUs, TimelineSpan, TrackId,
-};
+use gif_from_screen_domain::{AnnotationRequest, EditCommand, TrackId};
 use std::sync::atomic::AtomicBool;
 
 impl EditorWorkspace {
@@ -18,6 +17,7 @@ impl EditorWorkspace {
         progress: impl FnMut(AnnotationProgress),
     ) -> Result<usize, String> {
         self.apply_annotation_group(anchor, request, None, cancellation, progress)
+            .map(|report| report.frames)
     }
 
     pub(crate) fn apply_annotation_group(
@@ -27,8 +27,12 @@ impl EditorWorkspace {
         replacing: Option<TrackId>,
         cancellation: &AtomicBool,
         progress: impl FnMut(AnnotationProgress),
-    ) -> Result<usize, String> {
-        if !anchor.matches(self) {
+    ) -> Result<AnnotationEditReport, String> {
+        if !(if replacing.is_some() {
+            anchor.matches_project(self)
+        } else {
+            anchor.matches(self)
+        }) {
             return Err("Project or selection changed before annotation preparation.".to_owned());
         }
         let original = replacing
@@ -45,35 +49,47 @@ impl EditorWorkspace {
                     })
             })
             .transpose()?;
-        let mut selected = self.selection().selected().clone();
         let coverage = original
             .as_ref()
-            .map(|track| merged_spans(track.items.iter().map(|item| item.span)))
+            .map(|track| match &track.annotation_scope {
+                Some(scope) => Ok(scope.clone()),
+                None => gif_from_screen_domain::normalize_annotation_scope(
+                    &track.items.iter().map(|item| item.span).collect::<Vec<_>>(),
+                ),
+            })
             .transpose()?;
-        if let Some(coverage) = &coverage {
-            selected.clear();
-            let mut start = 0_u64;
-            for frame in &self.manifest().timeline.frames {
-                let end = start + frame.duration.get();
-                let index = coverage.partition_point(|(_, right)| *right <= start);
-                if coverage.get(index).is_some_and(|(left, _)| *left < end) {
-                    selected.insert(frame.id);
-                }
-                start = end;
-            }
-        }
-        let mut prepared = prepare_annotations_with_assets(
-            self.manifest(),
-            &selected,
-            request,
-            cancellation,
-            progress,
-            &|id| load_annotation_asset(self.manifest(), self.active_project().assets(), id),
-        )?;
-        if prepared.commands.is_empty() {
-            return Err("No matching recorded events were found. Choose manual keys, a manual click, or the built-in pointer when the backend has no input metadata.".to_owned());
-        }
+        let provider =
+            |id| load_annotation_asset(self.manifest(), self.active_project().assets(), id);
+        let mut prepared = if let Some(scope) = &coverage {
+            prepare_annotations_in_scope(
+                self.manifest(),
+                scope,
+                request,
+                cancellation,
+                progress,
+                &provider,
+            )?
+        } else {
+            prepare_annotations_with_assets(
+                self.manifest(),
+                self.selection().selected(),
+                request,
+                cancellation,
+                progress,
+                &provider,
+            )?
+        };
         if let Some(original) = original {
+            if prepared.commands.is_empty() {
+                let mut empty = original.clone();
+                empty.items.clear();
+                empty.annotation = Some(request.clone());
+                empty.annotation_scope = coverage;
+                empty.opacity = request.opacity;
+                prepared
+                    .commands
+                    .push(EditCommand::UpsertOverlayTrack { track: empty });
+            }
             let Some(EditCommand::UpsertOverlayTrack { track }) = prepared.commands.last_mut()
             else {
                 return Err("Annotation preparation did not produce a track.".to_owned());
@@ -82,35 +98,12 @@ impl EditorWorkspace {
             track.name = original.name;
             track.visible = original.visible;
             track.blend_mode = original.blend_mode;
-            let mut clipped = Vec::new();
-            for item in &track.items {
-                let end = item
-                    .span
-                    .end()
-                    .ok_or_else(|| "Annotation coverage overflows time.".to_owned())?
-                    .get();
-                let coverage = coverage.as_ref().expect("original has coverage");
-                let index = coverage.partition_point(|(_, right)| *right <= item.span.start.get());
-                for (left, right) in coverage[index..].iter().take_while(|(left, _)| *left < end) {
-                    let start = item.span.start.get().max(*left);
-                    let end = end.min(*right);
-                    if let Some(duration) = end.checked_sub(start).and_then(DurationUs::new) {
-                        if clipped.len() >= 40_000 {
-                            return Err(
-                                "Editing this annotation would exceed 40,000 fragments.".to_owned()
-                            );
-                        }
-                        let mut next = item.clone();
-                        next.id = OverlayId::from_u128(uuid::Uuid::new_v4().as_u128());
-                        next.span = TimelineSpan {
-                            start: TimeUs::new(start),
-                            duration,
-                        };
-                        clipped.push(next);
-                    }
-                }
-            }
-            track.items = clipped;
+        } else if prepared.commands.is_empty() {
+            return Err(if prepared.replay_skips.is_empty() {
+                "No matching recorded events were found. Choose manual keys, a manual click, or the built-in pointer when the backend has no input metadata.".to_owned()
+            } else {
+                prepared.replay_skips.message()
+            });
         }
         self.commit_annotations(prepared, cancellation)
     }
@@ -119,7 +112,7 @@ impl EditorWorkspace {
         &mut self,
         prepared: crate::annotation_engine::PreparedAnnotations,
         cancellation: &AtomicBool,
-    ) -> Result<usize, String> {
+    ) -> Result<AnnotationEditReport, String> {
         check_cancelled(cancellation)?;
         let command = EditCommand::Compound {
             commands: prepared.commands,
@@ -145,33 +138,11 @@ impl EditorWorkspace {
             prepared.assets.iter().map(|(asset, _)| asset.id).collect();
         self.asset_issues
             .retain(|issue| !repaired.contains(&super::asset_issue_id(issue)));
-        Ok(prepared.frames)
-    }
-}
-
-fn merged_spans(spans: impl Iterator<Item = TimelineSpan>) -> Result<Vec<(u64, u64)>, String> {
-    let mut spans: Vec<_> = spans
-        .map(|span| {
-            Ok((
-                span.start.get(),
-                span.end()
-                    .ok_or_else(|| "Annotation span overflow.".to_owned())?
-                    .get(),
-            ))
+        Ok(AnnotationEditReport {
+            frames: prepared.frames,
+            replay_skips: prepared.replay_skips,
         })
-        .collect::<Result<_, String>>()?;
-    spans.sort_unstable();
-    let mut result: Vec<(u64, u64)> = Vec::new();
-    for (left, right) in spans {
-        if let Some(last) = result.last_mut()
-            && left <= last.1
-        {
-            last.1 = last.1.max(right);
-            continue;
-        }
-        result.push((left, right));
     }
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -209,6 +180,259 @@ mod tests {
         workspace.select_only(FrameId::from_u128(1)).unwrap();
         workspace.toggle_selection(FrameId::from_u128(3)).unwrap();
         workspace
+    }
+
+    fn record_first_key(workspace: &mut EditorWorkspace) {
+        let commands = workspace
+            .manifest()
+            .timeline
+            .frames
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                let mut frame = source.clone();
+                frame.capture_binding = CaptureBinding::Original;
+                frame.capture_metadata.captured_at = Some(TimeUs::new(index as u64 * 100_000));
+                if index == 0 {
+                    frame.capture_metadata.key_strokes.push(KeyStroke {
+                        physical_key: "KeyA".to_owned(),
+                        display_text: Some("A".to_owned()),
+                        pressed: true,
+                        at: TimeUs::ZERO,
+                        repeat: false,
+                        modifiers: 0,
+                    });
+                }
+                EditCommand::ReplaceFrame {
+                    frame_id: frame.id,
+                    replacement: Box::new(frame),
+                }
+            })
+            .collect();
+        workspace
+            .execute(EditCommand::Compound { commands })
+            .unwrap();
+        workspace.select_all();
+    }
+
+    #[test]
+    fn saved_authoring_scope_grows_hold_independently_of_selection_and_survives_undo_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scope.gfsproj");
+        let mut workspace = workspace(&path);
+        record_first_key(&mut workspace);
+        let mut request = AnnotationRequest {
+            mode: AnnotationMode::RecordedKeys,
+            hold_ms: 1,
+            ..AnnotationRequest::default()
+        };
+        assert_eq!(
+            workspace
+                .apply_annotation_edit(
+                    &workspace.project_edit_anchor(),
+                    &request,
+                    &AtomicBool::new(false),
+                    |_| {}
+                )
+                .unwrap(),
+            1
+        );
+        let original = workspace.manifest().timeline.overlay_tracks[0].clone();
+        assert_eq!(original.annotation_scope.as_ref().unwrap().len(), 3);
+        let anchor = workspace.project_edit_anchor();
+        workspace.select_only(FrameId::from_u128(3)).unwrap();
+        request.hold_ms = 500;
+        assert_eq!(
+            workspace
+                .apply_annotation_group(
+                    &anchor,
+                    &request,
+                    Some(original.id),
+                    &AtomicBool::new(false),
+                    |_| {}
+                )
+                .unwrap()
+                .frames,
+            3
+        );
+        let updated = workspace.manifest().timeline.overlay_tracks[0].clone();
+        assert_eq!(updated.annotation_scope, original.annotation_scope);
+        assert_eq!(updated.items.len(), 3);
+        workspace.undo().unwrap();
+        assert_eq!(workspace.manifest().timeline.overlay_tracks[0], original);
+        workspace.redo().unwrap();
+        drop(workspace);
+        let reopened = EditorWorkspace::open(&path, LockPolicy::FailIfPresent, 16).unwrap();
+        assert_eq!(reopened.manifest().timeline.overlay_tracks[0], updated);
+        assert!(reopened.asset_issues().is_empty());
+    }
+
+    #[test]
+    fn updating_mixed_legacy_or_archived_authoring_scope_is_wholly_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        for (index, binding) in [
+            CaptureBinding::LegacyUnknown,
+            CaptureBinding::ArchivedAfterComposite,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut workspace = workspace(&dir.path().join(format!("guard-{index}.gfsproj")));
+            record_first_key(&mut workspace);
+            let mut request = AnnotationRequest {
+                mode: AnnotationMode::RecordedKeys,
+                hold_ms: 500,
+                ..AnnotationRequest::default()
+            };
+            workspace
+                .apply_annotation_edit(
+                    &workspace.project_edit_anchor(),
+                    &request,
+                    &AtomicBool::new(false),
+                    |_| {},
+                )
+                .unwrap();
+            let group = workspace.manifest().timeline.overlay_tracks[0].id;
+            workspace
+                .execute(EditCommand::SetCaptureBindings {
+                    changes: vec![FrameCaptureBindingChange {
+                        frame_id: FrameId::from_u128(2),
+                        binding,
+                    }],
+                })
+                .unwrap();
+            let before = workspace.manifest().clone();
+            let assets = std::fs::read_dir(workspace.active_project().assets().directory())
+                .unwrap()
+                .count();
+            request.foreground.red = 0;
+            let error = workspace
+                .apply_annotation_group(
+                    &workspace.project_edit_anchor(),
+                    &request,
+                    Some(group),
+                    &AtomicBool::new(false),
+                    |_| {},
+                )
+                .unwrap_err();
+            assert!(error.contains("whole group is unchanged"));
+            assert_eq!(workspace.manifest(), &before);
+            assert_eq!(
+                std::fs::read_dir(workspace.active_project().assets().directory())
+                    .unwrap()
+                    .count(),
+                assets
+            );
+            workspace.undo().unwrap();
+            assert_eq!(
+                workspace.manifest().timeline.frames[1].capture_binding,
+                CaptureBinding::Original
+            );
+            assert_eq!(
+                workspace.manifest().timeline.overlay_tracks,
+                before.timeline.overlay_tracks
+            );
+        }
+    }
+
+    #[test]
+    fn removing_the_only_input_then_updating_clears_old_marks_but_keeps_authoring_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut workspace = workspace(&dir.path().join("empty.gfsproj"));
+        record_first_key(&mut workspace);
+        let request = AnnotationRequest {
+            mode: AnnotationMode::RecordedKeys,
+            hold_ms: 500,
+            ..AnnotationRequest::default()
+        };
+        workspace
+            .apply_annotation_edit(
+                &workspace.project_edit_anchor(),
+                &request,
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        workspace
+            .execute(EditCommand::RemoveFrames {
+                frame_ids: vec![FrameId::from_u128(1)],
+            })
+            .unwrap();
+        let before = workspace.manifest().timeline.overlay_tracks[0].clone();
+        assert_eq!(before.items.len(), 2);
+        let result = workspace
+            .apply_annotation_group(
+                &workspace.project_edit_anchor(),
+                &request,
+                Some(before.id),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(result.frames, 0);
+        let updated = &workspace.manifest().timeline.overlay_tracks[0];
+        assert!(updated.items.is_empty());
+        assert_eq!(updated.annotation_scope, before.annotation_scope);
+        workspace.undo().unwrap();
+        assert_eq!(workspace.manifest().timeline.overlay_tracks[0], before);
+    }
+
+    #[test]
+    fn legacy_groups_conservatively_preserve_existing_partial_marker_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut workspace = workspace(&dir.path().join("legacy.gfsproj"));
+        let request = AnnotationRequest {
+            mode: AnnotationMode::ManualKeys {
+                text: "Legacy".to_owned(),
+            },
+            ..AnnotationRequest::default()
+        };
+        workspace
+            .apply_annotation_edit(
+                &workspace.project_edit_anchor(),
+                &request,
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        let mut legacy = workspace.manifest().timeline.overlay_tracks[0].clone();
+        legacy.annotation_scope = None;
+        legacy.items[0].span = TimelineSpan {
+            start: TimeUs::new(25_000),
+            duration: DurationUs::new(50_000).unwrap(),
+        };
+        workspace
+            .execute(EditCommand::UpsertOverlayTrack {
+                track: legacy.clone(),
+            })
+            .unwrap();
+        workspace.select_only(FrameId::from_u128(2)).unwrap();
+        workspace
+            .apply_annotation_group(
+                &workspace.project_edit_anchor(),
+                &request,
+                Some(legacy.id),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        let updated = &workspace.manifest().timeline.overlay_tracks[0];
+        assert_eq!(
+            updated.annotation_scope,
+            Some(legacy.items.iter().map(|item| item.span).collect())
+        );
+        assert_eq!(
+            updated
+                .items
+                .iter()
+                .map(|item| item.span)
+                .collect::<Vec<_>>(),
+            legacy
+                .items
+                .iter()
+                .map(|item| item.span)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -331,6 +555,7 @@ mod tests {
             start: TimeUs::new(25_000),
             duration: DurationUs::new(50_000).unwrap(),
         };
+        track.annotation_scope = Some(track.items.iter().map(|item| item.span).collect());
         track.visible = false;
         track.name = "Saved shortcut".to_owned();
         workspace
