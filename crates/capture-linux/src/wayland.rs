@@ -3,6 +3,7 @@
 use std::{
     fmt,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
+    sync::atomic::AtomicBool,
 };
 
 use ashpd::{
@@ -20,6 +21,11 @@ use gif_from_screen_capture::{
     CaptureSourceId, CaptureSourceKind, CursorCaptureMode, RecoveryHint,
 };
 use tokio::runtime::{Builder, Runtime};
+
+#[path = "wayland_cancel.rs"]
+mod cancel;
+pub(crate) use cancel::cancelled_error;
+use cancel::{RequestObjects, cancellable};
 
 pub(crate) const MONITOR_SOURCE_ID: &str = "wayland:portal:monitor";
 pub(crate) const WINDOW_SOURCE_ID: &str = "wayland:portal:window";
@@ -154,20 +160,32 @@ impl WaylandPortal {
     /// Returns an actionable [`CaptureError`] when the Tokio runtime, D-Bus
     /// session, portal frontend, or required properties are unavailable.
     pub fn connect() -> Result<Self, CaptureError> {
+        Self::connect_cancellable(&AtomicBool::new(false))
+    }
+
+    /// Connect while observing cancellation; no permission interaction is fabricated.
+    ///
+    /// # Errors
+    /// Returns the normal connection errors, or permission-cancellation when stopped.
+    pub fn connect_cancellable(cancellation: &AtomicBool) -> Result<Self, CaptureError> {
         let runtime = portal_runtime()?;
-        let (portal, capabilities) = runtime.block_on(portal_deadline(
-            std::time::Duration::from_secs(10),
-            "connect to and probe",
-            async {
-                let connection = ashpd::zbus::Connection::session().await.map_err(|error| {
-                    map_portal_error("connect to the session bus for", &error.into())
-                })?;
-                let portal = Screencast::with_connection(connection)
-                    .await
-                    .map_err(|error| map_portal_error("connect to", &error))?;
-                let capabilities = probe_proxy(&portal).await?;
-                Ok((portal, capabilities))
-            },
+        let (portal, capabilities) = runtime.block_on(cancellable(
+            cancellation,
+            portal_deadline(
+                std::time::Duration::from_secs(10),
+                "connect to and probe",
+                async {
+                    let connection = ashpd::zbus::Connection::session().await.map_err(|error| {
+                        map_portal_error("connect to the session bus for", &error.into())
+                    })?;
+                    let portal = Screencast::with_connection(connection)
+                        .await
+                        .map_err(|error| map_portal_error("connect to", &error))?;
+                    let capabilities = probe_proxy(&portal).await?;
+                    Ok((portal, capabilities))
+                },
+            ),
+            async {},
         ))?;
         Ok(Self {
             portal,
@@ -198,55 +216,105 @@ impl WaylandPortal {
         source_kind: CaptureSourceKind,
         cursor: CursorCaptureMode,
     ) -> Result<WaylandPortalSession, CaptureError> {
+        self.start_session_cancellable(source_kind, cursor, &AtomicBool::new(false))
+    }
+
+    /// Same trusted portal workflow, but closes pending Request/Session objects on cancellation.
+    ///
+    /// # Errors
+    /// Returns the same errors as `start_session`, including cancellation without a capture session.
+    pub fn start_session_cancellable(
+        self,
+        source_kind: CaptureSourceKind,
+        cursor: CursorCaptureMode,
+        cancellation: &AtomicBool,
+    ) -> Result<WaylandPortalSession, CaptureError> {
         let source_type = select_source_type(self.capabilities, source_kind)?;
         let cursor_mode = select_cursor_mode(self.capabilities, cursor)?;
         let runtime = self.runtime;
         let portal = self.portal;
         let (portal, session, stream, remote) = runtime.block_on(async {
-            let session = portal
-                .create_session(CreateSessionOptions::default())
-                .await
-                .map_err(|error| map_portal_error("create", &error))?;
+            let create = CreateSessionOptions::default();
+            let create_objects = RequestObjects::from_options(portal.connection(), &create, None)?;
+            let session = cancellable(
+                cancellation,
+                Box::pin(async {
+                    portal
+                        .create_session(create)
+                        .await
+                        .map_err(|error| map_portal_error("create", &error))
+                }),
+                create_objects.close(),
+            )
+            .await?;
             let outcome = async {
-                portal
-                    .select_sources(
-                        &session,
-                        SelectSourcesOptions::default()
-                            .set_cursor_mode(cursor_mode)
-                            .set_sources(Some(source_type.into()))
-                            .set_multiple(false)
-                            .set_persist_mode(PersistMode::DoNot),
-                    )
-                    .await
-                    .and_then(|request| request.response())
-                    .map_err(|error| map_portal_error("select sources for", &error))?;
-                let streams = portal
-                    .start(&session, None, StartCastOptions::default())
-                    .await
-                    .and_then(|request| request.response())
-                    .map_err(|error| map_portal_error("start", &error))?;
-                let [stream] = streams.streams() else {
-                    return Err(CaptureError::new(
-                        CaptureErrorKind::Platform,
-                        format!(
-                            "ScreenCast portal returned {} streams after requesting exactly one",
-                            streams.streams().len()
-                        ),
-                        RecoveryHint::ChooseDifferentSource,
-                    ));
-                };
-                let stream = PortalStreamInfo::from_portal(stream);
-                let remote = portal
-                    .open_pipe_wire_remote(&session, OpenPipeWireRemoteOptions::default())
-                    .await
-                    .map_err(|error| map_portal_error("open the PipeWire remote for", &error))?;
+                let options = SelectSourcesOptions::default()
+                    .set_cursor_mode(cursor_mode)
+                    .set_sources(Some(source_type.into()))
+                    .set_multiple(false)
+                    .set_persist_mode(PersistMode::DoNot);
+                let select_objects = RequestObjects::from_options(
+                    portal.connection(),
+                    &options,
+                    create_objects.session.clone(),
+                )?;
+                cancellable(
+                    cancellation,
+                    async {
+                        portal
+                            .select_sources(&session, options)
+                            .await
+                            .and_then(|request| request.response())
+                            .map_err(|error| map_portal_error("select sources for", &error))
+                    },
+                    select_objects.close(),
+                )
+                .await?;
+                let options = StartCastOptions::default();
+                let start_objects = RequestObjects::from_options(
+                    portal.connection(),
+                    &options,
+                    create_objects.session.clone(),
+                )?;
+                let streams = cancellable(
+                    cancellation,
+                    async {
+                        portal
+                            .start(&session, None, options)
+                            .await
+                            .and_then(|request| request.response())
+                            .map_err(|error| map_portal_error("start", &error))
+                    },
+                    start_objects.close(),
+                )
+                .await?;
+                let stream = single_stream_info(streams.streams())?;
+                let remote = cancellable(
+                    cancellation,
+                    async {
+                        portal
+                            .open_pipe_wire_remote(&session, OpenPipeWireRemoteOptions::default())
+                            .await
+                            .map_err(|error| {
+                                map_portal_error("open the PipeWire remote for", &error)
+                            })
+                    },
+                    start_objects.close(),
+                )
+                .await?;
                 Ok((stream, remote))
             }
             .await;
             match outcome {
                 Ok((stream, remote)) => Ok((portal, session, stream, remote)),
                 Err(error) => {
-                    let _ = session.close().await;
+                    if !cancellation.load(std::sync::atomic::Ordering::Acquire) {
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            session.close(),
+                        )
+                        .await;
+                    }
                     Err(error)
                 }
             }
@@ -261,6 +329,20 @@ impl WaylandPortal {
             state: WaylandPortalSessionState::Open,
         })
     }
+}
+
+fn single_stream_info(streams: &[PortalStream]) -> Result<PortalStreamInfo, CaptureError> {
+    let [stream] = streams else {
+        return Err(CaptureError::new(
+            CaptureErrorKind::Platform,
+            format!(
+                "ScreenCast portal returned {} streams after requesting exactly one",
+                streams.len()
+            ),
+            RecoveryHint::ChooseDifferentSource,
+        ));
+    };
+    Ok(PortalStreamInfo::from_portal(stream))
 }
 
 /// Metadata for the single `PipeWire` stream chosen by the compositor.
@@ -553,6 +635,38 @@ fn map_portal_error(operation: &str, error: &PortalError) -> CaptureError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn already_cancelled_connection_never_contacts_the_portal() {
+        let error = WaylandPortal::connect_cancellable(&AtomicBool::new(true)).unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[test]
+    #[ignore = "opens and programmatically cancels the real trusted chooser; isolated desktop only"]
+    fn cancelling_real_pending_chooser_does_not_require_a_permission_response() {
+        use std::sync::{Arc, atomic::Ordering};
+        assert_eq!(
+            std::env::var("GFS_ISOLATED_WAYLAND_TEST").as_deref(),
+            Ok("1")
+        );
+        let portal = WaylandPortal::connect().unwrap();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let trigger = Arc::clone(&cancellation);
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            trigger.store(true, Ordering::Release);
+        });
+        let started = std::time::Instant::now();
+        let result = portal.start_session_cancellable(
+            CaptureSourceKind::Monitor,
+            CursorCaptureMode::Automatic,
+            &cancellation,
+        );
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(7));
+        worker.join().unwrap();
+    }
 
     #[test]
     fn unresponsive_portal_calls_have_a_bounded_actionable_failure() {

@@ -44,6 +44,7 @@ const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 #[derive(Clone, Debug)]
 pub struct WaylandCaptureBackend {
     portal_capabilities: WaylandPortalCapabilities,
+    startup_cancellation: Arc<AtomicBool>,
 }
 
 impl WaylandCaptureBackend {
@@ -53,8 +54,20 @@ impl WaylandCaptureBackend {
     ///
     /// Returns [`CaptureError`] when the D-Bus session or portal frontend is unavailable.
     pub fn connect() -> Result<Self, CaptureError> {
+        Self::connect_cancellable(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Connects and starts sessions with a caller-owned startup cancellation flag.
+    ///
+    /// # Errors
+    /// Returns portal initialization errors, or cancellation before a session is started.
+    pub fn connect_cancellable(
+        startup_cancellation: Arc<AtomicBool>,
+    ) -> Result<Self, CaptureError> {
         Ok(Self {
-            portal_capabilities: WaylandPortal::connect()?.capabilities(),
+            portal_capabilities: WaylandPortal::connect_cancellable(&startup_cancellation)?
+                .capabilities(),
+            startup_cancellation,
         })
     }
 
@@ -119,6 +132,9 @@ impl CaptureBackend for WaylandCaptureBackend {
         &self,
         mut request: CaptureRequest,
     ) -> Result<Box<dyn CaptureSession>, CaptureError> {
+        if self.startup_cancellation.load(Ordering::Acquire) {
+            return Err(crate::wayland::cancelled_error());
+        }
         if matches!(request.cadence, CaptureCadence::OnInteraction) {
             return Err(unsupported(
                 "interaction-triggered capture because Wayland has no passive global input feed",
@@ -133,9 +149,17 @@ impl CaptureBackend for WaylandCaptureBackend {
             ));
         }
         request.cursor = self.effective_cursor_mode(request.cursor)?;
-        let portal = WaylandPortal::connect()?;
-        let portal_session = portal.start_session(target.source_kind, request.cursor)?;
-        WaylandCaptureSession::start(request, target, portal_session)
+        let portal = WaylandPortal::connect_cancellable(&self.startup_cancellation)?;
+        let mut portal_session = portal.start_session_cancellable(
+            target.source_kind,
+            request.cursor,
+            &self.startup_cancellation,
+        )?;
+        if self.startup_cancellation.load(Ordering::Acquire) {
+            let _ = portal_session.close();
+            return Err(crate::wayland::cancelled_error());
+        }
+        WaylandCaptureSession::start(request, target, portal_session, &self.startup_cancellation)
             .map(|session| Box::new(session) as Box<dyn CaptureSession>)
     }
 }
@@ -218,6 +242,7 @@ impl WaylandCaptureSession {
         request: CaptureRequest,
         target: ResolvedPortalTarget,
         portal: WaylandPortalSession,
+        startup_cancellation: &Arc<AtomicBool>,
     ) -> Result<Self, CaptureError> {
         if portal
             .stream()
@@ -236,9 +261,13 @@ impl WaylandCaptureSession {
         let (init_tx, init_rx) = mpsc::sync_channel(1);
         let cadence = CadenceGate::from_request(request.cadence)?;
         let requested_crop = target.crop;
+        let worker_cancellation = Arc::clone(startup_cancellation);
         let worker = thread::Builder::new()
             .name("gif-from-screen-pipewire".to_owned())
             .spawn(move || {
+                if worker_cancellation.load(Ordering::Acquire) {
+                    return Err(crate::wayland::cancelled_error());
+                }
                 let result = run_pipewire_worker(
                     portal,
                     requested_crop,
@@ -256,31 +285,21 @@ impl WaylandCaptureSession {
             })
             .map_err(|error| platform_error("spawn PipeWire capture thread", &error))?;
 
-        let initialized = match init_rx.recv_timeout(WORKER_START_TIMEOUT) {
-            Ok(Ok(initialized)) => initialized,
-            Ok(Err(error)) => {
-                let _ = worker.join();
-                return Err(error);
-            }
-            Err(RecvTimeoutError::Timeout) => {
+        let initialized = match wait_for_startup(&init_rx, startup_cancellation) {
+            Ok(initialized) => initialized,
+            Err(error) => {
                 let _ = command_tx.send(WorkerCommand::Shutdown { reply: None });
                 // Do not defeat the explicit timeout by synchronously joining
                 // a native call that may itself be stuck. The queued shutdown
                 // closes the portal as soon as the worker can make progress.
-                drop(worker);
-                return Err(CaptureError::new(
-                    CaptureErrorKind::Timeout,
-                    "PipeWire did not negotiate a video format within 10 seconds",
-                    RecoveryHint::Retry,
-                ));
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                let _ = worker.join();
-                return Err(CaptureError::new(
-                    CaptureErrorKind::Platform,
-                    "PipeWire worker exited before reporting its video format",
-                    RecoveryHint::Retry,
-                ));
+                if error.kind() == CaptureErrorKind::Timeout
+                    || startup_cancellation.load(Ordering::Acquire)
+                {
+                    drop(worker);
+                } else {
+                    let _ = worker.join();
+                }
+                return Err(error);
             }
         };
 
@@ -588,6 +607,42 @@ struct NegotiatedFormat {
 struct WorkerInitialized {
     source_size: PhysicalSize,
     output_size: PhysicalSize,
+}
+
+fn wait_for_startup(
+    initialized: &Receiver<Result<WorkerInitialized, CaptureError>>,
+    cancellation: &AtomicBool,
+) -> Result<WorkerInitialized, CaptureError> {
+    let deadline = Instant::now() + WORKER_START_TIMEOUT;
+    loop {
+        if cancellation.load(Ordering::Acquire) {
+            return Err(crate::wayland::cancelled_error());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(CaptureError::new(
+                CaptureErrorKind::Timeout,
+                "PipeWire did not negotiate a video format within 10 seconds",
+                RecoveryHint::Retry,
+            ));
+        }
+        match initialized.recv_timeout(remaining.min(Duration::from_millis(20))) {
+            Ok(result) => {
+                if cancellation.load(Ordering::Acquire) {
+                    return Err(crate::wayland::cancelled_error());
+                }
+                return result;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(CaptureError::new(
+                    CaptureErrorKind::Platform,
+                    "PipeWire worker exited before reporting its video format",
+                    RecoveryHint::Retry,
+                ));
+            }
+        }
+    }
 }
 
 enum WorkerCommand {
@@ -1366,6 +1421,9 @@ fn serialize_format_offer(frame_rate: u32) -> Result<Vec<u8>, CaptureError> {
                     ChoiceEnum::Enum {
                         default: Id(libspa_sys::SPA_VIDEO_FORMAT_BGRx),
                         alternatives: vec![
+                            // SPA treats the first value as a preference, not
+                            // as an enum member. The default must also be listed.
+                            Id(libspa_sys::SPA_VIDEO_FORMAT_BGRx),
                             Id(libspa_sys::SPA_VIDEO_FORMAT_BGRA),
                             Id(libspa_sys::SPA_VIDEO_FORMAT_RGBA),
                             Id(libspa_sys::SPA_VIDEO_FORMAT_RGBx),
@@ -1481,8 +1539,13 @@ fn parse_format_value(value: &Value) -> Result<NegotiatedFormat, CaptureError> {
             .properties
             .iter()
             .find(|property| property.key == key)
-            .and_then(|property| match property.value {
-                Value::Id(Id(value)) => Some(value),
+            .and_then(|property| match &property.value {
+                // Native SPA filtering/fixation may retain a Choice(None)
+                // wrapper even for scalar media type, subtype and pixel format.
+                Value::Id(Id(value))
+                | Value::Choice(ChoiceValue::Id(Choice(_, ChoiceEnum::None(Id(value))))) => {
+                    Some(*value)
+                }
                 _ => None,
             })
     };
@@ -1511,8 +1574,11 @@ fn parse_format_value(value: &Value) -> Result<NegotiatedFormat, CaptureError> {
         .properties
         .iter()
         .find(|property| property.key == libspa_sys::SPA_FORMAT_VIDEO_size)
-        .and_then(|property| match property.value {
-            Value::Rectangle(size) => Some(size),
+        .and_then(|property| match &property.value {
+            Value::Rectangle(size)
+            | Value::Choice(ChoiceValue::Rectangle(Choice(_, ChoiceEnum::None(size)))) => {
+                Some(*size)
+            }
             _ => None,
         })
         .ok_or_else(|| CaptureError::invalid_frame("PipeWire format omitted its video size"))?;
@@ -1557,6 +1623,120 @@ fn platform_error(operation: &str, error: &impl std::fmt::Display) -> CaptureErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn compile_spa_filter_probe(directory: &std::path::Path) -> std::path::PathBuf {
+        use std::process::Command;
+        let source = directory.join("native_format_filter.c");
+        std::fs::write(&source, include_str!("../tests/native_format_filter.c")).unwrap();
+        let cflags = Command::new("pkg-config")
+            .args(["--cflags", "libspa-0.2"])
+            .output()
+            .expect("native capture tests require pkg-config and SPA development headers");
+        assert!(
+            cflags.status.success(),
+            "pkg-config failed: {}",
+            String::from_utf8_lossy(&cflags.stderr)
+        );
+        let binary = directory.join("native-format-filter");
+        let output = Command::new(std::env::var_os("CC").unwrap_or_else(|| "cc".into()))
+            .arg("-std=gnu11")
+            .args(String::from_utf8(cflags.stdout).unwrap().split_whitespace())
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .output()
+            .expect("native capture tests require the C compiler used by PipeWire dependencies");
+        assert!(
+            output.status.success(),
+            "SPA probe compilation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        binary
+    }
+
+    fn native_spa_filter(
+        binary: &std::path::Path,
+        offer: &[u8],
+        format: u32,
+    ) -> std::process::Output {
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+        };
+        let mut child = Command::new(binary)
+            .arg(format.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(offer).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    #[test]
+    fn native_spa_filter_accepts_mutter_formats_and_rejects_missing_default_member() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = compile_spa_filter_probe(directory.path());
+        let offer = serialize_format_offer(10).unwrap();
+        let (_, unfixed) = PodDeserializer::deserialize_from::<Value>(&offer).unwrap();
+        assert!(
+            parse_format_value(&unfixed).is_err(),
+            "an unresolved format offer is not a negotiated format"
+        );
+        for format in [
+            libspa_sys::SPA_VIDEO_FORMAT_BGRx,
+            libspa_sys::SPA_VIDEO_FORMAT_BGRA,
+            libspa_sys::SPA_VIDEO_FORMAT_RGBA,
+            libspa_sys::SPA_VIDEO_FORMAT_RGBx,
+        ] {
+            let result = native_spa_filter(&binary, &offer, format);
+            assert!(
+                result.status.success(),
+                "native SPA rejected supported format {format}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let (_, fixed) = PodDeserializer::deserialize_from::<Value>(&result.stdout).unwrap();
+            let negotiated = parse_format_value(&fixed)
+                .expect("native fixed POD must be accepted by the actual Rust consumer");
+            assert_eq!(negotiated.size, PhysicalSize::new(1280, 720).unwrap());
+        }
+        let unsupported = native_spa_filter(&binary, &offer, libspa_sys::SPA_VIDEO_FORMAT_I420);
+        assert_eq!(
+            unsupported.status.code(),
+            Some(1),
+            "an unoffered YUV format must not negotiate"
+        );
+
+        // Reproduce the former broken offer: a preferred BGRx default was
+        // serialized, but only BGRA/RGBA/RGBx followed as actual enum members.
+        let (_, mut malformed) = PodDeserializer::deserialize_from::<Value>(&offer).unwrap();
+        let Value::Object(object) = &mut malformed else {
+            panic!("format object")
+        };
+        let property = object
+            .properties
+            .iter_mut()
+            .find(|property| property.key == libspa_sys::SPA_FORMAT_VIDEO_format)
+            .unwrap();
+        let Value::Choice(ChoiceValue::Id(Choice(_, ChoiceEnum::Enum { alternatives, .. }))) =
+            &mut property.value
+        else {
+            panic!("format enum")
+        };
+        alternatives.retain(|format| format.0 != libspa_sys::SPA_VIDEO_FORMAT_BGRx);
+        let malformed =
+            libspa::pod::serialize::PodSerializer::serialize(Cursor::new(Vec::new()), &malformed)
+                .unwrap()
+                .0
+                .into_inner();
+        let rejected = native_spa_filter(&binary, &malformed, libspa_sys::SPA_VIDEO_FORMAT_BGRx);
+        assert_eq!(
+            rejected.status.code(),
+            Some(1),
+            "SPA must reproduce the observed no-more-input-formats failure"
+        );
+    }
 
     fn format(size: PhysicalSize, format: RawVideoFormat) -> NegotiatedFormat {
         NegotiatedFormat { size, format }
@@ -1722,9 +1902,46 @@ mod tests {
     }
 
     #[test]
+    fn startup_cancellation_beats_ready_and_unblocks_pending_negotiation() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(WorkerInitialized {
+                source_size: PhysicalSize::new(2, 1).unwrap(),
+                output_size: PhysicalSize::new(2, 1).unwrap(),
+            }))
+            .unwrap();
+        assert!(
+            wait_for_startup(&receiver, &AtomicBool::new(true))
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        assert!(
+            receiver.try_recv().is_ok(),
+            "cancelled setup must not adopt a racing ready result"
+        );
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let trigger = Arc::clone(&cancellation);
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            trigger.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        assert!(
+            wait_for_startup(&receiver, &cancellation)
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn cursor_selection_is_explicit_and_metadata_is_not_overclaimed() {
         let backend = WaylandCaptureBackend {
             portal_capabilities: capabilities(),
+            startup_cancellation: Arc::new(AtomicBool::new(false)),
         };
         assert_eq!(
             backend

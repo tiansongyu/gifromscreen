@@ -8,6 +8,7 @@ use std::{
     io,
     sync::{
         Arc,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     },
     thread,
@@ -216,6 +217,7 @@ pub(crate) struct WaylandPrepareJob {
     commands: Option<Sender<WorkerCommand>>,
     receiver: Option<Receiver<WorkerMessage>>,
     result: Option<Result<WaylandPrepareOutcome, WaylandPrepareJobError>>,
+    startup_cancellation: Option<Arc<AtomicBool>>,
 }
 
 impl WaylandPrepareJob {
@@ -227,8 +229,8 @@ impl WaylandPrepareJob {
         cadence: CaptureCadence,
         cursor: CursorCaptureMode,
     ) -> Result<(), WaylandPrepareJobStartError> {
-        self.start_with_cursor(source, cadence, cursor, || {
-            WaylandCaptureBackend::connect()
+        self.start_cancellable(source, cadence, cursor, |cancellation| {
+            WaylandCaptureBackend::connect_cancellable(cancellation)
                 .map(|backend| Box::new(backend) as Box<dyn CaptureBackend>)
                 .map_err(WaylandPrepareJobError::Initialize)
         })
@@ -252,6 +254,7 @@ impl WaylandPrepareJob {
         )
     }
 
+    #[cfg(test)]
     fn start_with_cursor<F>(
         &mut self,
         source: CaptureSource,
@@ -262,11 +265,28 @@ impl WaylandPrepareJob {
     where
         F: FnOnce() -> Result<Box<dyn CaptureBackend>, WaylandPrepareJobError> + Send + 'static,
     {
+        self.start_cancellable(source, cadence, cursor, move |_| backend_factory())
+    }
+
+    fn start_cancellable<F>(
+        &mut self,
+        source: CaptureSource,
+        cadence: CaptureCadence,
+        cursor: CursorCaptureMode,
+        backend_factory: F,
+    ) -> Result<(), WaylandPrepareJobStartError>
+    where
+        F: FnOnce(Arc<AtomicBool>) -> Result<Box<dyn CaptureBackend>, WaylandPrepareJobError>
+            + Send
+            + 'static,
+    {
         if self.state != WaylandPrepareJobState::Idle {
             return Err(WaylandPrepareJobStartError::AlreadyStarted { state: self.state });
         }
         let (command_sender, command_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation);
         self.state = WaylandPrepareJobState::Connecting;
         self.result = None;
         let spawn = thread::Builder::new()
@@ -279,6 +299,7 @@ impl WaylandPrepareJob {
                     backend_factory,
                     &command_receiver,
                     &event_sender,
+                    &worker_cancellation,
                 );
             });
         if let Err(error) = spawn {
@@ -287,6 +308,7 @@ impl WaylandPrepareJob {
         }
         self.commands = Some(command_sender);
         self.receiver = Some(event_receiver);
+        self.startup_cancellation = Some(cancellation);
         Ok(())
     }
 
@@ -304,6 +326,9 @@ impl WaylandPrepareJob {
     pub(crate) fn cancel(&mut self) -> bool {
         if !self.is_active() || self.state == WaylandPrepareJobState::Cancelling {
             return false;
+        }
+        if let Some(cancellation) = &self.startup_cancellation {
+            cancellation.store(true, Ordering::Release);
         }
         let sent = self
             .commands
@@ -344,6 +369,7 @@ impl WaylandPrepareJob {
         self.commands = None;
         self.receiver = None;
         self.result = None;
+        self.startup_cancellation = None;
         Ok(RecordingJob {
             receiver,
             cancellation,
@@ -408,11 +434,15 @@ impl WaylandPrepareJob {
         self.receiver = None;
         self.result = Some(result);
         self.state = WaylandPrepareJobState::Finished;
+        self.startup_cancellation = None;
     }
 }
 
 impl Drop for WaylandPrepareJob {
     fn drop(&mut self) {
+        if let Some(cancellation) = &self.startup_cancellation {
+            cancellation.store(true, Ordering::Release);
+        }
         if let Some(commands) = self.commands.take() {
             let _ = commands.send(WorkerCommand::Cancel);
         }
@@ -427,10 +457,19 @@ fn prepare_worker<F>(
     backend_factory: F,
     commands: &Receiver<WorkerCommand>,
     events: &Sender<WorkerMessage>,
+    cancellation: &Arc<AtomicBool>,
 ) where
-    F: FnOnce() -> Result<Box<dyn CaptureBackend>, WaylandPrepareJobError>,
+    F: FnOnce(Arc<AtomicBool>) -> Result<Box<dyn CaptureBackend>, WaylandPrepareJobError>,
 {
-    let result = prepare_worker_inner(source, cadence, cursor, backend_factory, commands, events);
+    let result = prepare_worker_inner(
+        source,
+        cadence,
+        cursor,
+        backend_factory,
+        commands,
+        events,
+        cancellation,
+    );
     if let Some(result) = result {
         let _ = events.send(WorkerMessage::Finished(result));
     }
@@ -444,44 +483,24 @@ fn prepare_worker_inner<F>(
     backend_factory: F,
     commands: &Receiver<WorkerCommand>,
     events: &Sender<WorkerMessage>,
+    cancellation: &Arc<AtomicBool>,
 ) -> Option<Result<WaylandPrepareOutcome, WaylandPrepareJobError>>
 where
-    F: FnOnce() -> Result<Box<dyn CaptureBackend>, WaylandPrepareJobError>,
+    F: FnOnce(Arc<AtomicBool>) -> Result<Box<dyn CaptureBackend>, WaylandPrepareJobError>,
 {
-    if cancellation_requested(commands) {
-        return Some(Ok(WaylandPrepareOutcome::Cancelled));
-    }
-    if events
-        .send(WorkerMessage::Stage(WaylandPrepareJobState::Connecting))
-        .is_err()
-    {
-        return None;
-    }
-    let backend = match backend_factory() {
-        Ok(backend) => backend,
+    let mut session = match start_prepared_source(
+        source,
+        cadence,
+        cursor,
+        backend_factory,
+        commands,
+        events,
+        cancellation,
+    ) {
+        Ok(Some(session)) => session,
+        Ok(None) => return Some(Ok(WaylandPrepareOutcome::Cancelled)),
         Err(error) => return Some(Err(error)),
     };
-    if cancellation_requested(commands) {
-        return Some(Ok(WaylandPrepareOutcome::Cancelled));
-    }
-    if events
-        .send(WorkerMessage::Stage(WaylandPrepareJobState::Choosing))
-        .is_err()
-    {
-        return None;
-    }
-    let mut session = match start_full_source_session(&*backend, source, cadence, cursor) {
-        Ok(session) => session,
-        Err(WaylandPrepareJobError::StartSession(error))
-            if error.kind() == gif_from_screen_capture::CaptureErrorKind::PermissionRequired =>
-        {
-            return Some(Ok(WaylandPrepareOutcome::Cancelled));
-        }
-        Err(error) => return Some(Err(error)),
-    };
-    if cancellation_requested(commands) {
-        return Some(finish_cancel(&mut *session));
-    }
     if events
         .send(WorkerMessage::Stage(
             WaylandPrepareJobState::WaitingForFrame,
@@ -550,6 +569,62 @@ where
             },
         }
     }
+}
+
+fn start_prepared_source<F>(
+    source: &CaptureSource,
+    cadence: CaptureCadence,
+    cursor: CursorCaptureMode,
+    backend_factory: F,
+    commands: &Receiver<WorkerCommand>,
+    events: &Sender<WorkerMessage>,
+    cancellation: &Arc<AtomicBool>,
+) -> Result<Option<Box<dyn CaptureSession>>, WaylandPrepareJobError>
+where
+    F: FnOnce(Arc<AtomicBool>) -> Result<Box<dyn CaptureBackend>, WaylandPrepareJobError>,
+{
+    if cancellation.load(Ordering::Acquire) || cancellation_requested(commands) {
+        return Ok(None);
+    }
+    if events
+        .send(WorkerMessage::Stage(WaylandPrepareJobState::Connecting))
+        .is_err()
+    {
+        return Ok(None);
+    }
+    let backend = match backend_factory(Arc::clone(cancellation)) {
+        Ok(backend) => backend,
+        Err(_) if cancellation.load(Ordering::Acquire) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if cancellation.load(Ordering::Acquire) || cancellation_requested(commands) {
+        return Ok(None);
+    }
+    if events
+        .send(WorkerMessage::Stage(WaylandPrepareJobState::Choosing))
+        .is_err()
+    {
+        return Ok(None);
+    }
+    let mut session = match start_full_source_session(&*backend, source, cadence, cursor) {
+        Ok(session) => session,
+        Err(_) if cancellation.load(Ordering::Acquire) => {
+            return Ok(None);
+        }
+        Err(WaylandPrepareJobError::StartSession(error))
+            if error.kind() == gif_from_screen_capture::CaptureErrorKind::PermissionRequired =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if cancellation.load(Ordering::Acquire) || cancellation_requested(commands) {
+        finish_cancel(&mut *session)?;
+        return Ok(None);
+    }
+    Ok(Some(session))
 }
 
 fn wait_for_first_preview(
@@ -703,6 +778,7 @@ mod tests {
         pause_thread: Option<ThreadId>,
         discard_thread: Option<ThreadId>,
         start_calls: usize,
+        startup_cancelled: bool,
         started_cadence: Option<CaptureCadence>,
         started_cursor: Option<CursorCaptureMode>,
     }
@@ -775,6 +851,7 @@ mod tests {
         signals: Arc<Mutex<FakeSignals>>,
         discarded: Mutex<Option<Sender<()>>>,
         start_gate: Mutex<Option<Receiver<()>>>,
+        startup_cancellation: Option<Arc<AtomicBool>>,
     }
 
     impl CaptureBackend for FakeBackend {
@@ -815,7 +892,24 @@ mod tests {
                 ));
             }
             if let Some(gate) = self.start_gate.lock().unwrap().take() {
-                let _ = gate.recv();
+                if let Some(cancellation) = &self.startup_cancellation {
+                    loop {
+                        if cancellation.load(Ordering::Acquire) {
+                            self.signals.lock().unwrap().startup_cancelled = true;
+                            return Err(CaptureError::new(
+                                CaptureErrorKind::PermissionRequired,
+                                "pending trusted chooser cancelled",
+                                RecoveryHint::None,
+                            ));
+                        }
+                        match gate.recv_timeout(Duration::from_millis(5)) {
+                            Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                            Err(RecvTimeoutError::Timeout) => {}
+                        }
+                    }
+                } else {
+                    let _ = gate.recv();
+                }
             }
             let frames = self.frames.lock().unwrap().take().ok_or_else(|| {
                 CaptureError::new(
@@ -845,6 +939,7 @@ mod tests {
             signals,
             discarded: Mutex::new(Some(discarded)),
             start_gate: Mutex::new(start_gate),
+            startup_cancellation: None,
         })
     }
 
@@ -959,6 +1054,97 @@ mod tests {
         assert_eq!(signals.started_cursor, Some(CursorCaptureMode::Metadata));
         assert_eq!(signals.start_calls, 1);
         assert!(!signals.paused);
+    }
+
+    #[test]
+    fn shared_cancel_interrupts_pending_chooser_without_grant_or_project_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("never-created.gfsproj");
+        let output = directory.path().join("never-created.gif");
+        let signals = Arc::new(Mutex::new(FakeSignals::default()));
+        let worker_signals = Arc::clone(&signals);
+        let (_never_grant, grant_rx) = mpsc::channel();
+        let mut job = WaylandPrepareJob::default();
+        job.start_cancellable(
+            source_without_geometry(),
+            CaptureCadence::Manual,
+            CursorCaptureMode::Hidden,
+            move |flag| {
+                Ok(Box::new(FakeBackend {
+                    frames: Mutex::new(Some(VecDeque::new())),
+                    signals: worker_signals,
+                    discarded: Mutex::new(None),
+                    start_gate: Mutex::new(Some(grant_rx)),
+                    startup_cancellation: Some(flag),
+                }))
+            },
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while signals.lock().unwrap().start_calls == 0 {
+            let _ = job.drain();
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(job.cancel());
+        let worker = RecordingWorkerRequest {
+            settings: crate::RecordingSettings {
+                output: output.to_string_lossy().into_owned(),
+                ..crate::RecordingSettings::default()
+            },
+            source_id: source_without_geometry().id().clone(),
+            source_kind: CaptureSourceKind::Monitor,
+            source_label: "never granted".to_owned(),
+            project_path: project.clone(),
+            canvas: gif_from_screen_domain::PhysicalSize::new(1, 1).unwrap(),
+        };
+        assert!(matches!(
+            job.commit_crop(
+                gif_from_screen_capture::PhysicalRect::new(0, 0, 1, 1).unwrap(),
+                worker
+            ),
+            Err(WaylandCommitError::NotPrepared { .. })
+        ));
+        wait_for_finish(&mut job);
+        assert_eq!(
+            job.take_result().unwrap().unwrap(),
+            WaylandPrepareOutcome::Cancelled
+        );
+        assert!(signals.lock().unwrap().startup_cancelled);
+        assert!(!signals.lock().unwrap().paused);
+        assert!(!project.exists());
+        assert!(!output.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn dropping_during_connect_sets_the_same_worker_cancellation_flag() {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let mut job = WaylandPrepareJob::default();
+        job.start_cancellable(
+            source_without_geometry(),
+            CaptureCadence::Manual,
+            CursorCaptureMode::Automatic,
+            move |cancellation| {
+                ready_tx.send(()).unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(1);
+                while !cancellation.load(Ordering::Acquire) {
+                    assert!(std::time::Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(1));
+                }
+                stopped_tx.send(()).unwrap();
+                Err(WaylandPrepareJobError::Initialize(CaptureError::new(
+                    CaptureErrorKind::PermissionRequired,
+                    "cancelled",
+                    RecoveryHint::None,
+                )))
+            },
+        )
+        .unwrap();
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(job);
+        stopped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]
@@ -1145,7 +1331,13 @@ mod tests {
             project_path: project_path.clone(),
             canvas: ProjectSize::new(1, 1).unwrap(),
         };
+        let startup_cancellation = Arc::clone(preparation.startup_cancellation.as_ref().unwrap());
         let recording = preparation.commit_crop(crop, worker).unwrap();
+        drop(preparation);
+        assert!(
+            !startup_cancellation.load(Ordering::Acquire),
+            "dropping setup must not cancel the adopted recording session"
+        );
         let mut first_snapshot = recording.controller.trigger_snapshot();
         let mut boundary_snapshot = recording.controller.trigger_snapshot();
         let completion = loop {
