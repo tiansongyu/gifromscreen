@@ -42,8 +42,8 @@ impl CpuRenderer {
     /// at least one pixel, zero pressure is invisible, and width interpolates linearly along each
     /// segment. Line and Arrow run from the centers of the bounds' top-left and bottom-right pixels;
     /// Arrow adds a two-edge head and optionally fills its triangular interior. Rectangle and
-    /// Ellipse strokes are drawn inward, with the optional fill beneath them. Other overlay content
-    /// remains deferred.
+    /// Ellipse strokes are drawn inward, with the optional fill beneath them. Active unsupported
+    /// content returns an error instead of silently disappearing from preview or export.
     ///
     /// # Errors
     ///
@@ -200,7 +200,7 @@ where
                 layer.blend_mode,
                 cancellation,
             )?,
-            _ => {}
+            content => return Err(unsupported_overlay(layer.item.id, content)),
         }
     }
     Ok(())
@@ -222,12 +222,7 @@ where
         }
         for (item_index, item) in track.items.iter().enumerate() {
             check_cancelled(cancellation)?;
-            let supported_and_visible = match &item.content {
-                OverlayContent::Raster { opacity, .. } => *opacity != 0,
-                OverlayContent::Shape { .. } | OverlayContent::Drawing { .. } => true,
-                _ => false,
-            };
-            if !supported_and_visible {
+            if matches!(item.content, OverlayContent::Raster { opacity: 0, .. }) {
                 continue;
             }
             let end = item.span.end().ok_or(RenderError::OverlaySpanOverflow {
@@ -235,6 +230,14 @@ where
             })?;
             if sample_time < item.span.start || sample_time >= end {
                 continue;
+            }
+            if !matches!(
+                item.content,
+                OverlayContent::Raster { .. }
+                    | OverlayContent::Shape { .. }
+                    | OverlayContent::Drawing { .. }
+            ) {
+                return Err(unsupported_overlay(item.id, &item.content));
             }
             let requested = layers
                 .len()
@@ -255,6 +258,20 @@ where
     layers.sort_unstable_by_key(|layer| (layer.item.z_index, layer.track_index, layer.item_index));
     check_cancelled(cancellation)?;
     Ok(layers)
+}
+
+fn unsupported_overlay(overlay_id: OverlayId, content: &OverlayContent) -> RenderError {
+    let kind = match content {
+        OverlayContent::Text { .. } => "text",
+        OverlayContent::KeyStroke { .. } => "keystroke",
+        OverlayContent::Cursor { .. } => "cursor",
+        OverlayContent::MouseClick { .. } => "mouse click",
+        OverlayContent::Progress { .. } => "progress",
+        OverlayContent::Raster { .. } => "raster",
+        OverlayContent::Shape { .. } => "shape",
+        OverlayContent::Drawing { .. } => "drawing",
+    };
+    RenderError::UnsupportedOverlay { overlay_id, kind }
 }
 
 #[allow(
@@ -1037,6 +1054,48 @@ mod tests {
         );
         assert!(
             active_raster_overlay_assets(&tracks, TimeUs::new(20), &NeverCancel)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn active_unsupported_content_is_reported_but_hidden_and_inactive_items_are_safe() {
+        let item = OverlayItem {
+            id: OverlayId::from_u128(42),
+            span: TimelineSpan {
+                start: TimeUs::new(10),
+                duration: DurationUs::new(10).unwrap(),
+            },
+            z_index: 0,
+            content: OverlayContent::KeyStroke {
+                text: "Ctrl+C".to_owned(),
+                position: point(0, 0),
+            },
+        };
+        let mut tracks = vec![track(1, true, 255, BlendMode::Normal, vec![item])];
+        assert!(matches!(
+            active_raster_overlay_assets(&tracks, TimeUs::new(10), &NeverCancel),
+            Err(RenderError::UnsupportedOverlay { overlay_id, kind: "keystroke" })
+                if overlay_id == OverlayId::from_u128(42)
+        ));
+        for sample in [9, 20] {
+            assert!(
+                active_raster_overlay_assets(&tracks, TimeUs::new(sample), &NeverCancel)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        tracks[0].visible = false;
+        assert!(
+            active_raster_overlay_assets(&tracks, TimeUs::new(10), &NeverCancel)
+                .unwrap()
+                .is_empty()
+        );
+        tracks[0].visible = true;
+        tracks[0].opacity = 0;
+        assert!(
+            active_raster_overlay_assets(&tracks, TimeUs::new(10), &NeverCancel)
                 .unwrap()
                 .is_empty()
         );

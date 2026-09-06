@@ -56,6 +56,16 @@ impl std::fmt::Display for UnsupportedEffect {
 /// Errors produced by the deterministic CPU renderer.
 #[derive(Debug, Error)]
 pub enum RenderError {
+    /// An active overlay cannot yet be reproduced by the renderer.
+    #[error(
+        "overlay {overlay_id} uses unsupported {kind} content; hide or remove it before exporting"
+    )]
+    UnsupportedOverlay {
+        /// Item that would otherwise be silently lost from the output.
+        overlay_id: OverlayId,
+        /// Stable name of the unsupported content variant.
+        kind: &'static str,
+    },
     /// The caller requested cancellation.
     #[error("render cancelled")]
     Cancelled,
