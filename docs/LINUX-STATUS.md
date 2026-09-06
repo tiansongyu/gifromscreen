@@ -35,7 +35,7 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [x] Show overflow-safe timing, selection, canvas, and asset statistics.
 - [x] Route dropped project, GIF, PNG, JPEG, BMP, and WebP paths into background jobs.
 - [x] Create, replace, remove, and GIF-export Fade/Slide transitions.
-- [ ] Play the export-expanded Fade/Slide sequence in the editor preview.
+- [x] Play the export-expanded Fade/Slide sequence in the editor preview, with matching step timing, endpoint overlays, and pause/resume.
 - [x] Create transparent or solid blank animations from a bounded desktop form.
 - [x] Import ordered static-image sequences with timing, loop, reordering, and multi-file drop controls.
 - [x] Retain, select, remove, and clear a bounded multi-entry frame clipboard history.
@@ -58,6 +58,9 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [x] Re-edit saved text while preserving track/item identities, timing, z order, and blend settings.
 - [x] Insert undoable title frames at the beginning or after a chosen frame, excluding existing overlays from the title interval.
 - [x] Reuse validated raster assets across frame, overlay, and mask roles without changing their persisted descriptors.
+- [x] Import local video intervals through supervised FFmpeg/ffprobe with start, duration, FPS, size, progress, cancellation, and partial-project recovery.
+- [x] Insert a same-canvas recorded/imported project with remapped identities, overlays, transitions, and journal-backed undo/redo.
+- [x] Browse for projects, GIFs, images, and videos using native Linux file dialogs while retaining manual-path fallback.
 
 ## Delivery gates
 
@@ -103,8 +106,8 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 
 - [ ] Webcam recorder.
 - [ ] Drawing-board recorder.
-- [ ] Insert recording/media into an existing project.
-- [ ] Video import.
+- [x] Insert recording/media into an existing project via its saved .gfsproj (same canvas, 1,000 source frames, 512 MiB referenced raster budget).
+- [x] Video import (local whitelisted formats through system FFmpeg; bounded duration and disk usage).
 - [ ] Cursor, keyboard, and mouse-event metadata with capability fallbacks.
 - [ ] Cinemagraph, progress overlays, Smooth Loop, and automatic tasks.
 
