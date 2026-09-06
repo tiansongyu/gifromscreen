@@ -50,7 +50,9 @@ fn simulated_camera(options: &CameraCaptureOptions, size: &str) -> Command {
         "-f",
         "lavfi",
         "-i",
-        &format!("testsrc=size={size}:rate=20:duration=2"),
+        // Unique pixels identify every decoded preview frame independently of
+        // callback scheduling, queue pressure, or elapsed wall time.
+        &format!("testsrc=size={size}:rate=20:duration=2,geq=r='N+1':g=0:b=0"),
     ]);
     output_options(&mut command, options);
     command
@@ -100,20 +102,45 @@ fn preview_record_pause_resume_stop_yields_camera_project_without_paused_time() 
     let path = options.recording.project_path.clone();
     let command = simulated_camera(&options, "16x8");
     let control = CameraControl::default();
+    let mut previews = Vec::new();
+    let mut dropped_frames = 0;
+    let mut paused_clock = 0;
     let project = run_camera_command(
         options,
         command,
         &control,
         &AtomicBool::new(false),
-        |progress| match progress.preview.sequence {
-            1 => {
-                assert!(!path.exists());
-                control.record().unwrap();
+        |progress| {
+            let sequence = progress.preview.sequence;
+            previews.push((
+                sequence,
+                gif_from_screen_project::AssetStore::id_for_bytes(&progress.preview.pixels),
+            ));
+            assert!(progress.dropped_frames >= dropped_frames);
+            dropped_frames = progress.dropped_frames;
+            // Only 2, 5 and 6 are recording frames. The first two always fit
+            // the two-slot queue; its third submission may report backpressure.
+            assert!(dropped_frames <= u64::from(sequence == 6));
+            match sequence {
+                1 => {
+                    assert!(!path.exists());
+                    assert_eq!(control.phase(), CameraPhase::Preview);
+                    control.record().unwrap();
+                }
+                2 => {
+                    control.pause().unwrap();
+                    paused_clock = control.active_time_us();
+                }
+                3 | 4 => {
+                    assert_eq!(control.phase(), CameraPhase::Paused);
+                    assert_eq!(control.active_time_us(), paused_clock);
+                    if sequence == 4 {
+                        control.record().unwrap();
+                    }
+                }
+                6 => control.stop(),
+                _ => assert_eq!(control.phase(), CameraPhase::Recording),
             }
-            2 => control.pause().unwrap(),
-            4 => control.record().unwrap(),
-            6 => control.stop(),
-            _ => {}
         },
     )
     .unwrap()
@@ -123,7 +150,7 @@ fn preview_record_pause_resume_stop_yields_camera_project_without_paused_time() 
         manifest.source_provenance[0],
         SourceProvenance::Camera { .. }
     ));
-    assert_eq!(manifest.timeline.frames.len(), 3);
+    let frame_count = assert_camera_frame_selection(manifest, &previews, dropped_frames);
     let duration: u64 = manifest
         .timeline
         .frames
@@ -131,14 +158,61 @@ fn preview_record_pause_resume_stop_yields_camera_project_without_paused_time() 
         .map(|frame| frame.duration.get())
         .sum();
     assert!(
-        duration < 230_000,
-        "paused time must be excluded: {duration}"
+        duration <= control.active_time_us().saturating_add(1),
+        "project duration {duration} exceeds the frozen active clock {}",
+        control.active_time_us()
+    );
+    assert!(
+        duration >= control.active_time_us().saturating_sub(paused_clock),
+        "recording time after resume was lost"
     );
     manifest.validate().unwrap();
     drop(project);
     let reopened = ActiveProject::open(&path, LockPolicy::FailIfPresent).unwrap();
-    assert_eq!(reopened.project.manifest().timeline.frames.len(), 3);
+    assert_eq!(
+        reopened.project.manifest().timeline.frames.len(),
+        frame_count
+    );
     assert!(reopened.asset_issues.is_empty());
+}
+
+fn assert_camera_frame_selection(
+    manifest: &gif_from_screen_domain::ProjectManifest,
+    previews: &[(u64, gif_from_screen_domain::AssetId)],
+    dropped_frames: u64,
+) -> usize {
+    let frame_count = manifest.timeline.frames.len();
+    assert!(frame_count > 0);
+    assert_eq!(frame_count as u64 + dropped_frames, 3);
+    assert_eq!(
+        previews
+            .iter()
+            .map(|(_, asset)| *asset)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        6,
+        "the fixture must identify each preview independently"
+    );
+    let saved_sequences = manifest
+        .timeline
+        .frames
+        .iter()
+        .map(|frame| {
+            previews
+                .iter()
+                .find(|(_, asset)| *asset == frame.asset_id)
+                .expect("saved frame came from the preview")
+                .0
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(saved_sequences[0], 2);
+    assert!(
+        saved_sequences
+            .iter()
+            .all(|sequence| [2, 5, 6].contains(sequence))
+    );
+    assert!(saved_sequences.windows(2).all(|pair| pair[0] < pair[1]));
+    frame_count
 }
 
 #[test]
