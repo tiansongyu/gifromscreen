@@ -24,6 +24,7 @@ def main():
         environment["LIBGL_ALWAYS_SOFTWARE"] = "1"
         environment["XDG_CONFIG_HOME"] = str(Path(scratch) / "config")
         environment["XDG_DATA_HOME"] = str(Path(scratch) / "data")
+        environment["XDG_STATE_HOME"] = str(Path(scratch) / "state")
         with (Path(scratch) / "desktop.log").open("w+") as output:
             process = subprocess.Popen([str(bundle / "bin/gif-from-screen")], cwd=scratch, env=environment, stdout=output, stderr=output)
             try:
