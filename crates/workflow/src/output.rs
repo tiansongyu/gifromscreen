@@ -199,19 +199,17 @@ fn finish_recording(
         Err(error) => return Err(cleanup_after_failure(partial, error)),
     };
 
-    progress.report(WorkflowProgress::capture(
+    progress.report(WorkflowProgress::collection(
         WorkflowPhase::Committing,
-        collection.frames,
-        std::time::Duration::from_micros(collection.duration_us),
+        collection,
     ));
     if let Err(source) = fs::rename(partial, &target) {
         let error = WorkflowError::output_io("atomically commit output", &target, source);
         return Err(cleanup_after_failure(partial, error));
     }
-    progress.report(WorkflowProgress::capture(
+    progress.report(WorkflowProgress::collection(
         WorkflowPhase::Complete,
-        collection.frames,
-        std::time::Duration::from_micros(collection.duration_us),
+        collection,
     ));
     Ok(RecordToGifReport {
         collection,
@@ -264,11 +262,16 @@ struct EncodeProgressAdapter<'a> {
 
 impl ProgressSink for EncodeProgressAdapter<'_> {
     fn report(&mut self, progress: EncodeProgress) {
-        self.sink.report(WorkflowProgress::encoding(
-            self.collection.frames,
-            std::time::Duration::from_micros(self.collection.duration_us),
-            progress,
-        ));
+        self.sink.report(
+            WorkflowProgress::encoding(
+                self.collection.frames,
+                std::time::Duration::from_micros(self.collection.capture_duration_us),
+                progress,
+            )
+            .with_playback_duration(std::time::Duration::from_micros(
+                self.collection.duration_us,
+            )),
+        );
     }
 }
 

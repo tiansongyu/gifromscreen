@@ -334,15 +334,19 @@ pub fn copy_selected_frames(
             maximum: MAX_FRAME_CLIPBOARD_FRAMES,
         });
     }
-    Ok(FrameClipboard {
-        frames: project
-            .timeline
-            .frames
-            .iter()
-            .filter(|frame| selected.contains(&frame.id))
-            .cloned()
-            .collect(),
-    })
+    let mut frames = Vec::with_capacity(selected.len());
+    let mut source_time = 0_u64;
+    for frame in &project.timeline.frames {
+        if selected.contains(&frame.id) {
+            let mut copy = frame.clone();
+            copy.freeze_capture_clock(gif_from_screen_domain::TimeUs::new(source_time));
+            frames.push(copy);
+        }
+        source_time = source_time
+            .checked_add(frame.duration.get())
+            .ok_or(EditorError::InvalidDuration)?;
+    }
+    Ok(FrameClipboard { frames })
 }
 
 /// Builds one atomic cut command together with the clipboard to install after commit.
@@ -532,6 +536,7 @@ mod tests {
         );
         let frames = (0..frame_count)
             .map(|index| FrameClip {
+                capture_clock: None,
                 capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: FrameId::from_u128(u128::try_from(index).unwrap() + 1),
                 asset_id,
@@ -615,7 +620,13 @@ mod tests {
             ids(clipboard.frames()),
             [FrameId::from_u128(1), FrameId::from_u128(3)]
         );
-        assert_eq!(clipboard.frames()[0], timeline_project.timeline.frames[0]);
+        let mut expected = timeline_project.timeline.frames[0].clone();
+        expected.freeze_capture_clock(gif_from_screen_domain::TimeUs::ZERO);
+        assert_eq!(clipboard.frames()[0], expected);
+        assert_eq!(
+            timeline_project.timeline.frames[0].capture_clock, None,
+            "copy must not edit the source project"
+        );
 
         let oversized = project(MAX_FRAME_CLIPBOARD_FRAMES + 1);
         assert!(matches!(

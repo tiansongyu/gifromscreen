@@ -959,6 +959,7 @@ mod tests {
 
     fn clip(asset_id: AssetId) -> FrameClip {
         FrameClip {
+            capture_clock: None,
             capture_binding: gif_from_screen_domain::CaptureBinding::Original,
             id: gif_from_screen_domain::FrameId::from_u128(1),
             asset_id,

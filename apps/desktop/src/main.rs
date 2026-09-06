@@ -241,6 +241,7 @@ struct RecordingSettings {
     interval_count: u32,
     interval_unit: RecordingIntervalUnit,
     manual_frame_duration_ms: u64,
+    playback: RecordingPlaybackSettings,
     countdown_seconds: u8,
     changes_only: bool,
     input_events: bool,
@@ -258,6 +259,25 @@ enum RecordingCursor {
     Embedded,
     Hidden,
     Editable,
+}
+
+#[derive(Clone, Debug)]
+struct RecordingPlaybackSettings {
+    fixed_frame_rate: bool,
+    manual_fixed: bool,
+    periodic_fixed: bool,
+    periodic_frame_delay_ms: u64,
+}
+
+impl Default for RecordingPlaybackSettings {
+    fn default() -> Self {
+        Self {
+            fixed_frame_rate: false,
+            manual_fixed: true,
+            periodic_fixed: true,
+            periodic_frame_delay_ms: 66,
+        }
+    }
 }
 
 impl RecordingCursor {
@@ -284,7 +304,8 @@ impl Default for RecordingSettings {
             fps: 10,
             interval_count: 1,
             interval_unit: RecordingIntervalUnit::Seconds,
-            manual_frame_duration_ms: 100,
+            manual_frame_duration_ms: 1000,
+            playback: RecordingPlaybackSettings::default(),
             countdown_seconds: 3,
             changes_only: false,
             input_events: false,
@@ -910,6 +931,12 @@ impl eframe::App for GifFromScreenApp {
             AppView::ImportImageSequence => self.show_import_sequence(ui),
             AppView::ImportVideo => self.video_import.show(ui),
             AppView::NewBlankAnimation => self.show_blank_project(ui),
+            AppView::ScreenRecorder
+                if self.wayland_prepare_job.is_active()
+                    || self.wayland_frozen_preview.is_some() =>
+            {
+                self.show_wayland_preparation(ui);
+            }
             AppView::ScreenRecorder => {
                 egui::ScrollArea::vertical()
                     .id_salt("screen-recorder-page")
@@ -1743,10 +1770,6 @@ impl GifFromScreenApp {
 
     fn show_screen_recorder(&mut self, ui: &mut egui::Ui) {
         self.ensure_capture_source_catalog();
-        if self.wayland_prepare_job.is_active() || self.wayland_frozen_preview.is_some() {
-            self.show_wayland_preparation(ui);
-            return;
-        }
         if self.region_picker.is_some() {
             self.show_region_picker(ui);
             return;
@@ -1780,10 +1803,11 @@ impl GifFromScreenApp {
         if let Some(progress) = self.progress {
             ui.add_space(12.0);
             ui.label(format!(
-                "{:?}: {} captured frames, {:.2}s",
+                "{:?}: {} captured frames · source span {:.2}s · GIF {:.2}s",
                 progress.phase,
                 progress.frames_captured,
-                progress.capture_duration.as_secs_f32()
+                progress.capture_duration.as_secs_f32(),
+                progress.playback_duration.as_secs_f32()
             ));
         }
         if let Some(notice) = &self.notice {
@@ -1827,8 +1851,10 @@ impl GifFromScreenApp {
                 && !self.motion_tools.is_running()
                 && !self.annotation_tools.is_running(),
             |ui| {
-                if self.capture_binding_ui.show(ui, workspace)
-                    && let Err(error) = self.annotation_tools.queue_binding_confirmation(workspace)
+                if let Some(declare_common_clock) = self.capture_binding_ui.show(ui, workspace)
+                    && let Err(error) = self
+                        .annotation_tools
+                        .queue_binding_confirmation(workspace, declare_common_clock)
                 {
                     self.notice = Some(error);
                 }
@@ -1982,7 +2008,7 @@ impl GifFromScreenApp {
                 ui.label("Output GIF");
                 ui.text_edit_singleline(&mut self.settings.output);
                 ui.end_row();
-                ui.label("Maximum duration (ms, 0 = manual stop)");
+                ui.label("Maximum capture duration (ms, 0 = manual stop)");
                 ui.add(
                     egui::DragValue::new(&mut self.settings.duration_ms)
                         .range(0..=MAX_RECORDING_DURATION_MS),
@@ -2729,46 +2755,43 @@ impl GifFromScreenApp {
         ui.heading("Wayland source preparation");
         let mut selected_from_drag = None;
         let mut apply_exact = false;
-        let mut open_controller = false;
-        if let Some(preview) = &mut self.wayland_frozen_preview {
-            ui.label(format!(
-                "Frozen {}×{} PipeWire frame",
-                preview.source_size.width(),
-                preview.source_size.height()
-            ));
-            ui.weak(
-                "This is a source-local preview, not a window positioned over global desktop coordinates.",
-            );
-            ui.add_space(8.0);
-            selected_from_drag = draw_wayland_region_selector(ui, preview, true);
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label("X");
-                ui.add(egui::DragValue::new(&mut self.settings.region_x));
-                ui.label("Y");
-                ui.add(egui::DragValue::new(&mut self.settings.region_y));
-                ui.label("Width");
-                ui.add(egui::DragValue::new(&mut self.settings.region_width).range(1..=65_535));
-                ui.label("Height");
-                ui.add(egui::DragValue::new(&mut self.settings.region_height).range(1..=65_535));
-                apply_exact = ui.button("Apply exact region").clicked();
+        let cancelling = self.wayland_prepare_job.state() == WaylandPrepareJobState::Cancelling;
+        let (open, cancel) = Self::show_wayland_preparation_actions(
+            ui,
+            self.wayland_frozen_preview.is_some(),
+            cancelling,
+        );
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt("wayland-preparation-content")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if let Some(preview) = &mut self.wayland_frozen_preview {
+                    apply_exact = Self::show_wayland_preparation_coordinates(ui, &mut self.settings);
+                    ui.label(format!(
+                        "Selected {}×{} at {},{}",
+                        preview.selection.size().width(),
+                        preview.selection.size().height(),
+                        preview.selection.origin().x,
+                        preview.selection.origin().y
+                    ));
+                    ui.label(format!(
+                        "Frozen {}×{} PipeWire frame",
+                        preview.source_size.width(),
+                        preview.source_size.height()
+                    ));
+                    ui.weak("This is a source-local preview, not a window positioned over global desktop coordinates.");
+                    if let Some(notice) = &self.notice { ui.label(notice); }
+                    ui.add_space(8.0);
+                    selected_from_drag = draw_wayland_region_selector(ui, preview, true);
+                } else {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spinner();
+                        ui.label(wayland_prepare_state_notice(self.wayland_prepare_job.state()));
+                    });
+                    if let Some(notice) = &self.notice { ui.label(notice); }
+                }
             });
-            ui.label(format!(
-                "Selected {}×{} at {},{}",
-                preview.selection.size().width(),
-                preview.selection.size().height(),
-                preview.selection.origin().x,
-                preview.selection.origin().y
-            ));
-            open_controller = ui.button("Open source-local recorder controller").clicked();
-        } else {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(wayland_prepare_state_notice(
-                    self.wayland_prepare_job.state(),
-                ));
-            });
-        }
         if let Some(region) = selected_from_drag {
             if let Some(preview) = &mut self.wayland_frozen_preview {
                 preview.selection = region;
@@ -2806,24 +2829,52 @@ impl GifFromScreenApp {
                 Err(error) => self.notice = Some(error),
             }
         }
-        if open_controller && let Err(error) = self.open_wayland_crop_controller(ui.ctx()) {
+        if open.clicked()
+            && let Err(error) = self.open_wayland_crop_controller(ui.ctx())
+        {
             self.notice = Some(error);
         }
-        ui.add_space(8.0);
-        let cancelling = self.wayland_prepare_job.state() == WaylandPrepareJobState::Cancelling;
-        if ui
-            .add_enabled(!cancelling, egui::Button::new("Cancel preparation"))
-            .clicked()
-            && self.wayland_prepare_job.cancel()
-        {
+        if cancel.clicked() && self.wayland_prepare_job.cancel() {
             self.notice = Some(
                 "Cancellation requested. A prepared session will close immediately; an open system chooser may still need to be dismissed."
                     .to_owned(),
             );
         }
-        if let Some(notice) = &self.notice {
-            ui.label(notice);
-        }
+    }
+
+    fn show_wayland_preparation_actions(
+        ui: &mut egui::Ui,
+        ready: bool,
+        cancelling: bool,
+    ) -> (egui::Response, egui::Response) {
+        ui.horizontal_wrapped(|ui| {
+            let open = ui.add_enabled(
+                ready,
+                egui::Button::new("Open source-local recorder controller").wrap(),
+            );
+            let cancel =
+                ui.add_enabled(!cancelling, egui::Button::new("Cancel preparation").wrap());
+            (open, cancel)
+        })
+        .inner
+    }
+
+    fn show_wayland_preparation_coordinates(
+        ui: &mut egui::Ui,
+        settings: &mut RecordingSettings,
+    ) -> bool {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("X");
+            ui.add(egui::DragValue::new(&mut settings.region_x));
+            ui.label("Y");
+            ui.add(egui::DragValue::new(&mut settings.region_y));
+            ui.label("Width");
+            ui.add(egui::DragValue::new(&mut settings.region_width).range(1..=65_535));
+            ui.label("Height");
+            ui.add(egui::DragValue::new(&mut settings.region_height).range(1..=65_535));
+            ui.button("Apply exact region").clicked()
+        })
+        .inner
     }
 
     fn open_wayland_crop_controller(&mut self, context: &egui::Context) -> Result<(), String> {
@@ -4522,9 +4573,12 @@ fn show_recorder_position_controls(ui: &mut egui::Ui, context: &egui::Context) {
 fn show_overlay_progress(ui: &mut egui::Ui, progress: Option<WorkflowProgress>) {
     if let Some(progress) = progress {
         ui.label(format!(
-            "{} frames · {:.1}s",
+            "{} frames · GIF {:.1}s",
             progress.frames_captured,
-            progress.capture_duration.as_secs_f32()
+            progress.playback_duration.as_secs_f32()
+        )).on_hover_text(format!(
+            "Source sample span: {:.3}s. GIF playback duration: {:.3}s. Fixed playback delay does not change the captured input clock.",
+            progress.capture_duration.as_secs_f64(), progress.playback_duration.as_secs_f64()
         ));
     } else {
         ui.label("Starting…");
@@ -5517,6 +5571,7 @@ fn validate_settings(settings: &RecordingSettings) -> Result<(), String> {
     }
     let _ = recording_cadence(settings)?;
     let _ = recording_tail_frame_duration(settings)?;
+    let _ = recording_playback_timing(settings)?;
     if settings.countdown_seconds > MAX_COUNTDOWN_SECONDS {
         return Err(format!(
             "Countdown must be between 0 and {MAX_COUNTDOWN_SECONDS} seconds."
@@ -5611,18 +5666,44 @@ fn show_recording_cadence_settings(ui: &mut egui::Ui, settings: &mut RecordingSe
             });
             ui.end_row();
         }
-        RecordingCadenceChoice::Manual => {
-            ui.label("Final manual frame duration (ms)");
-            ui.horizontal_wrapped(|ui| {
-                ui.add(
-                    egui::DragValue::new(&mut settings.manual_frame_duration_ms)
-                        .range(1..=MAX_RECORDING_DURATION_MS),
-                );
-                ui.weak("Earlier frame durations follow the time between snapshot clicks.");
-            });
-            ui.end_row();
-        }
+        RecordingCadenceChoice::Manual => {}
     }
+    show_recording_playback_settings(ui, settings);
+}
+
+fn show_recording_playback_settings(ui: &mut egui::Ui, settings: &mut RecordingSettings) {
+    ui.label("GIF playback timing");
+    ui.horizontal_wrapped(|ui| match settings.cadence {
+        RecordingCadenceChoice::FixedFps => {
+            ui.checkbox(&mut settings.playback.fixed_frame_rate, "Fixed playback rate");
+            if settings.playback.fixed_frame_rate {
+                ui.weak(format!("{} ms per retained frame, independent of capture delays.", 1000 / settings.fps.max(1)));
+            } else {
+                ui.weak("Follow the active time between captured samples.");
+            }
+        }
+        RecordingCadenceChoice::Periodic => {
+            ui.checkbox(&mut settings.playback.periodic_fixed, "Fixed frame delay");
+            if settings.playback.periodic_fixed {
+                ui.add(egui::DragValue::new(&mut settings.playback.periodic_frame_delay_ms).range(1..=MAX_RECORDING_DURATION_MS).suffix(" ms per frame"));
+                ui.weak("Sampling interval and GIF playback speed are independent.");
+            } else {
+                ui.weak("Follow source timing; the final frame uses the sampling interval.");
+            }
+        }
+        RecordingCadenceChoice::Manual => {
+            ui.checkbox(&mut settings.playback.manual_fixed, "Fixed frame delay");
+            ui.add(egui::DragValue::new(&mut settings.manual_frame_duration_ms)
+                .range(1..=MAX_RECORDING_DURATION_MS)
+                .suffix(if settings.playback.manual_fixed { " ms per frame" } else { " ms final frame" }));
+            if settings.playback.manual_fixed {
+                ui.weak("Every snapshot gets this playback delay, regardless of time between clicks.");
+            } else {
+                ui.weak("Earlier frames follow active time between clicks; this is only the final frame's delay.");
+            }
+        }
+    });
+    ui.end_row();
 }
 
 fn show_recording_annotations_setting(
@@ -5660,11 +5741,18 @@ fn show_frame_retention_setting(ui: &mut egui::Ui, settings: &mut RecordingSetti
         ui.add_enabled_ui(settings.cadence != RecordingCadenceChoice::Manual, |ui| {
             ui.checkbox(
                 &mut settings.changes_only,
-                "Store only frames whose pixels changed",
+                "Store only changed pixels, cursor or input",
             );
         });
         if settings.cadence == RecordingCadenceChoice::Manual {
             ui.weak("Every manual trigger is retained, including identical pixels.");
+        } else if settings.changes_only
+            && matches!(
+                recording_playback_timing(settings),
+                Ok(gif_from_screen_workflow::PlaybackTiming::Fixed(_))
+            )
+        {
+            ui.weak("Skipped samples add no GIF playback time in fixed-delay mode.");
         }
     });
     ui.end_row();
@@ -5941,8 +6029,40 @@ fn collection_options(settings: &RecordingSettings) -> Result<CollectOptions, St
         limit: collection_limit(settings.duration_ms),
         frame_retention: frame_retention(settings.changes_only),
         tail_frame_duration: recording_tail_frame_duration(settings)?,
+        playback_timing: recording_playback_timing(settings)?,
         ..CollectOptions::default()
     })
+}
+
+fn recording_playback_timing(
+    settings: &RecordingSettings,
+) -> Result<gif_from_screen_workflow::PlaybackTiming, String> {
+    use gif_from_screen_workflow::PlaybackTiming;
+    let fixed_ms = match settings.cadence {
+        RecordingCadenceChoice::FixedFps if settings.playback.fixed_frame_rate => {
+            if !(1..=60).contains(&settings.fps) {
+                return Err("FPS must be between 1 and 60.".to_owned());
+            }
+            // Matches the reference recorder's integer millisecond playback delay.
+            Some(1000 / u64::from(settings.fps))
+        }
+        RecordingCadenceChoice::Periodic if settings.playback.periodic_fixed => {
+            Some(settings.playback.periodic_frame_delay_ms)
+        }
+        RecordingCadenceChoice::Manual if settings.playback.manual_fixed => {
+            Some(settings.manual_frame_duration_ms)
+        }
+        _ => None,
+    };
+    match fixed_ms {
+        Some(delay) if (1..=MAX_RECORDING_DURATION_MS).contains(&delay) => {
+            Ok(PlaybackTiming::Fixed(Duration::from_millis(delay)))
+        }
+        Some(_) => Err(format!(
+            "Fixed GIF frame delay must be between 1 and {MAX_RECORDING_DURATION_MS} milliseconds."
+        )),
+        None => Ok(PlaybackTiming::Measured),
+    }
 }
 
 fn collection_limit(duration_ms: u64) -> CollectionLimit {
@@ -6752,6 +6872,97 @@ mod tests {
     }
 
     #[test]
+    fn playback_defaults_match_capture_modes_without_changing_sampling_intervals() {
+        use gif_from_screen_workflow::PlaybackTiming;
+        let mut settings = RecordingSettings::default();
+        assert_eq!(
+            collection_options(&settings).unwrap().playback_timing,
+            PlaybackTiming::Measured
+        );
+        settings.fps = 30;
+        settings.playback.fixed_frame_rate = true;
+        assert_eq!(
+            collection_options(&settings).unwrap().playback_timing,
+            PlaybackTiming::Fixed(Duration::from_millis(33))
+        );
+        assert_eq!(
+            recording_cadence(&settings).unwrap(),
+            CaptureCadence::fixed_fps(30).unwrap()
+        );
+
+        settings.cadence = RecordingCadenceChoice::Manual;
+        assert_eq!(
+            recording_cadence(&settings).unwrap(),
+            CaptureCadence::Manual
+        );
+        assert_eq!(
+            collection_options(&settings).unwrap().playback_timing,
+            PlaybackTiming::Fixed(Duration::from_secs(1))
+        );
+        settings.manual_frame_duration_ms = 250;
+        assert_eq!(
+            collection_options(&settings).unwrap().playback_timing,
+            PlaybackTiming::Fixed(Duration::from_millis(250))
+        );
+        settings.playback.manual_fixed = false;
+        assert_eq!(
+            collection_options(&settings).unwrap().playback_timing,
+            PlaybackTiming::Measured
+        );
+        assert_eq!(
+            collection_options(&settings).unwrap().tail_frame_duration,
+            Duration::from_millis(250)
+        );
+
+        settings.cadence = RecordingCadenceChoice::Periodic;
+        settings.interval_unit = RecordingIntervalUnit::Minutes;
+        settings.interval_count = 3;
+        assert_eq!(
+            recording_cadence(&settings).unwrap(),
+            CaptureCadence::Interval(Duration::from_secs(180))
+        );
+        assert_eq!(
+            collection_options(&settings).unwrap().playback_timing,
+            PlaybackTiming::Fixed(Duration::from_millis(66))
+        );
+        settings.playback.periodic_frame_delay_ms = 125;
+        assert_eq!(
+            collection_options(&settings).unwrap().playback_timing,
+            PlaybackTiming::Fixed(Duration::from_millis(125))
+        );
+        settings.playback.periodic_fixed = false;
+        assert_eq!(
+            collection_options(&settings).unwrap().playback_timing,
+            PlaybackTiming::Measured
+        );
+        assert_eq!(
+            collection_options(&settings).unwrap().tail_frame_duration,
+            Duration::from_secs(180)
+        );
+    }
+
+    #[test]
+    fn invalid_fixed_playback_delay_fails_before_recording_and_does_not_affect_other_modes() {
+        let mut settings = RecordingSettings {
+            cadence: RecordingCadenceChoice::Periodic,
+            ..RecordingSettings::default()
+        };
+        for delay in [0, MAX_RECORDING_DURATION_MS + 1] {
+            settings.playback.periodic_frame_delay_ms = delay;
+            assert!(collection_options(&settings).is_err());
+        }
+        settings.playback.periodic_fixed = false;
+        assert!(
+            collection_options(&settings).is_ok(),
+            "inactive fixed-delay draft must not invalidate measured timing"
+        );
+        settings.cadence = RecordingCadenceChoice::FixedFps;
+        settings.playback.fixed_frame_rate = true;
+        settings.fps = 0;
+        assert!(collection_options(&settings).is_err());
+    }
+
+    #[test]
     fn selected_export_frames_follow_timeline_order_not_identity_order() {
         let timeline_order = [
             FrameId::from_u128(30),
@@ -7155,6 +7366,7 @@ mod tests {
                     EditCommand::InsertFrames {
                         index: 0,
                         frames: vec![FrameClip {
+                            capture_clock: None,
                             capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                             id: FrameId::from_u128(7),
                             asset_id,

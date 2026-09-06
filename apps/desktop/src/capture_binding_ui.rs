@@ -10,12 +10,13 @@ pub(crate) struct CaptureBindingUi {
     anchor: Option<OverlaySelectionAnchor>,
     counts: CaptureBindingSummary,
     verified_original_pixels: bool,
+    verified_common_clock: bool,
 }
 
 impl CaptureBindingUi {
     /// The root queues the returned request in the existing annotation worker.
-    pub(crate) fn show(&mut self, ui: &mut egui::Ui, workspace: &EditorWorkspace) -> bool {
-        let mut confirm = false;
+    pub(crate) fn show(&mut self, ui: &mut egui::Ui, workspace: &EditorWorkspace) -> Option<bool> {
+        let mut confirm = None;
         egui::CollapsingHeader::new("Recorded input provenance")
             .id_salt("recorded-input-provenance")
             .show(ui, |ui| {
@@ -30,29 +31,42 @@ impl CaptureBindingUi {
                 if self.counts.selected_not_recorded > 0 {
                     ui.label("Some selected frames were created without screen-input metadata, such as titles or imported images. They cannot be relabeled as screen recordings; unselect them before confirming a legacy recording interval.");
                 }
-                if self.counts.selected_legacy_unknown == 0 || !self.has_recorded_input() {
-                    ui.weak("No selected legacy input needs confirmation. Pixels, saved annotations and GIF export remain unchanged.");
+                if !self.needs_confirmation() || !self.has_recorded_input() {
+                    ui.weak("No selected input association needs confirmation. Pixels, saved annotations and GIF export remain unchanged.");
                     return;
                 }
-                ui.label("Earlier projects did not record whether a frame had been baked. Only confirm after checking that the selected legacy frames still use their original captured pixels, with any crop or resize kept as editable transforms.");
-                ui.label(format!("Confirmation includes all {} selected legacy frames, including frames between recorded events. Original association flags remain unchanged.", self.counts.selected_legacy_unknown));
-                ui.weak("This does not restore original pixels or remap old coordinates. Do not confirm frames that already contain flattened annotations or mixed images.");
-                ui.checkbox(
-                    &mut self.verified_original_pixels,
-                    "I verified that these legacy frames retain their original captured pixels",
-                );
+                self.show_acknowledgements(ui);
                 if self.counts.selected_archived_after_composite > 0 {
                     ui.weak("Unselect the baked frames before confirming legacy frames. Known baked frames cannot be relabeled as original.");
                 }
                 if ui
-                    .add_enabled(self.can_confirm(), egui::Button::new("Confirm original input association"))
+                    .add_enabled(self.can_confirm(), egui::Button::new("Confirm selected input association"))
                     .clicked()
                 {
                     confirm = self.take_confirmation();
                 }
-                ui.weak("Only the selected legacy association flags change. Raw input and pixels remain intact; one Undo restores the prior flags.");
+                ui.weak("Raw events, pixels and existing annotations remain intact. One Undo restores the prior associations; reapply recorded annotations to use the confirmed information.");
             });
         confirm
+    }
+
+    fn show_acknowledgements(&mut self, ui: &mut egui::Ui) {
+        if self.counts.selected_legacy_unknown > 0 {
+            ui.label("Earlier projects did not record whether a frame had been baked. Only confirm after checking that the selected legacy frames still use their original captured pixels, with any crop or resize kept as editable transforms.");
+            ui.label(format!("Pixel confirmation includes all {} selected legacy frames, including frames between recorded events. It does not restore pixels or remap coordinates.", self.counts.selected_legacy_unknown));
+            ui.checkbox(
+                &mut self.verified_original_pixels,
+                "I verified that these legacy frames retain their original captured pixels",
+            );
+        }
+        if self.counts.selected_missing_clock > 0 {
+            ui.label(format!("{} selected frames have no verified recording clock. Pixel confirmation alone does not allow key or click holds to continue between them.", self.counts.selected_missing_clock));
+            ui.checkbox(
+                &mut self.verified_common_clock,
+                "Each selected continuous unknown-clock interval is from one recording with trustworthy original sample times",
+            );
+            ui.weak("Optional and separate from pixel confirmation. Known recording clocks are never merged. Leave this unchecked if the original timing is uncertain; use per-frame or manual annotations instead.");
+        }
     }
 
     fn sync_workspace(&mut self, workspace: &EditorWorkspace) {
@@ -64,6 +78,7 @@ impl CaptureBindingUi {
             return;
         }
         self.verified_original_pixels = false;
+        self.verified_common_clock = false;
         self.counts = capture_binding_summary(
             workspace
                 .manifest()
@@ -76,11 +91,16 @@ impl CaptureBindingUi {
     }
 
     fn can_confirm(&self) -> bool {
-        self.verified_original_pixels
-            && self.has_recorded_input()
-            && self.counts.selected_legacy_unknown > 0
+        self.has_recorded_input()
+            && (self.counts.selected_legacy_unknown == 0 || self.verified_original_pixels)
+            && (self.counts.selected_legacy_unknown > 0
+                || self.counts.selected_missing_clock > 0 && self.verified_common_clock)
             && self.counts.selected_archived_after_composite == 0
             && self.counts.selected_not_recorded == 0
+    }
+
+    fn needs_confirmation(&self) -> bool {
+        self.counts.selected_legacy_unknown > 0 || self.counts.selected_missing_clock > 0
     }
 
     fn has_recorded_input(&self) -> bool {
@@ -91,9 +111,10 @@ impl CaptureBindingUi {
             > 0
     }
 
-    fn take_confirmation(&mut self) -> bool {
-        let confirmed = self.can_confirm();
+    fn take_confirmation(&mut self) -> Option<bool> {
+        let confirmed = self.can_confirm().then_some(self.verified_common_clock);
         self.verified_original_pixels = false;
+        self.verified_common_clock = false;
         confirmed
     }
 }
@@ -169,10 +190,10 @@ mod tests {
         let mut ui = CaptureBindingUi::default();
         ui.sync_workspace(&workspace);
         assert_eq!(ui.counts.legacy_unknown, 1);
-        assert!(!ui.take_confirmation());
+        assert_eq!(ui.take_confirmation(), None);
         ui.verified_original_pixels = true;
-        assert!(ui.take_confirmation());
-        assert!(!ui.take_confirmation());
+        assert_eq!(ui.take_confirmation(), Some(false));
+        assert_eq!(ui.take_confirmation(), None);
         workspace.select_all();
         ui.sync_workspace(&workspace);
         assert_eq!(ui.counts.archived_after_composite, 1);
@@ -182,7 +203,54 @@ mod tests {
             "empty image input is not a confirmation candidate"
         );
         ui.verified_original_pixels = true;
-        assert!(!ui.take_confirmation());
+        assert_eq!(ui.take_confirmation(), None);
+    }
+
+    #[test]
+    fn clock_confirmation_is_independent_and_can_follow_an_earlier_pixel_confirmation() {
+        let mut ui = CaptureBindingUi {
+            counts: CaptureBindingSummary {
+                legacy_unknown: 1,
+                selected_legacy_unknown: 2,
+                selected_missing_clock: 2,
+                ..CaptureBindingSummary::default()
+            },
+            verified_common_clock: true,
+            ..CaptureBindingUi::default()
+        };
+        assert_eq!(
+            ui.take_confirmation(),
+            None,
+            "clock trust cannot imply pixel trust"
+        );
+        ui.verified_original_pixels = true;
+        assert_eq!(
+            ui.take_confirmation(),
+            Some(false),
+            "pixel trust cannot imply clock trust"
+        );
+        ui.verified_original_pixels = true;
+        ui.verified_common_clock = true;
+        assert_eq!(ui.take_confirmation(), Some(true));
+        assert_eq!(ui.take_confirmation(), None);
+
+        ui.counts.legacy_unknown = 0;
+        ui.counts.selected_legacy_unknown = 0;
+        ui.counts.original = 1;
+        assert_eq!(ui.take_confirmation(), None);
+        ui.verified_common_clock = true;
+        assert_eq!(
+            ui.take_confirmation(),
+            Some(true),
+            "already confirmed pixels do not need reconfirmation"
+        );
+        ui.counts.selected_missing_clock = 0;
+        ui.verified_common_clock = true;
+        assert_eq!(
+            ui.take_confirmation(),
+            None,
+            "known clocks are not reassigned"
+        );
     }
 
     #[test]
@@ -226,14 +294,18 @@ mod tests {
         let mut ui = CaptureBindingUi::default();
         ui.sync_workspace(&workspace);
         ui.verified_original_pixels = true;
+        ui.verified_common_clock = true;
         ui.sync_workspace(&workspace);
         assert!(ui.can_confirm());
+        assert!(ui.verified_common_clock);
         workspace.select_all();
         ui.sync_workspace(&workspace);
         assert!(!ui.verified_original_pixels);
+        assert!(!ui.verified_common_clock);
         workspace.select_first().unwrap();
         ui.sync_workspace(&workspace);
         ui.verified_original_pixels = true;
+        ui.verified_common_clock = true;
         let original = workspace.manifest().timeline.frames[0].clone();
         workspace
             .execute(EditCommand::ReplaceFrame {
@@ -243,12 +315,15 @@ mod tests {
             .unwrap();
         ui.sync_workspace(&workspace);
         assert!(!ui.verified_original_pixels);
+        assert!(!ui.verified_common_clock);
         ui.verified_original_pixels = true;
+        ui.verified_common_clock = true;
         let other = self::workspace(&directory.path().join("other.gfsproj"));
         ui.sync_workspace(&other);
         assert!(
             !ui.verified_original_pixels,
             "even matching project IDs cannot transfer consent across paths"
         );
+        assert!(!ui.verified_common_clock);
     }
 }

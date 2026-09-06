@@ -16,8 +16,8 @@ mod progress;
 
 pub use collect::{
     CollectOptions, CollectedRecording, CollectionLimit, CollectionSummary, FrameRetention,
-    collect, collect_controlled, collect_controlled_to_sink, collect_controlled_with_sink,
-    collect_prestarted_controlled_to_sink,
+    PlaybackTiming, collect, collect_controlled, collect_controlled_to_sink,
+    collect_controlled_with_sink, collect_prestarted_controlled_to_sink,
 };
 pub use control::{
     MAX_PENDING_SNAPSHOTS, RecordingControl, RecordingController, SnapshotReceipt,

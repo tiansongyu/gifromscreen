@@ -322,6 +322,7 @@ impl EditorWorkspace {
             let start = u64::from(index) * duration_us / u64::from(count);
             let end = (u64::from(index) + 1) * duration_us / u64::from(count);
             frames.push(FrameClip {
+                capture_clock: None,
                 capture_binding: gif_from_screen_domain::CaptureBinding::ArchivedAfterComposite,
                 id: FrameId::from_u128(Uuid::new_v4().as_u128()),
                 asset_id,

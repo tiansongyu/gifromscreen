@@ -29,13 +29,30 @@ pub struct WorkflowProgress {
     pub phase: WorkflowPhase,
     /// Number of native frames retained by the collection phase.
     pub frames_captured: u64,
-    /// Presentation duration currently represented by captured timestamps.
+    /// Observed active capture-time span, excluding pauses and synthetic tail
+    /// playback delay. This is not the wall-clock time since pressing Start.
     pub capture_duration: Duration,
+    /// Known GIF playback duration. During measured collection the unresolved
+    /// final tail is excluded; fixed collection counts every retained delay.
+    /// Encoding and completion report the final unquantized playback duration.
+    pub playback_duration: Duration,
     /// Detailed encoder progress while `phase` is [`WorkflowPhase::Encoding`].
     pub encode: Option<EncodeProgress>,
 }
 
 impl WorkflowProgress {
+    pub(crate) const fn collection(
+        phase: WorkflowPhase,
+        summary: crate::CollectionSummary,
+    ) -> Self {
+        Self::capture(
+            phase,
+            summary.frames,
+            Duration::from_micros(summary.capture_duration_us),
+        )
+        .with_playback_duration(Duration::from_micros(summary.duration_us))
+    }
+
     pub(crate) const fn capture(
         phase: WorkflowPhase,
         frames_captured: u64,
@@ -45,6 +62,7 @@ impl WorkflowProgress {
             phase,
             frames_captured,
             capture_duration,
+            playback_duration: capture_duration,
             encode: None,
         }
     }
@@ -58,8 +76,14 @@ impl WorkflowProgress {
             phase: WorkflowPhase::Encoding,
             frames_captured,
             capture_duration,
+            playback_duration: capture_duration,
             encode: Some(encode),
         }
+    }
+
+    pub(crate) const fn with_playback_duration(mut self, duration: Duration) -> Self {
+        self.playback_duration = duration;
+        self
     }
 }
 

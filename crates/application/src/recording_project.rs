@@ -190,6 +190,7 @@ pub struct IncrementalRecordingProject {
     canvas: PhysicalSize,
     frame_durations: HashMap<FrameId, DurationUs>,
     duration_us: u64,
+    capture_clock_id: gif_from_screen_domain::CaptureClockId,
 }
 
 impl IncrementalRecordingProject {
@@ -240,6 +241,7 @@ impl IncrementalRecordingProject {
             canvas,
             frame_durations: HashMap::new(),
             duration_us: 0,
+            capture_clock_id: fresh_capture_clock_id(),
         })
     }
 
@@ -318,6 +320,12 @@ impl IncrementalRecordingProject {
         let (capture_metadata, new_cursor_asset) =
             self.store_cursor_metadata(metadata, asset_id, frame_index)?;
         let clip = FrameClip {
+            capture_clock: capture_metadata.captured_at.map(|sampled_at| {
+                gif_from_screen_domain::CaptureClockContext {
+                    id: Some(self.capture_clock_id),
+                    sampled_at,
+                }
+            }),
             capture_binding: if metadata.is_some() {
                 gif_from_screen_domain::CaptureBinding::Original
             } else {
@@ -752,6 +760,10 @@ fn map_persist_error(error: PersistRgbaProjectError) -> PersistRecordingError {
             PersistRecordingError::CheckpointAndCompact { source }
         }
     }
+}
+
+pub(crate) fn fresh_capture_clock_id() -> gif_from_screen_domain::CaptureClockId {
+    gif_from_screen_domain::CaptureClockId::from_u128(uuid::Uuid::new_v4().as_u128())
 }
 
 pub(crate) fn domain_capture_metadata(metadata: &RecordingMetadata) -> CaptureMetadata {

@@ -1,5 +1,8 @@
 //! End-to-end tests spanning synthetic capture, workflow normalization, and GIF decoding.
 
+#[path = "roundtrip/playback.rs"]
+mod playback;
+
 use std::fs;
 use std::io;
 use std::io::Cursor;

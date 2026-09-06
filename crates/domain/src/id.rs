@@ -103,6 +103,7 @@ macro_rules! stable_id {
 
 stable_id!(ProjectId);
 stable_id!(FrameId);
+stable_id!(CaptureClockId);
 stable_id!(TrackId);
 stable_id!(OverlayId);
 stable_id!(TransitionId);

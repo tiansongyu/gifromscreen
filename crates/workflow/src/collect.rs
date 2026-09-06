@@ -41,9 +41,22 @@ pub enum FrameRetention {
     /// Retain the first frame and frames whose normalized RGBA pixels differ
     /// from the preceding retained frame.
     ///
-    /// Skipped samples still extend presentation time. This reduces project
-    /// memory without changing the animation observed at any timestamp.
+    /// With measured playback, skipped samples extend presentation time. With
+    /// fixed playback, only retained samples contribute their configured delay.
     ChangesOnly,
+}
+
+/// Assigns GIF playback durations independently of native capture sampling.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PlaybackTiming {
+    /// Use the active capture-time interval between retained samples, with the
+    /// configured tail duration when the final interval is not known.
+    #[default]
+    Measured,
+    /// Assign this duration to each retained sample, including the final one.
+    /// Skipped samples do not accumulate delay. Native metadata and timestamps
+    /// remain unchanged. The duration must fit in nonzero u64 microseconds.
+    Fixed(Duration),
 }
 
 /// Bounds and timing policy for frame collection.
@@ -53,12 +66,14 @@ pub struct CollectOptions {
     pub limit: CollectionLimit,
     /// Pixel-change filtering applied after native format normalization.
     pub frame_retention: FrameRetention,
+    /// GIF playback timing, independent of the request's capture cadence.
+    pub playback_timing: PlaybackTiming,
     /// Maximum normalized RGBA bytes retained before returning an error.
     pub frame_buffer_limit_bytes: u64,
     /// Maximum duration of an individual blocking capture poll.
     pub poll_interval: Duration,
-    /// Duration assigned to the last frame when no duration boundary supplies
-    /// an exact ending timestamp.
+    /// Measured-playback duration assigned to the last frame when no duration
+    /// boundary supplies an exact ending timestamp. Ignored for fixed playback.
     pub tail_frame_duration: Duration,
 }
 
@@ -67,6 +82,7 @@ impl Default for CollectOptions {
         Self {
             limit: CollectionLimit::Duration(Duration::from_secs(5)),
             frame_retention: FrameRetention::default(),
+            playback_timing: PlaybackTiming::default(),
             frame_buffer_limit_bytes: DEFAULT_FRAME_BUFFER_LIMIT_BYTES,
             poll_interval: DEFAULT_POLL_INTERVAL,
             tail_frame_duration: DEFAULT_TAIL_FRAME_DURATION,
@@ -81,6 +97,10 @@ pub struct CollectionSummary {
     pub frames: u64,
     /// Sum of the presentation durations assigned to retained frames.
     pub duration_us: u64,
+    /// Active span from the first retained sample to the last observed sample,
+    /// excluding pauses and synthetic tail delay. A reached duration limit
+    /// supplies its exact capture-time boundary, relative to the first sample.
+    pub capture_duration_us: u64,
     /// Bytes occupied by normalized RGBA pixel buffers.
     pub rgba_bytes: u64,
 }
@@ -170,6 +190,7 @@ struct ValidatedOptions {
     frame_retention: FrameRetention,
     poll_interval: Duration,
     tail_duration_us: u64,
+    fixed_duration_us: Option<u64>,
     frame_buffer_limit_bytes: u64,
 }
 
@@ -185,11 +206,11 @@ enum ValidatedLimit {
 
 /// Starts a capture session and synchronously collects normalized RGBA frames.
 ///
-/// Consecutive frame durations come exclusively from the session-relative,
-/// monotonic capture timestamps. For duration-limited collection, the final
-/// retained frame ends exactly at the requested timestamp span. For frame-count
-/// limits or an early end-of-stream, `tail_frame_duration` supplies the
-/// otherwise unknowable final duration.
+/// With measured playback, consecutive frame durations come from monotonic
+/// capture timestamps; a reached duration limit supplies the final boundary,
+/// otherwise `tail_frame_duration` supplies the final duration. Fixed playback
+/// assigns its configured duration to every retained sample instead. Limits
+/// always constrain capture sampling, never the fixed GIF playback duration.
 ///
 /// On any failure or cancellation, the active native session is discarded on
 /// a best-effort basis. The function is intentionally synchronous and can be
@@ -254,10 +275,10 @@ pub fn collect_controlled(
 
 /// Starts controlled capture while durably observing every retained frame.
 ///
-/// Each retained frame is sent to `sink` immediately with the configured tail
-/// duration as a provisional value. The preceding duration is corrected when
-/// the next retained timestamp arrives, and the final duration is corrected at
-/// the stop boundary. Sink calls run synchronously on the capture worker so a
+/// Each retained frame is sent to `sink` immediately with its configured fixed
+/// delay or measured tail-duration provisional value. Only measured durations
+/// need correction at the next retained sample or stop boundary. Sink calls
+/// run synchronously on the capture worker so a
 /// successful return means the corresponding journal operation completed.
 ///
 /// # Errors
@@ -460,8 +481,18 @@ fn validate_options(options: &CollectOptions) -> Result<ValidatedOptions, Workfl
             "poll interval must be greater than zero".to_owned(),
         ));
     }
-    let tail_duration_us =
-        duration_to_nonzero_micros(options.tail_frame_duration, "tail frame duration")?;
+    let fixed_duration_us = match options.playback_timing {
+        PlaybackTiming::Measured => None,
+        PlaybackTiming::Fixed(duration) => Some(duration_to_nonzero_micros(
+            duration,
+            "fixed playback duration",
+        )?),
+    };
+    let tail_duration_us = if let Some(duration) = fixed_duration_us {
+        duration
+    } else {
+        duration_to_nonzero_micros(options.tail_frame_duration, "tail frame duration")?
+    };
     let limit = match options.limit {
         CollectionLimit::UntilStopped => ValidatedLimit::UntilStopped,
         CollectionLimit::Duration(duration) => {
@@ -483,6 +514,7 @@ fn validate_options(options: &CollectOptions) -> Result<ValidatedOptions, Workfl
         frame_retention: options.frame_retention,
         poll_interval: options.poll_interval,
         tail_duration_us,
+        fixed_duration_us,
         frame_buffer_limit_bytes: options.frame_buffer_limit_bytes,
     })
 }
@@ -545,6 +577,7 @@ fn collect_session(
                 captures.len(),
                 first_timestamp,
                 last_observed_timestamp,
+                options.fixed_duration_us,
             );
             std::thread::sleep(options.poll_interval);
             continue;
@@ -557,6 +590,7 @@ fn collect_session(
                 captures.len(),
                 first_timestamp,
                 last_observed_timestamp,
+                options.fixed_duration_us,
             );
         }
         if duration_deadline_reached(options.limit) {
@@ -621,6 +655,7 @@ fn collect_session(
                     captures.len(),
                     first_timestamp,
                     last_observed_timestamp,
+                    options.fixed_duration_us,
                 );
                 if frame_limit_reached(options.limit, captures.len()) {
                     break StopReason::FrameLimitReached;
@@ -679,6 +714,7 @@ fn collect_session_to_sink(
                 state.retained_frames,
                 state.first_timestamp,
                 state.last_observed_timestamp,
+                options.fixed_duration_us,
             );
             std::thread::sleep(options.poll_interval);
             continue;
@@ -691,6 +727,7 @@ fn collect_session_to_sink(
                 state.retained_frames,
                 state.first_timestamp,
                 state.last_observed_timestamp,
+                options.fixed_duration_us,
             );
         }
         if duration_deadline_reached(options.limit) {
@@ -709,10 +746,8 @@ fn collect_session_to_sink(
                 if controlled_manual && let Some(retained) = retained {
                     control.complete_snapshot(&frame, retained);
                 }
-                match outcome {
-                    SinkFrameOutcome::Continue => {}
-                    SinkFrameOutcome::DurationReached => break StopReason::DurationReached,
-                    SinkFrameOutcome::FrameLimitReached => break StopReason::FrameLimitReached,
+                if outcome == SinkFrameOutcome::DurationReached {
+                    break StopReason::DurationReached;
                 }
                 report_collection_progress(
                     progress,
@@ -720,7 +755,11 @@ fn collect_session_to_sink(
                     state.retained_frames,
                     state.first_timestamp,
                     state.last_observed_timestamp,
+                    options.fixed_duration_us,
                 );
+                if outcome == SinkFrameOutcome::FrameLimitReached {
+                    break StopReason::FrameLimitReached;
+                }
             }
             FramePoll::Pending => {}
             FramePoll::EndOfStream => break StopReason::EndOfStream,
@@ -800,6 +839,7 @@ impl SinkOnlyCollectionState {
             .retained_frames
             .checked_add(1)
             .ok_or_else(|| collection_counter_overflow("retained frame count"))?;
+        validate_fixed_duration_total(options.fixed_duration_us, next_retained_frames)?;
         if frame_bytes > options.frame_buffer_limit_bytes {
             return Err(WorkflowError::FrameBufferLimitExceeded {
                 required_bytes: frame_bytes,
@@ -809,12 +849,17 @@ impl SinkOnlyCollectionState {
         let frame_index = u64::try_from(self.retained_frames)
             .map_err(|_| collection_counter_overflow("retained frame count"))?;
         if let Some(previous) = &self.last_retained {
-            let duration_us = normalized.timestamp_us - previous.timestamp_us;
-            update_sink_duration(sink, frame_index - 1, duration_us)?;
-            self.finalized_duration_us = self
+            let duration_us = options
+                .fixed_duration_us
+                .unwrap_or(normalized.timestamp_us - previous.timestamp_us);
+            let finalized_duration_us = self
                 .finalized_duration_us
                 .checked_add(duration_us)
                 .ok_or_else(duration_overflow_error)?;
+            if options.fixed_duration_us.is_none() {
+                update_sink_duration(sink, frame_index - 1, duration_us)?;
+            }
+            self.finalized_duration_us = finalized_duration_us;
         }
         append_sink_frame(sink, frame_index, &normalized, options.tail_duration_us)?;
         self.rgba_bytes = next_rgba_bytes;
@@ -831,13 +876,6 @@ impl SinkOnlyCollectionState {
         options: ValidatedOptions,
         progress: &mut dyn WorkflowProgressSink,
     ) -> Result<CollectionSummary, WorkflowError> {
-        report_collection_progress(
-            progress,
-            WorkflowPhase::StoppingCapture,
-            self.retained_frames,
-            self.first_timestamp,
-            self.last_observed_timestamp,
-        );
         let last_retained_timestamp = self
             .last_retained
             .as_ref()
@@ -853,18 +891,31 @@ impl SinkOnlyCollectionState {
         )?;
         let final_index = u64::try_from(self.retained_frames - 1)
             .map_err(|_| collection_counter_overflow("retained frame count"))?;
-        update_sink_duration(sink, final_index, last_duration_us)?;
+        if options.fixed_duration_us.is_none() {
+            update_sink_duration(sink, final_index, last_duration_us)?;
+        }
         self.finalized_duration_us = self
             .finalized_duration_us
             .checked_add(last_duration_us)
             .ok_or_else(duration_overflow_error)?;
         stop_session_if_live(session)?;
-        Ok(CollectionSummary {
+        let summary = CollectionSummary {
             frames: u64::try_from(self.retained_frames)
                 .map_err(|_| collection_counter_overflow("retained frame count"))?,
             duration_us: self.finalized_duration_us,
+            capture_duration_us: completed_capture_duration(
+                self.first_timestamp,
+                self.last_observed_timestamp,
+                stop_reason,
+                options.limit,
+            ),
             rgba_bytes: self.rgba_bytes,
-        })
+        };
+        progress.report(WorkflowProgress::collection(
+            WorkflowPhase::StoppingCapture,
+            summary,
+        ));
+        Ok(summary)
     }
 }
 
@@ -872,6 +923,20 @@ fn duration_overflow_error() -> WorkflowError {
     WorkflowError::InvalidCollectionOption(
         "collected presentation duration overflowed u64 microseconds".to_owned(),
     )
+}
+
+fn validate_fixed_duration_total(
+    fixed_duration_us: Option<u64>,
+    retained_frames: usize,
+) -> Result<(), WorkflowError> {
+    if let Some(duration) = fixed_duration_us {
+        let count = u64::try_from(retained_frames)
+            .map_err(|_| collection_counter_overflow("retained frame count"))?;
+        duration
+            .checked_mul(count)
+            .ok_or_else(duration_overflow_error)?;
+    }
+    Ok(())
 }
 
 const fn collection_counter_overflow(counter: &'static str) -> WorkflowError {
@@ -885,6 +950,11 @@ fn retain_normalized_capture(
     options: ValidatedOptions,
     sink: &mut Option<&mut dyn RecordingFrameSink>,
 ) -> Result<(), WorkflowError> {
+    let next_retained_frames = captures
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| collection_counter_overflow("retained frame count"))?;
+    validate_fixed_duration_total(options.fixed_duration_us, next_retained_frames)?;
     let frame_bytes = u64::try_from(normalized.pixels.len())
         .map_err(|_| collection_counter_overflow("RGBA byte count"))?;
     let required_bytes = rgba_bytes
@@ -897,7 +967,7 @@ fn retain_normalized_capture(
         });
     }
     if let Some(sink) = sink.as_mut() {
-        persist_retained_frame(*sink, captures, &normalized, options.tail_duration_us)?;
+        persist_retained_frame(*sink, captures, &normalized, options)?;
     }
     *rgba_bytes = required_bytes;
     captures.push(normalized);
@@ -918,18 +988,11 @@ fn finish_session_collection(
         first_timestamp,
         last_observed_timestamp,
     } = state;
-    progress.report(WorkflowProgress::capture(
-        WorkflowPhase::StoppingCapture,
-        u64::try_from(captures.len()).unwrap_or(u64::MAX),
-        Duration::from_micros(current_timestamp_span(
-            first_timestamp,
-            last_observed_timestamp,
-        )),
-    ));
     let last_duration_us =
         calculate_last_duration(&captures, last_observed_timestamp, stop_reason, options)?;
     if let Some(sink) = sink
         && !captures.is_empty()
+        && options.fixed_duration_us.is_none()
     {
         let frame_index = u64::try_from(captures.len() - 1).unwrap_or(u64::MAX);
         sink.update_frame_duration(frame_index, last_duration_us)
@@ -940,7 +1003,23 @@ fn finish_session_collection(
             })?;
     }
     stop_session_if_live(session)?;
-    finish_collection(captures, rgba_bytes, last_duration_us)
+    let recording = finish_collection(
+        captures,
+        rgba_bytes,
+        last_duration_us,
+        options.fixed_duration_us,
+        completed_capture_duration(
+            first_timestamp,
+            last_observed_timestamp,
+            stop_reason,
+            options.limit,
+        ),
+    )?;
+    progress.report(WorkflowProgress::collection(
+        WorkflowPhase::StoppingCapture,
+        recording.summary(),
+    ));
+    Ok(recording)
 }
 
 fn report_collection_progress(
@@ -949,30 +1028,36 @@ fn report_collection_progress(
     frames: usize,
     first_timestamp: Option<u64>,
     last_observed_timestamp: Option<u64>,
+    fixed_duration_us: Option<u64>,
 ) {
-    progress.report(WorkflowProgress::capture(
-        phase,
-        u64::try_from(frames).unwrap_or(u64::MAX),
-        Duration::from_micros(current_timestamp_span(
-            first_timestamp,
-            last_observed_timestamp,
-        )),
-    ));
+    let frames = u64::try_from(frames).unwrap_or(u64::MAX);
+    let capture_duration_us = current_timestamp_span(first_timestamp, last_observed_timestamp);
+    // Stored timing is checked before each append. Saturation here is only a
+    // best-effort progress fallback, never used to assign frame durations.
+    let playback_duration_us = fixed_duration_us.map_or(capture_duration_us, |duration| {
+        frames.saturating_mul(duration)
+    });
+    progress.report(
+        WorkflowProgress::capture(phase, frames, Duration::from_micros(capture_duration_us))
+            .with_playback_duration(Duration::from_micros(playback_duration_us)),
+    );
 }
 
 fn persist_retained_frame(
     sink: &mut dyn RecordingFrameSink,
     captures: &[NormalizedCapture],
     capture: &NormalizedCapture,
-    provisional_duration_us: u64,
+    options: ValidatedOptions,
 ) -> Result<(), WorkflowError> {
-    if let Some(previous) = captures.last() {
+    if let Some(previous) = captures.last()
+        && options.fixed_duration_us.is_none()
+    {
         let frame_index = u64::try_from(captures.len() - 1).unwrap_or(u64::MAX);
         let duration_us = capture.timestamp_us - previous.timestamp_us;
         update_sink_duration(sink, frame_index, duration_us)?;
     }
     let frame_index = u64::try_from(captures.len()).unwrap_or(u64::MAX);
-    append_sink_frame(sink, frame_index, capture, provisional_duration_us)
+    append_sink_frame(sink, frame_index, capture, options.tail_duration_us)
 }
 
 fn append_sink_frame(
@@ -1261,6 +1346,8 @@ fn finish_collection(
     captures: Vec<NormalizedCapture>,
     rgba_bytes: u64,
     last_duration_us: u64,
+    fixed_duration_us: Option<u64>,
+    capture_duration_us: u64,
 ) -> Result<CollectedRecording, WorkflowError> {
     if captures.is_empty() {
         return Err(WorkflowError::EmptyCapture);
@@ -1271,8 +1358,10 @@ fn finish_collection(
     let mut duration_us = 0_u64;
     let mut captures = captures.into_iter().peekable();
     while let Some(capture) = captures.next() {
-        let frame_duration = captures.peek().map_or(last_duration_us, |next| {
-            next.timestamp_us - capture.timestamp_us
+        let frame_duration = fixed_duration_us.unwrap_or_else(|| {
+            captures.peek().map_or(last_duration_us, |next| {
+                next.timestamp_us - capture.timestamp_us
+            })
         });
         duration_us = duration_us.checked_add(frame_duration).ok_or_else(|| {
             WorkflowError::InvalidCollectionOption(
@@ -1290,6 +1379,7 @@ fn finish_collection(
     let summary = CollectionSummary {
         frames: u64::try_from(frames.len()).unwrap_or(u64::MAX),
         duration_us,
+        capture_duration_us,
         rgba_bytes,
     };
     Ok(CollectedRecording {
@@ -1328,6 +1418,9 @@ fn calculate_last_duration_values(
     stop_reason: StopReason,
     options: ValidatedOptions,
 ) -> Result<u64, WorkflowError> {
+    if let Some(duration) = options.fixed_duration_us {
+        return Ok(duration);
+    }
     let last_duration_us =
         if let (StopReason::DurationReached, ValidatedLimit::Duration { duration_us, .. }) =
             (stop_reason, options.limit)
@@ -1360,6 +1453,21 @@ fn current_timestamp_span(first: Option<u64>, last: Option<u64>) -> u64 {
     first
         .zip(last)
         .map_or(0, |(first, last)| last.saturating_sub(first))
+}
+
+fn completed_capture_duration(
+    first_timestamp: Option<u64>,
+    last_observed_timestamp: Option<u64>,
+    stop_reason: StopReason,
+    limit: ValidatedLimit,
+) -> u64 {
+    if let (StopReason::DurationReached, ValidatedLimit::Duration { duration_us, .. }) =
+        (stop_reason, limit)
+    {
+        duration_us
+    } else {
+        current_timestamp_span(first_timestamp, last_observed_timestamp)
+    }
 }
 
 fn stop_session_if_live(session: &mut dyn CaptureSession) -> Result<(), WorkflowError> {

@@ -53,10 +53,11 @@ pub type RecordingFrameSinkError = Box<dyn Error + Send + Sync + 'static>;
 
 /// Durable observer for frames retained by the capture workflow.
 ///
-/// A newly retained frame is appended immediately with the configured safe
-/// provisional tail duration. Once a later retained timestamp or the final
-/// stop boundary is known, the workflow replaces that frame's duration. Calls
-/// are strictly ordered and never overlap.
+/// A newly retained frame is appended immediately with its fixed playback
+/// duration or a safe measured-playback provisional tail. Only measured timing
+/// is corrected when a later sample or final stop boundary is known. Fixed
+/// playback never requires a duration update. Calls are strictly ordered and
+/// never overlap; native metadata always keeps its original capture clock.
 pub trait RecordingFrameSink {
     /// Durably appends one newly retained frame in zero-based timeline order.
     ///

@@ -30,6 +30,7 @@ enum PendingAnnotation {
     },
     ConfirmBinding {
         anchor: OverlaySelectionAnchor,
+        declare_common_clock: bool,
     },
 }
 
@@ -41,7 +42,7 @@ impl PendingAnnotation {
                 replacing: Some(_),
                 ..
             } => anchor.matches_project(workspace),
-            Self::Apply { anchor, .. } | Self::ConfirmBinding { anchor } => {
+            Self::Apply { anchor, .. } | Self::ConfirmBinding { anchor, .. } => {
                 anchor.matches(workspace)
             }
         }
@@ -66,6 +67,7 @@ impl AnnotationTools {
     pub(crate) fn queue_binding_confirmation(
         &mut self,
         workspace: &EditorWorkspace,
+        declare_common_clock: bool,
     ) -> Result<(), String> {
         if self.is_running() {
             return Err("Another annotation operation is already running.".to_owned());
@@ -73,7 +75,10 @@ impl AnnotationTools {
         let anchor = workspace
             .overlay_selection_anchor()
             .map_err(|error| error.to_string())?;
-        self.pending = Some(PendingAnnotation::ConfirmBinding { anchor });
+        self.pending = Some(PendingAnnotation::ConfirmBinding {
+            anchor,
+            declare_common_clock,
+        });
         self.confirming = true;
         self.cancel_pending.store(false, Ordering::Release);
         self.notice = None;
@@ -155,7 +160,7 @@ impl AnnotationTools {
             *workspace = loan.lock().unwrap_or_else(PoisonError::into_inner).take();
             let notice = match self.completed.take()? {
                 Ok(report) if self.confirming => format!(
-                    "Confirmed original input coordinates on {} frames; no annotations were added. One undo restores the previous binding.",
+                    "Updated input associations on {} frames; raw pixels/events are unchanged and no annotations were added. One undo restores the previous bindings and clocks.",
                     report.frames
                 ),
                 Ok(report) => format!(
@@ -206,8 +211,15 @@ impl AnnotationTools {
                     context.cancellation(),
                     |progress| context.report(progress),
                 ),
-                PendingAnnotation::ConfirmBinding { anchor } => workspace
-                    .confirm_original_capture_binding(&anchor, context.cancellation())
+                PendingAnnotation::ConfirmBinding {
+                    anchor,
+                    declare_common_clock,
+                } => workspace
+                    .confirm_original_capture_binding(
+                        &anchor,
+                        declare_common_clock,
+                        context.cancellation(),
+                    )
                     .map(|frames| AnnotationEditReport {
                         frames,
                         replay_skips: AnnotationReplaySkips::default(),
@@ -460,6 +472,7 @@ mod tests {
         let bytes = vec![0; 240 * 40 * 4];
         let asset_id = workspace.active_project().assets().put(&bytes).unwrap();
         let frame = FrameClip {
+            capture_clock: None,
             id: FrameId::from_u128(1),
             asset_id,
             capture_binding: CaptureBinding::LegacyUnknown,
@@ -511,17 +524,17 @@ mod tests {
             .capture_metadata
             .clone();
         let mut tool = AnnotationTools::default();
-        tool.queue_binding_confirmation(workspace.as_ref().unwrap())
+        tool.queue_binding_confirmation(workspace.as_ref().unwrap(), false)
             .unwrap();
         assert!(tool.is_running());
         assert!(
-            tool.queue_binding_confirmation(workspace.as_ref().unwrap())
+            tool.queue_binding_confirmation(workspace.as_ref().unwrap(), false)
                 .is_err()
         );
         assert!(tool.poll(&mut workspace).is_none());
         assert!(workspace.is_none());
         let notice = finish(&mut tool, &mut workspace);
-        assert!(notice.contains("Confirmed original input coordinates on 1"));
+        assert!(notice.contains("Updated input associations on 1"));
         assert!(notice.contains("no annotations were added"));
         let workspace = workspace.as_mut().unwrap();
         assert_eq!(
@@ -547,12 +560,12 @@ mod tests {
         let mut workspace = Some(legacy_workspace(&dir.path().join("cancel-confirm.gfsproj")));
         let before = workspace.as_ref().unwrap().manifest().clone();
         let mut tool = AnnotationTools::default();
-        tool.queue_binding_confirmation(workspace.as_ref().unwrap())
+        tool.queue_binding_confirmation(workspace.as_ref().unwrap(), false)
             .unwrap();
         tool.cancel();
         assert!(tool.poll(&mut workspace).unwrap().contains("cancelled"));
         assert_eq!(workspace.as_ref().unwrap().manifest(), &before);
-        tool.queue_binding_confirmation(workspace.as_ref().unwrap())
+        tool.queue_binding_confirmation(workspace.as_ref().unwrap(), false)
             .unwrap();
         workspace
             .as_mut()

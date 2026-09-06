@@ -56,6 +56,9 @@ impl Error for UnitError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ValidationIssue {
+    InvalidCaptureClock {
+        frame_id: FrameId,
+    },
     InvalidAnnotationScope {
         track_id: TrackId,
         reason: String,

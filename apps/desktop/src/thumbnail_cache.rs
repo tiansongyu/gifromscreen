@@ -400,6 +400,7 @@ mod tests {
         );
         manifest.timeline.frames = (0..frame_count)
             .map(|index| FrameClip {
+                capture_clock: None,
                 capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: FrameId::from_u128(index as u128 + 1),
                 asset_id,

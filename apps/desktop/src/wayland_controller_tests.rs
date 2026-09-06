@@ -17,6 +17,248 @@ fn controller(context: &egui::Context) -> WaylandCropController {
     }
 }
 
+fn preparation_fixture(font_scale: f32) -> (egui::Context, GifFromScreenApp) {
+    let context = egui::Context::default();
+    context.style_mut(|style| {
+        for font in style.text_styles.values_mut() {
+            font.size *= font_scale;
+        }
+    });
+    let mut app = GifFromScreenApp::default();
+    app.view = AppView::ScreenRecorder;
+    app.settings.region_x = 41;
+    app.settings.region_y = 53;
+    app.settings.region_width = 211;
+    app.settings.region_height = 173;
+    app.wayland_frozen_preview = Some(WaylandFrozenPreview {
+        texture: context.load_texture(
+            "preparation-layout",
+            egui::ColorImage::filled([692, 509], egui::Color32::BLUE),
+            egui::TextureOptions::NEAREST,
+        ),
+        source_size: gif_from_screen_capture::PhysicalSize::new(692, 509).unwrap(),
+        selection: PhysicalRect::new(10, 20, 100, 80).unwrap(),
+        drag_start: None,
+        drag_current: None,
+        drag_initial_region: None,
+    });
+    (context, app)
+}
+
+fn preparation_frame(
+    context: &egui::Context,
+    app: &mut GifFromScreenApp,
+    size: egui::Vec2,
+    events: Vec<egui::Event>,
+) -> egui::FullOutput {
+    context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            events,
+            ..egui::RawInput::default()
+        },
+        |context| {
+            app.show_app_header(context);
+            egui::CentralPanel::default().show(context, |ui| {
+                let scroll_id = ui.make_persistent_id(egui::Id::new("wayland-preparation-content"));
+                context.data_mut(|data| {
+                    data.insert_temp(egui::Id::new("preparation-test-scroll-id"), scroll_id);
+                });
+                app.show_wayland_preparation(ui);
+            });
+        },
+    )
+}
+
+fn preparation_text_rect(output: &egui::FullOutput, label: &str) -> (egui::Rect, egui::Rect) {
+    fn find(shape: &egui::Shape, label: &str) -> Option<egui::Rect> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text() == label => {
+                Some(text.galley.rect.translate(text.pos.to_vec2()))
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, label)),
+            _ => None,
+        }
+    }
+    output
+        .shapes
+        .iter()
+        .find_map(|clipped| find(&clipped.shape, label).map(|rect| (rect, clipped.clip_rect)))
+        .unwrap_or_else(|| panic!("missing preparation control {label}"))
+}
+
+fn preparation_image_rect(output: &egui::FullOutput, texture: egui::TextureId) -> egui::Rect {
+    fn find(shape: &egui::Shape, texture: egui::TextureId) -> Option<egui::Rect> {
+        match shape {
+            egui::Shape::Mesh(mesh) if mesh.texture_id == texture => Some(mesh.calc_bounds()),
+            egui::Shape::Rect(rect)
+                if rect
+                    .brush
+                    .as_ref()
+                    .is_some_and(|brush| brush.fill_texture_id == texture) =>
+            {
+                Some(rect.rect)
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, texture)),
+            _ => None,
+        }
+    }
+    output
+        .shapes
+        .iter()
+        .find_map(|clipped| find(&clipped.shape, texture))
+        .expect("preview image mesh")
+}
+
+#[test]
+fn prepared_page_controls_have_visible_hit_targets_in_small_and_large_font_viewports() {
+    for size in [egui::vec2(640.0, 480.0), egui::vec2(1280.0, 720.0)] {
+        for font_scale in [1.0, 2.0] {
+            for label in [
+                "Open source-local recorder controller",
+                "Cancel preparation",
+                "Apply exact region",
+                "41",
+                "53",
+                "211",
+                "173",
+            ] {
+                check_preparation_control_hit(size, font_scale, label);
+            }
+        }
+    }
+}
+
+fn check_preparation_control_hit(size: egui::Vec2, font_scale: f32, label: &str) {
+    let (context, mut app) = preparation_fixture(font_scale);
+    preparation_frame(&context, &mut app, size, Vec::new());
+    let output = preparation_frame(&context, &mut app, size, Vec::new());
+    let (text, clip) = preparation_text_rect(&output, label);
+    let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+    assert!(
+        viewport.contains_rect(text),
+        "{label}: {text:?} outside {size:?}, font {font_scale}"
+    );
+    assert!(
+        clip.contains_rect(text),
+        "{label}: control is clipped, font {font_scale}"
+    );
+    let pos = text.center();
+    for pressed in [true, false] {
+        preparation_frame(
+            &context,
+            &mut app,
+            size,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+    }
+    let clicked = context
+        .interaction_snapshot(|snapshot| snapshot.clicked)
+        .expect("visible control must receive the pointer click");
+    let response = context.read_response(clicked).unwrap();
+    assert!(
+        response.clicked() && response.rect.contains(pos),
+        "{label} must have a real clickable target"
+    );
+    assert!(
+        viewport.contains_rect(response.interact_rect),
+        "{label} hit target must fit viewport"
+    );
+    if label == "Apply exact region" {
+        assert_eq!(
+            app.wayland_frozen_preview.as_ref().unwrap().selection,
+            PhysicalRect::new(41, 53, 211, 173).unwrap()
+        );
+    } else if label == "Open source-local recorder controller" {
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("The Wayland source is not ready yet."),
+            "the synthetic preview has no portal session, but the real Open handler must be reached"
+        );
+    }
+}
+
+#[test]
+fn prepared_page_preview_fits_available_space_without_changing_aspect() {
+    for size in [egui::vec2(640.0, 480.0), egui::vec2(1280.0, 720.0)] {
+        for font_scale in [1.0, 2.0] {
+            let (context, mut app) = preparation_fixture(font_scale);
+            let texture = app.wayland_frozen_preview.as_ref().unwrap().texture.id();
+            preparation_frame(&context, &mut app, size, Vec::new());
+            let before = preparation_frame(&context, &mut app, size, Vec::new());
+            let initial = preparation_image_rect(&before, texture);
+            assert!((initial.aspect_ratio() - 692.0 / 509.0).abs() < 0.001);
+            assert!(initial.is_positive());
+            assert!(
+                egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(initial),
+                "preview should fit rather than require scrolling at {size:?}, font {font_scale}"
+            );
+        }
+    }
+}
+
+#[test]
+fn prepared_page_overflow_scrolls_without_hiding_top_actions() {
+    for size in [egui::vec2(640.0, 480.0), egui::vec2(1280.0, 720.0)] {
+        for font_scale in [1.0, 2.0] {
+            let (context, mut app) = preparation_fixture(font_scale);
+            app.notice = Some("Diagnostic detail must remain accessible.\n".repeat(40));
+            preparation_frame(&context, &mut app, size, Vec::new());
+            let before = preparation_frame(&context, &mut app, size, Vec::new());
+            let scroll_id = context
+                .data(|data| data.get_temp::<egui::Id>(egui::Id::new("preparation-test-scroll-id")))
+                .unwrap();
+            assert!(
+                egui::scroll_area::State::load(&context, scroll_id)
+                    .unwrap()
+                    .offset
+                    .y
+                    .abs()
+                    < f32::EPSILON
+            );
+            let after = preparation_frame(
+                &context,
+                &mut app,
+                size,
+                vec![
+                    egui::Event::PointerMoved(egui::pos2(size.x / 2.0, size.y - 30.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -1000.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            assert!(
+                egui::scroll_area::State::load(&context, scroll_id)
+                    .unwrap()
+                    .offset
+                    .y
+                    > 0.0,
+                "overflowing body must scroll at {size:?}, font {font_scale}"
+            );
+            for label in [
+                "Open source-local recorder controller",
+                "Cancel preparation",
+            ] {
+                assert_eq!(
+                    preparation_text_rect(&before, label).0,
+                    preparation_text_rect(&after, label).0,
+                    "{label} must stay above the scrolling body"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn monitor_controller_warns_about_self_capture_without_font_dependent_arrows() {
     fn labels(shape: &egui::Shape, output: &mut String) {
@@ -145,6 +387,7 @@ fn failed_or_discarded_recording_clears_live_progress_and_ignores_late_messages(
             phase: WorkflowPhase::Capturing,
             frames_captured: 209,
             capture_duration: Duration::from_secs(21),
+            playback_duration: Duration::from_secs(21),
             encode: None,
         };
         sender.send(JobMessage::Progress(progress)).unwrap();

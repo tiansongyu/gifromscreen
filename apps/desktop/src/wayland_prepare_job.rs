@@ -1315,6 +1315,10 @@ mod tests {
                 interval_count: 1,
                 interval_unit: crate::RecordingIntervalUnit::Seconds,
                 manual_frame_duration_ms: 100,
+                playback: crate::RecordingPlaybackSettings {
+                    manual_fixed: false,
+                    ..crate::RecordingPlaybackSettings::default()
+                },
                 countdown_seconds: 2,
                 changes_only: false,
                 input_events: false,

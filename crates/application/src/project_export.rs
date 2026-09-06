@@ -1695,6 +1695,7 @@ mod tests {
                 },
             });
             clips.push(FrameClip {
+                capture_clock: None,
                 capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: spec.id,
                 asset_id,

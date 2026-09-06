@@ -193,6 +193,10 @@ mod tests {
                 let mut frame = source.clone();
                 frame.capture_binding = CaptureBinding::Original;
                 frame.capture_metadata.captured_at = Some(TimeUs::new(index as u64 * 100_000));
+                frame.capture_clock = Some(gif_from_screen_domain::CaptureClockContext {
+                    id: Some(gif_from_screen_domain::CaptureClockId::from_u128(777)),
+                    sampled_at: TimeUs::new(index as u64 * 100_000),
+                });
                 if index == 0 {
                     frame.capture_metadata.key_strokes.push(KeyStroke {
                         physical_key: "KeyA".to_owned(),

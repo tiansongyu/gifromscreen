@@ -131,25 +131,7 @@ pub fn create_blank_animation_project(
     options: BlankAnimationProjectOptions,
 ) -> Result<ActiveProject, CreateBlankAnimationError> {
     validate_options(&options)?;
-    let required_bytes = options
-        .canvas
-        .area()
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or(CreateBlankAnimationError::InvalidCanvas {
-            source: UnitError::PhysicalAreaOverflow,
-        })?;
-    if required_bytes > options.frame_limit_bytes {
-        return Err(CreateBlankAnimationError::FrameLimitExceeded {
-            required_bytes,
-            limit_bytes: options.frame_limit_bytes,
-        });
-    }
-    let required = usize::try_from(required_bytes).map_err(|_| {
-        CreateBlankAnimationError::FrameLimitExceeded {
-            required_bytes,
-            limit_bytes: options.frame_limit_bytes,
-        }
-    })?;
+    let (required_bytes, required) = blank_buffer_size(&options)?;
     let mut pixels = Vec::new();
     pixels
         .try_reserve_exact(required)
@@ -209,6 +191,7 @@ pub fn create_blank_animation_project(
         },
     };
     let frame = FrameClip {
+        capture_clock: None,
         capture_binding: gif_from_screen_domain::CaptureBinding::NotRecorded,
         id: options.frame_id,
         asset_id,
@@ -232,6 +215,31 @@ pub fn create_blank_animation_project(
         .checkpoint_and_compact()
         .map_err(|source| CreateBlankAnimationError::Finalize { source })?;
     Ok(project)
+}
+
+fn blank_buffer_size(
+    options: &BlankAnimationProjectOptions,
+) -> Result<(u64, usize), CreateBlankAnimationError> {
+    let required_bytes = options
+        .canvas
+        .area()
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(CreateBlankAnimationError::InvalidCanvas {
+            source: UnitError::PhysicalAreaOverflow,
+        })?;
+    if required_bytes > options.frame_limit_bytes {
+        return Err(CreateBlankAnimationError::FrameLimitExceeded {
+            required_bytes,
+            limit_bytes: options.frame_limit_bytes,
+        });
+    }
+    let required = usize::try_from(required_bytes).map_err(|_| {
+        CreateBlankAnimationError::FrameLimitExceeded {
+            required_bytes,
+            limit_bytes: options.frame_limit_bytes,
+        }
+    })?;
+    Ok((required_bytes, required))
 }
 
 fn validate_options(

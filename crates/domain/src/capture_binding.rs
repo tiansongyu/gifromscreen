@@ -20,6 +20,8 @@ pub struct CaptureBindingSummary {
     pub selected_legacy_unknown: usize,
     pub selected_archived_after_composite: usize,
     pub selected_not_recorded: usize,
+    /// Original/legacy frames without a confirmed shared capture-clock identity.
+    pub selected_missing_clock: usize,
 }
 
 /// Input that can be used for recorded annotations, excluding empty image imports.
@@ -42,6 +44,13 @@ pub fn capture_binding_summary<'a>(
 ) -> CaptureBindingSummary {
     let mut summary = CaptureBindingSummary::default();
     for frame in frames {
+        if matches!(
+            frame.capture_binding,
+            CaptureBinding::Original | CaptureBinding::LegacyUnknown
+        ) && frame.capture_clock.and_then(|clock| clock.id).is_none()
+        {
+            summary.selected_missing_clock += 1;
+        }
         match frame.capture_binding {
             CaptureBinding::LegacyUnknown => summary.selected_legacy_unknown += 1,
             CaptureBinding::ArchivedAfterComposite => {

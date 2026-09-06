@@ -433,16 +433,19 @@ fn render_scope_samples(
     let mut recent_clicks: Vec<(u64, MouseButton, PhysicalPoint, Option<CaptureOrigin>)> =
         Vec::new();
     let mut previous_clock = None;
+    let mut previous_identity = None;
     let mut previous_run = None;
     for planned in &plan.samples {
         check_cancelled(labels.cancellation)?;
         let frame = &manifest.timeline.frames[planned.index];
         let clock = frame
-            .capture_metadata
-            .captured_at
+            .capture_sample_time()
             .map_or(planned.frame_start, TimeUs::get);
+        let identity = frame.capture_clock.and_then(|clock| clock.id);
         // Never carry an event across a selection gap or a backwards/repeated capture clock.
         if blocked.contains(&frame.id)
+            || identity.is_none()
+            || identity != previous_identity
             || previous_run != Some(planned.run)
             || previous_clock.is_some_and(|previous| clock <= previous)
         {
@@ -450,6 +453,7 @@ fn render_scope_samples(
             recent_clicks.clear();
         }
         previous_clock = Some(clock);
+        previous_identity = identity;
         previous_run = Some(planned.run);
         completed.insert(frame.id);
         progress(AnnotationProgress {
@@ -1032,6 +1036,10 @@ mod tests {
         );
         for index in 0_u64..3 {
             manifest.timeline.frames.push(FrameClip {
+                capture_clock: Some(gif_from_screen_domain::CaptureClockContext {
+                    id: Some(gif_from_screen_domain::CaptureClockId::from_u128(1)),
+                    sampled_at: TimeUs::new(index * 100_000),
+                }),
                 capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: FrameId::from_u128(u128::from(index) + 1),
                 asset_id: id,
@@ -1638,6 +1646,7 @@ mod tests {
             .zip([10_000_000, 10_100_000, 10_600_000])
         {
             frame.capture_metadata.captured_at = Some(TimeUs::new(time));
+            frame.capture_clock.as_mut().unwrap().sampled_at = TimeUs::new(time);
         }
         let first = &mut manifest.timeline.frames[0];
         first.capture_metadata.key_strokes = [(1_000_000, "Old"), (20_000_000, "Future")]
@@ -1742,6 +1751,127 @@ mod tests {
             .unwrap_err()
             .contains("fit inside")
         );
+    }
+
+    #[test]
+    fn independent_increasing_capture_clocks_never_exchange_held_input() {
+        use gif_from_screen_domain::CaptureClockId;
+        let mut project = manifest();
+        project.timeline.frames[0]
+            .capture_metadata
+            .key_strokes
+            .push(KeyStroke {
+                physical_key: "A".to_owned(),
+                display_text: Some("A".to_owned()),
+                pressed: true,
+                at: TimeUs::ZERO,
+                repeat: false,
+                modifiers: 0,
+            });
+        project.timeline.frames[0]
+            .capture_metadata
+            .mouse_events
+            .push(MouseInputEvent {
+                at: TimeUs::ZERO,
+                button: MouseButton::Left,
+                pressed: true,
+                position: Some(PhysicalPoint::default()),
+            });
+        for frame in &mut project.timeline.frames[1..] {
+            frame.capture_clock.as_mut().unwrap().id = Some(CaptureClockId::from_u128(2));
+        }
+        for mode in [AnnotationMode::RecordedKeys, AnnotationMode::RecordedClicks] {
+            let prepared = prepare(
+                &project,
+                &[1, 2, 3],
+                AnnotationRequest {
+                    mode,
+                    hold_ms: 500,
+                    ..AnnotationRequest::default()
+                },
+            );
+            assert_eq!(
+                track(&prepared).items.len(),
+                1,
+                "nearby increasing timestamps cannot identify a common recording"
+            );
+        }
+        for frame in &mut project.timeline.frames {
+            frame.capture_clock.as_mut().unwrap().id = Some(CaptureClockId::from_u128(1));
+        }
+        let same = prepare(
+            &project,
+            &[1, 2, 3],
+            AnnotationRequest {
+                mode: AnnotationMode::RecordedKeys,
+                hold_ms: 500,
+                ..AnnotationRequest::default()
+            },
+        );
+        assert_eq!(
+            track(&same).items.len(),
+            3,
+            "event-empty samples from the same capture retain held input"
+        );
+        for frame in &mut project.timeline.frames {
+            frame.capture_clock.as_mut().unwrap().id = None;
+        }
+        let unknown = prepare(
+            &project,
+            &[1, 2, 3],
+            AnnotationRequest {
+                mode: AnnotationMode::RecordedKeys,
+                hold_ms: 500,
+                ..AnnotationRequest::default()
+            },
+        );
+        assert_eq!(
+            track(&unknown).items.len(),
+            1,
+            "two unknown identities are never treated as the same clock"
+        );
+    }
+
+    #[test]
+    fn frozen_legacy_sample_time_keeps_own_event_when_moved_earlier_or_later() {
+        let mut source = manifest();
+        let mut moved = source.timeline.frames[1].clone();
+        moved.capture_metadata.captured_at = None;
+        moved.capture_clock = None;
+        moved.capture_metadata.key_strokes.push(KeyStroke {
+            physical_key: "C".to_owned(),
+            display_text: Some("C".to_owned()),
+            pressed: true,
+            at: TimeUs::new(99_000),
+            repeat: false,
+            modifiers: 0,
+        });
+        let raw = moved.capture_metadata.clone();
+        moved.freeze_capture_clock(TimeUs::new(100_000));
+        let mut preceding = source.timeline.frames[0].clone();
+        preceding.duration = DurationUs::new(1_000_000).unwrap();
+        preceding.capture_binding = gif_from_screen_domain::CaptureBinding::NotRecorded;
+        preceding.capture_clock = None;
+        for earlier in [true, false] {
+            source.timeline.frames = if earlier {
+                vec![moved.clone()]
+            } else {
+                vec![preceding.clone(), moved.clone()]
+            };
+            let prepared = prepare(
+                &source,
+                &[2],
+                AnnotationRequest {
+                    mode: AnnotationMode::RecordedKeys,
+                    ..AnnotationRequest::default()
+                },
+            );
+            assert_eq!(prepared.frames, 1);
+            assert!(
+                matches!(&track(&prepared).items[0].content,OverlayContent::KeyStroke{text,..}if text=="C")
+            );
+            assert_eq!(source.timeline.frames.last().unwrap().capture_metadata, raw);
+        }
     }
 
     #[test]

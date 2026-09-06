@@ -98,6 +98,13 @@ pub fn save_project_copy(
     let source_id = snapshot.manifest.project_id;
     let source_revision = snapshot.manifest.revision;
     let mut manifest = snapshot.manifest.clone();
+    let mut source_time = 0_u64;
+    for frame in &mut manifest.timeline.frames {
+        frame.freeze_capture_clock(gif_from_screen_domain::TimeUs::new(source_time));
+        source_time = source_time
+            .checked_add(frame.duration.get())
+            .ok_or("Source capture timeline overflows.")?;
+    }
     manifest.project_id = options.project_id;
     manifest.revision = ProjectRevision::ZERO;
     manifest.created_at = options.created_at;
@@ -396,6 +403,10 @@ mod tests {
                     EditCommand::InsertFrames {
                         index: 0,
                         frames: vec![FrameClip {
+                            capture_clock: Some(gif_from_screen_domain::CaptureClockContext {
+                                id: Some(gif_from_screen_domain::CaptureClockId::from_u128(200)),
+                                sampled_at: gif_from_screen_domain::TimeUs::ZERO,
+                            }),
                             capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                             id: FrameId::from_u128(1),
                             asset_id: id,

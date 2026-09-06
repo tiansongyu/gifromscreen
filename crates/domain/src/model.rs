@@ -266,6 +266,8 @@ pub struct FrameClip {
     /// Input remains immutable when pixel edits detach it from the current frame geometry.
     #[serde(default)]
     pub capture_binding: crate::CaptureBinding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_clock: Option<crate::CaptureClockContext>,
     pub effects: Vec<Effect>,
 }
 
@@ -732,6 +734,11 @@ impl ProjectManifest {
 
         let mut track_ids = BTreeSet::new();
         let mut overlay_ids = BTreeSet::new();
+        for frame in &self.timeline.frames {
+            if !frame.has_valid_capture_clock() {
+                issues.push(ValidationIssue::InvalidCaptureClock { frame_id: frame.id });
+            }
+        }
         for track in &self.timeline.overlay_tracks {
             if track.id.is_nil() {
                 issues.push(ValidationIssue::NilTrackId);
@@ -920,6 +927,7 @@ pub(crate) mod test_fixtures {
 
     pub fn frame(number: u8, asset_id: AssetId) -> FrameClip {
         FrameClip {
+            capture_clock: None,
             capture_binding: crate::CaptureBinding::Original,
             id: FrameId::from_u128(u128::from(number)),
             asset_id,

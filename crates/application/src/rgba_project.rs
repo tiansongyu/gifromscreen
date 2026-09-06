@@ -151,6 +151,7 @@ pub(crate) fn persist_rgba_project_with_metadata(
         .map_err(|source| PersistRgbaProjectError::CreateProject { source })?;
     let mut descriptors = BTreeMap::new();
     let mut clips = Vec::with_capacity(frames.len());
+    let capture_clock_id = crate::recording_project::fresh_capture_clock_id();
     for (frame_index, ((frame, frame_id), duration)) in frames
         .iter()
         .zip(validated.frame_ids)
@@ -184,6 +185,12 @@ pub(crate) fn persist_rgba_project_with_metadata(
             frame_index,
         )?;
         clips.push(FrameClip {
+            capture_clock: capture_metadata.captured_at.map(|sampled_at| {
+                gif_from_screen_domain::CaptureClockContext {
+                    id: Some(capture_clock_id),
+                    sampled_at,
+                }
+            }),
             capture_binding: if metadata.get(frame_index).is_some() {
                 gif_from_screen_domain::CaptureBinding::Original
             } else {

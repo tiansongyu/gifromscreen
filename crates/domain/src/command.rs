@@ -60,6 +60,10 @@ pub enum EditCommand {
     SetCaptureBindings {
         changes: Vec<crate::FrameCaptureBindingChange>,
     },
+    /// Source-clock-only edit, with no copied or rewritten raw event buffers.
+    SetCaptureClocks {
+        changes: Vec<crate::FrameCaptureClockChange>,
+    },
     ReorderFrames {
         order: Vec<FrameId>,
     },
@@ -339,6 +343,36 @@ impl EditCommand {
                     }
                 }
                 Ok(Self::SetCaptureBindings { changes: inverse })
+            }
+            Self::SetCaptureClocks { changes } => {
+                ensure_unique_frame_command(changes.iter().map(|change| change.frame_id))?;
+                let requested: BTreeMap<_, _> = changes
+                    .iter()
+                    .map(|change| (change.frame_id, change.clock))
+                    .collect();
+                let existing: BTreeSet<_> = project
+                    .timeline
+                    .frames
+                    .iter()
+                    .map(|frame| frame.id)
+                    .collect();
+                if let Some(change) = changes
+                    .iter()
+                    .find(|change| !existing.contains(&change.frame_id))
+                {
+                    return Err(DomainError::UnknownFrame(change.frame_id));
+                }
+                let mut inverse = Vec::with_capacity(changes.len());
+                for frame in &mut project.timeline.frames {
+                    if let Some(clock) = requested.get(&frame.id) {
+                        inverse.push(crate::FrameCaptureClockChange {
+                            frame_id: frame.id,
+                            clock: frame.capture_clock,
+                        });
+                        frame.capture_clock = *clock;
+                    }
+                }
+                Ok(Self::SetCaptureClocks { changes: inverse })
             }
             Self::ReplaceFrame {
                 frame_id,

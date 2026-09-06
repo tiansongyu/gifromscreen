@@ -412,6 +412,7 @@ mod tests {
 
     fn frame(id: u128, duration: u64) -> FrameClip {
         FrameClip {
+            capture_clock: None,
             capture_binding: gif_from_screen_domain::CaptureBinding::Original,
             id: FrameId::from_u128(id),
             asset_id: AssetId::from_digest([u8::try_from(id).unwrap(); 32]),

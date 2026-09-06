@@ -154,6 +154,7 @@ impl EditorWorkspace {
         let text_asset = self.raster_asset_descriptor(image.size, &image.rgba)?;
         let frame_id = FrameId::from_u128(Uuid::new_v4().as_u128());
         let frame = FrameClip {
+            capture_clock: None,
             capture_binding: gif_from_screen_domain::CaptureBinding::NotRecorded,
             id: frame_id,
             asset_id: frame_asset.id,

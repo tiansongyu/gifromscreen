@@ -316,7 +316,7 @@ fn insertion_command(
     let RemappedFrames {
         frames,
         by_source: frame_ids,
-    } = remap_frames(timeline, &source.timeline, start)?;
+    } = remap_frames(timeline, &source.timeline)?;
     let inserted_frames = frames.iter().map(|frame| frame.id).collect();
     let mut commands = descriptors
         .iter()
@@ -442,7 +442,6 @@ struct RemappedFrames {
 fn remap_frames(
     destination: &Timeline,
     source: &Timeline,
-    start: u64,
 ) -> Result<RemappedFrames, ProjectInsertionError> {
     let mut used_frames = destination
         .frames
@@ -452,7 +451,12 @@ fn remap_frames(
         .collect::<BTreeSet<_>>();
     let mut by_source = BTreeMap::new();
     let mut frames = source.frames.clone();
+    let mut source_time = 0_u64;
     for frame in &mut frames {
+        frame.freeze_capture_clock(TimeUs::new(source_time));
+        source_time = source_time
+            .checked_add(frame.duration.get())
+            .ok_or(ProjectInsertionError::DurationOverflow)?;
         let id = loop {
             let id = FrameId::from_u128(Uuid::new_v4().as_u128());
             if used_frames.insert(id) {
@@ -461,19 +465,6 @@ fn remap_frames(
         };
         by_source.insert(frame.id, id);
         frame.id = id;
-        // Native events and captured_at share the original recording clock.
-        // Insertion changes the owning clip's timeline position, not that clock.
-        if frame.capture_metadata.captured_at.is_some() {
-            continue;
-        }
-        for key in &mut frame.capture_metadata.key_strokes {
-            key.at = TimeUs::new(
-                key.at
-                    .get()
-                    .checked_add(start)
-                    .ok_or(ProjectInsertionError::DurationOverflow)?,
-            );
-        }
     }
     Ok(RemappedFrames { frames, by_source })
 }
@@ -654,18 +645,20 @@ mod tests {
             pressed: true,
             position: Some(PhysicalPoint::default()),
         });
-        let remapped = remap_frames(&Timeline::default(), &timeline, 500_000).unwrap();
+        let remapped = remap_frames(&Timeline::default(), &timeline).unwrap();
         assert_eq!(
             remapped.frames[0].capture_metadata,
             timeline.frames[0].capture_metadata
         );
         timeline.frames[0].capture_metadata.captured_at = None;
         timeline.frames[0].capture_metadata.mouse_events.clear();
-        let legacy = remap_frames(&Timeline::default(), &timeline, 500_000).unwrap();
+        let legacy = remap_frames(&Timeline::default(), &timeline).unwrap();
         assert_eq!(
             legacy.frames[0].capture_metadata.key_strokes[0].at,
-            TimeUs::new(519_000)
+            TimeUs::new(19_000)
         );
+        assert_eq!(legacy.frames[0].capture_clock.unwrap().id, None);
+        assert_eq!(legacy.frames[0].capture_sample_time(), Some(TimeUs::ZERO));
     }
 
     fn workspace(root: &Path, frames: usize, color: [u8; 4]) -> EditorWorkspace {
@@ -701,6 +694,7 @@ mod tests {
                         index: 0,
                         frames: (0..frames)
                             .map(|index| FrameClip {
+                                capture_clock: None,
                                 capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                                 id: frame_id(index as u128 + 1),
                                 asset_id,

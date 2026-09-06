@@ -310,6 +310,12 @@ impl ActiveProject {
         frame: &FrameClip,
     ) -> Result<(), ProjectError> {
         self.ensure_writable()?;
+        if !frame.has_valid_capture_clock() {
+            return Err(ProjectError::InvalidRecordingMutation(
+                "capture clock identity is nil or its sampling time differs from raw capture time"
+                    .to_owned(),
+            ));
+        }
         if frame.id.is_nil() {
             return Err(ProjectError::InvalidRecordingMutation(
                 "recording frame identity must not be nil".to_owned(),
@@ -682,6 +688,7 @@ mod tests {
 
     fn recording_frame(id: u128, asset_id: AssetId, duration_us: u64) -> FrameClip {
         FrameClip {
+            capture_clock: None,
             capture_binding: gif_from_screen_domain::CaptureBinding::Original,
             id: FrameId::from_u128(id),
             asset_id,
@@ -725,6 +732,54 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn invalid_capture_clocks_are_rejected_before_fast_append_mutates_any_durable_state() {
+        use gif_from_screen_domain::{CaptureClockContext, CaptureClockId, TimeUs};
+        let directory = tempdir().unwrap();
+        let mut active = ActiveProject::create(directory.path(), manifest()).unwrap();
+        let asset_id = active.assets().put(&[255; 16]).unwrap();
+        let before = active.manifest().clone();
+        let journal = fs::read(&active.layout().journal).unwrap();
+        let file_count = fs::read_dir(&active.layout().assets).unwrap().count();
+        for clock in [
+            CaptureClockContext {
+                id: Some(CaptureClockId::NIL),
+                sampled_at: TimeUs::new(7),
+            },
+            CaptureClockContext {
+                id: Some(CaptureClockId::from_u128(2)),
+                sampled_at: TimeUs::new(8),
+            },
+        ] {
+            let mut frame = recording_frame(1, asset_id, 10);
+            frame.capture_metadata.captured_at = Some(TimeUs::new(7));
+            frame.capture_clock = Some(clock);
+            assert!(matches!(
+                active.commit_recording_append(Some(recording_asset(asset_id)), frame),
+                Err(ProjectError::InvalidRecordingMutation(_))
+            ));
+            assert_eq!(active.manifest(), &before);
+            assert_eq!(fs::read(&active.layout().journal).unwrap(), journal);
+            assert_eq!(
+                fs::read_dir(&active.layout().assets).unwrap().count(),
+                file_count
+            );
+        }
+        let mut valid = recording_frame(1, asset_id, 10);
+        valid.capture_metadata.captured_at = Some(TimeUs::new(7));
+        valid.capture_clock = Some(CaptureClockContext {
+            id: Some(CaptureClockId::from_u128(2)),
+            sampled_at: TimeUs::new(7),
+        });
+        active
+            .commit_recording_append(Some(recording_asset(asset_id)), valid.clone())
+            .unwrap();
+        drop(active);
+        let reopened = ActiveProject::open(directory.path(), LockPolicy::FailIfPresent).unwrap();
+        assert_eq!(reopened.project.manifest().timeline.frames, [valid]);
+        assert!(reopened.journal_recovery.is_clean());
     }
 
     #[test]

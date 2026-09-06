@@ -294,6 +294,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, duration)| FrameClip {
+                capture_clock: None,
                 capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: FrameId::from_u128(index as u128 + 1),
                 asset_id: AssetId::from_digest([1; 32]),

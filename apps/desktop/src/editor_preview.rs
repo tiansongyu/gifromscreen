@@ -997,6 +997,7 @@ mod tests {
                     EditCommand::InsertFrames {
                         index: 0,
                         frames: vec![FrameClip {
+                            capture_clock: None,
                             capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                             id: frame_id,
                             asset_id,
@@ -1118,6 +1119,7 @@ mod tests {
                     EditCommand::InsertFrames {
                         index: 1,
                         frames: vec![FrameClip {
+                            capture_clock: None,
                             capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                             id: second,
                             asset_id,

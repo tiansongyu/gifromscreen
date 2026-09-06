@@ -9,6 +9,7 @@
 mod annotation_options;
 mod annotation_scope;
 mod capture_binding;
+mod capture_clock;
 mod command;
 mod editing_task;
 mod error;
@@ -27,11 +28,12 @@ pub use capture_binding::{
     capture_binding_summary, has_recorded_input, recorded_annotation_barrier,
     recorded_annotation_block,
 };
+pub use capture_clock::{CaptureClockContext, FrameCaptureClockChange};
 pub use command::{AppliedEdit, EditCommand, FrameDurationChange, IndexedFrame};
 pub use editing_task::*;
 pub use error::{DomainError, IdParseError, UnitError, ValidationIssue};
 pub use export_preset::*;
-pub use id::{AssetId, FrameId, OverlayId, ProjectId, TrackId, TransitionId};
+pub use id::{AssetId, CaptureClockId, FrameId, OverlayId, ProjectId, TrackId, TransitionId};
 pub use model::*;
 pub use progress_fraction::ProgressFraction;
 pub use task_run::*;

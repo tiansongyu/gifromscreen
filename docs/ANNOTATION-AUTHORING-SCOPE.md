@@ -7,7 +7,7 @@ An annotation group's generated marks are not its authoring scope. A short key/c
 ## Editing invariants
 
 - Updating a group uses its saved scope, never the current frame selection. Its project/revision must still match; confirmation of legacy input coordinates retains a stricter selection anchor.
-- Event holds use original capture clocks. Scope intersections are edited-timeline intervals; clipping an item does not change the event clock, frame number, or full-frame-end progress value.
+- Event holds use original capture clocks, independently of fixed or measured GIF playback. Scope intersections are edited-timeline intervals; clipping an item does not change the event clock, frame number, or full-frame-end progress value. Changing playback duration never rewrites raw event/sample timestamps; see [Capture playback timing](CAPTURE-PLAYBACK-TIMING.md).
 - Positive gaps restart input history, including gaps that fall within or between partially covered frames.
 - Insertions exclude new frames. Retiming splits scope at every old frame intersection before mapping; merely mapping a long interval's endpoints would incorrectly include inserted time.
 - Frame deletion removes corresponding scope, and duration changes scale partial bounds outward. The existing whole-track inverse preserves exact pre-edit scope through undo/redo and journal recovery, including rounding cases.
@@ -24,12 +24,29 @@ Known imported/generated frames are explicitly `NotRecorded`: this includes titl
 
 New groups can process their safe portion, with typed legacy/archive skip counts surfaced to the editor or automatic-task result. Updating an existing recorded-input group is stricter: if any of its authored scope has an unusable binding, the entire update is rejected and its request, marks, pixels and history remain unchanged. A group never stores one new global recipe over a silently mixed old/new result.
 
-Legacy input-coordinate confirmation uses the existing annotation worker/loan, requires an explicit stable-selection confirmation, writes one undoable binding command and adds no annotations. It cannot relabel archived composites as original. Manual annotations and progress overlays do not replay capture coordinates and are unaffected by this guard.
+Legacy input-coordinate confirmation uses the existing annotation worker/loan and requires an explicit stable-selection confirmation. It writes one atomic undoable edit containing binding and, when needed, field-only clock commands, and adds no annotations. It cannot relabel archived composites or `NotRecorded` frames as original. Manual annotations and progress overlays do not replay capture coordinates and are unaffected by this guard.
 
-A remaining source-clock identity gap is explicit: two independently recorded `Original` screen segments inserted into one project can have increasing, apparently compatible timestamps. Without a per-frame capture-sequence identity, held labels can cross that boundary when creating a new group over both segments. A future frame-owned sequence ID must preserve original session membership through insertion/copy; coordinates, timestamp order and asset hashes must not be used as guessed session identities. This batch does not claim to solve that separate case.
+## Capture-clock persistence and schema compatibility
+
+`FrameClip.capture_clock` now stores `CaptureClockContext { id: Option<CaptureClockId>, sampled_at: TimeUs }`, separately from raw `CaptureMetadata` and pixel applicability. Each new screen-recording writer or batch persistence operation receives a fresh identity. Pause, retargeting and playback-delay changes keep that identity; Save As, frame clipboard copies and project insertion preserve the original source context rather than substituting the destination project's identity.
+
+Recorded key/click history only carries across matching nonempty identities with increasing sampling times and continuous eligible authoring scope. Unknown or different identities clear that history even if timestamps appear compatible. Thus the formerly unrepresented boundary between independently recorded segments now has an explicit implementation. This does not assert that all other authoring-scope fidelity gaps are resolved.
+
+For legacy frames, moving/copying freezes an existing raw sampling timestamp, or the original source-frame start when no raw timestamp was saved. This preserves the previous per-frame interpretation without inventing a shared identity. The input-confirmation UI separately offers an explicit declaration that each selected continuous unknown-clock interval comes from one recording with trustworthy sampling times. Declared unknown intervals get separate fresh identities; existing known clocks and selection gaps are never merged. Pixel confirmation alone does not authorize cross-frame holds. Without trustworthy original timing, leave the declaration unchecked and use per-frame/manual annotations.
+
+The project remains at schema version 1; this is an additive read-compatibility change for the current reader, not a downgrade guarantee:
+
+- Missing `FrameClip.capture_clock` deserializes as `None` and is omitted when serializing `None`. No source identity is inferred from a legacy timestamp, project ID, label or asset hash. Missing `capture_binding` still defaults to `LegacyUnknown`.
+- Missing `OverlayTrack.annotation_scope` remains `None`: use existing marker coverage, not a guessed original selection. `Some([])` remains distinct from missing scope and represents explicitly removed authored time.
+- When a clock is present, a nil identity is invalid; when a raw capture timestamp is also present, `sampled_at` must equal it. Clock-only commands do not copy or mutate raw event buffers. Current journal replay, undo and checkpoint/reopen preserve the context.
+- New journals may contain `SetCaptureClocks`. Older executables do not necessarily understand that command or preserve new optional fields when saving; do not use them to round-trip an edited project. Keep a backup when moving projects between application versions. The unchanged schema number does not promise backwards executable compatibility.
 
 ## Bounds and verification
 
 Scope is sorted, non-overlapping, inside the timeline and limited to 40,000 fragments. Generated frame intersections have the same limit; one preparation selects at most 10,000 frames. Errors are explicit, with no silent truncation of authored coverage.
 
 Coverage is exercised by domain interval/retiming tests, `annotation_scope_tests.rs`, durable editor annotation tests, title/project-insertion tests, motion/binding tests and the confirmation worker tests. The tests cover unmarked-frame hold expansion, partial gaps, original clocks after duration edits, inserted-frame exclusion, visible versus unmarked baked coverage, atomic blocked updates, conservative legacy fallback, empty groups, selection-independent updates, undo/redo and reopen.
+
+For this timing/clock cohort, `crates/application/tests/fixed_playback.rs` passes four tests on Rust 1.98.0 and 1.88.0, covering 18 real project stores/exports through batch and independent incremental writers. It verifies exact project delays, untouched raw sample/key/mouse timestamps, per-recording identity, recovery from an uncheckpointed recording journal, reopen and decoded GIF timing. These synthetic-source integration results are not a native confirmation/re-edit, compositor, hardware or physical-input acceptance claim. The reorder/deleted-gap semantics above, broader platform acceptance and remaining scope work are still open.
+
+Separate [native manual fixed-playback evidence](NATIVE-PLAYBACK-QA-2026-09-07.md) verifies one private nested GNOME recording through pause/crop movement and CLI reopen/GIF export: its three 1 s project frames retain their nonuniform native sampling times and shared recording identity. This validates that bounded recording/persistence path, not the full legacy-declaration/re-edit UI or cross-compositor/hardware scope gates.

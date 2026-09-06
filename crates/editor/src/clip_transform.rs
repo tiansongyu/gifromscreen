@@ -197,6 +197,7 @@ mod tests {
 
     fn frame(id: u128, asset: AssetId, transform: ClipTransform) -> FrameClip {
         FrameClip {
+            capture_clock: None,
             capture_binding: gif_from_screen_domain::CaptureBinding::Original,
             id: FrameId::from_u128(id),
             asset_id: asset,

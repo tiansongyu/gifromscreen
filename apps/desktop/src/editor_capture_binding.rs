@@ -6,15 +6,27 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::{EditorWorkspace, OverlaySelectionAnchor};
 
 impl EditorWorkspace {
-    /// Run on the editor worker after the user verifies that legacy pixels are still original.
+    /// Confirm coordinates only unless the user separately declares a shared original clock.
     pub(crate) fn confirm_original_capture_binding(
         &mut self,
         anchor: &OverlaySelectionAnchor,
+        declare_common_clock: bool,
         cancellation: &AtomicBool,
     ) -> Result<usize, String> {
-        if cancellation.load(Ordering::Acquire) {
-            return Err("Original-coordinate confirmation cancelled before saving.".to_owned());
-        }
+        let (command, count) =
+            self.capture_confirmation_command(anchor, declare_common_clock, cancellation)?;
+        check_cancelled(cancellation)?;
+        self.execute(command).map_err(|error| error.to_string())?;
+        Ok(count)
+    }
+
+    fn capture_confirmation_command(
+        &self,
+        anchor: &OverlaySelectionAnchor,
+        declare_common_clock: bool,
+        cancellation: &AtomicBool,
+    ) -> Result<(EditCommand, usize), String> {
+        check_cancelled(cancellation)?;
         if !anchor.matches(self) {
             return Err(
                 "The project or selection changed before confirming original capture coordinates."
@@ -22,48 +34,98 @@ impl EditorWorkspace {
             );
         }
         if self.selection().is_empty() {
-            return Err("Select the legacy frames whose original pixels you verified.".to_owned());
+            return Err("Select the source frames whose original pixels you verified.".to_owned());
         }
         if self.selection().selected().len() > 100_000 {
             return Err("Confirm at most 100,000 original frames at a time.".to_owned());
         }
-        let mut changes = Vec::new();
-        let mut has_input = false;
-        for frame in self
+        let mut bindings = Vec::new();
+        let mut clocks = Vec::new();
+        let mut changed = std::collections::BTreeSet::new();
+        let mut used: std::collections::BTreeSet<_> = self
             .manifest()
             .timeline
             .frames
             .iter()
-            .filter(|frame| self.selection().contains(frame.id))
-        {
-            if cancellation.load(Ordering::Acquire) {
-                return Err("Original-coordinate confirmation cancelled before saving.".to_owned());
+            .filter_map(|frame| frame.capture_clock.and_then(|clock| clock.id))
+            .collect();
+        let mut run_identity = None;
+        let mut source_time = 0_u64;
+        let mut has_input = false;
+        for frame in &self.manifest().timeline.frames {
+            check_cancelled(cancellation)?;
+            let sample_time = gif_from_screen_domain::TimeUs::new(source_time);
+            source_time = source_time
+                .checked_add(frame.duration.get())
+                .ok_or("Source timeline duration overflow.")?;
+            if !self.selection().contains(frame.id) {
+                run_identity = None;
+                continue;
             }
             has_input |= frame.has_recorded_annotation_input();
             match frame.capture_binding {
                 CaptureBinding::ArchivedAfterComposite=>return Err("A mixed-source composite cannot be confirmed as original capture pixels. Unselect it, undo the composite, or use manual annotations.".to_owned()),
                 CaptureBinding::NotRecorded=>return Err("An imported or generated frame has no original screen-input coordinate source. Unselect it or use manual annotations; it cannot be confirmed as a recording.".to_owned()),
                 CaptureBinding::Original=>{},
-                CaptureBinding::LegacyUnknown=>{
-                    changes.push(FrameCaptureBindingChange{frame_id:frame.id,binding:CaptureBinding::Original});
-                }
+                CaptureBinding::LegacyUnknown=>{bindings.push(FrameCaptureBindingChange{frame_id:frame.id,binding:CaptureBinding::Original});changed.insert(frame.id);},
+            }
+            let mut clock =
+                frame
+                    .capture_clock
+                    .unwrap_or(gif_from_screen_domain::CaptureClockContext {
+                        id: None,
+                        sampled_at: frame.capture_metadata.captured_at.unwrap_or(sample_time),
+                    });
+            if clock.id.is_some() {
+                run_identity = None;
+            } else if declare_common_clock {
+                let id = *run_identity.get_or_insert_with(|| fresh_clock_id(&mut used));
+                clock.id = Some(id);
+            }
+            if frame.capture_clock != Some(clock) {
+                clocks.push(gif_from_screen_domain::FrameCaptureClockChange {
+                    frame_id: frame.id,
+                    clock: Some(clock),
+                });
+                changed.insert(frame.id);
             }
         }
         if !has_input {
             return Err("The selection contains no recorded input to confirm.".to_owned());
         }
-        if changes.is_empty() {
-            return Err(
-                "No selected legacy frames need original-coordinate confirmation.".to_owned(),
-            );
+        if bindings.is_empty() && !declare_common_clock {
+            return Err("Coordinates are already confirmed. Declare the shared recording clock separately to enable cross-frame input hold.".to_owned());
         }
-        let count = changes.len();
-        if cancellation.load(Ordering::Acquire) {
-            return Err("Original-coordinate confirmation cancelled before saving.".to_owned());
+        if changed.is_empty() {
+            return Err("No selected source association needs confirmation.".to_owned());
         }
-        self.execute(EditCommand::SetCaptureBindings { changes })
-            .map_err(|error| error.to_string())?;
-        Ok(count)
+        let mut commands = Vec::new();
+        if !bindings.is_empty() {
+            commands.push(EditCommand::SetCaptureBindings { changes: bindings });
+        }
+        if !clocks.is_empty() {
+            commands.push(EditCommand::SetCaptureClocks { changes: clocks });
+        }
+        Ok((EditCommand::Compound { commands }, changed.len()))
+    }
+}
+
+fn check_cancelled(cancellation: &AtomicBool) -> Result<(), String> {
+    if cancellation.load(Ordering::Acquire) {
+        Err("Original-coordinate confirmation cancelled before saving.".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+fn fresh_clock_id(
+    used: &mut std::collections::BTreeSet<gif_from_screen_domain::CaptureClockId>,
+) -> gif_from_screen_domain::CaptureClockId {
+    loop {
+        let id = gif_from_screen_domain::CaptureClockId::from_u128(uuid::Uuid::new_v4().as_u128());
+        if used.insert(id) {
+            return id;
+        }
     }
 }
 
@@ -76,6 +138,174 @@ mod tests {
     use gif_from_screen_domain::{FrameId, KeyStroke, PhysicalSize, ProjectId, TimeUs, UnixTimeMs};
     use gif_from_screen_gif::RgbaFrame;
     use gif_from_screen_project::LockPolicy;
+
+    #[test]
+    fn coordinate_confirmation_does_not_imply_common_clock_and_later_declaration_is_undoable() {
+        use gif_from_screen_domain::{AnnotationMode, AnnotationRequest, CaptureMetadata};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("separate-declarations");
+        let mut workspace = workspace(&root);
+        let mut second = workspace.manifest().timeline.frames[0].clone();
+        second.id = FrameId::from_u128(2);
+        second.capture_metadata = CaptureMetadata::default();
+        workspace
+            .execute(EditCommand::InsertFrames {
+                index: 1,
+                frames: vec![second],
+            })
+            .unwrap();
+        workspace.select_all();
+        workspace
+            .confirm_original_capture_binding(
+                &workspace.project_edit_anchor(),
+                false,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(
+            workspace
+                .manifest()
+                .timeline
+                .frames
+                .iter()
+                .all(|frame| frame.capture_clock.unwrap().id.is_none())
+        );
+        let request = AnnotationRequest {
+            mode: AnnotationMode::RecordedKeys,
+            ..AnnotationRequest::default()
+        };
+        let prepare = |workspace: &EditorWorkspace| {
+            crate::annotation_engine::prepare_annotations_with_assets(
+                workspace.manifest(),
+                workspace.selection().selected(),
+                &request,
+                &AtomicBool::new(false),
+                |_| {},
+                &|_| panic!("keys do not load source pixels"),
+            )
+            .unwrap()
+        };
+        assert_eq!(prepare(&workspace).frames, 1);
+        let before = workspace.manifest().clone();
+        workspace
+            .confirm_original_capture_binding(
+                &workspace.project_edit_anchor(),
+                true,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let frames = &workspace.manifest().timeline.frames;
+        assert_eq!(
+            frames[0].capture_clock.unwrap().id,
+            frames[1].capture_clock.unwrap().id
+        );
+        assert!(frames[0].capture_clock.unwrap().id.is_some());
+        assert_eq!(prepare(&workspace).frames, 2);
+        workspace.undo().unwrap();
+        let mut undone = workspace.manifest().clone();
+        undone.revision = before.revision;
+        assert_eq!(undone, before);
+        workspace.redo().unwrap();
+        drop(workspace);
+        let mut reopened = EditorWorkspace::open(root, LockPolicy::FailIfPresent, 16).unwrap();
+        reopened.select_all();
+        assert_eq!(prepare(&reopened).frames, 2);
+    }
+
+    #[test]
+    fn clock_declaration_never_relabels_known_clocks_or_joins_unknown_intervals_across_them() {
+        use gif_from_screen_domain::{
+            CaptureClockContext, CaptureClockId, FrameCaptureClockChange,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut workspace = workspace(&dir.path().join("known-clocks"));
+        let first = workspace.manifest().timeline.frames[0].clone();
+        let extra = (2..=6)
+            .map(|id| {
+                let mut frame = first.clone();
+                frame.id = FrameId::from_u128(id);
+                frame.capture_metadata = gif_from_screen_domain::CaptureMetadata::default();
+                frame
+            })
+            .collect();
+        workspace
+            .execute(EditCommand::InsertFrames {
+                index: 1,
+                frames: extra,
+            })
+            .unwrap();
+        let a = CaptureClockId::from_u128(1);
+        let b = CaptureClockId::from_u128(2);
+        let at = |frame_id, id, micros| FrameCaptureClockChange {
+            frame_id,
+            clock: Some(CaptureClockContext {
+                id: Some(id),
+                sampled_at: TimeUs::new(micros),
+            }),
+        };
+        workspace
+            .execute(EditCommand::SetCaptureClocks {
+                changes: vec![
+                    at(first.id, a, 0),
+                    at(FrameId::from_u128(3), b, 20_000),
+                    at(FrameId::from_u128(6), a, 50_000),
+                ],
+            })
+            .unwrap();
+        workspace.select_all();
+        let original = workspace.manifest().clone();
+        let (command, _) = workspace
+            .capture_confirmation_command(
+                &workspace.project_edit_anchor(),
+                true,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(!serde_json::to_string(&command).unwrap().contains("Ctrl+C"));
+        workspace
+            .confirm_original_capture_binding(
+                &workspace.project_edit_anchor(),
+                true,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let clocks: Vec<_> = workspace
+            .manifest()
+            .timeline
+            .frames
+            .iter()
+            .map(|frame| frame.capture_clock.unwrap())
+            .collect();
+        assert_eq!(clocks[0].id, Some(a));
+        assert_eq!(clocks[2].id, Some(b));
+        assert_eq!(clocks[5].id, Some(a));
+        assert_eq!(clocks[3].id, clocks[4].id);
+        assert_ne!(clocks[1].id, clocks[3].id);
+        for clock in [clocks[1], clocks[3]] {
+            assert!(clock.id.is_some());
+            assert_ne!(clock.id, Some(a));
+            assert_ne!(clock.id, Some(b));
+        }
+        assert_eq!(
+            workspace
+                .manifest()
+                .timeline
+                .frames
+                .iter()
+                .map(|frame| &frame.capture_metadata)
+                .collect::<Vec<_>>(),
+            original
+                .timeline
+                .frames
+                .iter()
+                .map(|frame| &frame.capture_metadata)
+                .collect::<Vec<_>>()
+        );
+        workspace.undo().unwrap();
+        let mut restored = workspace.manifest().clone();
+        restored.revision = original.revision;
+        assert_eq!(restored, original);
+    }
 
     #[test]
     fn imported_or_generated_frames_cannot_be_claimed_as_original_even_without_raw_input() {
@@ -96,6 +326,7 @@ mod tests {
         let error = workspace
             .confirm_original_capture_binding(
                 &workspace.project_edit_anchor(),
+                false,
                 &AtomicBool::new(false),
             )
             .unwrap_err();
@@ -143,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmation_changes_only_binding_and_survives_undo_redo_and_reopen() {
+    fn confirmation_changes_only_association_fields_and_survives_undo_redo_and_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("legacy.gfsproj");
         let mut workspace = workspace(&root);
@@ -153,6 +384,7 @@ mod tests {
             workspace
                 .confirm_original_capture_binding(
                     &workspace.project_edit_anchor(),
+                    false,
                     &AtomicBool::new(false)
                 )
                 .unwrap(),
@@ -160,6 +392,7 @@ mod tests {
         );
         let mut expected = original.clone();
         expected.capture_binding = CaptureBinding::Original;
+        expected.freeze_capture_clock(TimeUs::ZERO);
         assert_eq!(workspace.manifest().timeline.frames[0], expected);
         assert_eq!(workspace.manifest().revision.get(), revision.get() + 1);
         workspace.undo().unwrap();
@@ -196,6 +429,7 @@ mod tests {
             workspace
                 .confirm_original_capture_binding(
                     &workspace.project_edit_anchor(),
+                    true,
                     &AtomicBool::new(false)
                 )
                 .unwrap(),
@@ -254,6 +488,7 @@ mod tests {
             workspace
                 .confirm_original_capture_binding(
                     &workspace.project_edit_anchor(),
+                    false,
                     &AtomicBool::new(false)
                 )
                 .unwrap_err()
@@ -279,6 +514,7 @@ mod tests {
             workspace
                 .confirm_original_capture_binding(
                     &workspace.project_edit_anchor(),
+                    false,
                     &AtomicBool::new(false)
                 )
                 .unwrap_err()
@@ -295,7 +531,7 @@ mod tests {
         let before_cancel = workspace.manifest().clone();
         assert!(
             workspace
-                .confirm_original_capture_binding(&stale, &AtomicBool::new(true))
+                .confirm_original_capture_binding(&stale, false, &AtomicBool::new(true))
                 .unwrap_err()
                 .contains("cancelled")
         );
@@ -311,7 +547,7 @@ mod tests {
         let before = workspace.manifest().clone();
         assert!(
             workspace
-                .confirm_original_capture_binding(&stale, &AtomicBool::new(false))
+                .confirm_original_capture_binding(&stale, false, &AtomicBool::new(false))
                 .unwrap_err()
                 .contains("changed")
         );
@@ -319,6 +555,7 @@ mod tests {
             workspace
                 .confirm_original_capture_binding(
                     &workspace.project_edit_anchor(),
+                    false,
                     &AtomicBool::new(false)
                 )
                 .unwrap_err()
