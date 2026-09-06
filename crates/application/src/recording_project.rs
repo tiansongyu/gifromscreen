@@ -199,6 +199,18 @@ impl IncrementalRecordingProject {
         canvas: PhysicalSize,
         options: IncrementalRecordingProjectOptions,
     ) -> Result<Self, IncrementalRecordingProjectError> {
+        let provenance = SourceProvenance::Screen {
+            source_label: options.source_label.clone(),
+        };
+        Self::create_with_provenance(root, canvas, options, provenance)
+    }
+
+    pub(crate) fn create_with_provenance(
+        root: impl AsRef<Path>,
+        canvas: PhysicalSize,
+        options: IncrementalRecordingProjectOptions,
+        provenance: SourceProvenance,
+    ) -> Result<Self, IncrementalRecordingProjectError> {
         let mut manifest = ProjectManifest::new(
             options.project_id,
             options.app_version,
@@ -211,9 +223,7 @@ impl IncrementalRecordingProject {
         )
         .map_err(ProjectError::from)
         .map_err(|source| IncrementalRecordingProjectError::CreateProject { source })?;
-        manifest.source_provenance = vec![SourceProvenance::Screen {
-            source_label: options.source_label,
-        }];
+        manifest.source_provenance = vec![provenance];
         manifest
             .validate()
             .map_err(ProjectError::from)

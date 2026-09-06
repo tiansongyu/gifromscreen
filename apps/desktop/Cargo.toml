@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 eframe.workspace = true
+rfd = "0.17.2"
 gif-from-screen-application = { path = "../../crates/application" }
 gif-from-screen-capture = { path = "../../crates/capture" }
 gif-from-screen-capture-linux = { path = "../../crates/capture-linux", features = ["native-wayland", "native-x11"] }

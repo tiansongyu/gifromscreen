@@ -4,11 +4,18 @@
 
 mod blank_project;
 mod import_project;
+mod presentation_plan;
 mod project_export;
 mod recording_project;
 mod rgba_project;
 mod static_image_project;
 mod static_image_sequence_project;
+mod video_import;
+
+pub use video_import::{
+    VideoImportError, VideoImportLimits, VideoImportOptions, VideoImportProgress,
+    import_video_project,
+};
 
 pub use blank_project::{
     BLANK_ANIMATION_PRESET_NAME, BlankAnimationProjectOptions, CreateBlankAnimationError,
@@ -19,6 +26,10 @@ pub use import_project::{
     persist_decoded_animation,
 };
 
+pub use presentation_plan::{
+    PresentationPlan, PresentationSample, PresentationTransitionStep, transition_step_duration,
+    transition_step_progress,
+};
 pub use project_export::{
     CustomGifPalette, CustomGifPaletteError, NoopProjectExportProgress, ProjectExportPhase,
     ProjectExportProgress, ProjectExportProgressSink, ProjectExportSnapshot, ProjectFrameSelection,

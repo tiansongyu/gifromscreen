@@ -14,6 +14,9 @@ gif-from-screen-render = { path = "../render" }
 gif-from-screen-workflow = { path = "../workflow" }
 tempfile.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 gif-from-screen-capture = { path = "../capture" }

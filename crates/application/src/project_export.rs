@@ -4,8 +4,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use gif_from_screen_domain::{
-    AssetId, AssetKind, FrameClip, FrameId, MAX_TRANSITION_STEPS, OverlayId, OverlayTrack,
-    ProjectId, ProjectManifest, ProjectRevision, RasterEncoding, TimeUs, Transition, TransitionId,
+    AssetId, AssetKind, FrameClip, FrameId, OverlayId, OverlayTrack, ProjectId, ProjectManifest,
+    ProjectRevision, RasterEncoding, TimeUs, Transition, TransitionId,
 };
 use gif_from_screen_gif::{
     BuiltinGifEncoder, CancellationToken as GifCancellationToken, EncodeOptions, EncodeProgress,
@@ -15,11 +15,15 @@ use gif_from_screen_gif::{
 use gif_from_screen_project::{ActiveProject, AssetStore, ProjectError};
 use gif_from_screen_render::{
     AssetProviderError, CancellationToken as RenderCancellationToken, CpuRenderer,
-    FrameAssetProvider, RenderError, RenderLimits, RgbaSurface, SurfaceError, TransitionProgress,
+    FrameAssetProvider, RenderError, RenderLimits, RgbaSurface, SurfaceError,
     active_raster_overlay_assets, render_transition,
 };
 use tempfile::NamedTempFile;
 use thiserror::Error;
+
+#[cfg(test)]
+use crate::presentation_plan::expanded_frame_count;
+use crate::{PresentationPlan, transition_step_duration, transition_step_progress};
 
 /// Lock-free, read-only inputs needed to export one project revision.
 ///
@@ -702,9 +706,8 @@ pub fn export_project_snapshot_to_gif(
     let frame_times = selected_frame_start_times(&snapshot.manifest, &clips)?;
     let selected_frames =
         u64::try_from(clips.len()).map_err(|_| ProjectGifExportError::OutputFrameCountOverflow)?;
-    let transitions = applicable_transitions(&snapshot.manifest, &clips)?;
-    let total_frames = expanded_frame_count(clips.len(), &transitions)?;
-    validate_expanded_duration(&clips, &transitions)?;
+    let presentation = PresentationPlan::new(&snapshot.manifest, &clips)?;
+    let total_frames = presentation.frame_count();
     let mut execution = ExportExecution::new(cancellation, progress, total_frames);
     execution.report_phase(ProjectExportPhase::Preparing);
     let (assets, source_bytes) = load_selected_assets(
@@ -718,7 +721,7 @@ pub fn export_project_snapshot_to_gif(
     let gif_frames = render_selected_frames(
         &clips,
         &frame_times,
-        &transitions,
+        presentation.transitions(),
         &snapshot.manifest.timeline.overlay_tracks,
         &provider,
         source_bytes,
@@ -766,99 +769,6 @@ impl<'a> ExportExecution<'a> {
         self.state.phase = phase;
         self.progress.report(self.state);
     }
-}
-
-fn applicable_transitions(
-    manifest: &ProjectManifest,
-    clips: &[FrameClip],
-) -> Result<Vec<Option<Transition>>, ProjectGifExportError> {
-    let positions: BTreeMap<_, _> = manifest
-        .timeline
-        .frames
-        .iter()
-        .enumerate()
-        .map(|(index, frame)| (frame.id, index))
-        .collect();
-    let mut transitions_by_endpoint = BTreeMap::new();
-    for transition in &manifest.timeline.transitions {
-        let endpoints = (transition.from_frame, transition.to_frame);
-        if let Some(first) = transitions_by_endpoint.insert(endpoints, transition) {
-            return Err(ProjectGifExportError::DuplicateTransitionEndpoints {
-                first_transition_id: first.id,
-                duplicate_transition_id: transition.id,
-                from_frame: transition.from_frame,
-                to_frame: transition.to_frame,
-            });
-        }
-    }
-    clips
-        .windows(2)
-        .map(|pair| {
-            let forward_adjacent = positions
-                .get(&pair[0].id)
-                .zip(positions.get(&pair[1].id))
-                .is_some_and(|(from, to)| from.checked_add(1) == Some(*to));
-            if !forward_adjacent {
-                return Ok(None);
-            }
-            let transition = transitions_by_endpoint
-                .get(&(pair[0].id, pair[1].id))
-                .map(|transition| (*transition).clone());
-            if let Some(transition) = &transition {
-                validate_transition_timing(transition)?;
-            }
-            Ok(transition)
-        })
-        .collect()
-}
-
-fn validate_transition_timing(transition: &Transition) -> Result<(), ProjectGifExportError> {
-    if transition.steps == 0 || transition.steps > MAX_TRANSITION_STEPS {
-        return Err(ProjectGifExportError::InvalidTransitionSteps {
-            transition: transition.clone(),
-            steps: transition.steps,
-        });
-    }
-    if transition.duration.get() < u64::from(transition.steps) {
-        return Err(ProjectGifExportError::TransitionDurationTooShort {
-            transition: transition.clone(),
-            duration_us: transition.duration.get(),
-            steps: transition.steps,
-        });
-    }
-    Ok(())
-}
-
-fn expanded_frame_count(
-    selected_frames: usize,
-    transitions: &[Option<Transition>],
-) -> Result<u64, ProjectGifExportError> {
-    let count = transitions
-        .iter()
-        .flatten()
-        .try_fold(selected_frames, |total, transition| {
-            total.checked_add(usize::from(transition.steps))
-        })
-        .ok_or(ProjectGifExportError::OutputFrameCountOverflow)?;
-    u64::try_from(count).map_err(|_| ProjectGifExportError::OutputFrameCountOverflow)
-}
-
-fn validate_expanded_duration(
-    clips: &[FrameClip],
-    transitions: &[Option<Transition>],
-) -> Result<(), ProjectGifExportError> {
-    let mut total = 0_u64;
-    for duration_us in clips.iter().map(|clip| clip.duration.get()).chain(
-        transitions
-            .iter()
-            .flatten()
-            .map(|transition| transition.duration.get()),
-    ) {
-        total = total
-            .checked_add(duration_us)
-            .ok_or(ProjectGifExportError::OutputDurationOverflow)?;
-    }
-    Ok(())
 }
 
 #[allow(
@@ -929,7 +839,6 @@ fn render_selected_frames(
                 .map_err(|_| ProjectGifExportError::OutputFrameAllocationFailed {
                     requested: usize::from(transition.steps),
                 })?;
-            let denominator = u32::from(transition.steps) + 1;
             for step in 1..=transition.steps {
                 ensure_not_cancelled(execution.cancellation)?;
                 ensure_render_buffer(
@@ -938,14 +847,13 @@ fn render_selected_frames(
                     &[current_bytes, next_bytes, intermediate_bytes, current_bytes],
                     buffer_limit_bytes,
                 )?;
-                let progress =
-                    TransitionProgress::new(u32::from(step), denominator).map_err(|source| {
-                        ProjectGifExportError::RenderTransition {
-                            transition: transition.clone(),
-                            step,
-                            source: Box::new(source),
-                        }
-                    })?;
+                let progress = transition_step_progress(transition, step).map_err(|source| {
+                    ProjectGifExportError::RenderTransition {
+                        transition: transition.clone(),
+                        step,
+                        source: Box::new(source),
+                    }
+                })?;
                 let surface = render_transition(
                     &current,
                     &next,
@@ -1049,13 +957,6 @@ fn render_clip_surface(
                 }
             }
         })
-}
-
-fn transition_step_duration(transition: &Transition, zero_based_step: u16) -> u64 {
-    let steps = u64::from(transition.steps);
-    let base = transition.duration.get() / steps;
-    let remainder = transition.duration.get() % steps;
-    base + u64::from(u64::from(zero_based_step) < remainder)
 }
 
 fn ensure_render_buffer(
@@ -2803,7 +2704,7 @@ mod tests {
         clips[1].duration = DurationUs::new(1).unwrap();
 
         assert!(matches!(
-            validate_expanded_duration(&clips, &[None]),
+            PresentationPlan::new(&snapshot.manifest, &clips),
             Err(ProjectGifExportError::OutputDurationOverflow)
         ));
         assert!(matches!(

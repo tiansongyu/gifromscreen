@@ -21,6 +21,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes \
             clang \
+            ffmpeg \
             libclang-dev \
             libpipewire-0.3-dev \
             libwayland-dev \
