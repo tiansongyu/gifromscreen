@@ -2,6 +2,8 @@
 
 审计日期：2026-09-06。审计对象：`454fb95783318cd3a8ebf546daeb2d565f0e82f6`。本文是该提交的基线快照；后续功能提交需要追加验收结果，不能让这份快照代替新版本验收。
 
+后续实现与验收记录：[视频/转场](LINUX-ITERATION-VIDEO.md)、[摄像头/画板/工程服务](LINUX-ITERATION-LIVE-SOURCES.md)、[输入标注/自动任务/循环匹配](LINUX-ITERATION-ANNOTATIONS.md)。下方保留原始审计结果，不应将其中已经由后续提交实现的功能继续当作当前缺失，也不应将局部实现提升为整行完整对齐。
+
 上游固定为 ScreenToGif 2.43.2、`a4d0a67c2131cd048ceec86cd40afc2f1a06f2fd`。本次重新核对了该提交的 `Editor.xaml`、`Editor.xaml.cs`、`NewRecorder.xaml`、`NewRecorder.xaml.cs`、`Commands.cs`、`CaptureFrequencies.cs` 与设置/导出模型，并核对本仓库 Rust 实际调用路径。本次为只读代码审计，没有运行新的桌面实机验收。测试文件存在、测试通过、真实桌面可用是三种不同证据。
 
 ## 状态口径

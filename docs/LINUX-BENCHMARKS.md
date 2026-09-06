@@ -105,3 +105,23 @@ capture rate: generation was unpaced, timestamps were synthetic, and GIF
 encoding, compositor interaction, dropped-frame telemetry, cold-cache disk
 performance, and long-duration recording were outside the measurement.
 The 1080p/4K sustained native release gates above remain open.
+
+## 2026-09-06 — metadata-path regression repeat
+
+After adding input/cursor metadata persistence and private project creation,
+the same 1,000-frame 720p sink-only test above passed again:
+
+- Asset bytes: `3,686,400,000`; replayed records: `976`.
+- Persist: `7.568512434s`; reopen: `1.180074418s`; verify all digests: `690.037424ms`.
+- VmHWM: `5,572 KiB` baseline, `27,592 KiB` after capture, `28,696 KiB` final.
+- Whole test including cleanup: `9.78s`.
+
+The separate 10,000-frame small-pixel durability preflight also passed again:
+append plus duration correction took `21.688927133s`, recovery replayed `545`
+tail records, and the complete test took `28.85s`.
+
+Every generated asset and the temporary project were removed by the test;
+they are reproducible test data, not user recordings. These observations
+confirm the metadata changes did not accidentally reintroduce a retained
+full-animation pixel list in this path. They remain sink-only measurements,
+not a native capture throughput or zero-regression guarantee.

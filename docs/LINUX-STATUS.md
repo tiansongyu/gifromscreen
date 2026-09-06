@@ -67,7 +67,13 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [x] Return to an already-open editor from the launcher; pause preview when leaving the editor.
 - [x] Record a drawing board using pen/highlighter/eraser, automatic or completed-stroke sampling, pause/resume, stop/save, and explicit discard.
 - [x] Enumerate Linux V4L2 cameras and provide opt-in preview, recording, pause/resume, stop/save, and discard (simulated-source acceptance; physical cameras still need verification).
-- [x] Bake rectangular Cinemagraph motion regions and append Smooth-loop crossfades in an exclusive background edit with exact undo/redo.
+- [x] Bake rectangular Cinemagraph motion regions and optional loop crossfades in an exclusive background edit with exact undo/redo.
+- [x] Match upstream Smooth Loop's exact-pixel similarity, skip threshold and search direction; trim after the first qualifying candidate, preserving no-op history.
+- [x] Capture opt-in X11 physical key/button events and editable cursor images; preserve the active capture clock, moving origin and metadata in incremental and batch projects.
+- [x] Show paused only after the capture backend acknowledges pause; stop the input listener during pause and after recording.
+- [x] Author/re-edit durable progress, key, click and cursor annotations; preserve selection gaps, original capture timing and exact cursor frame transforms.
+- [x] Persist ordered automatic editing presets; trigger only on eligible new projects, await startup settings, report task outcomes, and undo a whole chain atomically.
+- [x] Create new project directories and metadata/assets with owner-only Unix permissions; leave existing opened-file permissions unchanged.
 - [x] Save an independently identified project copy without switching the current editor, and retain a bounded recent-project list.
 - [x] Build and verify an Ubuntu-22-compatible x86_64 portable tarball with exact-file installation, checksums, license notices, and CI artifacts.
 
@@ -82,6 +88,8 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [ ] Long-recording frame-store benchmark.
 - [x] Initial GIF timing, loop, transparency, delta and disposal round-trip corpus.
 - [x] 50,000-frame virtualized timeline prototype.
+
+The next reproducible compositor check is the [isolated nested GNOME plan](WAYLAND-NESTED-QA-PLAN.md). It is not yet executed and cannot replace the physical GNOME/KDE gates above.
 
 ### M1 — usable alpha
 
@@ -109,9 +117,9 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [x] Palette, dithering, transparency, and delta-frame controls.
 - [x] PNG/JPEG/BMP/WebP/GIF import.
 - [x] Bounded multi-entry frame clipboard history and project statistics.
-- [ ] Reusable editing/export presets.
+- [x] Reusable editing/export presets.
 
-Export presets are implemented; reusable editing-action presets/automatic tasks remain pending.
+Export presets and the six upstream automatic-task classes are implemented. Annotation parameter parity is still partial; see [annotation limits](ANNOTATIONS.md) and [automatic tasks](AUTOMATIC-TASKS.md).
 
 ### M3 — complete content sources
 
@@ -120,9 +128,11 @@ Export presets are implemented; reusable editing-action presets/automatic tasks 
 - [x] Drawing-board recorder, including native pointer-drawing acceptance.
 - [x] Insert recording/media into an existing project via its saved .gfsproj (same canvas, 1,000 source frames, 512 MiB referenced raster budget).
 - [x] Video import (local whitelisted formats through system FFmpeg; bounded duration and disk usage).
-- [ ] Cursor, keyboard, and mouse-event metadata with capability fallbacks.
-- [x] Rectangular baked Cinemagraph and baked Smooth Loop, with limits and undo/redo.
-- [ ] Freeform Cinemagraph masks, progress overlays, and automatic tasks.
+- [x] X11 cursor, physical keyboard, and mouse-button metadata with manual annotation fallbacks for unsupported backends.
+- [ ] Complete keyboard layout/repeat and Wayland cursor-metadata coverage, with real-desktop acceptance.
+- [x] Rectangular baked Cinemagraph, optional loop crossfade and upstream-style Smooth Loop search, with limits and undo/redo.
+- [x] Basic progress overlays and the six upstream automatic-task classes.
+- [ ] Freeform Cinemagraph masks and remaining progress/text parameter parity.
 
 ### M4 — Linux release
 
