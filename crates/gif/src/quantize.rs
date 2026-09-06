@@ -2,6 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{CancellationToken, QuantizationError, RgbaFrame};
 
+mod streaming;
+pub use streaming::GlobalPaletteBuilder;
+
 const HISTOGRAM_CHANNEL_BITS: usize = 5;
 const HISTOGRAM_CHANNEL_SIZE: usize = 1 << HISTOGRAM_CHANNEL_BITS;
 const HISTOGRAM_LEN: usize =
@@ -1080,6 +1083,14 @@ fn make_neuquant_palette(
     cancellation: &dyn CancellationToken,
 ) -> Result<ColorPalette, QuantizationError> {
     let input = collect_neuquant_input(frames, settings, cancellation)?;
+    make_neuquant_palette_from_input(input, settings, cancellation)
+}
+
+fn make_neuquant_palette_from_input(
+    input: NeuQuantInput,
+    settings: QuantizationSettings,
+    cancellation: &dyn CancellationToken,
+) -> Result<ColorPalette, QuantizationError> {
     if let Some(colors) = input.exact_colors {
         return finish_palette(colors, input.has_transparency);
     }
@@ -1156,13 +1167,13 @@ impl FrameQuantizer for MedianCutQuantizer {
         cancellation: &dyn CancellationToken,
     ) -> Result<ColorPalette, QuantizationError> {
         let (histogram, has_transparency) = build_rgb_histogram(frames, settings, cancellation)?;
-
-        let points = histogram_points(&histogram);
-        let opaque_limit = opaque_color_limit(settings.max_colors, has_transparency);
-        let mut opaque_palette = make_palette(&points, opaque_limit, cancellation)?;
-        opaque_palette.sort_unstable();
-
-        finish_palette(opaque_palette, has_transparency)
+        streaming::finish_rgb(
+            &histogram,
+            QuantizerStrategy::MedianCut,
+            opaque_color_limit(settings.max_colors, has_transparency),
+            has_transparency,
+            cancellation,
+        )
     }
 }
 
@@ -1210,23 +1221,13 @@ impl FrameQuantizer for MostUsedQuantizer {
         cancellation: &dyn CancellationToken,
     ) -> Result<ColorPalette, QuantizationError> {
         let (histogram, has_transparency) = build_rgb_histogram(frames, settings, cancellation)?;
-        let mut points = histogram_points(&histogram);
-        points.sort_unstable_by(|left, right| {
-            right
-                .count
-                .cmp(&left.count)
-                .then_with(|| left.rgb.cmp(&right.rgb))
-        });
-        check_now(cancellation)?;
-
-        let opaque_limit = opaque_color_limit(settings.max_colors, has_transparency);
-        let opaque_palette = points
-            .into_iter()
-            .take(opaque_limit)
-            .map(|point| point.rgb)
-            .collect();
-
-        finish_palette(opaque_palette, has_transparency)
+        streaming::finish_rgb(
+            &histogram,
+            QuantizerStrategy::MostUsed,
+            opaque_color_limit(settings.max_colors, has_transparency),
+            has_transparency,
+            cancellation,
+        )
     }
 }
 
@@ -1247,11 +1248,13 @@ impl FrameQuantizer for OctreeQuantizer {
         cancellation: &dyn CancellationToken,
     ) -> Result<ColorPalette, QuantizationError> {
         let (histogram, has_transparency) = build_rgb_histogram(frames, settings, cancellation)?;
-        let opaque_limit = opaque_color_limit(settings.max_colors, has_transparency);
-        let nodes = build_octree(&histogram, cancellation)?;
-        let opaque_palette = reduce_octree(&nodes, opaque_limit, cancellation)?;
-
-        finish_palette(opaque_palette, has_transparency)
+        streaming::finish_rgb(
+            &histogram,
+            QuantizerStrategy::Octree,
+            opaque_color_limit(settings.max_colors, has_transparency),
+            has_transparency,
+            cancellation,
+        )
     }
 }
 
@@ -1272,9 +1275,13 @@ impl FrameQuantizer for WuQuantizer {
         cancellation: &dyn CancellationToken,
     ) -> Result<ColorPalette, QuantizationError> {
         let (histogram, has_transparency) = build_rgb_histogram(frames, settings, cancellation)?;
-        let opaque_limit = opaque_color_limit(settings.max_colors, has_transparency);
-        let opaque_palette = make_wu_palette(&histogram, opaque_limit, cancellation)?;
-        finish_palette(opaque_palette, has_transparency)
+        streaming::finish_rgb(
+            &histogram,
+            QuantizerStrategy::Wu,
+            opaque_color_limit(settings.max_colors, has_transparency),
+            has_transparency,
+            cancellation,
+        )
     }
 }
 

@@ -32,7 +32,8 @@ pub enum PaletteMode {
     #[default]
     LocalPerFrame,
     /// Analyze all retained frames and write one GIF global color table.
-    /// This mode buffers frames up to `EncodeOptions::global_palette_buffer_limit_bytes`.
+    /// One-shot sources buffer up to `EncodeOptions::global_palette_buffer_limit_bytes`.
+    /// A precomputed global palette allows bounded streaming instead.
     Global,
 }
 
@@ -74,7 +75,9 @@ pub struct EncodeOptions {
     pub quantizer: QuantizerStrategy,
     pub delta_mode: DeltaMode,
     pub dither: DitherMode,
-    /// Maximum RGBA pixel bytes retained while planning a global palette.
+    /// Maximum RGBA pixel bytes retained by a one-shot global encoder source.
+    /// Precomputed palettes and replay-based project exports do not use this
+    /// full-sequence buffer; their analysis workspaces are independently bounded.
     pub global_palette_buffer_limit_bytes: u64,
 }
 
@@ -95,7 +98,12 @@ impl Default for EncodeOptions {
 }
 
 impl EncodeOptions {
-    fn validate(&self) -> Result<(), GifEncodeError> {
+    /// Validates color and loop settings before rendering or analysis starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-color-count or invalid-repeat-count error.
+    pub fn validate(&self) -> Result<(), GifEncodeError> {
         if !(2..=256).contains(&self.max_colors) {
             return Err(GifEncodeError::InvalidColorCount(self.max_colors));
         }
@@ -135,6 +143,7 @@ pub trait GifEncoder: Send + Sync {
 #[derive(Default)]
 pub struct BuiltinGifEncoder {
     custom_quantizer: Option<Box<dyn FrameQuantizer>>,
+    prepared_global_palette: Option<ColorPalette>,
 }
 
 impl std::fmt::Debug for BuiltinGifEncoder {
@@ -159,6 +168,17 @@ impl BuiltinGifEncoder {
     pub fn new(quantizer: Box<dyn FrameQuantizer>) -> Self {
         Self {
             custom_quantizer: Some(quantizer),
+            prepared_global_palette: None,
+        }
+    }
+
+    /// Uses a precomputed global table and streams source frames without the
+    /// one-shot global RGBA buffer. The caller is responsible for analyzing an
+    /// identical immutable sequence. Local mode retains its normal behavior.
+    pub fn with_global_palette(palette: ColorPalette) -> Self {
+        Self {
+            custom_quantizer: None,
+            prepared_global_palette: Some(palette),
         }
     }
 
@@ -186,7 +206,7 @@ impl BuiltinGifEncoder {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn encode_local(
+    fn encode_streaming(
         &self,
         source: &mut dyn RgbaFrameSource,
         output: &mut dyn Write,
@@ -195,7 +215,11 @@ impl BuiltinGifEncoder {
         progress: &mut dyn ProgressSink,
         mut report: EncodeReport,
         total_frames_hint: Option<u64>,
+        global_palette: Option<&ColorPalette>,
     ) -> Result<EncodeReport, GifEncodeError> {
+        if let Some(palette) = global_palette {
+            validate_palette_limit(palette, options.max_colors)?;
+        }
         let first = read_frame(
             source,
             cancellation,
@@ -207,7 +231,17 @@ impl BuiltinGifEncoder {
         let width = first.width();
         let height = first.height();
         let loop_first = first.clone();
-        let mut writer = gif::Encoder::new(output, width, height, &[])?;
+        let mut writer = gif::Encoder::new(
+            output,
+            width,
+            height,
+            global_palette.map_or(&[], ColorPalette::colors),
+        )?;
+        let storage = if global_palette.is_some() {
+            PaletteStorage::Global
+        } else {
+            PaletteStorage::Local
+        };
         configure_loop(&mut writer, options.loop_behavior)?;
 
         let mut timing = GifTimingQuantizer::new();
@@ -236,8 +270,7 @@ impl BuiltinGifEncoder {
                 &frame,
                 alpha_threshold(options.transparency),
             );
-            let prepared = prepare_local_frame(
-                self.quantizer(options),
+            let prepared = self.prepare_streaming_frame(
                 &pending,
                 options,
                 clear_after,
@@ -245,6 +278,7 @@ impl BuiltinGifEncoder {
                 progress,
                 report,
                 total_frames_hint,
+                global_palette,
             )?;
             let target = prepared.target_rgba.clone();
             write_prepared_frame(
@@ -260,7 +294,7 @@ impl BuiltinGifEncoder {
                 &mut report,
                 total_frames_hint,
                 &mut timing,
-                PaletteStorage::Local,
+                storage,
             )?;
             previous_target = Some(target);
             force_full = clear_after;
@@ -271,8 +305,7 @@ impl BuiltinGifEncoder {
         let clear_after = loop_next.is_some_and(|next| {
             transition_needs_background_clear(&pending, next, alpha_threshold(options.transparency))
         });
-        let prepared = prepare_local_frame(
-            self.quantizer(options),
+        let prepared = self.prepare_streaming_frame(
             &pending,
             options,
             clear_after,
@@ -280,6 +313,7 @@ impl BuiltinGifEncoder {
             progress,
             report,
             total_frames_hint,
+            global_palette,
         )?;
         write_prepared_frame(
             &mut writer,
@@ -294,7 +328,7 @@ impl BuiltinGifEncoder {
             &mut report,
             total_frames_hint,
             &mut timing,
-            PaletteStorage::Local,
+            storage,
         )?;
         finish(
             writer,
@@ -304,6 +338,42 @@ impl BuiltinGifEncoder {
             progress,
             total_frames_hint,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_streaming_frame(
+        &self,
+        frame: &RgbaFrame,
+        options: &EncodeOptions,
+        reserve_transparency: bool,
+        cancellation: &dyn CancellationToken,
+        progress: &mut dyn ProgressSink,
+        report: EncodeReport,
+        total_frames_hint: Option<u64>,
+        global_palette: Option<&ColorPalette>,
+    ) -> Result<PreparedFrame, GifEncodeError> {
+        if let Some(palette) = global_palette {
+            prepare_global_frame(
+                frame,
+                palette,
+                options,
+                cancellation,
+                progress,
+                report,
+                total_frames_hint,
+            )
+        } else {
+            prepare_local_frame(
+                self.quantizer(options),
+                frame,
+                options,
+                reserve_transparency,
+                cancellation,
+                progress,
+                report,
+                total_frames_hint,
+            )
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -421,7 +491,7 @@ impl GifEncoder for BuiltinGifEncoder {
         let report = EncodeReport::default();
         report_progress(progress, EncodePhase::Reading, report, total_frames_hint);
         match options.palette_mode {
-            PaletteMode::LocalPerFrame => self.encode_local(
+            PaletteMode::LocalPerFrame => self.encode_streaming(
                 source,
                 output,
                 options,
@@ -429,6 +499,17 @@ impl GifEncoder for BuiltinGifEncoder {
                 progress,
                 report,
                 total_frames_hint,
+                None,
+            ),
+            PaletteMode::Global if self.prepared_global_palette.is_some() => self.encode_streaming(
+                source,
+                output,
+                options,
+                cancellation,
+                progress,
+                report,
+                total_frames_hint,
+                self.prepared_global_palette.as_ref(),
             ),
             PaletteMode::Global => self.encode_global(
                 source,

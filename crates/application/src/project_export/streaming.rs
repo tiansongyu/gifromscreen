@@ -4,8 +4,9 @@ use std::{collections::BTreeMap, path::Path};
 
 use gif_from_screen_domain::{FrameClip, TimeUs};
 use gif_from_screen_gif::{
-    CancellationToken as GifCancellationToken, EncodeReport, FrameSourceError, RgbaFrame,
-    RgbaFrameSource, Transparency,
+    BuiltinGifEncoder, CancellationToken as GifCancellationToken, ColorPalette, EncodeReport,
+    FrameSourceError, GifEncodeError, GlobalPaletteBuilder, PaletteMode, QuantizationError,
+    QuantizationSettings, RgbaFrame, RgbaFrameSource, Transparency,
 };
 use gif_from_screen_render::{CpuRenderer, RenderLimits, RgbaSurface, render_transition};
 
@@ -21,7 +22,7 @@ use crate::{PresentationPlan, transition_step_progress};
     clippy::too_many_arguments,
     reason = "the immutable render plan and atomic output context remain explicit"
 )]
-pub(super) fn encode_local(
+pub(super) fn encode(
     snapshot: &ProjectExportSnapshot,
     clips: &[FrameClip],
     frame_times: &[TimeUs],
@@ -33,23 +34,26 @@ pub(super) fn encode_local(
 ) -> Result<(EncodeReport, u64), ProjectGifExportError> {
     // Palette shape is validated up front; missing transparency is checked on
     // each rendered frame so custom palettes also remain genuinely streaming.
-    let encoder = encoder_for_options(options, &[], execution.cancellation)?;
-    let mut source = RenderedFrameSource {
+    let mut encoder = encoder_for_options(options, &[], execution.cancellation)?;
+    options
+        .encoding
+        .validate()
+        .map_err(|source| ProjectGifExportError::Encode { source })?;
+    let mut source = RenderedFrameSource::new(
         snapshot,
         clips,
         frame_times,
         presentation,
         options,
-        cancellation: execution.cancellation,
-        cached: BTreeMap::new(),
-        next_time_us: 0,
-        frames_rendered: 0,
-        prefetched: None,
-        failure: None,
-    };
+        execution.cancellation,
+    );
+    if options.encoding.palette_mode == PaletteMode::Global {
+        encoder = BuiltinGifEncoder::with_global_palette(analyze_global(&mut source, execution)?);
+        source.rewind();
+    }
     execution.report_phase(ProjectExportPhase::Rendering);
     source.prefetched = source.render_next()?;
-    execution.state.frames_rendered = source.frames_rendered;
+    execution.state.frames_rendered = execution.state.frames_rendered.max(source.frames_rendered);
     execution.progress.report(execution.state);
     let result = encode_source_and_commit(
         &encoder,
@@ -63,6 +67,90 @@ pub(super) fn encode_local(
     // Preserve application-level asset/geometry errors instead of flattening
     // them into the encoder's object-safe frame-source error boundary.
     source.failure.take().map_or(result, Err)
+}
+
+fn analyze_global(
+    source: &mut RenderedFrameSource<'_>,
+    execution: &mut ExportExecution<'_>,
+) -> Result<ColorPalette, ProjectGifExportError> {
+    let settings = QuantizationSettings {
+        max_colors: source.options.encoding.max_colors,
+        alpha_threshold: match source.options.encoding.transparency {
+            Transparency::Opaque => None,
+            Transparency::AlphaThreshold(threshold) => Some(threshold),
+        },
+        reserve_transparency: false,
+    };
+    let mut builder = if let Some(palette) = &source.options.custom_palette {
+        let palette = ColorPalette::new(palette.packed_rgb().to_vec(), palette.transparent_index())
+            .map_err(palette_error)?;
+        GlobalPaletteBuilder::from_palette(palette, settings)
+    } else {
+        GlobalPaletteBuilder::new(source.options.encoding.quantizer, settings)
+    }
+    .map_err(palette_error)?;
+    execution.report_phase(ProjectExportPhase::AnalyzingPalette);
+    loop {
+        analyze_pass(source, &mut builder, execution)?;
+        if let Some(palette) = builder
+            .finish_pass(execution.cancellation)
+            .map_err(palette_error)?
+        {
+            return Ok(palette);
+        }
+        // NeuQuant needs a count before it can choose the exact old sample
+        // positions. The extra pass is explicit; logical frame counts stay N.
+        execution.report_phase(ProjectExportPhase::SamplingPalette);
+        source.rewind();
+    }
+}
+
+fn analyze_pass(
+    source: &mut RenderedFrameSource<'_>,
+    builder: &mut GlobalPaletteBuilder,
+    execution: &mut ExportExecution<'_>,
+) -> Result<(), ProjectGifExportError> {
+    let mut previous: Option<RgbaFrame> = None;
+    while let Some(frame) = source.render_next()? {
+        if let Some(previous) = &previous {
+            if frame.width() != previous.width() || frame.height() != previous.height() {
+                return Err(ProjectGifExportError::Encode {
+                    source: GifEncodeError::DimensionMismatch {
+                        frame_index: source.frames_rendered - 1,
+                        expected_width: previous.width(),
+                        expected_height: previous.height(),
+                        actual_width: frame.width(),
+                        actual_height: frame.height(),
+                    },
+                });
+            }
+            if source.options.encoding.merge_duplicate_frames && frame.pixels() == previous.pixels()
+            {
+                execution.state.frames_rendered =
+                    execution.state.frames_rendered.max(source.frames_rendered);
+                execution.progress.report(execution.state);
+                continue;
+            }
+        }
+        builder
+            .push_frame(&frame, execution.cancellation)
+            .map_err(palette_error)?;
+        previous = Some(frame);
+        execution.state.frames_rendered =
+            execution.state.frames_rendered.max(source.frames_rendered);
+        execution.progress.report(execution.state);
+    }
+    Ok(())
+}
+
+fn palette_error(source: QuantizationError) -> ProjectGifExportError {
+    if source == QuantizationError::Cancelled {
+        ProjectGifExportError::Cancelled
+    } else {
+        ProjectGifExportError::Encode {
+            source: GifEncodeError::Quantization(source),
+        }
+    }
 }
 
 /// Reconstructing this source from the immutable plan is a deterministic replay.
@@ -101,7 +189,38 @@ impl RgbaFrameSource for RenderedFrameSource<'_> {
     }
 }
 
-impl RenderedFrameSource<'_> {
+impl<'a> RenderedFrameSource<'a> {
+    fn new(
+        snapshot: &'a ProjectExportSnapshot,
+        clips: &'a [FrameClip],
+        frame_times: &'a [TimeUs],
+        presentation: &'a PresentationPlan,
+        options: &'a ProjectGifExportOptions,
+        cancellation: &'a dyn GifCancellationToken,
+    ) -> Self {
+        Self {
+            snapshot,
+            clips,
+            frame_times,
+            presentation,
+            options,
+            cancellation,
+            cached: BTreeMap::new(),
+            next_time_us: 0,
+            frames_rendered: 0,
+            prefetched: None,
+            failure: None,
+        }
+    }
+
+    fn rewind(&mut self) {
+        self.cached.clear();
+        self.next_time_us = 0;
+        self.frames_rendered = 0;
+        self.prefetched = None;
+        self.failure = None;
+    }
+
     fn render_next(&mut self) -> Result<Option<RgbaFrame>, ProjectGifExportError> {
         ensure_not_cancelled(self.cancellation)?;
         let Some(sample) = self.presentation.sample_at_us(self.next_time_us) else {

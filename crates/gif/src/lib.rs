@@ -32,9 +32,9 @@ pub use encoder::{
 pub use error::{FrameError, FrameSourceError, GifEncodeError, QuantizationError};
 pub use frame::{DirtyRect, RgbaFrame};
 pub use quantize::{
-    ColorPalette, DitherMode, FixedPaletteQuantizer, FrameQuantizer, GrayscaleQuantizer,
-    IndexedFrame, MedianCutQuantizer, MostUsedQuantizer, NeuQuantQuantizer, OctreeQuantizer,
-    PredefinedPalette, QuantizationSettings, QuantizerStrategy, WuQuantizer,
+    ColorPalette, DitherMode, FixedPaletteQuantizer, FrameQuantizer, GlobalPaletteBuilder,
+    GrayscaleQuantizer, IndexedFrame, MedianCutQuantizer, MostUsedQuantizer, NeuQuantQuantizer,
+    OctreeQuantizer, PredefinedPalette, QuantizationSettings, QuantizerStrategy, WuQuantizer,
 };
 pub use source::{IteratorFrameSource, RgbaFrameSource};
 pub use timing::{GIF_TICK_US, GifTimingQuantizer};

@@ -4,29 +4,35 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use gif_from_screen_domain::{
-    AssetId, AssetKind, FrameClip, FrameId, OverlayId, OverlayTrack, ProjectId, ProjectManifest,
-    ProjectRevision, RasterEncoding, TimeUs, Transition, TransitionId,
+    AssetId, AssetKind, FrameClip, FrameId, OverlayId, ProjectId, ProjectManifest, ProjectRevision,
+    RasterEncoding, TimeUs, Transition, TransitionId,
 };
 use gif_from_screen_gif::{
     BuiltinGifEncoder, CancellationToken as GifCancellationToken, EncodeOptions, EncodeProgress,
-    EncodeReport, FixedPaletteQuantizer, FrameError, GifEncodeError, GifEncoder,
-    IteratorFrameSource, PaletteMode, ProgressSink, QuantizationError, RgbaFrame, RgbaFrameSource,
-    Transparency,
+    EncodeReport, FixedPaletteQuantizer, FrameError, GifEncodeError, GifEncoder, ProgressSink,
+    QuantizationError, RgbaFrame, RgbaFrameSource, Transparency,
 };
 use gif_from_screen_project::{ActiveProject, AssetStore, ProjectError};
 use gif_from_screen_render::{
-    AssetProviderError, CancellationToken as RenderCancellationToken, CpuRenderer,
-    FrameAssetProvider, RenderError, RenderLimits, RgbaSurface, SurfaceError,
-    active_raster_overlay_assets, render_transition,
+    AssetProviderError, CancellationToken as RenderCancellationToken, FrameAssetProvider,
+    RenderError, RgbaSurface, SurfaceError, active_raster_overlay_assets,
 };
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
 mod streaming;
 
+use crate::PresentationPlan;
 #[cfg(test)]
 use crate::presentation_plan::expanded_frame_count;
-use crate::{PresentationPlan, transition_step_duration, transition_step_progress};
+#[cfg(test)]
+use crate::{transition_step_duration, transition_step_progress};
+#[cfg(test)]
+use gif_from_screen_domain::OverlayTrack;
+#[cfg(test)]
+use gif_from_screen_gif::IteratorFrameSource;
+#[cfg(test)]
+use gif_from_screen_render::{CpuRenderer, RenderLimits, render_transition};
 
 /// Lock-free, read-only inputs needed to export one project revision.
 ///
@@ -161,7 +167,7 @@ pub struct ProjectGifExportOptions {
     /// Whether a successfully encoded GIF may atomically replace an existing file.
     pub overwrite_existing: bool,
     /// Maximum combined source-asset and rendered-frame working set. Local
-    /// palettes stream frames, while Global currently buffers the full sequence.
+    /// palettes stream frames; Global replays bounded rendering for palette analysis.
     /// Renderer/quantizer scratch buffers are additionally bounded per buffer.
     pub render_buffer_limit_bytes: u64,
 }
@@ -184,6 +190,10 @@ impl Default for ProjectGifExportOptions {
 pub enum ProjectExportPhase {
     /// Validate selection and load immutable assets.
     Preparing,
+    /// Render one pass to collect bounded global-palette statistics.
+    AnalyzingPalette,
+    /// Replay `NeuQuant`'s exact bounded sample after counting opaque pixels.
+    SamplingPalette,
     /// Apply clip transforms and effects with the deterministic CPU renderer.
     Rendering,
     /// Quantize and encode rendered frames as GIF.
@@ -715,38 +725,16 @@ pub fn export_project_snapshot_to_gif(
     let total_frames = presentation.frame_count();
     let mut execution = ExportExecution::new(cancellation, progress, total_frames);
     execution.report_phase(ProjectExportPhase::Preparing);
-    let (encoding, bytes_written) = if options.encoding.palette_mode == PaletteMode::LocalPerFrame {
-        streaming::encode_local(
-            snapshot,
-            &clips,
-            &frame_times,
-            &presentation,
-            &output,
-            parent,
-            options,
-            &mut execution,
-        )?
-    } else {
-        let (assets, source_bytes) = load_selected_assets(
-            snapshot,
-            &clips,
-            &frame_times,
-            options.render_buffer_limit_bytes,
-            cancellation,
-        )?;
-        let provider = LoadedAssetProvider { assets };
-        let gif_frames = render_selected_frames(
-            &clips,
-            &frame_times,
-            presentation.transitions(),
-            &snapshot.manifest.timeline.overlay_tracks,
-            &provider,
-            source_bytes,
-            options.render_buffer_limit_bytes,
-            &mut execution,
-        )?;
-        encode_and_commit(gif_frames, &output, parent, options, &mut execution)?
-    };
+    let (encoding, bytes_written) = streaming::encode(
+        snapshot,
+        &clips,
+        &frame_times,
+        &presentation,
+        &output,
+        parent,
+        options,
+        &mut execution,
+    )?;
     execution.report_phase(ProjectExportPhase::Complete);
     Ok(ProjectGifExportReport {
         project_id: snapshot.manifest.project_id,
@@ -793,6 +781,7 @@ impl<'a> ExportExecution<'a> {
     clippy::too_many_lines,
     reason = "the bounded two-surface lookahead keeps output ordering and memory accounting auditable"
 )]
+#[cfg(test)]
 fn render_selected_frames(
     clips: &[FrameClip],
     frame_times: &[TimeUs],
@@ -950,6 +939,7 @@ fn surface_to_gif_frame(
     clippy::too_many_arguments,
     reason = "the helper keeps frame identity, timeline sample, provider, and cancellation context explicit"
 )]
+#[cfg(test)]
 fn render_clip_surface(
     renderer: &CpuRenderer,
     clip: &FrameClip,
@@ -1002,6 +992,7 @@ fn ensure_render_buffer(
     }
 }
 
+#[cfg(test)]
 fn append_gif_frame(
     frames: &mut Vec<RgbaFrame>,
     frame: RgbaFrame,
@@ -1025,6 +1016,7 @@ fn append_gif_frame(
     Ok(())
 }
 
+#[cfg(test)]
 fn encode_and_commit(
     gif_frames: Vec<RgbaFrame>,
     output: &Path,
@@ -1642,7 +1634,7 @@ mod tests {
         ProjectManifest, Rgba, ShapeKind, SlideDirection, StrokePoint, TimelineSpan, TrackId,
         Transition, TransitionId, TransitionKind, UnixTimeMs,
     };
-    use gif_from_screen_gif::{CancellationFlag, DitherMode, PaletteMode};
+    use gif_from_screen_gif::{CancellationFlag, DitherMode, NeverCancel, PaletteMode};
     use gif_from_screen_project::LockPolicy;
     use tempfile::tempdir;
 
@@ -3049,7 +3041,7 @@ mod tests {
     }
 
     #[test]
-    fn local_palette_streams_more_than_512_mib_of_720p_frames_under_a_12_mib_budget() {
+    fn local_and_global_stream_more_than_512_mib_of_720p_frames_under_a_12_mib_budget() {
         let directory = tempdir().unwrap();
         let pixels = [24, 96, 160, 255].repeat(1280 * 720);
         let (mut snapshot, _) = snapshot(
@@ -3075,16 +3067,77 @@ mod tests {
         assert_eq!(report.encoding.input_frames, 151);
         assert_eq!(report.encoding.duplicate_frames_merged, 150);
         assert_eq!(report.encoding.input_duration_us, 1_510_000);
-        assert_eq!(decode_rgba(&output), vec![(151, pixels)]);
+        assert_eq!(decode_rgba(&output), vec![(151, pixels.clone())]);
 
         let mut global = options;
         global.encoding.palette_mode = PaletteMode::Global;
-        let global_output = directory.path().join("global-remains-bounded.gif");
-        assert!(matches!(
-            export(&snapshot, &global_output, &global),
-            Err(ProjectGifExportError::RenderBufferLimitExceeded { .. })
-        ));
-        assert!(!global_output.exists());
+        global.encoding.global_palette_buffer_limit_bytes = 1;
+        let global_output = directory.path().join("global-streamed-720p.gif");
+        let report = export(&snapshot, &global_output, &global).unwrap();
+        assert_eq!(report.encoding.input_frames, 151);
+        assert_eq!(report.encoding.duplicate_frames_merged, 150);
+        assert_eq!(report.encoding.input_duration_us, 1_510_000);
+        assert_eq!(decode_rgba(&global_output), vec![(151, pixels)]);
+    }
+
+    #[test]
+    fn global_streams_151_nonduplicate_720p_frames_without_a_sequence_pixel_buffer() {
+        let directory = tempdir().unwrap();
+        let first_pixels = [24, 96, 160, 255].repeat(1280 * 720);
+        let second_pixels = [220, 120, 40, 255].repeat(1280 * 720);
+        let (mut snapshot, _) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(1280, 720).unwrap(),
+            &[
+                TestClip::rgba(1, &first_pixels, 10_000),
+                TestClip::rgba(2, &second_pixels, 10_000),
+            ],
+        );
+        let source_frames = snapshot.manifest.timeline.frames.clone();
+        for index in 2..151 {
+            snapshot.manifest.timeline.frames.push(FrameClip {
+                id: FrameId::from_u128(index as u128 + 1),
+                ..source_frames[index % 2].clone()
+            });
+        }
+        snapshot.manifest.validate().unwrap();
+        assert!(first_pixels.len() * 151 > 512 * 1024 * 1024);
+        let output = directory.path().join("global-alternating-720p.gif");
+        let options = ProjectGifExportOptions {
+            render_buffer_limit_bytes: 12 * 1024 * 1024,
+            encoding: EncodeOptions {
+                palette_mode: PaletteMode::Global,
+                max_colors: 2,
+                global_palette_buffer_limit_bytes: 1,
+                ..EncodeOptions::default()
+            },
+            ..ProjectGifExportOptions::default()
+        };
+        let report = export(&snapshot, &output, &options).unwrap();
+        assert_eq!(report.encoding.input_frames, 151);
+        assert_eq!(report.encoding.encoded_frames, 151);
+        assert_eq!(report.encoding.duplicate_frames_merged, 0);
+        // The test decoder must also retain only one frame, not recreate the
+        // half-gigabyte allocation this regression is intended to prevent.
+        let mut decoder_options = gif::DecodeOptions::new();
+        decoder_options.set_color_output(gif::ColorOutput::RGBA);
+        let mut decoder = decoder_options
+            .read_info(File::open(&output).unwrap())
+            .unwrap();
+        let mut count = 0;
+        while let Some(frame) = decoder.read_next_frame().unwrap() {
+            assert_eq!(frame.delay, 1);
+            assert_eq!(
+                &*frame.buffer,
+                if count % 2 == 0 {
+                    first_pixels.as_slice()
+                } else {
+                    second_pixels.as_slice()
+                }
+            );
+            count += 1;
+        }
+        assert_eq!(count, 151);
     }
 
     fn buffered_local_reference(
@@ -3176,6 +3229,191 @@ mod tests {
                 "{quantizer:?}"
             );
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture covers every quantizer and the complete byte/progress contract"
+    )]
+    fn global_replay_matches_buffered_bytes_and_report_for_all_quantizers() {
+        use gif_from_screen_gif::{DeltaMode, LoopBehavior, QuantizerStrategy};
+        let directory = tempdir().unwrap();
+        let first: Vec<u8> = (0_u8..64)
+            .flat_map(|pixel| {
+                [
+                    pixel.wrapping_mul(31),
+                    pixel.wrapping_mul(67),
+                    pixel.wrapping_mul(113),
+                    255,
+                ]
+            })
+            .collect();
+        let mut second = first.clone();
+        for (index, pixel) in second.chunks_exact_mut(4).enumerate() {
+            pixel[0] = pixel[0].wrapping_add(53);
+            if index % 7 == 0 {
+                pixel[3] = 0;
+            }
+        }
+        let (mut snapshot, _) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(8, 8).unwrap(),
+            &[
+                TestClip::rgba(1, &first, 33_333),
+                TestClip::rgba(2, &second, 20_000),
+                TestClip::rgba(3, &second, 50_000),
+                TestClip::rgba(4, &first, 10_001),
+            ],
+        );
+        add_transition(&mut snapshot, 1, 2, 31_337, 3, TransitionKind::FadeToNext);
+        for (index, quantizer) in [
+            QuantizerStrategy::MedianCut,
+            QuantizerStrategy::Grayscale,
+            QuantizerStrategy::MostUsed,
+            QuantizerStrategy::Octree,
+            QuantizerStrategy::Wu,
+            QuantizerStrategy::NeuQuant,
+            QuantizerStrategy::WebSafe216,
+            QuantizerStrategy::Monochrome,
+            QuantizerStrategy::Windows16,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (mode, (merge_duplicate_frames, loop_behavior, dither)) in [
+                (true, LoopBehavior::Finite(3), DitherMode::FloydSteinberg),
+                (false, LoopBehavior::Once, DitherMode::Bayer4x4),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let options = ProjectGifExportOptions {
+                    encoding: EncodeOptions {
+                        quantizer,
+                        palette_mode: PaletteMode::Global,
+                        merge_duplicate_frames,
+                        delta_mode: DeltaMode::ChangedRectangles,
+                        loop_behavior,
+                        dither,
+                        max_colors: if index < 6 { 8 } else { 256 },
+                        ..EncodeOptions::default()
+                    },
+                    ..ProjectGifExportOptions::default()
+                };
+                let reference = directory
+                    .path()
+                    .join(format!("global-reference-{index}-{mode}.gif"));
+                let replayed = directory
+                    .path()
+                    .join(format!("global-replayed-{index}-{mode}.gif"));
+                buffered_local_reference(&snapshot, &reference, &options);
+                let mut progress = Vec::new();
+                let report = export_project_snapshot_to_gif(
+                    &snapshot,
+                    &replayed,
+                    &options,
+                    &NeverCancel,
+                    &mut |value| progress.push(value),
+                )
+                .unwrap();
+                assert_eq!(
+                    fs::read(&replayed).unwrap(),
+                    fs::read(&reference).unwrap(),
+                    "{quantizer:?}/{mode}"
+                );
+                assert_eq!(report.encoding.input_frames, 7);
+                assert_eq!(
+                    report.encoding.duplicate_frames_merged,
+                    u64::from(merge_duplicate_frames)
+                );
+                assert!(
+                    progress
+                        .windows(2)
+                        .all(|pair| pair[0].frames_rendered <= pair[1].frames_rendered
+                            && pair[0].frames_encoded <= pair[1].frames_encoded)
+                );
+                assert!(
+                    progress
+                        .iter()
+                        .all(|value| value.frames_rendered <= value.total_frames
+                            && value.frames_encoded <= value.total_frames)
+                );
+                assert!(
+                    progress
+                        .iter()
+                        .any(|value| value.phase == ProjectExportPhase::AnalyzingPalette)
+                );
+                assert_eq!(
+                    progress
+                        .iter()
+                        .any(|value| value.phase == ProjectExportPhase::SamplingPalette),
+                    quantizer == QuantizerStrategy::NeuQuant
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_and_asset_mutation_between_global_passes_preserve_existing_output() {
+        let directory = tempdir().unwrap();
+        let (snapshot, assets) = snapshot(
+            &directory.path().join("project"),
+            PhysicalSize::new(1, 1).unwrap(),
+            &[
+                TestClip::rgba(1, &[255, 0, 0, 255], 10_000),
+                TestClip::rgba(2, &[0, 0, 255, 255], 20_000),
+            ],
+        );
+        let output = directory.path().join("preserved.gif");
+        fs::write(&output, b"existing output").unwrap();
+        let options = ProjectGifExportOptions {
+            overwrite_existing: true,
+            encoding: EncodeOptions {
+                palette_mode: PaletteMode::Global,
+                ..EncodeOptions::default()
+            },
+            ..ProjectGifExportOptions::default()
+        };
+        let flag = gif_from_screen_gif::CancellationFlag::default();
+        let cancelled = export_project_snapshot_to_gif(
+            &snapshot,
+            &output,
+            &options,
+            &flag,
+            &mut |progress: ProjectExportProgress| {
+                if progress.phase == ProjectExportPhase::AnalyzingPalette
+                    && progress.frames_rendered == progress.total_frames
+                {
+                    flag.cancel();
+                }
+            },
+        );
+        assert!(matches!(cancelled, Err(ProjectGifExportError::Cancelled)));
+        assert_eq!(fs::read(&output).unwrap(), b"existing output");
+        let mut changed = false;
+        let error = export_project_snapshot_to_gif(
+            &snapshot,
+            &output,
+            &options,
+            &NeverCancel,
+            &mut |progress: ProjectExportProgress| {
+                if !changed && progress.phase == ProjectExportPhase::Rendering {
+                    fs::write(snapshot.assets.asset_path(assets[1]), [7, 8, 9, 255]).unwrap();
+                    changed = true;
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProjectGifExportError::CorruptAsset { .. }));
+        assert_eq!(fs::read(&output).unwrap(), b"existing output");
+        assert!(!fs::read_dir(directory.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".partial")
+        }));
     }
 
     #[test]
