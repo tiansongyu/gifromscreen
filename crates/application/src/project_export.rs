@@ -3250,7 +3250,7 @@ mod tests {
             })
             .collect();
         let mut second = first.clone();
-        for (index, pixel) in second.chunks_exact_mut(4).enumerate() {
+        for (index, pixel) in second.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             pixel[0] = pixel[0].wrapping_add(53);
             if index % 7 == 0 {
                 pixel[3] = 0;
