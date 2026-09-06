@@ -1348,4 +1348,68 @@ mod tests {
         assert!(session.undo().unwrap());
         assert!(!session.undo().unwrap());
     }
+
+    #[test]
+    fn reducing_annotated_frames_retains_valid_spans_and_undo_restores_exact_tracks() {
+        use gif_from_screen_domain::{
+            BlendMode, OverlayContent, OverlayId, OverlayItem, OverlayTrack, PhysicalPoint, TimeUs,
+            TimelineSpan, TrackId,
+        };
+
+        for delay_mode in [
+            ReduceDelayMode::DontAdjust,
+            ReduceDelayMode::Previous,
+            ReduceDelayMode::Evenly,
+        ] {
+            let mut project = project_with_durations(&[100, 100, 100, 100]);
+            let asset_id = project.timeline.frames[0].asset_id;
+            project.timeline.overlay_tracks.push(OverlayTrack {
+                id: TrackId::from_u128(1),
+                name: "Selected frame watermarks".to_owned(),
+                visible: true,
+                opacity: 255,
+                blend_mode: BlendMode::Normal,
+                items: [(0, 400), (100, 200), (300, 400)]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (start, end))| OverlayItem {
+                        id: OverlayId::from_u128(index as u128 + 1),
+                        span: TimelineSpan {
+                            start: TimeUs::new(start),
+                            duration: DurationUs::new(end - start).unwrap(),
+                        },
+                        z_index: 0,
+                        content: OverlayContent::Raster {
+                            asset_id,
+                            position: PhysicalPoint::default(),
+                            size: PhysicalSize::new(2, 2).unwrap(),
+                            opacity: 255,
+                        },
+                    })
+                    .collect(),
+            });
+            let original = project.timeline.clone();
+            let command = reduce_frames(
+                &project,
+                frame_ids(&project),
+                ReduceOptions {
+                    keep_every: 2,
+                    delay_mode,
+                },
+            )
+            .unwrap();
+            let mut session = EditorSession::new(project, 10).unwrap();
+            session.execute(&command).unwrap();
+            let edited = session.project().timeline.clone();
+            assert_eq!(edited.overlay_tracks[0].items.len(), 1);
+            assert_eq!(
+                edited.overlay_tracks[0].items[0].span.end(),
+                edited.total_duration()
+            );
+            assert!(session.undo().unwrap());
+            assert_eq!(session.project().timeline, original);
+            assert!(session.redo().unwrap());
+            assert_eq!(session.project().timeline, edited);
+        }
+    }
 }

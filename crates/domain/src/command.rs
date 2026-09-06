@@ -42,6 +42,13 @@ pub enum EditCommand {
     RestoreFrames {
         frames: Vec<IndexedFrame>,
     },
+    /// Exact inverse of a frame edit that changed overlay timing. Keeping the
+    /// original spans avoids cumulative rounding during repeated undo/redo.
+    /// `edit` must be a single insert, remove, restore, replace, or duration edit.
+    RestoreFrameEdit {
+        edit: Box<EditCommand>,
+        overlay_tracks: Vec<OverlayTrack>,
+    },
     ReplaceFrame {
         frame_id: FrameId,
         replacement: FrameClip,
@@ -116,7 +123,61 @@ impl ProjectManifest {
 
 impl EditCommand {
     fn apply_inner(&self, project: &mut ProjectManifest) -> Result<Self, DomainError> {
+        if let Self::RestoreFrameEdit {
+            edit,
+            overlay_tracks,
+        } = self
+        {
+            if !edit.changes_frame_timing() {
+                return Err(DomainError::InvalidFrameEditRestore);
+            }
+            let inverse = edit.apply_without_retiming(project)?;
+            let previous =
+                std::mem::replace(&mut project.timeline.overlay_tracks, overlay_tracks.clone());
+            return Ok(Self::RestoreFrameEdit {
+                edit: Box::new(inverse),
+                overlay_tracks: previous,
+            });
+        }
+
+        if !self.changes_frame_timing() || project.timeline.overlay_tracks.is_empty() {
+            return self.apply_without_retiming(project);
+        }
+
+        let before: Vec<_> = project
+            .timeline
+            .frames
+            .iter()
+            .map(|frame| (frame.id, frame.duration))
+            .collect();
+        let inverse = self.apply_without_retiming(project)?;
+        let timing = crate::overlay_timing::FrameTimingMap::new(&before, &project.timeline.frames)?;
+        let previous = project.timeline.overlay_tracks.clone();
+        timing.retime(&mut project.timeline.overlay_tracks);
+        if project.timeline.overlay_tracks == previous {
+            Ok(inverse)
+        } else {
+            Ok(Self::RestoreFrameEdit {
+                edit: Box::new(inverse),
+                overlay_tracks: previous,
+            })
+        }
+    }
+
+    const fn changes_frame_timing(&self) -> bool {
+        matches!(
+            self,
+            Self::InsertFrames { .. }
+                | Self::RemoveFrames { .. }
+                | Self::RestoreFrames { .. }
+                | Self::ReplaceFrame { .. }
+                | Self::SetFrameDurations { .. }
+        )
+    }
+
+    fn apply_without_retiming(&self, project: &mut ProjectManifest) -> Result<Self, DomainError> {
         match self {
+            Self::RestoreFrameEdit { .. } => self.apply_inner(project),
             Self::RegisterAsset { asset } => {
                 if project.assets.contains_key(&asset.id) {
                     return Err(DomainError::DuplicateAssetId(asset.id));

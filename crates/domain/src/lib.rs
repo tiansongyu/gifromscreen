@@ -10,6 +10,7 @@ mod command;
 mod error;
 mod id;
 mod model;
+mod overlay_timing;
 mod units;
 
 pub use command::{AppliedEdit, EditCommand, FrameDurationChange, IndexedFrame};

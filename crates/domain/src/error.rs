@@ -169,6 +169,7 @@ pub enum DomainError {
     FrameIdentityMismatch { expected: FrameId, actual: FrameId },
     ReorderDoesNotMatchTimeline,
     RestoreIndexOutOfBounds { index: usize, len: usize },
+    InvalidFrameEditRestore,
     EmptyCommand,
     AssetStillReferenced(AssetId),
 }
@@ -220,6 +221,9 @@ impl fmt::Display for DomainError {
                     "restore index {index} exceeds timeline length {len}"
                 )
             }
+            Self::InvalidFrameEditRestore => formatter.write_str(
+                "frame edit restore must contain one insert, remove, restore, replace, or duration edit",
+            ),
             Self::EmptyCommand => formatter.write_str("compound edit command must not be empty"),
             Self::AssetStillReferenced(id) => write!(formatter, "asset {id} is still referenced"),
         }
