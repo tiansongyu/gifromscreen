@@ -913,7 +913,11 @@ impl eframe::App for GifFromScreenApp {
                 if self.auto_tasks.is_running() {
                     self.auto_tasks.show_running(ui);
                 } else {
-                    self.auto_tasks.show(ui, self.editor_workspace.as_ref());
+                    egui::ScrollArea::vertical()
+                        .id_salt("editing-tasks-page")
+                        .show(ui, |ui| {
+                            self.auto_tasks.show(ui, self.editor_workspace.as_ref());
+                        });
                 }
             }
             AppView::Editor => self.show_editor(ui),
@@ -1044,7 +1048,9 @@ impl GifFromScreenApp {
 
     fn handle_worker_shutdown(&mut self, context: &egui::Context) {
         if context.input(|input| input.viewport().close_requested())
-            && (self.source_workers_active() || self.project_library.is_active())
+            && (self.source_workers_active()
+                || self.project_library.is_active()
+                || self.auto_tasks.is_loading())
         {
             self.video_import.cancel();
             self.project_insert.cancel();
@@ -1056,7 +1062,10 @@ impl GifFromScreenApp {
             self.shutdown = ShutdownState::WaitingForWorkers;
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
-        if self.shutdown == ShutdownState::WaitingForWorkers && !self.source_workers_active() {
+        if self.shutdown == ShutdownState::WaitingForWorkers
+            && !self.source_workers_active()
+            && !self.auto_tasks.is_loading()
+        {
             self.project_library.shutdown();
             if self.project_library.is_active() {
                 return;

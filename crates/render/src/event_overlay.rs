@@ -185,19 +185,34 @@ fn composite_progress<P: FrameAssetProvider + ?Sized, C: CancellationToken + ?Si
             let y = i64::from(bounds.origin.y.get());
             let w = i64::from(bounds.size.width.get());
             let h = i64::from(bounds.size.height.get());
+            let extent = match direction {
+                ProgressDirection::LeftToRight | ProgressDirection::RightToLeft => {
+                    bounds.size.width.get()
+                }
+                ProgressDirection::TopToBottom | ProgressDirection::BottomToTop => {
+                    bounds.size.height.get()
+                }
+            };
+            let filled = style.as_ref().and_then(|style| style.fraction).map_or_else(
+                || {
+                    u32::try_from((u64::from(extent) * u64::from(amount)).div_ceil(1_000_000))
+                        .expect("legacy fill is bounded by extent")
+                },
+                |fraction| fraction.scaled_rounded(extent),
+            );
             scan_signed(
                 destination,
                 layer,
                 (x, y, x + w, y + h),
                 cancellation,
                 |dx, dy| {
-                    let (offset, extent) = match direction {
-                        ProgressDirection::LeftToRight => (dx - x, w),
-                        ProgressDirection::RightToLeft => (x + w - 1 - dx, w),
-                        ProgressDirection::TopToBottom => (dy - y, h),
-                        ProgressDirection::BottomToTop => (y + h - 1 - dy, h),
+                    let offset = match direction {
+                        ProgressDirection::LeftToRight => dx - x,
+                        ProgressDirection::RightToLeft => x + w - 1 - dx,
+                        ProgressDirection::TopToBottom => dy - y,
+                        ProgressDirection::BottomToTop => y + h - 1 - dy,
                     };
-                    Some(if offset * 1_000_000 < extent * i64::from(amount) {
+                    Some(if offset < i64::from(filled) {
                         *foreground
                     } else {
                         *background
@@ -272,6 +287,10 @@ mod tests {
     };
 
     fn render(content: OverlayContent) -> RgbaSurface {
+        render_size(content, PhysicalSize::new(4, 4).unwrap())
+    }
+
+    fn render_size(content: OverlayContent, size: PhysicalSize) -> RgbaSurface {
         let item = OverlayItem {
             id: OverlayId::from_u128(2),
             z_index: 0,
@@ -281,8 +300,11 @@ mod tests {
             },
             content,
         };
-        let mut destination =
-            RgbaSurface::new(PhysicalSize::new(4, 4).unwrap(), vec![0; 64]).unwrap();
+        let mut destination = RgbaSurface::new(
+            size,
+            vec![0; usize::try_from(size.area().unwrap()).unwrap() * 4],
+        )
+        .unwrap();
         let provider = |_id: AssetId| {
             RgbaSurface::new(PhysicalSize::new(2, 2).unwrap(), vec![255; 16])
                 .map_err(|e| -> crate::AssetProviderError { Box::new(e) })
@@ -328,6 +350,7 @@ mod tests {
                 show_frame_number: false,
                 style: Some(ProgressStyle {
                     amount_millionths: 500_000,
+                    fraction: None,
                     direction,
                     label: None,
                     label_position: PhysicalPoint::default(),
@@ -349,6 +372,69 @@ mod tests {
                 ProgressDirection::LeftToRight | ProgressDirection::TopToBottom
             );
             assert_eq!(output.pixels()[3] != 0, expected_first);
+        }
+    }
+
+    #[test]
+    fn exact_progress_rounds_even_while_legacy_progress_keeps_old_pixels() {
+        use gif_from_screen_domain::ProgressFraction;
+        for (width, amount, fraction, expected) in [
+            (10, 333_333, None, 4),
+            (10, 0, ProgressFraction::new(1, 3), 3),
+            (9, 166_666, ProgressFraction::new(1, 6), 2),
+            (3, 166_666, ProgressFraction::new(1, 6), 0),
+        ] {
+            for direction in [
+                ProgressDirection::LeftToRight,
+                ProgressDirection::RightToLeft,
+                ProgressDirection::TopToBottom,
+                ProgressDirection::BottomToTop,
+            ] {
+                let vertical = matches!(
+                    direction,
+                    ProgressDirection::TopToBottom | ProgressDirection::BottomToTop
+                );
+                let size = if vertical {
+                    PhysicalSize::new(1, width)
+                } else {
+                    PhysicalSize::new(width, 1)
+                }
+                .unwrap();
+                let content = OverlayContent::Progress {
+                    bounds: PhysicalRect {
+                        origin: PhysicalPoint::default(),
+                        size,
+                    },
+                    foreground: Rgba {
+                        red: 255,
+                        green: 0,
+                        blue: 0,
+                        alpha: 255,
+                    },
+                    background: Rgba::TRANSPARENT,
+                    show_frame_number: false,
+                    style: Some(ProgressStyle {
+                        amount_millionths: amount,
+                        fraction,
+                        direction,
+                        label: None,
+                        label_position: PhysicalPoint::default(),
+                        label_text: String::new(),
+                    }),
+                };
+                let output = render_size(content, size);
+                assert_eq!(
+                    output
+                        .pixels()
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .filter(|pixel| pixel[3] != 0)
+                        .count(),
+                    expected,
+                    "width={width}, direction={direction:?}, fraction={fraction:?}"
+                );
+            }
         }
     }
 

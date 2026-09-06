@@ -223,6 +223,76 @@ fn disabled_tasks_and_non_screen_input_filters_are_reported_without_inventing_ev
 }
 
 #[test]
+fn no_recorded_events_skip_unused_large_boxes_and_allow_later_tasks_to_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut current = workspace(&dir.path().join("project"));
+    let before = current.manifest().clone();
+    let mut actions = [
+        AnnotationMode::RecordedKeys,
+        AnnotationMode::RecordedClicks,
+        AnnotationMode::RecordedCursor,
+    ]
+    .into_iter()
+    .map(|mode| EditingTaskAction::Annotation {
+        request: AnnotationRequest {
+            mode,
+            ..AnnotationRequest::default()
+        },
+    })
+    .collect::<Vec<_>>();
+    actions.extend([delay(200), border()]);
+    let result = apply_task_chain(
+        &mut current,
+        &preset(actions),
+        EditTaskTrigger::ScreenRecording,
+        &AtomicBool::new(false),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(result.skipped, ["Task 1", "Task 2", "Task 3"]);
+    assert_eq!(result.completed, ["Task 4", "Task 5"]);
+    assert_eq!(
+        current.manifest().timeline.frames[0].duration.get(),
+        200_000
+    );
+    assert_eq!(current.manifest().timeline.frames[0].effects.len(), 1);
+    assert_eq!(
+        current.manifest().task_runs[0].skipped_tasks,
+        result.skipped
+    );
+    assert!(current.undo().unwrap());
+    let mut expected = before;
+    expected.revision = current.manifest().revision;
+    assert_eq!(current.manifest(), &expected);
+}
+
+#[test]
+fn an_explicit_progress_box_outside_the_canvas_is_not_silently_resized() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut current = workspace(&dir.path().join("project"));
+    let before = current.manifest().clone();
+    let chain = preset(vec![
+        delay(200),
+        EditingTaskAction::Annotation {
+            request: AnnotationRequest::default(),
+        },
+    ]);
+    let request_before = chain.clone();
+    let error = apply_task_chain(
+        &mut current,
+        &chain,
+        EditTaskTrigger::Manual,
+        &AtomicBool::new(false),
+        |_| {},
+    )
+    .unwrap_err();
+    assert!(error.contains("Task 2"));
+    assert!(error.contains("canvas"));
+    assert_eq!(chain, request_before);
+    assert_eq!(current.manifest(), &before);
+}
+
+#[test]
 fn pending_new_project_waits_for_configuration_and_background_run_keeps_undo() {
     let dir = tempfile::tempdir().unwrap();
     let settings_path = dir.path().join("tasks.json");
@@ -586,4 +656,68 @@ fn journal_failure_does_not_mutate_memory_or_allow_a_second_commit_without_recov
     .unwrap_err();
     assert!(retry.contains("previous journal write failed"), "{retry}");
     assert_eq!(current.manifest(), &before);
+}
+
+#[test]
+fn close_waits_for_an_in_flight_settings_save_before_exiting() {
+    use eframe::egui::{Context, RawInput, ViewportCommand, ViewportEvent, ViewportId};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tasks.json");
+    let mut tool = AutoTasks::new(path.clone());
+    wait_loaded(&mut tool, &mut None);
+    let mut config = tool.draft.clone();
+    config.presets.push(preset(vec![delay(123)]));
+    config.active_preset = Some("Demo".to_owned());
+    let previous = tool.snapshot.clone().unwrap();
+    let store = tool.store.clone();
+    let worker_config = config.clone();
+    let (release, wait_for_release) = std::sync::mpsc::sync_channel(1);
+    tool.settings_job
+        .start("gfs-delayed-settings-save-test", move |_| {
+            wait_for_release.recv().map_err(|error| error.to_string())?;
+            store.save(&previous, worker_config)
+        })
+        .unwrap();
+    let mut app = crate::GifFromScreenApp::default();
+    std::mem::swap(&mut app.auto_tasks, &mut tool);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.project_library.is_active() {
+        app.project_library.poll();
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    assert!(!app.source_workers_active());
+    assert!(!app.project_library.is_active());
+    let context = Context::default();
+    let mut closing = RawInput::default();
+    closing
+        .viewports
+        .entry(ViewportId::ROOT)
+        .or_default()
+        .events
+        .push(ViewportEvent::Close);
+    let output = context.run(closing, |context| app.handle_worker_shutdown(context));
+    assert!(
+        output.viewport_output[&ViewportId::ROOT]
+            .commands
+            .contains(&ViewportCommand::CancelClose)
+    );
+    assert!(
+        !output.viewport_output[&ViewportId::ROOT]
+            .commands
+            .contains(&ViewportCommand::Close)
+    );
+    assert_eq!(app.shutdown, crate::ShutdownState::WaitingForWorkers);
+    assert!(!path.exists());
+    release.send(()).unwrap();
+    wait_loaded(&mut app.auto_tasks, &mut app.editor_workspace);
+    let output = context.run(RawInput::default(), |context| {
+        app.handle_worker_shutdown(context);
+    });
+    assert!(
+        output.viewport_output[&ViewportId::ROOT]
+            .commands
+            .contains(&ViewportCommand::Close)
+    );
+    assert_eq!(AutoTaskStore::new(path).load().unwrap().config, config);
 }

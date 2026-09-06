@@ -7,10 +7,10 @@ use std::{
 
 use gif_from_screen_domain::{
     AnnotationMode, AnnotationRequest, AssetDescriptor, AssetKind, BlendMode, CaptureOrigin,
-    EditCommand, FrameClip, FrameId, HorizontalAlignment, KeyStroke, MouseButton, OverlayContent,
-    OverlayId, OverlayItem, OverlayTrack, PhysicalPoint, PhysicalPx, PhysicalRect, ProgressMeasure,
-    ProgressOptions, ProgressStyle, ProjectManifest, QuarterTurn, RasterEncoding, Rgba, TextRaster,
-    TimeUs, TimelineSpan, TrackId,
+    EditCommand, FrameClip, FrameId, HorizontalAlignment, MouseButton, OverlayContent, OverlayId,
+    OverlayItem, OverlayTrack, PhysicalPoint, PhysicalPx, PhysicalRect, ProgressFraction,
+    ProgressMeasure, ProgressOptions, ProgressStyle, ProjectManifest, QuarterTurn, RasterEncoding,
+    Rgba, TextRaster, TimeUs, TimelineSpan, TrackId,
 };
 use gif_from_screen_project::AssetStore;
 use gif_from_screen_render::RgbaSurface;
@@ -25,6 +25,10 @@ const MAX_ACTIVE_EVENTS: usize = 256;
 
 #[path = "annotation_cursor.rs"]
 mod cursor;
+
+#[path = "annotation_keys.rs"]
+mod keys;
+use keys::KeyLabelHistory;
 
 #[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct AnnotationProgress {
@@ -198,7 +202,7 @@ impl Labels<'_> {
                 font_size_px: self.request.font_size_px,
                 size: self.request.size,
                 foreground: self.request.foreground,
-                background: if matches!(self.request.mode, AnnotationMode::Progress(_)) {
+                background: if matches!(&self.request.mode, AnnotationMode::Progress(options) if options.show_bar) {
                     None
                 } else {
                     Some(self.request.background)
@@ -261,19 +265,20 @@ pub(crate) fn prepare_annotations_with_assets(
 ) -> Result<PreparedAnnotations, String> {
     check_cancelled(cancellation)?;
     manifest.validate().map_err(|error| error.to_string())?;
+    request.validate_settings()?;
+    validate_selection(manifest, selected)?;
+    if no_recorded_candidates(manifest, selected, &request.mode, cancellation)? {
+        progress(AnnotationProgress {
+            completed: selected.len(),
+            total: selected.len(),
+        });
+        return Ok(PreparedAnnotations {
+            commands: Vec::new(),
+            assets: Vec::new(),
+            frames: 0,
+        });
+    }
     request.validate(manifest.canvas.size)?;
-    if selected.is_empty() || selected.len() > MAX_FRAMES {
-        return Err("Select between 1 and 10,000 frames for annotations.".to_owned());
-    }
-    let existing: BTreeSet<_> = manifest
-        .timeline
-        .frames
-        .iter()
-        .map(|frame| frame.id)
-        .collect();
-    if !selected.is_subset(&existing) {
-        return Err("The annotation selection contains a missing frame.".to_owned());
-    }
     let total_us = manifest
         .timeline
         .total_duration()
@@ -294,7 +299,7 @@ pub(crate) fn prepare_annotations_with_assets(
     let mut start = 0_u64;
     let mut completed = 0;
     let mut affected = 0;
-    let mut recent_keys: Vec<(u64, String)> = Vec::new();
+    let mut recent_keys = KeyLabelHistory::default();
     let mut recent_clicks: Vec<(u64, MouseButton, PhysicalPoint, Option<CaptureOrigin>)> =
         Vec::new();
     let mut previous_clock = None;
@@ -356,6 +361,81 @@ pub(crate) fn prepare_annotations_with_assets(
     }
     check_cancelled(cancellation)?;
     finish_annotations(labels, items, affected)
+}
+
+fn validate_selection(
+    manifest: &ProjectManifest,
+    selected: &BTreeSet<FrameId>,
+) -> Result<(), String> {
+    if selected.is_empty() || selected.len() > MAX_FRAMES {
+        return Err("Select between 1 and 10,000 frames for annotations.".to_owned());
+    }
+    let existing: BTreeSet<_> = manifest
+        .timeline
+        .frames
+        .iter()
+        .map(|frame| frame.id)
+        .collect();
+    if !selected.is_subset(&existing) {
+        return Err("The annotation selection contains a missing frame.".to_owned());
+    }
+    Ok(())
+}
+
+/// Empty input tasks are no-ops even when their unused text box does not fit this project.
+fn no_recorded_candidates(
+    manifest: &ProjectManifest,
+    selected: &BTreeSet<FrameId>,
+    mode: &AnnotationMode,
+    cancellation: &AtomicBool,
+) -> Result<bool, String> {
+    if !matches!(
+        mode,
+        AnnotationMode::RecordedKeys
+            | AnnotationMode::RecordedClicks
+            | AnnotationMode::RecordedCursor
+    ) {
+        return Ok(false);
+    }
+    for frame in manifest
+        .timeline
+        .frames
+        .iter()
+        .filter(|frame| selected.contains(&frame.id))
+    {
+        check_cancelled(cancellation)?;
+        let metadata = &frame.capture_metadata;
+        let exists = match mode {
+            AnnotationMode::RecordedKeys => {
+                if metadata.key_strokes.len() > MAX_EVENTS_PER_FRAME {
+                    return Err("A frame has more than 512 key events.".to_owned());
+                }
+                metadata
+                    .key_strokes
+                    .iter()
+                    .any(|key| key.pressed && !key.repeat)
+            }
+            AnnotationMode::RecordedClicks => {
+                if metadata.mouse_events.len() > MAX_EVENTS_PER_FRAME {
+                    return Err("A frame has more than 512 mouse events.".to_owned());
+                }
+                metadata
+                    .mouse_events
+                    .iter()
+                    .any(|event| event.pressed && event.position.is_some())
+            }
+            AnnotationMode::RecordedCursor => {
+                metadata.cursor_visible
+                    && !metadata.cursor_embedded
+                    && metadata.cursor_position.is_some()
+            }
+            _ => false,
+        };
+        if exists {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn finish_annotations(
@@ -427,7 +507,7 @@ struct AnnotationFrame<'a> {
 fn prepare_frame(
     labels: &mut Labels<'_>,
     sample: &AnnotationFrame<'_>,
-    recent_keys: &mut Vec<(u64, String)>,
+    recent_keys: &mut KeyLabelHistory,
     recent_clicks: &mut Vec<(u64, MouseButton, PhysicalPoint, Option<CaptureOrigin>)>,
 ) -> Result<Vec<OverlayContent>, String> {
     let request = labels.request;
@@ -491,13 +571,15 @@ fn prepare_progress(
     };
     let amount = u32::try_from(u128::from(value) * 1_000_000 / u128::from(total))
         .expect("bounded progress fraction");
+    let fraction =
+        ProgressFraction::new(value, total).expect("bounded progress fraction with nonzero total");
     let text = progress_label(
         &options.format,
         index + 1,
         manifest.timeline.frames.len(),
         end,
         total_us,
-        amount,
+        fraction.scaled_rounded(1000),
     );
     let label = if text.trim().is_empty() {
         None
@@ -523,6 +605,7 @@ fn prepare_progress(
             || options.format.contains("{frames}"),
         style: Some(ProgressStyle {
             amount_millionths: amount,
+            fraction: Some(fraction),
             direction: options.direction,
             label,
             label_position: request.position,
@@ -535,39 +618,13 @@ fn prepare_progress(
 fn prepare_keys(
     labels: &mut Labels<'_>,
     sample: &AnnotationFrame<'_>,
-    recent_keys: &mut Vec<(u64, String)>,
+    recent_keys: &mut KeyLabelHistory,
     contents: &mut Vec<OverlayContent>,
 ) -> Result<(), String> {
     let frame = sample.frame;
     let clock = sample.clock;
     let request = labels.request;
-    if frame.capture_metadata.key_strokes.len() > MAX_EVENTS_PER_FRAME {
-        return Err(
-            "A frame has more than 512 key events; reduce the recording event rate.".to_owned(),
-        );
-    }
-    let oldest = clock.saturating_sub(u64::from(request.hold_ms) * 1000);
-    recent_keys.retain(|(at, _)| *at >= oldest && *at <= clock);
-    for key in &frame.capture_metadata.key_strokes {
-        if !key.pressed || key.repeat || key.at.get() > clock || key.at.get() < oldest {
-            continue;
-        }
-        let text = key_label(key);
-        if text.len() > 4096 {
-            return Err("A recorded key label exceeds 4096 bytes.".to_owned());
-        }
-        if !text.trim().is_empty() {
-            recent_keys.push((key.at.get(), text));
-        }
-    }
-    if recent_keys.len() > MAX_ACTIVE_EVENTS {
-        return Err("More than 256 simultaneous key labels; shorten the hold time.".to_owned());
-    }
-    let text = recent_keys
-        .iter()
-        .map(|(_, text)| text.as_str())
-        .collect::<Vec<_>>()
-        .join("  ");
+    let text = recent_keys.update(&frame.capture_metadata.key_strokes, clock, request.hold_ms)?;
     if !text.is_empty() {
         contents.push(OverlayContent::KeyStroke {
             text: text.clone(),
@@ -596,11 +653,10 @@ fn prepare_clicks(
     for event in &frame.capture_metadata.mouse_events {
         if event.pressed
             && event.at.get() <= clock
-            && event.at.get() >= oldest
             && let Some(position) = event.position
         {
             recent_clicks.push((
-                event.at.get(),
+                clock,
                 event.button,
                 position,
                 frame.capture_metadata.capture_origin,
@@ -674,30 +730,13 @@ fn rebase_position(
     }
 }
 
-fn key_label(key: &KeyStroke) -> String {
-    let key_text = key.display_text.as_deref().unwrap_or(&key.physical_key);
-    let mut result = String::new();
-    for (bit, name) in [(2, "Ctrl"), (4, "Alt"), (1, "Shift"), (8, "Super")] {
-        if key.modifiers & bit != 0
-            && !key_text
-                .to_ascii_lowercase()
-                .contains(&name.to_ascii_lowercase())
-        {
-            result.push_str(name);
-            result.push('+');
-        }
-    }
-    result.push_str(key_text);
-    result
-}
-
 fn progress_label(
     format: &str,
     frame: usize,
     frames: usize,
     elapsed: u64,
     total: u64,
-    amount: u32,
+    percent_tenths: u32,
 ) -> String {
     format
         .replace("{frame}", &frame.to_string())
@@ -707,7 +746,11 @@ fn progress_label(
         .replace("{remaining}", &format_time(total.saturating_sub(elapsed)))
         .replace(
             "{percent}",
-            &format!("{}.{:01}%", amount / 10_000, (amount / 1_000) % 10),
+            &if percent_tenths.is_multiple_of(10) {
+                format!("{}%", percent_tenths / 10)
+            } else {
+                format!("{}.{:01}%", percent_tenths / 10, percent_tenths % 10)
+            },
         )
 }
 
@@ -831,7 +874,7 @@ mod tests {
     use super::*;
     use gif_from_screen_domain::{
         AssetId, Canvas, CanvasBackground, CaptureMetadata, ClipTransform, ColorSpace, DurationUs,
-        MouseInputEvent, PhysicalSize, ProjectId, UnixTimeMs,
+        KeyStroke, MouseInputEvent, PhysicalSize, ProjectId, UnixTimeMs,
     };
 
     fn manifest() -> ProjectManifest {
@@ -975,9 +1018,9 @@ mod tests {
                 4,
                 1_234_000,
                 3_000_000,
-                500_000
+                500
             ),
-            "2/4 00:00:01.234 00:00:03.000 00:00:01.766 50.0%"
+            "2/4 00:00:01.234 00:00:03.000 00:00:01.766 50%"
         );
         let invalid = AnnotationRequest {
             mode: AnnotationMode::Progress(ProgressOptions {
@@ -987,6 +1030,89 @@ mod tests {
             ..AnnotationRequest::default()
         };
         assert!(invalid.validate_settings().is_err());
+    }
+
+    #[test]
+    fn text_only_progress_composites_its_semitransparent_background_once() {
+        use gif_from_screen_render::{CpuRenderer, NeverCancel};
+        let manifest = manifest();
+        let background = Rgba {
+            red: 10,
+            green: 30,
+            blue: 50,
+            alpha: 128,
+        };
+        let prepared = prepare(
+            &manifest,
+            &[1],
+            AnnotationRequest {
+                background,
+                mode: AnnotationMode::Progress(ProgressOptions {
+                    show_bar: false,
+                    format: "{percent}".to_owned(),
+                    ..ProgressOptions::default()
+                }),
+                ..AnnotationRequest::default()
+            },
+        );
+        let track = track(&prepared);
+        assert!(
+            matches!(&track.items[0].content,OverlayContent::Progress{foreground,background,style:Some(style),..} if *foreground==Rgba::TRANSPARENT&&*background==Rgba::TRANSPARENT&&style.label_text=="33.3%")
+        );
+        let source = RgbaSurface::new(manifest.canvas.size, vec![0; 240 * 40 * 4]).unwrap();
+        let label = RgbaSurface::new(
+            prepared.assets[0].0.kind.raster_size().unwrap(),
+            prepared.assets[0].1.clone(),
+        )
+        .unwrap();
+        assert_eq!(&label.pixels()[..4], &[10, 30, 50, 128]);
+        let frame = &manifest.timeline.frames[0];
+        let output = CpuRenderer::new()
+            .render_clip_with_overlays(
+                frame,
+                std::slice::from_ref(track),
+                TimeUs::ZERO,
+                &|id| {
+                    Ok(if id == frame.asset_id {
+                        source.clone()
+                    } else {
+                        label.clone()
+                    })
+                },
+                &NeverCancel,
+            )
+            .unwrap();
+        assert_eq!(&output.pixels()[..4], &[10, 30, 50, 128]);
+    }
+
+    #[test]
+    fn new_percent_labels_round_the_exact_ratio_without_editing_the_format() {
+        let manifest = manifest();
+        let request = AnnotationRequest {
+            mode: AnnotationMode::Progress(ProgressOptions {
+                format: "{frame}/{frames} {percent}".to_owned(),
+                ..ProgressOptions::default()
+            }),
+            ..AnnotationRequest::default()
+        };
+        let prepared = prepare(&manifest, &[1, 2, 3], request.clone());
+        let labels: Vec<_> = track(&prepared)
+            .items
+            .iter()
+            .map(|item| match &item.content {
+                OverlayContent::Progress {
+                    style: Some(style), ..
+                } => style.label_text.as_str(),
+                _ => panic!("progress expected"),
+            })
+            .collect();
+        assert_eq!(labels, ["1/3 33.3%", "2/3 66.7%", "3/3 100%"]);
+        assert_eq!(track(&prepared).annotation.as_ref().unwrap(), &request);
+        let with_bar = prepare(&manifest, &[1], request);
+        assert_eq!(
+            with_bar.assets[0].1[3], 0,
+            "bar background is not baked into the text twice"
+        );
     }
 
     #[test]
@@ -1371,6 +1497,122 @@ mod tests {
             })
         );
         assert!(transform_point(&manifest, &frame, PhysicalPoint::default()).is_none());
+    }
+
+    #[test]
+    fn sparse_samples_show_newly_delivered_events_then_expire_without_showing_future_events() {
+        let mut manifest = manifest();
+        for (frame, time) in manifest
+            .timeline
+            .frames
+            .iter_mut()
+            .zip([10_000_000, 10_100_000, 10_600_000])
+        {
+            frame.capture_metadata.captured_at = Some(TimeUs::new(time));
+        }
+        let first = &mut manifest.timeline.frames[0];
+        first.capture_metadata.key_strokes = [(1_000_000, "Old"), (20_000_000, "Future")]
+            .into_iter()
+            .map(|(time, text)| KeyStroke {
+                physical_key: text.to_owned(),
+                display_text: Some(text.to_owned()),
+                pressed: true,
+                at: TimeUs::new(time),
+                repeat: false,
+                modifiers: 0,
+            })
+            .collect();
+        first.capture_metadata.mouse_events = [1_000_000, 20_000_000]
+            .into_iter()
+            .map(|time| MouseInputEvent {
+                at: TimeUs::new(time),
+                button: MouseButton::Left,
+                pressed: true,
+                position: Some(PhysicalPoint::default()),
+            })
+            .collect();
+        for mode in [AnnotationMode::RecordedKeys, AnnotationMode::RecordedClicks] {
+            let prepared = prepare(
+                &manifest,
+                &[1, 2, 3],
+                AnnotationRequest {
+                    mode,
+                    hold_ms: 500,
+                    ..AnnotationRequest::default()
+                },
+            );
+            assert_eq!(
+                track(&prepared).items.len(),
+                2,
+                "one new event in first sample, then carry-over, then expiry"
+            );
+            assert_eq!(track(&prepared).items[0].span.start.get(), 0);
+            assert_eq!(track(&prepared).items[1].span.start.get(), 100_000);
+            if let OverlayContent::KeyStroke { text, .. } = &track(&prepared).items[0].content {
+                assert_eq!(text, "Old");
+            }
+        }
+    }
+
+    #[test]
+    fn empty_recorded_tasks_skip_unused_oversized_boxes_without_loading_assets() {
+        let mut manifest = manifest();
+        manifest.canvas.size = PhysicalSize::new(100, 50).unwrap();
+        let selected = manifest
+            .timeline
+            .frames
+            .iter()
+            .map(|frame| frame.id)
+            .collect();
+        for mode in [
+            AnnotationMode::RecordedKeys,
+            AnnotationMode::RecordedClicks,
+            AnnotationMode::RecordedCursor,
+        ] {
+            let request = AnnotationRequest {
+                mode,
+                ..AnnotationRequest::default()
+            };
+            let prepared = prepare_annotations_with_assets(
+                &manifest,
+                &selected,
+                &request,
+                &AtomicBool::new(false),
+                |_| {},
+                &|_| panic!("empty annotation task must not load pixels"),
+            )
+            .unwrap();
+            assert!(prepared.commands.is_empty());
+            assert!(prepared.assets.is_empty());
+            assert_eq!(prepared.frames, 0);
+        }
+        manifest.timeline.frames[0]
+            .capture_metadata
+            .key_strokes
+            .push(KeyStroke {
+                physical_key: "C".to_owned(),
+                display_text: Some("C".to_owned()),
+                pressed: true,
+                at: TimeUs::ZERO,
+                repeat: false,
+                modifiers: 2,
+            });
+        let request = AnnotationRequest {
+            mode: AnnotationMode::RecordedKeys,
+            ..AnnotationRequest::default()
+        };
+        assert!(
+            prepare_annotations_with_assets(
+                &manifest,
+                &selected,
+                &request,
+                &AtomicBool::new(false),
+                |_| {},
+                &|_| panic!("invalid text box must fail before asset loading")
+            )
+            .unwrap_err()
+            .contains("fit inside")
+        );
     }
 
     #[test]

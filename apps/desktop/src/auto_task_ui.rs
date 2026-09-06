@@ -9,7 +9,7 @@ use crate::editor_workspace::EditorWorkspace;
 
 impl AutoTasks {
     pub(crate) fn show(&mut self, ui: &mut egui::Ui, workspace: Option<&EditorWorkspace>) {
-        egui::CollapsingHeader::new("Automatic tasks & editing presets").id_salt("automatic-editing-tasks").show(ui, |ui| {
+        egui::CollapsingHeader::new("Automatic tasks & editing presets").id_salt("automatic-editing-tasks").default_open(true).show(ui, |ui| {
             ui.label("Apply a saved, ordered editing chain after recording or import. Reuse it manually with one undo for the whole chain.");
             if self.is_loading() { ui.horizontal(|ui| { ui.spinner(); ui.label("Loading or saving editing presets…"); }); }
             if let Some(error) = &self.settings_error { ui.colored_label(ui.visuals().error_fg_color, error); }
@@ -40,7 +40,7 @@ impl AutoTasks {
                     ui.horizontal_wrapped(|ui| {
                         ui.label("After"); ui.checkbox(&mut preset.sources.screen, "Screen recording"); ui.checkbox(&mut preset.sources.camera, "Camera"); ui.checkbox(&mut preset.sources.board, "Board"); ui.checkbox(&mut preset.sources.import, "Import");
                     });
-                    ui.weak("Recorded input tasks are only automatic for screen recordings. Missing input data causes a named task error instead of inventing events.");
+                    ui.weak("Recorded input tasks are only automatic for screen recordings. Tasks with no matching events are skipped, and later tasks continue; input is never invented.");
                     let mut operation = None;
                     for (index, task) in preset.tasks.iter_mut().enumerate() {
                         ui.push_id(index, |ui| {
@@ -59,7 +59,7 @@ impl AutoTasks {
                     if let Some((index, direction)) = operation { match direction { -1 if index > 0 => preset.tasks.swap(index, index - 1), 1 if index + 1 < preset.tasks.len() => preset.tasks.swap(index, index + 1), 0 => { preset.tasks.remove(index); }, _ => {} } }
                     ui.horizontal_wrapped(|ui| {
                         egui::ComboBox::from_id_salt("new-editing-task-type").selected_text(task_label(self.new_kind)).show_ui(ui, |ui| { for kind in 0..7 { ui.selectable_value(&mut self.new_kind, kind, task_label(kind)); } });
-                        if ui.add_enabled(preset.tasks.len() < MAX_EDIT_TASKS, egui::Button::new("Add task")).clicked() { preset.tasks.push(new_task(self.new_kind)); }
+                        if ui.add_enabled(preset.tasks.len() < MAX_EDIT_TASKS, egui::Button::new("Add task")).clicked() { preset.tasks.push(new_task(self.new_kind, workspace.map(|workspace| workspace.manifest().canvas.size))); }
                     });
                     if ui.button("Delete this preset").clicked() {
                         let removed = self.draft.presets.remove(self.selected);
@@ -226,7 +226,7 @@ fn task_label(kind: usize) -> &'static str {
     }
 }
 
-fn new_task(kind: usize) -> EditingTask {
+fn new_task(kind: usize, canvas: Option<gif_from_screen_domain::PhysicalSize>) -> EditingTask {
     let color = Rgba {
         red: 0,
         green: 0,
@@ -254,6 +254,16 @@ fn new_task(kind: usize) -> EditingTask {
         },
         _ => {
             let mut request = AnnotationRequest::default();
+            if let Some(canvas) = canvas {
+                request.size = gif_from_screen_domain::PhysicalSize::new(
+                    canvas.width.get().min(request.size.width.get()),
+                    canvas.height.get().min(request.size.height.get()),
+                )
+                .expect("a project canvas and default annotation have nonzero dimensions");
+                request.font_size_px = u16::try_from(request.size.height.get())
+                    .unwrap_or(u16::MAX)
+                    .min(request.font_size_px);
+            }
             request.mode = match kind {
                 2 => AnnotationMode::RecordedClicks,
                 3 => AnnotationMode::RecordedKeys,
@@ -267,5 +277,36 @@ fn new_task(kind: usize) -> EditingTask {
         name: task_label(kind).to_owned(),
         enabled: true,
         action,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gif_from_screen_domain::PhysicalSize;
+
+    #[test]
+    fn initial_annotation_options_fit_the_open_canvas_without_mutating_saved_parameters() {
+        for size in [
+            PhysicalSize::new(1, 1).unwrap(),
+            PhysicalSize::new(100, 25).unwrap(),
+            PhysicalSize::new(640, 480).unwrap(),
+        ] {
+            for kind in [1, 2, 3, 6] {
+                let task = new_task(kind, Some(size));
+                let EditingTaskAction::Annotation { request } = task.action else {
+                    panic!("annotation task expected");
+                };
+                request.validate(size).unwrap();
+                assert!(request.size.width.get() <= size.width.get());
+                assert!(request.size.height.get() <= size.height.get());
+                assert!(u32::from(request.font_size_px) <= size.height.get());
+            }
+        }
+        let task = new_task(1, None);
+        let EditingTaskAction::Annotation { request } = task.action else {
+            panic!("annotation task expected");
+        };
+        assert_eq!(request.size, AnnotationRequest::default().size);
     }
 }

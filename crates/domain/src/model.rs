@@ -328,6 +328,9 @@ pub enum ProgressDirection {
 pub struct ProgressStyle {
     /// 0 through 1,000,000. Rendering clamps values from old or externally edited projects.
     pub amount_millionths: u32,
+    /// Authoritative exact ratio for newly authored overlays. Absence preserves legacy pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fraction: Option<crate::ProgressFraction>,
     pub direction: ProgressDirection,
     pub label: Option<TextRaster>,
     pub label_position: PhysicalPoint,

@@ -54,6 +54,17 @@ pub enum AnnotationMode {
     BuiltinCursor,
 }
 
+impl AnnotationMode {
+    /// Whether this mode actually shapes text (a bar-only progress overlay does not).
+    pub fn uses_text(&self) -> bool {
+        match self {
+            Self::Progress(options) => !options.format.trim().is_empty(),
+            Self::ManualKeys { .. } | Self::RecordedKeys => true,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AnnotationRequest {
@@ -108,7 +119,12 @@ impl AnnotationRequest {
 
     /// Check all resource and placement limits before loading fonts or writing assets.
     pub fn validate(&self, canvas: PhysicalSize) -> Result<(), String> {
-        if self.opacity == 0 || self.foreground.alpha == 0 {
+        let uses_text = self.mode.uses_text();
+        let uses_clicks = matches!(
+            self.mode,
+            AnnotationMode::ManualClick { .. } | AnnotationMode::RecordedClicks
+        );
+        if self.opacity == 0 || (uses_text || uses_clicks) && self.foreground.alpha == 0 {
             return Err("Choose a visible annotation color and opacity.".to_owned());
         }
         let uses_box = matches!(
@@ -126,29 +142,39 @@ impl AnnotationRequest {
         {
             return Err("Place the annotation inside the canvas.".to_owned());
         }
-        if self.size.validate().is_err()
-            || self.size.width.get() > 4096
-            || self.size.height.get() > 4096
-            || uses_box
-                && (u64::from(self.position.x.get()) + u64::from(self.size.width.get())
+        if uses_box
+            && (self.size.validate().is_err()
+                || self.size.width.get() > 4096
+                || self.size.height.get() > 4096
+                || (u64::from(self.position.x.get()) + u64::from(self.size.width.get())
                     > u64::from(canvas.width.get())
                     || u64::from(self.position.y.get()) + u64::from(self.size.height.get())
-                        > u64::from(canvas.height.get()))
+                        > u64::from(canvas.height.get())))
         {
             return Err(
                 "The annotation box must fit inside the canvas, up to 4096 pixels per edge."
                     .to_owned(),
             );
         }
-        if self.font_family.trim().is_empty()
-            || self.font_family.len() > 256
-            || !(1..=512).contains(&self.font_size_px)
-            || !(1..=1024).contains(&self.click_radius)
-            || !(1..=60_000).contains(&self.hold_ms)
+        if uses_text
+            && (self.font_family.trim().is_empty()
+                || self.font_family.len() > 256
+                || !(1..=512).contains(&self.font_size_px))
         {
             return Err(
-                "Check annotation font, radius (1–1024), and event hold time (1–60000 ms)."
-                    .to_owned(),
+                "Choose a font family of 1–256 bytes and a font size of 1–512 pixels.".to_owned(),
+            );
+        }
+        if uses_clicks && !(1..=1024).contains(&self.click_radius) {
+            return Err("Click radius must be between 1 and 1024 pixels.".to_owned());
+        }
+        if matches!(
+            self.mode,
+            AnnotationMode::RecordedKeys | AnnotationMode::RecordedClicks
+        ) && !(1..=60_000).contains(&self.hold_ms)
+        {
+            return Err(
+                "Recorded event hold time must be between 1 and 60000 milliseconds.".to_owned(),
             );
         }
         match &self.mode {
@@ -191,6 +217,72 @@ impl AnnotationRequest {
 mod tests {
     use super::*;
     use crate::{OverlayContent, OverlayTrack};
+
+    #[test]
+    fn cursor_validation_ignores_unused_style_but_requires_real_opacity_and_manual_position() {
+        let canvas = PhysicalSize::new(8, 8).unwrap();
+        for mode in [
+            AnnotationMode::RecordedCursor,
+            AnnotationMode::BuiltinCursor,
+        ] {
+            let mut request = AnnotationRequest {
+                mode,
+                font_family: String::new(),
+                font_size_px: 0,
+                size: PhysicalSize {
+                    width: crate::PhysicalPx::ZERO,
+                    height: crate::PhysicalPx::ZERO,
+                },
+                foreground: Rgba::TRANSPARENT,
+                click_radius: 0,
+                hold_ms: 0,
+                ..AnnotationRequest::default()
+            };
+            assert!(request.validate_settings().is_ok());
+            assert!(request.validate(canvas).is_ok());
+            request.opacity = 0;
+            assert!(request.validate(canvas).is_err());
+            request.opacity = 255;
+            request.position.x = crate::PhysicalPx::new(8);
+            assert_eq!(
+                request.validate(canvas).is_ok(),
+                matches!(request.mode, AnnotationMode::RecordedCursor)
+            );
+        }
+    }
+
+    #[test]
+    fn text_click_and_hold_fields_are_checked_only_when_consumed() {
+        let mut request = AnnotationRequest {
+            mode: AnnotationMode::ManualKeys {
+                text: "C".to_owned(),
+            },
+            font_size_px: 0,
+            click_radius: 0,
+            hold_ms: 0,
+            ..AnnotationRequest::default()
+        };
+        assert!(request.validate_settings().is_err());
+        request.font_size_px = 20;
+        assert!(request.validate_settings().is_ok());
+        request.mode = AnnotationMode::ManualClick {
+            button: MouseButton::Left,
+        };
+        request.font_family.clear();
+        assert!(request.validate_settings().is_err());
+        request.click_radius = 1;
+        assert!(request.validate_settings().is_ok());
+        request.mode = AnnotationMode::RecordedClicks;
+        assert!(request.validate_settings().is_err());
+        request.hold_ms = 1;
+        assert!(request.validate_settings().is_ok());
+        request.mode = AnnotationMode::Progress(ProgressOptions {
+            format: String::new(),
+            ..ProgressOptions::default()
+        });
+        request.foreground = Rgba::TRANSPARENT;
+        assert!(request.validate_settings().is_ok());
+    }
 
     #[test]
     fn legacy_overlay_json_keeps_its_original_meaning() {

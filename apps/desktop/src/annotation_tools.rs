@@ -187,11 +187,16 @@ pub(crate) fn show_annotation_options(ui: &mut egui::Ui, request: &mut Annotatio
                     ProgressMeasure::ElapsedTime,
                     "Elapsed time",
                 );
-                ui.checkbox(&mut options.remaining, "Count down");
+                ui.checkbox(&mut options.remaining, "Reverse bar / percent");
                 ui.checkbox(&mut options.show_bar, "Show bar");
             });
             egui::ComboBox::from_id_salt("progress-direction")
-                .selected_text(format!("{:?}", options.direction))
+                .selected_text(match options.direction {
+                    ProgressDirection::LeftToRight => "Left → right",
+                    ProgressDirection::RightToLeft => "Right → left",
+                    ProgressDirection::TopToBottom => "Top → bottom",
+                    ProgressDirection::BottomToTop => "Bottom → top",
+                })
                 .show_ui(ui, |ui| {
                     for (direction, name) in [
                         (ProgressDirection::LeftToRight, "Left → right"),
@@ -209,6 +214,7 @@ pub(crate) fn show_annotation_options(ui: &mut egui::Ui, request: &mut Annotatio
             ui.label("Label format (empty = bar only)");
             ui.add(egui::TextEdit::singleline(&mut options.format).char_limit(1024));
             ui.weak("{frame}  {frames}  {elapsed}  {total}  {remaining}  {percent}");
+            ui.weak("{remaining} shows time left. {frame} and {elapsed} always count up; reversing does not change your format.");
         }
         AnnotationMode::ManualKeys { text } => {
             ui.label("Key label (including modifiers)");
@@ -233,36 +239,60 @@ pub(crate) fn show_annotation_options(ui: &mut egui::Ui, request: &mut Annotatio
 }
 
 fn show_common_annotation_options(ui: &mut egui::Ui, request: &mut AnnotationRequest) {
+    let uses_text = request.mode.uses_text();
+    let uses_box = matches!(
+        request.mode,
+        AnnotationMode::Progress(_)
+            | AnnotationMode::ManualKeys { .. }
+            | AnnotationMode::RecordedKeys
+    );
+    let uses_clicks = matches!(
+        request.mode,
+        AnnotationMode::ManualClick { .. } | AnnotationMode::RecordedClicks
+    );
+    if uses_box
+        || matches!(
+            request.mode,
+            AnnotationMode::ManualClick { .. } | AnnotationMode::BuiltinCursor
+        )
+    {
+        ui.horizontal_wrapped(|ui| {
+            let (mut x, mut y, mut width, mut height) = (
+                request.position.x.get(),
+                request.position.y.get(),
+                request.size.width.get(),
+                request.size.height.get(),
+            );
+            ui.add(egui::DragValue::new(&mut x).prefix("X ").range(0..=16_383));
+            ui.add(egui::DragValue::new(&mut y).prefix("Y ").range(0..=16_383));
+            if uses_box {
+                ui.add(
+                    egui::DragValue::new(&mut width)
+                        .prefix("Width ")
+                        .range(1..=4096),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut height)
+                        .prefix("Height ")
+                        .range(1..=4096),
+                );
+            }
+            request.position = PhysicalPoint {
+                x: PhysicalPx::new(x),
+                y: PhysicalPx::new(y),
+            };
+            request.size = PhysicalSize::new(width, height).unwrap_or(request.size);
+        });
+    }
     ui.horizontal_wrapped(|ui| {
-        let (mut x, mut y, mut width, mut height) = (
-            request.position.x.get(),
-            request.position.y.get(),
-            request.size.width.get(),
-            request.size.height.get(),
-        );
-        ui.add(egui::DragValue::new(&mut x).prefix("X ").range(0..=16_383));
-        ui.add(egui::DragValue::new(&mut y).prefix("Y ").range(0..=16_383));
-        ui.add(
-            egui::DragValue::new(&mut width)
-                .prefix("Width ")
-                .range(1..=4096),
-        );
-        ui.add(
-            egui::DragValue::new(&mut height)
-                .prefix("Height ")
-                .range(1..=4096),
-        );
-        request.position = PhysicalPoint {
-            x: PhysicalPx::new(x),
-            y: PhysicalPx::new(y),
-        };
-        request.size = PhysicalSize::new(width, height).unwrap_or(request.size);
-    });
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Foreground");
-        edit_color(ui, &mut request.foreground);
-        ui.label("Background");
-        edit_color(ui, &mut request.background);
+        if uses_text || uses_clicks {
+            ui.label("Foreground");
+            edit_color(ui, &mut request.foreground);
+        }
+        if uses_box {
+            ui.label("Background");
+            edit_color(ui, &mut request.background);
+        }
         ui.add(
             egui::DragValue::new(&mut request.opacity)
                 .prefix("Opacity ")
@@ -274,12 +304,7 @@ fn show_common_annotation_options(ui: &mut egui::Ui, request: &mut AnnotationReq
                 .range(-1000..=1000),
         );
     });
-    if matches!(
-        request.mode,
-        AnnotationMode::ManualKeys { .. }
-            | AnnotationMode::RecordedKeys
-            | AnnotationMode::Progress(_)
-    ) {
+    if uses_text {
         ui.horizontal(|ui| {
             ui.label("Font");
             ui.add(
@@ -294,10 +319,7 @@ fn show_common_annotation_options(ui: &mut egui::Ui, request: &mut AnnotationReq
             );
         });
     }
-    if matches!(
-        request.mode,
-        AnnotationMode::ManualClick { .. } | AnnotationMode::RecordedClicks
-    ) {
+    if uses_clicks {
         ui.add(
             egui::DragValue::new(&mut request.click_radius)
                 .prefix("Click radius ")
@@ -444,6 +466,66 @@ mod tests {
             other.unwrap().manifest().project_id,
             ProjectId::from_u128(1)
         );
+    }
+
+    #[test]
+    fn cursor_forms_hide_unused_controls_and_leave_hidden_settings_unchanged() {
+        fn collect(shape: &egui::epaint::Shape, text: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(shape) => text.push(shape.galley.job.text.clone()),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for mode in [
+            AnnotationMode::RecordedCursor,
+            AnnotationMode::BuiltinCursor,
+        ] {
+            let mut request = AnnotationRequest {
+                mode,
+                foreground: Rgba::TRANSPARENT,
+                font_family: String::new(),
+                font_size_px: 0,
+                click_radius: 0,
+                hold_ms: 0,
+                size: PhysicalSize {
+                    width: PhysicalPx::ZERO,
+                    height: PhysicalPx::ZERO,
+                },
+                ..AnnotationRequest::default()
+            };
+            let before = request.clone();
+            let ctx = egui::Context::default();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| show_annotation_options(ui, &mut request));
+            });
+            let mut texts = Vec::new();
+            for shape in output.shapes {
+                collect(&shape.shape, &mut texts);
+            }
+            for label in [
+                "Foreground",
+                "Background",
+                "Font",
+                "Click radius",
+                "Hold ",
+                "Width ",
+                "Height ",
+            ] {
+                assert!(
+                    !texts
+                        .iter()
+                        .any(|text| text == label || text.starts_with(label)),
+                    "cursor mode exposed {label}: {texts:?}"
+                );
+            }
+            assert_eq!(request, before);
+        }
     }
 
     #[test]

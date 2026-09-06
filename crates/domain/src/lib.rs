@@ -14,6 +14,7 @@ mod export_preset;
 mod id;
 mod model;
 mod overlay_timing;
+mod progress_fraction;
 mod task_run;
 mod units;
 
@@ -24,6 +25,7 @@ pub use error::{DomainError, IdParseError, UnitError, ValidationIssue};
 pub use export_preset::*;
 pub use id::{AssetId, FrameId, OverlayId, ProjectId, TrackId, TransitionId};
 pub use model::*;
+pub use progress_fraction::ProgressFraction;
 pub use task_run::*;
 pub use units::*;
 
