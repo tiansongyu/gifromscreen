@@ -130,6 +130,9 @@ impl WaylandPortalCapabilities {
 /// Construction opens the D-Bus portal proxy and reads its source/cursor
 /// properties. It does not display a chooser until [`Self::start_session`].
 pub struct WaylandPortal {
+    // A proxy must never borrow ashpd's process-global connection: that connection
+    // may belong to an earlier, already-dropped capability-probe runtime.
+    portal: Screencast,
     runtime: Runtime,
     capabilities: WaylandPortalCapabilities,
 }
@@ -152,13 +155,22 @@ impl WaylandPortal {
     /// session, portal frontend, or required properties are unavailable.
     pub fn connect() -> Result<Self, CaptureError> {
         let runtime = portal_runtime()?;
-        let capabilities = runtime.block_on(async {
-            let portal = Screencast::new()
-                .await
-                .map_err(|error| map_portal_error("connect to", &error))?;
-            probe_proxy(&portal).await
-        })?;
+        let (portal, capabilities) = runtime.block_on(portal_deadline(
+            std::time::Duration::from_secs(10),
+            "connect to and probe",
+            async {
+                let connection = ashpd::zbus::Connection::session().await.map_err(|error| {
+                    map_portal_error("connect to the session bus for", &error.into())
+                })?;
+                let portal = Screencast::with_connection(connection)
+                    .await
+                    .map_err(|error| map_portal_error("connect to", &error))?;
+                let capabilities = probe_proxy(&portal).await?;
+                Ok((portal, capabilities))
+            },
+        ))?;
         Ok(Self {
+            portal,
             runtime,
             capabilities,
         })
@@ -189,10 +201,8 @@ impl WaylandPortal {
         let source_type = select_source_type(self.capabilities, source_kind)?;
         let cursor_mode = select_cursor_mode(self.capabilities, cursor)?;
         let runtime = self.runtime;
+        let portal = self.portal;
         let (portal, session, stream, remote) = runtime.block_on(async {
-            let portal = Screencast::new()
-                .await
-                .map_err(|error| map_portal_error("connect to", &error))?;
             let session = portal
                 .create_session(CreateSessionOptions::default())
                 .await
@@ -322,10 +332,11 @@ impl WaylandPortalSessionState {
 
 /// Live portal session that must outlive its `PipeWire` stream consumer.
 pub struct WaylandPortalSession {
-    runtime: Runtime,
     // Retains the D-Bus connection that owns `session`.
     _portal: Screencast,
     session: Session<Screencast>,
+    // Drop connection owners before their runtime. Close runs while all remain alive.
+    runtime: Runtime,
     stream: PortalStreamInfo,
     remote: Option<OwnedFd>,
     state: WaylandPortalSessionState,
@@ -376,10 +387,16 @@ impl WaylandPortalSession {
             return Ok(());
         }
         self.remote = None;
-        let result = self
-            .runtime
-            .block_on(self.session.close())
-            .map_err(|error| map_portal_error("close", &error));
+        let result = self.runtime.block_on(portal_deadline(
+            std::time::Duration::from_secs(5),
+            "close",
+            async {
+                self.session
+                    .close()
+                    .await
+                    .map_err(|error| map_portal_error("close", &error))
+            },
+        ));
         self.state = WaylandPortalSessionState::Closed;
         result
     }
@@ -389,6 +406,20 @@ impl Drop for WaylandPortalSession {
     fn drop(&mut self) {
         let _ = self.close();
     }
+}
+
+async fn portal_deadline<T>(
+    timeout: std::time::Duration,
+    operation: &str,
+    future: impl std::future::Future<Output = Result<T, CaptureError>>,
+) -> Result<T, CaptureError> {
+    tokio::time::timeout(timeout, future).await.map_err(|_| {
+        CaptureError::new(
+            CaptureErrorKind::BackendUnavailable,
+            format!("Timed out trying to {operation} the ScreenCast portal. Check the desktop portal service and retry."),
+            RecoveryHint::Retry,
+        )
+    })?
 }
 
 async fn probe_proxy(portal: &Screencast) -> Result<WaylandPortalCapabilities, CaptureError> {
@@ -522,6 +553,51 @@ fn map_portal_error(operation: &str, error: &PortalError) -> CaptureError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unresponsive_portal_calls_have_a_bounded_actionable_failure() {
+        let runtime = portal_runtime().unwrap();
+        let error = runtime
+            .block_on(portal_deadline(
+                std::time::Duration::from_millis(1),
+                "test an unresponsive",
+                std::future::pending::<Result<(), CaptureError>>(),
+            ))
+            .unwrap_err();
+        assert_eq!(error.kind(), CaptureErrorKind::BackendUnavailable);
+        assert_eq!(error.recovery(), RecoveryHint::Retry);
+        assert!(error.to_string().contains("Timed out"));
+        let value = runtime
+            .block_on(portal_deadline(
+                std::time::Duration::from_secs(1),
+                "test a ready",
+                async { Ok(42) },
+            ))
+            .unwrap();
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated real ScreenCast portal and GFS_ISOLATED_WAYLAND_TEST=1"]
+    fn repeated_real_portal_probes_outlive_other_probe_runtimes() {
+        assert_eq!(
+            std::env::var("GFS_ISOLATED_WAYLAND_TEST").as_deref(),
+            Ok("1")
+        );
+        let mut expected = None;
+        for _ in 0..3 {
+            let earlier = WaylandPortal::connect().unwrap();
+            let later = WaylandPortal::connect().unwrap();
+            assert_eq!(earlier.capabilities(), later.capabilities());
+            if let Some(expected) = expected {
+                assert_eq!(later.capabilities(), expected);
+            }
+            expected = Some(later.capabilities());
+            // Capability discovery drops its owner before recording connects again.
+            drop(earlier);
+            drop(later);
+        }
+    }
 
     fn capabilities() -> WaylandPortalCapabilities {
         WaylandPortalCapabilities {
