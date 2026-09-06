@@ -16,7 +16,7 @@ pub(super) fn composite_event<P: FrameAssetProvider + ?Sized, C: CancellationTok
     limits: RenderLimits,
     cancellation: &C,
 ) -> Result<(), RenderError> {
-    match &layer.item.content {
+    match layer.content {
         OverlayContent::MouseClick {
             position,
             color,
@@ -53,7 +53,7 @@ pub(super) fn composite_event<P: FrameAssetProvider + ?Sized, C: CancellationTok
             limits,
             cancellation,
         ),
-        content => Err(unsupported_overlay(layer.item.id, content)),
+        content => Err(unsupported_overlay(layer.id, content)),
     }
 }
 
@@ -65,7 +65,7 @@ fn composite_cursor<P: FrameAssetProvider + ?Sized, C: CancellationToken + ?Size
     limits: RenderLimits,
     cancellation: &C,
 ) -> Result<(), RenderError> {
-    match &layer.item.content {
+    match layer.content {
         OverlayContent::Cursor {
             cursor_asset: Some(asset_id),
             position,
@@ -75,7 +75,7 @@ fn composite_cursor<P: FrameAssetProvider + ?Sized, C: CancellationToken + ?Size
                 provider
                     .load_rgba8(*asset_id)
                     .map_err(|source| RenderError::OverlayAssetLoad {
-                        overlay_id: layer.item.id,
+                        overlay_id: layer.id,
                         asset_id: *asset_id,
                         source,
                     })?;
@@ -142,7 +142,7 @@ fn composite_cursor<P: FrameAssetProvider + ?Sized, C: CancellationToken + ?Size
                 },
             )
         }
-        content => Err(unsupported_overlay(layer.item.id, content)),
+        content => Err(unsupported_overlay(layer.id, content)),
     }
 }
 
@@ -154,7 +154,7 @@ fn composite_progress<P: FrameAssetProvider + ?Sized, C: CancellationToken + ?Si
     limits: RenderLimits,
     cancellation: &C,
 ) -> Result<(), RenderError> {
-    match &layer.item.content {
+    match layer.content {
         OverlayContent::Progress {
             bounds,
             foreground,
@@ -162,22 +162,18 @@ fn composite_progress<P: FrameAssetProvider + ?Sized, C: CancellationToken + ?Si
             style,
             ..
         } => {
-            let amount = style
-                .as_ref()
-                .map_or_else(
-                    || {
-                        let elapsed = sample_time
-                            .get()
-                            .saturating_sub(layer.item.span.start.get());
-                        u32::try_from(
-                            u128::from(elapsed) * 1_000_000
-                                / u128::from(layer.item.span.duration.get()),
-                        )
-                        .unwrap_or(1_000_000)
-                    },
-                    |style| style.amount_millionths,
-                )
-                .min(1_000_000);
+            let amount = if let Some(style) = style {
+                style.amount_millionths
+            } else {
+                let span = layer.span.ok_or(RenderError::InvalidOverlayGeometry {
+                    overlay_id: layer.id,
+                    reason: "frame-owned progress requires a frozen style",
+                })?;
+                let elapsed = sample_time.get().saturating_sub(span.start.get());
+                u32::try_from(u128::from(elapsed) * 1_000_000 / u128::from(span.duration.get()))
+                    .unwrap_or(1_000_000)
+            }
+            .min(1_000_000);
             let direction = style
                 .as_ref()
                 .map_or(ProgressDirection::LeftToRight, |style| style.direction);
@@ -224,7 +220,7 @@ fn composite_progress<P: FrameAssetProvider + ?Sized, C: CancellationToken + ?Si
             {
                 composite_raster_overlay(
                     destination,
-                    layer.item.id,
+                    layer.id,
                     label.asset_id,
                     style.label_position,
                     label.size,
@@ -238,7 +234,7 @@ fn composite_progress<P: FrameAssetProvider + ?Sized, C: CancellationToken + ?Si
             }
             Ok(())
         }
-        content => Err(unsupported_overlay(layer.item.id, content)),
+        content => Err(unsupported_overlay(layer.id, content)),
     }
 }
 fn scan_signed<C: CancellationToken + ?Sized>(
@@ -312,7 +308,10 @@ mod tests {
         composite_event(
             &mut destination,
             OverlayLayer {
-                item: &item,
+                id: item.id,
+                content: &item.content,
+                span: Some(item.span),
+                z_index: item.z_index,
                 track_opacity: 255,
                 blend_mode: BlendMode::Normal,
                 track_index: 0,

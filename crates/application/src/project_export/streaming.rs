@@ -326,7 +326,9 @@ impl<'a> RenderedFrameSource<'a> {
             },
         )?;
         // Reuse the existing descriptor/digest/active-overlay checks, but load
-        // only the assets needed for this one original frame's source time.
+        // only the assets needed for this original frame's identity and source
+        // time. Transition endpoints therefore include whole-frame marks too;
+        // presentation positions never substitute for the original frame ID.
         let (assets, source_bytes) = load_selected_assets(
             self.snapshot,
             std::slice::from_ref(clip),

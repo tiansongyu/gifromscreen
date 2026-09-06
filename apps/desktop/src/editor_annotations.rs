@@ -49,6 +49,12 @@ impl EditorWorkspace {
                     })
             })
             .transpose()?;
+        if original
+            .as_ref()
+            .is_some_and(|track| track.frame_cells.is_some())
+        {
+            return Err("Frame-owned group re-authoring is not supported by this editor yet. Its saved marks, scope and settings are unchanged; create a new group instead.".to_owned());
+        }
         let coverage = original
             .as_ref()
             .map(|track| match &track.annotation_scope {
@@ -217,6 +223,72 @@ mod tests {
             .execute(EditCommand::Compound { commands })
             .unwrap();
         workspace.select_all();
+    }
+
+    #[test]
+    fn unsupported_frame_owned_reauthor_never_clears_marks_or_changes_saved_recipe() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owned-reauthor.gfsproj");
+        let mut workspace = workspace(&path);
+        let mut request = AnnotationRequest {
+            mode: AnnotationMode::ManualKeys {
+                text: "Frozen".to_owned(),
+            },
+            ..AnnotationRequest::default()
+        };
+        workspace
+            .apply_annotation_edit(
+                &workspace.project_edit_anchor(),
+                &request,
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        let mut track = workspace.manifest().timeline.overlay_tracks[0].clone();
+        track.frame_cells = Some(
+            std::mem::take(&mut track.items)
+                .into_iter()
+                .zip([1, 3])
+                .map(|(item, owner)| FrameOverlayCell {
+                    frame_id: FrameId::from_u128(owner),
+                    scopes: vec![FrameAuthoringSpan {
+                        run_id: u32::try_from(owner).unwrap(),
+                        span: FrameLocalSpan::WHOLE,
+                    }],
+                    marks: vec![FrameOverlayMark {
+                        id: item.id,
+                        z_index: item.z_index,
+                        content: item.content,
+                    }],
+                })
+                .collect(),
+        );
+        track.annotation_scope = None;
+        let track_id = track.id;
+        workspace
+            .execute(EditCommand::UpsertOverlayTrack { track })
+            .unwrap();
+        let before = workspace.manifest().clone();
+        let journal = std::fs::read(path.join("journal.ndjson")).unwrap();
+        request.opacity = 31;
+        request.mode = AnnotationMode::ManualKeys {
+            text: "Do not replace saved pixels".to_owned(),
+        };
+        let error = workspace
+            .apply_annotation_group(
+                &workspace.project_edit_anchor(),
+                &request,
+                Some(track_id),
+                &AtomicBool::new(false),
+                |_| panic!("unsupported reauthor must not start generation"),
+            )
+            .unwrap_err();
+        assert!(error.contains("re-authoring is not supported"));
+        assert_eq!(workspace.manifest(), &before);
+        assert_eq!(std::fs::read(path.join("journal.ndjson")).unwrap(), journal);
+        drop(workspace);
+        let reopened = EditorWorkspace::open(path, LockPolicy::FailIfPresent, 16).unwrap();
+        assert_eq!(reopened.manifest(), &before);
     }
 
     #[test]

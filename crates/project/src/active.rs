@@ -457,11 +457,46 @@ impl ActiveProject {
         let applied = candidate.apply_command(&command)?;
         let timeline_index = TimelineIndex::build(&candidate)?;
         let record = JournalRecord::new(applied.from_revision, applied.to_revision, command)?;
+        self.stamp_schema_upgrade(candidate.schema_version)?;
         self.append_record(&record, applied.to_revision)?;
         self.manifest = candidate;
         self.frame_positions = timeline_index.frame_positions;
         self.timeline_duration_us = timeline_index.duration_us;
         Ok(applied.into())
+    }
+
+    /// Publish the format gate before journaling any newly supported payload.
+    /// The snapshot contains only previously committed state, at the same
+    /// revision. Format upgrades are sticky even if the next edit is undone.
+    fn stamp_schema_upgrade(&mut self, version: u32) -> Result<(), ProjectError> {
+        self.stamp_schema_upgrade_with(version, write_manifest)
+    }
+
+    fn stamp_schema_upgrade_with(
+        &mut self,
+        version: u32,
+        write: impl FnOnce(&Path, &ProjectManifest) -> Result<(), ProjectError>,
+    ) -> Result<(), ProjectError> {
+        self.ensure_writable()?;
+        let previous = self.manifest.schema_version;
+        if version <= previous {
+            return Ok(());
+        }
+        let mut upgraded = self.manifest.clone();
+        upgraded.schema_version = version;
+        upgraded.validate()?;
+        if let Err(source) = write(&self.layout.manifest, &upgraded) {
+            // A rename can already have succeeded when the parent fsync fails.
+            // Never permit the old in-memory schema to overwrite that snapshot.
+            self.write_requires_recovery = true;
+            return Err(ProjectError::SchemaUpgradeFailed {
+                from_version: previous,
+                to_version: version,
+                source: Box::new(source),
+            });
+        }
+        self.manifest.schema_version = version;
+        Ok(())
     }
 
     fn ensure_writable(&self) -> Result<(), ProjectError> {
@@ -569,6 +604,10 @@ impl ActiveProject {
         Ok(issues)
     }
 }
+
+#[cfg(test)]
+#[path = "schema_migration.rs"]
+mod schema_migration;
 
 fn validate_raw_recording_asset(
     manifest: &ProjectManifest,

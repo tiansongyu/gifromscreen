@@ -322,6 +322,7 @@ impl EditorWorkspace {
         let track_id = TrackId::from_u128(Uuid::new_v4().as_u128());
         self.execute(EditCommand::UpsertOverlayTrack {
             track: OverlayTrack {
+                frame_cells: None,
                 annotation: None,
                 annotation_scope: None,
                 id: track_id,
@@ -389,6 +390,7 @@ impl EditorWorkspace {
             &[(asset.clone(), rgba)],
             vec![EditCommand::UpsertOverlayTrack {
                 track: OverlayTrack {
+                    frame_cells: None,
                     annotation: None,
                     annotation_scope: None,
                     id: track_id,

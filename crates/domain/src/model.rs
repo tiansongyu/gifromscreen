@@ -454,6 +454,9 @@ pub enum BlendMode {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OverlayTrack {
     pub id: TrackId,
+    /// Schema 2 frame-owned pixels. Absent means the unchanged legacy timed representation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_cells: Option<Vec<crate::FrameOverlayCell>>,
     /// Optional authoring recipe for a regenerable annotation group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotation: Option<crate::AnnotationRequest>,
@@ -467,6 +470,37 @@ pub struct OverlayTrack {
     pub opacity: u8,
     pub blend_mode: BlendMode,
     pub items: Vec<OverlayItem>,
+}
+
+impl OverlayTrack {
+    /// Includes hidden and zero-opacity content, for persistence and asset ownership checks.
+    pub fn all_mark_contents(&self) -> impl Iterator<Item = (OverlayId, &OverlayContent)> {
+        self.items
+            .iter()
+            .map(|item| (item.id, &item.content))
+            .chain(
+                self.frame_cells
+                    .iter()
+                    .flatten()
+                    .flat_map(|cell| &cell.marks)
+                    .map(|mark| (mark.id, &mark.content)),
+            )
+    }
+
+    pub fn referenced_assets(&self) -> impl Iterator<Item = AssetId> + '_ {
+        self.all_mark_contents()
+            .filter_map(|(_, content)| content.referenced_asset())
+    }
+
+    /// Counts authored marks without walking or cloning each mark's content.
+    pub fn mark_count(&self) -> usize {
+        self.frame_cells
+            .iter()
+            .flatten()
+            .fold(self.items.len(), |total, cell| {
+                total.saturating_add(cell.marks.len())
+            })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -621,7 +655,7 @@ impl ProjectManifest {
 
     pub fn validate(&self) -> Result<(), DomainError> {
         let mut issues = Vec::new();
-        if self.schema_version != CURRENT_SCHEMA_VERSION {
+        if !(1..=CURRENT_SCHEMA_VERSION).contains(&self.schema_version) {
             issues.push(ValidationIssue::UnsupportedSchema {
                 found: self.schema_version,
                 current: CURRENT_SCHEMA_VERSION,
@@ -740,6 +774,21 @@ impl ProjectManifest {
             }
         }
         for track in &self.timeline.overlay_tracks {
+            if track.frame_cells.is_some() && self.schema_version < 2 {
+                issues.push(ValidationIssue::InvalidFrameOverlay {
+                    track_id: track.id,
+                    reason: "Frame-owned overlays require schema 2.".to_owned(),
+                });
+            }
+            if let Err(reason) = crate::frame_overlay::validate_cells(track, &frame_ids) {
+                issues.push(ValidationIssue::InvalidFrameOverlay {
+                    track_id: track.id,
+                    reason,
+                });
+                // Do not allocate a global identity set for already rejected,
+                // unbounded frame-owned payloads.
+                continue;
+            }
             if track.id.is_nil() {
                 issues.push(ValidationIssue::NilTrackId);
             }
@@ -763,24 +812,24 @@ impl ProjectManifest {
                 }
             }
             for overlay in &track.items {
-                if overlay.id.is_nil() {
-                    issues.push(ValidationIssue::NilOverlayId);
-                }
-                if !overlay_ids.insert(overlay.id) {
-                    issues.push(ValidationIssue::DuplicateOverlayId {
-                        overlay_id: overlay.id,
-                    });
-                }
                 if overlay.span.end().is_none_or(|end| end > timeline_duration) {
                     issues.push(ValidationIssue::OverlayOutsideTimeline {
                         overlay_id: overlay.id,
                     });
                 }
-                if let Some(asset_id) = overlay.content.referenced_asset()
+            }
+            for (overlay_id, content) in track.all_mark_contents() {
+                if overlay_id.is_nil() {
+                    issues.push(ValidationIssue::NilOverlayId);
+                }
+                if !overlay_ids.insert(overlay_id) {
+                    issues.push(ValidationIssue::DuplicateOverlayId { overlay_id });
+                }
+                if let Some(asset_id) = content.referenced_asset()
                     && !self.assets.contains_key(&asset_id)
                 {
                     issues.push(ValidationIssue::MissingOverlayAsset {
-                        overlay_id: overlay.id,
+                        overlay_id,
                         asset_id,
                     });
                 }
@@ -887,12 +936,11 @@ impl ProjectManifest {
                     .effects
                     .iter()
                     .any(|effect| effect.referenced_asset() == Some(asset_id))
-        }) || self.timeline.overlay_tracks.iter().any(|track| {
-            track
-                .items
-                .iter()
-                .any(|item| item.content.referenced_asset() == Some(asset_id))
-        })
+        }) || self
+            .timeline
+            .overlay_tracks
+            .iter()
+            .any(|track| track.referenced_assets().any(|id| id == asset_id))
     }
 }
 
@@ -1100,6 +1148,8 @@ mod tests {
         let decoded: Transition = serde_json::from_value(json).unwrap();
 
         assert_eq!(decoded.steps, DEFAULT_TRANSITION_STEPS);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 1);
+        let mut old_project = manifest();
+        old_project.schema_version = 1;
+        old_project.validate().unwrap();
     }
 }

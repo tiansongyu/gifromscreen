@@ -20,6 +20,7 @@ struct FrameInterval {
 
 pub(crate) struct FrameTimingMap {
     intervals: Vec<FrameInterval>,
+    retained_frames: std::collections::BTreeSet<FrameId>,
 }
 
 impl FrameTimingMap {
@@ -55,11 +56,18 @@ impl FrameTimingMap {
             preceding_end = new_start + new_duration;
             old_start = old_end;
         }
-        Ok(Self { intervals })
+        Ok(Self {
+            intervals,
+            retained_frames: starts.into_keys().collect(),
+        })
     }
 
     pub(crate) fn retime(&self, tracks: &mut [OverlayTrack]) -> Result<(), DomainError> {
         for track in tracks {
+            if let Some(cells) = &mut track.frame_cells {
+                cells.retain(|cell| self.retained_frames.contains(&cell.frame_id));
+                continue;
+            }
             track.items.retain_mut(|item| {
                 let Some(old_end) = item.span.end() else {
                     // Compound edits can have temporarily invalid spans. Leave
@@ -177,6 +185,7 @@ mod tests {
             })
             .collect();
         project.timeline.overlay_tracks.push(OverlayTrack {
+            frame_cells: None,
             annotation: None,
             annotation_scope: None,
             id: TrackId::from_u128(1),

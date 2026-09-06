@@ -14,6 +14,7 @@ mod command;
 mod editing_task;
 mod error;
 mod export_preset;
+mod frame_overlay;
 mod id;
 mod model;
 mod overlay_timing;
@@ -33,6 +34,7 @@ pub use command::{AppliedEdit, EditCommand, FrameDurationChange, IndexedFrame};
 pub use editing_task::*;
 pub use error::{DomainError, IdParseError, UnitError, ValidationIssue};
 pub use export_preset::*;
+pub use frame_overlay::*;
 pub use id::{AssetId, CaptureClockId, FrameId, OverlayId, ProjectId, TrackId, TransitionId};
 pub use model::*;
 pub use progress_fraction::ProgressFraction;
@@ -40,4 +42,4 @@ pub use task_run::*;
 pub use units::*;
 
 /// Current on-disk manifest schema understood by this version of the domain.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;

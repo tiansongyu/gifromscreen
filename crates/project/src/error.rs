@@ -25,6 +25,11 @@ pub enum ProjectError {
         revision: ProjectRevision,
         source: Box<ProjectError>,
     },
+    SchemaUpgradeFailed {
+        from_version: u32,
+        to_version: u32,
+        source: Box<ProjectError>,
+    },
     RequiresRecovery,
     RequiresJournalRepair,
     CorruptAsset {
@@ -106,8 +111,12 @@ impl fmt::Display for ProjectError {
                     "journal commit for revision {revision} is ambiguous: {source}"
                 )
             }
+            Self::SchemaUpgradeFailed { from_version, to_version, source } => write!(
+                formatter,
+                "schema upgrade from {from_version} to {to_version} could not be confirmed; the format may already be upgraded, but the new edit was not committed: {source}"
+            ),
             Self::RequiresRecovery => formatter
-                .write_str("a previous journal write failed; close and recover the project"),
+                .write_str("a previous journal write failed, or a schema upgrade could not be confirmed; close and recover the project"),
             Self::RequiresJournalRepair => formatter
                 .write_str("journal has an invalid tail; repair it before appending more commands"),
             Self::CorruptAsset { asset_id, path } => {
@@ -149,6 +158,7 @@ impl Error for ProjectError {
             Self::Json { source, .. } => Some(source),
             Self::Domain(source) => Some(source),
             Self::JournalCommitFailed { source, .. } => Some(source.as_ref()),
+            Self::SchemaUpgradeFailed { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }

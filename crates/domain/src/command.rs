@@ -119,6 +119,7 @@ impl ProjectManifest {
         let from_revision = self.revision;
         let to_revision = from_revision.next().ok_or(DomainError::RevisionOverflow)?;
 
+        self.schema_version = self.schema_version.max(command.required_schema_version());
         let result = command.apply_inner(self).and_then(|inverse| {
             self.revision = to_revision;
             self.validate()?;
@@ -140,6 +141,34 @@ impl ProjectManifest {
 }
 
 impl EditCommand {
+    /// Minimum format needed to understand the entire serialized command, including inverses.
+    pub fn required_schema_version(&self) -> u32 {
+        match self {
+            Self::UpsertOverlayTrack { track } | Self::RestoreOverlayTrack { track, .. } => {
+                if track.frame_cells.is_some() { 2 } else { 1 }
+            }
+            Self::RestoreFrameEdit {
+                edit,
+                overlay_tracks,
+            } => edit.required_schema_version().max(
+                if overlay_tracks
+                    .iter()
+                    .any(|track| track.frame_cells.is_some())
+                {
+                    2
+                } else {
+                    1
+                },
+            ),
+            Self::Compound { commands } => commands
+                .iter()
+                .map(Self::required_schema_version)
+                .max()
+                .unwrap_or(1),
+            _ => 1,
+        }
+    }
+
     fn apply_inner(&self, project: &mut ProjectManifest) -> Result<Self, DomainError> {
         if let Self::RestoreFrameEdit {
             edit,

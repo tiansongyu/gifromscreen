@@ -9,7 +9,7 @@ description = "Timeline editing use cases and persistent undo/redo semantics for
 [dependencies]
 gif-from-screen-domain = { path = "../domain" }
 thiserror.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true
-

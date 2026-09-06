@@ -12,9 +12,10 @@ use std::{
 };
 
 use gif_from_screen_domain::{
-    AssetDescriptor, AssetId, DurationUs, EditCommand, Effect, FrameClip, FrameId, OverlayId,
-    ProjectManifest, ProjectRevision, RasterEncoding, TimeUs, Timeline, TrackId, TransitionId,
+    AssetDescriptor, AssetId, DurationUs, EditCommand, Effect, FrameClip, FrameId, ProjectManifest,
+    ProjectRevision, RasterEncoding, TimeUs, Timeline, TrackId, TransitionId,
 };
+use gif_from_screen_editor::{FrameBundle, FrameBundleIdentities};
 use gif_from_screen_gif::CancellationToken;
 use gif_from_screen_project::{ActiveProject, AssetStore, LockPolicy, ProjectError};
 use thiserror::Error;
@@ -217,7 +218,7 @@ fn validate_source(
             .timeline
             .overlay_tracks
             .iter()
-            .map(|track| track.items.len())
+            .map(|track| track.all_mark_contents().count())
             .try_fold(0_usize, usize::checked_add)
             .is_none_or(|items| items > MAX_OVERLAY_ITEMS)
     {
@@ -254,8 +255,7 @@ fn referenced_assets(source: &ProjectManifest) -> BTreeSet<AssetId> {
             .timeline
             .overlay_tracks
             .iter()
-            .flat_map(|track| &track.items)
-            .filter_map(|item| item.content.referenced_asset()),
+            .flat_map(gif_from_screen_domain::OverlayTrack::referenced_assets),
     );
     needed
 }
@@ -343,7 +343,11 @@ fn insertion_command(
     });
     // Preserve destination annotation coverage exactly, excluding the inserted
     // interval. Generic timeline insertion intentionally extends crossing spans.
-    for track in &timeline.overlay_tracks {
+    for track in timeline
+        .overlay_tracks
+        .iter()
+        .filter(|track| track.frame_cells.is_none())
+    {
         let mut shifted = track.clone();
         shifted.items = super::text::exclude_inserted_title(&track.items, start, duration)?;
         if let Some(scope) = &track.annotation_scope {
@@ -354,7 +358,7 @@ fn insertion_command(
         }
         commands.push(EditCommand::UpsertOverlayTrack { track: shifted });
     }
-    append_source_tracks(&mut commands, timeline, &source.timeline, start)?;
+    append_source_tracks(&mut commands, timeline, source, start, &frame_ids)?;
     let mut used_transitions = timeline
         .transitions
         .iter()
@@ -380,23 +384,41 @@ fn insertion_command(
 fn append_source_tracks(
     commands: &mut Vec<EditCommand>,
     destination: &Timeline,
-    source: &Timeline,
+    source: &ProjectManifest,
     start: u64,
+    frame_ids: &BTreeMap<FrameId, FrameId>,
 ) -> Result<(), ProjectInsertionError> {
-    let mut used_tracks = destination
-        .overlay_tracks
+    let mut identities = FrameBundleIdentities::new(
+        destination
+            .overlay_tracks
+            .iter()
+            .chain(&source.timeline.overlay_tracks),
+    )?;
+    let selected = source
+        .timeline
+        .frames
         .iter()
-        .chain(&source.overlay_tracks)
+        .map(|frame| frame.id)
+        .collect();
+    let bundle = FrameBundle::capture(source, &selected)?;
+    let mut generate = || FrameId::from_u128(Uuid::new_v4().as_u128());
+    let remapped = bundle.remap(frame_ids, &mut identities, &mut generate)?;
+    let mut frame_tracks: BTreeMap<TrackId, _> = bundle
+        .tracks()
+        .iter()
         .map(|track| track.id)
-        .collect::<BTreeSet<_>>();
-    let mut used_items = destination
-        .overlay_tracks
-        .iter()
-        .chain(&source.overlay_tracks)
-        .flat_map(|track| &track.items)
-        .map(|item| item.id)
-        .collect::<BTreeSet<_>>();
-    for track in &source.overlay_tracks {
+        .zip(remapped)
+        .collect();
+    // Preserve mixed legacy/frame-owned source track order: it participates
+    // in z-order tie breaking. All branches share the same identity allocator.
+    for track in &source.timeline.overlay_tracks {
+        if track.frame_cells.is_some() {
+            let imported = frame_tracks
+                .remove(&track.id)
+                .expect("full source bundle includes every frame-owned track");
+            commands.push(EditCommand::UpsertOverlayTrack { track: imported });
+            continue;
+        }
         let mut imported = track.clone();
         if let Some(scope) = &mut imported.annotation_scope {
             for span in scope {
@@ -408,19 +430,9 @@ fn append_source_tracks(
                 );
             }
         }
-        imported.id = loop {
-            let id = TrackId::from_u128(Uuid::new_v4().as_u128());
-            if used_tracks.insert(id) {
-                break id;
-            }
-        };
+        imported.id = identities.track(&mut generate)?;
         for item in &mut imported.items {
-            item.id = loop {
-                let id = OverlayId::from_u128(Uuid::new_v4().as_u128());
-                if used_items.insert(id) {
-                    break id;
-                }
-            };
+            item.id = identities.mark(&mut generate)?;
             item.span.start = TimeUs::new(
                 item.span
                     .start
@@ -565,6 +577,8 @@ fn check_cancelled(cancellation: &dyn CancellationToken) -> Result<(), ProjectIn
 #[derive(Debug, Error)]
 pub(crate) enum ProjectInsertionError {
     #[error(transparent)]
+    FrameBundle(#[from] gif_from_screen_editor::FrameBundleError),
+    #[error(transparent)]
     Project(#[from] ProjectError),
     #[error(transparent)]
     Workspace(#[from] EditorWorkspaceError),
@@ -607,6 +621,10 @@ pub(crate) enum ProjectInsertionError {
     #[error("the destination project changed while insertion was being prepared; prepare it again")]
     StaleTarget,
 }
+
+#[cfg(test)]
+#[path = "editor_insert_frame_owned_tests.rs"]
+mod frame_owned_tests;
 
 #[cfg(test)]
 mod tests {
@@ -661,7 +679,7 @@ mod tests {
         assert_eq!(legacy.frames[0].capture_sample_time(), Some(TimeUs::ZERO));
     }
 
-    fn workspace(root: &Path, frames: usize, color: [u8; 4]) -> EditorWorkspace {
+    pub(super) fn workspace(root: &Path, frames: usize, color: [u8; 4]) -> EditorWorkspace {
         let size = PhysicalSize::new(2, 1).unwrap();
         let manifest = ProjectManifest::new(
             ProjectId::from_u128(Uuid::new_v4().as_u128()),
@@ -711,7 +729,7 @@ mod tests {
         EditorWorkspace::from_active(active, 16).unwrap()
     }
 
-    fn prepare(
+    pub(super) fn prepare(
         destination: &EditorWorkspace,
         source: &EditorWorkspace,
         after: Option<FrameId>,
@@ -725,13 +743,13 @@ mod tests {
         .unwrap()
     }
 
-    fn same_content(actual: &ProjectManifest, expected: &ProjectManifest) {
+    pub(super) fn same_content(actual: &ProjectManifest, expected: &ProjectManifest) {
         let mut actual = actual.clone();
         actual.revision = expected.revision;
         assert_eq!(&actual, expected);
     }
 
-    fn annotate(workspace: &mut EditorWorkspace, color: Rgba) {
+    pub(super) fn annotate(workspace: &mut EditorWorkspace, color: Rgba) {
         workspace.select_only(frame_id(1)).unwrap();
         workspace.toggle_selection(frame_id(2)).unwrap();
         workspace

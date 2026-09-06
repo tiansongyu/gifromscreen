@@ -111,6 +111,12 @@ pub enum JournalStopReason {
         line: u64,
         message: String,
     },
+    /// New payload appeared before its required schema was durably stamped.
+    SchemaMismatch {
+        line: u64,
+        snapshot_schema: u32,
+        required_schema: u32,
+    },
     NonMonotonicRevision {
         line: u64,
         previous: ProjectRevision,
@@ -171,6 +177,7 @@ pub(crate) fn recover(
     path: &Path,
 ) -> Result<RecoveredJournal, ProjectError> {
     manifest.validate()?;
+    let snapshot_schema = manifest.schema_version;
     let snapshot_revision = manifest.revision;
     let mut report = JournalRecoveryReport {
         snapshot_revision,
@@ -220,6 +227,15 @@ pub(crate) fn recover(
             report.stop_reason = Some(JournalStopReason::InvalidEnvelope {
                 line: line_number,
                 message: error.to_string(),
+            });
+            break;
+        }
+        let required_schema = record.command.required_schema_version();
+        if required_schema > snapshot_schema {
+            report.stop_reason = Some(JournalStopReason::SchemaMismatch {
+                line: line_number,
+                snapshot_schema,
+                required_schema,
             });
             break;
         }

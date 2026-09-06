@@ -15,7 +15,7 @@ use gif_from_screen_gif::{
 use gif_from_screen_project::{ActiveProject, AssetStore, ProjectError};
 use gif_from_screen_render::{
     AssetProviderError, CancellationToken as RenderCancellationToken, FrameAssetProvider,
-    RenderError, RgbaSurface, SurfaceError, active_raster_overlay_assets,
+    RenderError, RgbaSurface, SurfaceError, active_raster_overlay_assets_for_frame,
 };
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -1311,8 +1311,9 @@ fn load_selected_assets(
     let mut overlay_assets = BTreeMap::new();
     for (clip, sample_time) in clips.iter().zip(frame_times.iter().copied()) {
         ensure_not_cancelled(cancellation)?;
-        let active = active_raster_overlay_assets(
+        let active = active_raster_overlay_assets_for_frame(
             &snapshot.manifest.timeline.overlay_tracks,
+            clip.id,
             sample_time,
             &render_cancellation,
         )
@@ -1629,10 +1630,11 @@ mod tests {
 
     use gif_from_screen_domain::{
         AssetDescriptor, BlendMode, Canvas, CanvasBackground, CaptureMetadata, ClipTransform,
-        ColorSpace, DurationUs, EdgeWidths, EditCommand, Effect, FrameClip, OverlayContent,
-        OverlayItem, OverlayTrack, PhysicalPoint, PhysicalPx, PhysicalSize, ProjectId,
-        ProjectManifest, Rgba, ShapeKind, SlideDirection, StrokePoint, TimelineSpan, TrackId,
-        Transition, TransitionId, TransitionKind, UnixTimeMs,
+        ColorSpace, DurationUs, EdgeWidths, EditCommand, Effect, FrameAuthoringSpan, FrameClip,
+        FrameLocalSpan, FrameOverlayCell, FrameOverlayMark, OverlayContent, OverlayItem,
+        OverlayTrack, PhysicalPoint, PhysicalPx, PhysicalSize, ProjectId, ProjectManifest, Rgba,
+        ShapeKind, SlideDirection, StrokePoint, TimelineSpan, TrackId, Transition, TransitionId,
+        TransitionKind, UnixTimeMs,
     };
     use gif_from_screen_gif::{CancellationFlag, DitherMode, NeverCancel, PaletteMode};
     use gif_from_screen_project::LockPolicy;
@@ -1799,6 +1801,7 @@ mod tests {
         size: PhysicalSize,
     ) -> OverlayTrack {
         OverlayTrack {
+            frame_cells: None,
             annotation: None,
             annotation_scope: None,
             id: TrackId::from_u128(1),
@@ -1818,6 +1821,203 @@ mod tests {
                 },
             }],
         }
+    }
+
+    fn add_owned_raster(snapshot: &mut ProjectExportSnapshot, owner: FrameId) -> AssetId {
+        let size = PhysicalSize::new(1, 1).unwrap();
+        let asset_id = add_overlay_asset(snapshot, size, &[255, 0, 0, 255]);
+        let mut track = raster_overlay_track(
+            asset_id,
+            TimelineSpan {
+                start: TimeUs::ZERO,
+                duration: DurationUs::new(10_000).unwrap(),
+            },
+            PhysicalPoint::default(),
+            size,
+        );
+        track.id = TrackId::from_u128(2);
+        let item = track.items.remove(0);
+        track.frame_cells = Some(vec![FrameOverlayCell {
+            frame_id: owner,
+            scopes: vec![FrameAuthoringSpan {
+                run_id: 1,
+                span: FrameLocalSpan::new(2, 3, DurationUs::new(4).unwrap()).unwrap(),
+            }],
+            marks: vec![FrameOverlayMark {
+                id: OverlayId::from_u128(2),
+                z_index: item.z_index,
+                content: item.content,
+            }],
+        }]);
+        snapshot.manifest.timeline.overlay_tracks.push(track);
+        asset_id
+    }
+
+    fn mixed_overlay_snapshot(root: &Path) -> ProjectExportSnapshot {
+        let blue = [0, 0, 255, 255].repeat(2);
+        let (mut snapshot, _) = snapshot(
+            root,
+            PhysicalSize::new(2, 1).unwrap(),
+            &[
+                TestClip::rgba(1, &blue, 10_000),
+                TestClip::rgba(2, &blue, 30_000),
+            ],
+        );
+        let green = add_overlay_asset(
+            &mut snapshot,
+            PhysicalSize::new(1, 1).unwrap(),
+            &[0, 255, 0, 255],
+        );
+        snapshot
+            .manifest
+            .timeline
+            .overlay_tracks
+            .push(raster_overlay_track(
+                green,
+                TimelineSpan {
+                    start: TimeUs::ZERO,
+                    duration: DurationUs::new(10_000).unwrap(),
+                },
+                PhysicalPoint {
+                    x: PhysicalPx::new(1),
+                    y: PhysicalPx::ZERO,
+                },
+                PhysicalSize::new(1, 1).unwrap(),
+            ));
+        add_owned_raster(&mut snapshot, FrameId::from_u128(2));
+        snapshot.manifest.validate().unwrap();
+        snapshot
+    }
+
+    #[test]
+    fn frame_owned_and_legacy_rasters_export_reversed_and_retimed_without_lost_assets() {
+        let directory = tempdir().unwrap();
+        let mut snapshot = mixed_overlay_snapshot(&directory.path().join("project"));
+        for (index, palette) in [PaletteMode::LocalPerFrame, PaletteMode::Global]
+            .into_iter()
+            .enumerate()
+        {
+            let output = directory.path().join(format!("reverse-{index}.gif"));
+            let options = ProjectGifExportOptions {
+                frames: ProjectFrameSelection::Ordered(vec![
+                    FrameId::from_u128(2),
+                    FrameId::from_u128(1),
+                ]),
+                encoding: EncodeOptions {
+                    palette_mode: palette,
+                    ..EncodeOptions::default()
+                },
+                ..ProjectGifExportOptions::default()
+            };
+            export(&snapshot, &output, &options).unwrap();
+            assert_eq!(
+                decode_rgba(&output),
+                vec![
+                    (3, vec![255, 0, 0, 255, 0, 0, 255, 255]),
+                    (1, vec![0, 0, 255, 255, 0, 255, 0, 255]),
+                ]
+            );
+        }
+        let cells = snapshot.manifest.timeline.overlay_tracks[1]
+            .frame_cells
+            .clone();
+        snapshot
+            .manifest
+            .apply_command(&EditCommand::ReorderFrames {
+                order: vec![FrameId::from_u128(2), FrameId::from_u128(1)],
+            })
+            .unwrap();
+        snapshot
+            .manifest
+            .apply_command(&EditCommand::SetFrameDurations {
+                changes: vec![gif_from_screen_domain::FrameDurationChange {
+                    frame_id: FrameId::from_u128(2),
+                    duration: DurationUs::new(90_000).unwrap(),
+                }],
+            })
+            .unwrap();
+        assert_eq!(
+            snapshot.manifest.timeline.overlay_tracks[1].frame_cells,
+            cells
+        );
+        let output = directory.path().join("retimed.gif");
+        export(&snapshot, &output, &ProjectGifExportOptions::default()).unwrap();
+        assert_eq!(
+            decode_rgba(&output),
+            vec![
+                (9, vec![255, 0, 0, 255, 0, 255, 0, 255]),
+                (1, vec![0, 0, 255, 255, 0, 0, 255, 255]),
+            ]
+        );
+    }
+
+    #[test]
+    fn frame_owned_transition_streaming_matches_buffered_and_global_endpoints() {
+        let directory = tempdir().unwrap();
+        let mut snapshot = mixed_overlay_snapshot(&directory.path().join("project"));
+        add_transition(&mut snapshot, 1, 2, 20_000, 1, TransitionKind::FadeToNext);
+        let options = ProjectGifExportOptions::default();
+        let buffered = directory.path().join("buffered.gif");
+        buffered_local_reference(&snapshot, &buffered, &options);
+        for (index, palette) in [PaletteMode::LocalPerFrame, PaletteMode::Global]
+            .into_iter()
+            .enumerate()
+        {
+            let output = directory.path().join(format!("streamed-{index}.gif"));
+            let options = ProjectGifExportOptions {
+                encoding: EncodeOptions {
+                    palette_mode: palette,
+                    ..EncodeOptions::default()
+                },
+                ..ProjectGifExportOptions::default()
+            };
+            export(&snapshot, &output, &options).unwrap();
+            assert_eq!(
+                decode_rgba(&output),
+                vec![
+                    (1, vec![0, 0, 255, 255, 0, 255, 0, 255]),
+                    (2, vec![128, 0, 128, 255, 0, 128, 128, 255]),
+                    (3, vec![255, 0, 0, 255, 0, 0, 255, 255]),
+                ]
+            );
+            if palette == PaletteMode::LocalPerFrame {
+                assert_eq!(fs::read(&output).unwrap(), fs::read(&buffered).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn frame_owned_asset_failure_is_scoped_to_visible_selected_owner() {
+        let directory = tempdir().unwrap();
+        let mut snapshot = mixed_overlay_snapshot(&directory.path().join("project"));
+        let asset_id = snapshot.manifest.timeline.overlay_tracks[1]
+            .referenced_assets()
+            .next()
+            .unwrap();
+        fs::remove_file(snapshot.assets.asset_path(asset_id)).unwrap();
+        let output = directory.path().join("missing-owned.gif");
+        let options = ProjectGifExportOptions::default();
+        assert!(matches!(
+            export(&snapshot, &output, &options),
+            Err(ProjectGifExportError::MissingOverlayAssetFile { .. })
+        ));
+        assert!(!output.exists());
+        assert_eq!(partial_files(directory.path()), 0);
+        let selection = ProjectGifExportOptions {
+            frames: ProjectFrameSelection::Ordered(vec![FrameId::from_u128(1)]),
+            ..options.clone()
+        };
+        export(
+            &snapshot,
+            &directory.path().join("other-owner.gif"),
+            &selection,
+        )
+        .unwrap();
+        snapshot.manifest.timeline.overlay_tracks[1].visible = false;
+        export(&snapshot, &directory.path().join("hidden.gif"), &options).unwrap();
+        snapshot.manifest.timeline.overlay_tracks[1].visible = true;
+        snapshot.manifest.timeline.overlay_tracks[1].opacity = 0;
+        export(&snapshot, &directory.path().join("invisible.gif"), &options).unwrap();
     }
 
     #[test]
@@ -2062,6 +2262,7 @@ mod tests {
             .timeline
             .overlay_tracks
             .push(OverlayTrack {
+                frame_cells: None,
                 annotation: None,
                 annotation_scope: None,
                 id: TrackId::from_u128(1),
@@ -2189,6 +2390,7 @@ mod tests {
                 },
             });
         ignored.manifest.timeline.overlay_tracks.push(OverlayTrack {
+            frame_cells: None,
             annotation: None,
             annotation_scope: None,
             id: TrackId::from_u128(2),

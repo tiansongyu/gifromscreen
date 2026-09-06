@@ -56,6 +56,10 @@ impl Error for UnitError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ValidationIssue {
+    InvalidFrameOverlay {
+        track_id: TrackId,
+        reason: String,
+    },
     InvalidCaptureClock {
         frame_id: FrameId,
     },

@@ -169,6 +169,7 @@ impl EditorWorkspace {
         let mut commands = self.title_insertion_commands(index, start, request.duration, frame)?;
         commands.push(EditCommand::UpsertOverlayTrack {
             track: OverlayTrack {
+                frame_cells: None,
                 annotation: None,
                 annotation_scope: None,
                 id: TrackId::from_u128(Uuid::new_v4().as_u128()),

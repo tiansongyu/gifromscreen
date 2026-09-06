@@ -3,9 +3,10 @@ use gif_from_screen_application::{
     IncrementalRecordingProject, IncrementalRecordingProjectOptions,
 };
 use gif_from_screen_domain::{
-    AnnotationMode, AnnotationRequest, BlendMode, CaptureBinding, CaptureMetadata, KeyStroke,
-    MouseButton, MouseInputEvent, OverlayContent, PhysicalPoint, PhysicalPx, ProjectId,
-    ProjectManifest, Rgba, ShapeKind, UnixTimeMs,
+    AnnotationMode, AnnotationRequest, BlendMode, CaptureBinding, CaptureMetadata,
+    FrameAuthoringSpan, FrameLocalSpan, FrameOverlayCell, FrameOverlayMark, KeyStroke, MouseButton,
+    MouseInputEvent, OverlayContent, OverlayTrack, PhysicalPoint, PhysicalPx, ProjectId,
+    ProjectManifest, Rgba, ShapeKind, TrackId, UnixTimeMs,
 };
 use gif_from_screen_gif::RgbaFrame;
 use gif_from_screen_project::LockPolicy;
@@ -581,6 +582,248 @@ fn add_overlay(workspace: &mut EditorWorkspace) {
             BlendMode::Normal,
         )
         .unwrap();
+}
+
+fn add_owned_overlay(workspace: &mut EditorWorkspace) -> OverlayTrack {
+    add_overlay(workspace);
+    let mut track = workspace.manifest().timeline.overlay_tracks[0].clone();
+    let content = track.items[0].content.clone();
+    track.items.clear();
+    track.annotation = Some(AnnotationRequest::default());
+    track.annotation_scope = None;
+    track.opacity = 177;
+    track.blend_mode = BlendMode::Multiply;
+    track.frame_cells = Some(
+        workspace
+            .manifest()
+            .timeline
+            .frames
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| FrameOverlayCell {
+                frame_id: frame.id,
+                scopes: vec![FrameAuthoringSpan {
+                    run_id: 1,
+                    span: FrameLocalSpan::new(1, 2, DurationUs::new(3).unwrap()).unwrap(),
+                }],
+                marks: vec![FrameOverlayMark {
+                    id: OverlayId::from_u128(10_000 + index as u128),
+                    z_index: 4,
+                    content: content.clone(),
+                }],
+            })
+            .collect(),
+    );
+    workspace
+        .execute(EditCommand::UpsertOverlayTrack {
+            track: track.clone(),
+        })
+        .unwrap();
+    track
+}
+
+fn bake_whole_selected(workspace: &mut EditorWorkspace) {
+    workspace
+        .apply_motion_edit(
+            &workspace.project_edit_anchor(),
+            MotionOperation::Cinemagraph {
+                region: PhysicalRect::new(0, 0, 2, 1).unwrap(),
+                invert: false,
+            },
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+}
+
+#[test]
+fn frame_owned_cinemagraph_bakes_once_preserving_unselected_owners_and_raw_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("owned-cinemagraph.gfsproj");
+    let mut workspace = workspace(&root);
+    add_raw_input(&mut workspace);
+    let original_track = add_owned_overlay(&mut workspace);
+    workspace.select_only(FrameId::from_u128(1)).unwrap();
+    workspace.toggle_selection(FrameId::from_u128(3)).unwrap();
+    let before = workspace.manifest().clone();
+    let visible = (1..=3).map(|id| pixels(&workspace, id)).collect::<Vec<_>>();
+    let raw = serde_json::to_vec(
+        &before
+            .timeline
+            .frames
+            .iter()
+            .map(|frame| &frame.capture_metadata)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    bake_whole_selected(&mut workspace);
+    assert_eq!(
+        (1..=3).map(|id| pixels(&workspace, id)).collect::<Vec<_>>(),
+        visible
+    );
+    let kept = &workspace.manifest().timeline.overlay_tracks[0];
+    assert_eq!(
+        kept.frame_cells.as_ref().unwrap(),
+        &original_track.frame_cells.as_ref().unwrap()[1..2]
+    );
+    assert_eq!(
+        serde_json::to_vec(
+            &workspace
+                .manifest()
+                .timeline
+                .frames
+                .iter()
+                .map(|frame| &frame.capture_metadata)
+                .collect::<Vec<_>>()
+        )
+        .unwrap(),
+        raw
+    );
+    assert_eq!(
+        workspace.manifest().timeline.frames[1],
+        before.timeline.frames[1]
+    );
+    let baked = workspace.manifest().clone();
+    workspace.undo().unwrap();
+    equal_except_revision(workspace.manifest(), &before);
+    assert_eq!(
+        (1..=3).map(|id| pixels(&workspace, id)).collect::<Vec<_>>(),
+        visible
+    );
+    workspace.redo().unwrap();
+    equal_except_revision(workspace.manifest(), &baked);
+    workspace.checkpoint().unwrap();
+    drop(workspace);
+    let reopened = EditorWorkspace::open(&root, LockPolicy::FailIfPresent, 32).unwrap();
+    assert_eq!(
+        (1..=3).map(|id| pixels(&reopened, id)).collect::<Vec<_>>(),
+        visible
+    );
+    assert_eq!(
+        reopened.manifest().timeline.overlay_tracks[0],
+        *kept_from(&baked, original_track.id)
+    );
+}
+
+fn kept_from(manifest: &ProjectManifest, id: TrackId) -> &OverlayTrack {
+    manifest
+        .timeline
+        .overlay_tracks
+        .iter()
+        .find(|track| track.id == id)
+        .unwrap()
+}
+
+fn renamed_track(original: &OverlayTrack, id: u128) -> OverlayTrack {
+    let mut track = original.clone();
+    track.id = TrackId::from_u128(id);
+    for (index, mark) in track
+        .frame_cells
+        .as_mut()
+        .unwrap()
+        .iter_mut()
+        .flat_map(|cell| &mut cell.marks)
+        .enumerate()
+    {
+        mark.id = OverlayId::from_u128(id * 100 + index as u128);
+    }
+    track
+}
+
+#[test]
+fn frame_owned_bake_keeps_hidden_zero_tracks_and_zero_marks_with_their_scopes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut workspace = workspace(&dir.path().join("invisible-owned.gfsproj"));
+    let original = add_owned_overlay(&mut workspace);
+    let mut hidden = renamed_track(&original, 91);
+    hidden.visible = false;
+    let mut zero = renamed_track(&original, 92);
+    zero.opacity = 0;
+    let mut zero_marks = renamed_track(&original, 93);
+    for cell in zero_marks.frame_cells.as_mut().unwrap() {
+        cell.marks[0].content = OverlayContent::Raster {
+            asset_id: workspace.manifest().timeline.frames[0].asset_id,
+            position: PhysicalPoint::default(),
+            size: PhysicalSize::new(2, 1).unwrap(),
+            opacity: 0,
+        };
+    }
+    let mut mixed = original.clone();
+    let cells = mixed.frame_cells.as_mut().unwrap();
+    let mut retained_zero = zero_marks.frame_cells.as_ref().unwrap()[0].marks[0].clone();
+    retained_zero.id = OverlayId::from_u128(94_000);
+    cells[0].marks.push(retained_zero.clone());
+    // Selected empty coverage is consumed; unselected empty coverage survives.
+    cells[1].marks.clear();
+    cells[2].marks.clear();
+    for track in [&hidden, &zero, &zero_marks, &mixed] {
+        workspace
+            .execute(EditCommand::UpsertOverlayTrack {
+                track: track.clone(),
+            })
+            .unwrap();
+    }
+    workspace.select_only(FrameId::from_u128(1)).unwrap();
+    workspace.toggle_selection(FrameId::from_u128(3)).unwrap();
+    let visible = (1..=3).map(|id| pixels(&workspace, id)).collect::<Vec<_>>();
+    bake_whole_selected(&mut workspace);
+    assert_eq!(
+        (1..=3).map(|id| pixels(&workspace, id)).collect::<Vec<_>>(),
+        visible
+    );
+    for track in [&hidden, &zero, &zero_marks] {
+        assert_eq!(kept_from(workspace.manifest(), track.id), track);
+    }
+    let remaining = kept_from(workspace.manifest(), original.id)
+        .frame_cells
+        .as_ref()
+        .unwrap();
+    assert_eq!(remaining.len(), 2);
+    assert_eq!(remaining[0].marks, vec![retained_zero]);
+    assert_eq!(
+        remaining[0].scopes,
+        mixed.frame_cells.as_ref().unwrap()[0].scopes
+    );
+    assert_eq!(remaining[1], mixed.frame_cells.as_ref().unwrap()[1]);
+}
+
+#[test]
+fn frame_owned_bake_removes_exhausted_track_but_loop_preserves_source_owners() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut workspace = workspace(&dir.path().join("whole-owned.gfsproj"));
+    let original = add_owned_overlay(&mut workspace);
+    let visible = (1..=3).map(|id| pixels(&workspace, id)).collect::<Vec<_>>();
+    bake_whole_selected(&mut workspace);
+    assert!(workspace.manifest().timeline.overlay_tracks.is_empty());
+    assert_eq!(
+        (1..=3).map(|id| pixels(&workspace, id)).collect::<Vec<_>>(),
+        visible
+    );
+    workspace.undo().unwrap();
+    workspace
+        .apply_motion_edit(
+            &workspace.project_edit_anchor(),
+            MotionOperation::LoopCrossfade {
+                frames: 1,
+                duration_us: 10_000,
+            },
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+    assert_eq!(workspace.manifest().timeline.overlay_tracks, vec![original]);
+    let appended = workspace.manifest().timeline.frames[3].id;
+    assert_eq!(
+        render(
+            workspace.active_project(),
+            appended,
+            PhysicalSize::new(2, 1).unwrap(),
+            &AtomicBool::new(false)
+        )
+        .unwrap()
+        .pixels(),
+        visible[0]
+    );
 }
 
 #[test]

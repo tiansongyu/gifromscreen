@@ -3,7 +3,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use gif_from_screen_domain::{EditCommand, FrameClip, FrameId, ProjectManifest};
 use thiserror::Error;
 
-use crate::{EditorError, ensure_known_selection, remove_frames_atomically};
+use crate::{
+    EditorError, FrameBundle, FrameBundleIdentities, ensure_known_selection,
+    remove_frames_atomically,
+};
 
 /// Maximum number of clips retained by one application clipboard snapshot.
 pub const MAX_FRAME_CLIPBOARD_FRAMES: usize = 512;
@@ -20,6 +23,7 @@ pub const MAX_FRAME_CLIPBOARD_HISTORY_CAPACITY: usize = 64;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrameClipboard {
     frames: Vec<FrameClip>,
+    bundle: FrameBundle,
 }
 
 impl FrameClipboard {
@@ -36,6 +40,12 @@ impl FrameClipboard {
     /// Borrows copied clips in original timeline order.
     pub fn frames(&self) -> &[FrameClip] {
         &self.frames
+    }
+
+    /// Frozen frame-owned marks accompanying these clips; legacy timed tracks
+    /// are intentionally not part of the clipboard.
+    pub const fn frame_bundle(&self) -> &FrameBundle {
+        &self.bundle
     }
 }
 
@@ -334,6 +344,7 @@ pub fn copy_selected_frames(
             maximum: MAX_FRAME_CLIPBOARD_FRAMES,
         });
     }
+    let bundle = FrameBundle::capture(project, &selected)?;
     let mut frames = Vec::with_capacity(selected.len());
     let mut source_time = 0_u64;
     for frame in &project.timeline.frames {
@@ -346,7 +357,7 @@ pub fn copy_selected_frames(
             .checked_add(frame.duration.get())
             .ok_or(EditorError::InvalidDuration)?;
     }
-    Ok(FrameClipboard { frames })
+    Ok(FrameClipboard { frames, bundle })
 }
 
 /// Builds one atomic cut command together with the clipboard to install after commit.
@@ -379,6 +390,9 @@ pub fn cut_selected_frames(
 /// Every pasted clip receives a fresh identity from `generate_frame_id`. Asset references and all
 /// other clip fields are reused unchanged. A transition crossing the insertion point is removed;
 /// no transition is synthesized for pasted frames.
+/// Frame-owned groups are copied without event recomputation. When present,
+/// their fresh track/mark IDs consume additional values from the same injected
+/// 128-bit identity source; legacy-only pastes retain the original call count.
 ///
 /// # Errors
 ///
@@ -415,6 +429,7 @@ where
         .map(|frame| frame.id)
         .collect();
     let mut pasted = Vec::with_capacity(clipboard.len());
+    let mut frame_ids = BTreeMap::new();
     let mut added_duration = 0_u64;
     for source in &clipboard.frames {
         let frame_id = generate_frame_id();
@@ -429,6 +444,7 @@ where
             .ok_or(EditorError::InvalidDuration)?;
         let mut clone = source.clone();
         clone.id = frame_id;
+        frame_ids.insert(source.id, frame_id);
         pasted.push(clone);
     }
     project
@@ -448,6 +464,22 @@ where
         index: insertion_index,
         frames: pasted,
     });
+    if !clipboard.bundle.tracks().is_empty() {
+        let mut identities = FrameBundleIdentities::new(
+            project
+                .timeline
+                .overlay_tracks
+                .iter()
+                .chain(clipboard.bundle.tracks()),
+        )?;
+        commands.extend(
+            clipboard
+                .bundle
+                .remap(&frame_ids, &mut identities, &mut generate_frame_id)?
+                .into_iter()
+                .map(|track| EditCommand::UpsertOverlayTrack { track }),
+        );
+    }
     Ok(EditCommand::Compound { commands })
 }
 
@@ -455,6 +487,7 @@ fn validate_clipboard_assets(
     project: &ProjectManifest,
     clipboard: &FrameClipboard,
 ) -> Result<(), EditorError> {
+    clipboard.bundle.validate_assets(project)?;
     for frame in &clipboard.frames {
         let asset = project
             .assets
@@ -859,7 +892,10 @@ mod tests {
 
         let mut history = FrameClipboardHistory::new(1).unwrap();
         assert!(matches!(
-            history.push(FrameClipboard { frames: Vec::new() }),
+            history.push(FrameClipboard {
+                frames: Vec::new(),
+                bundle: FrameBundle::default()
+            }),
             Err(FrameClipboardHistoryError::EmptyClipboard)
         ));
         assert!(history.is_empty());
@@ -882,6 +918,7 @@ mod tests {
     fn clipboard_history_preview_reports_duration_overflow_without_panicking() {
         let mut clipboard = FrameClipboard {
             frames: project(2).timeline.frames,
+            bundle: FrameBundle::default(),
         };
         clipboard.frames[0].duration = DurationUs::new(u64::MAX).unwrap();
         clipboard.frames[1].duration = DurationUs::new(1).unwrap();

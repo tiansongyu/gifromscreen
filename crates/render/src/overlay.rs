@@ -1,6 +1,6 @@
 use gif_from_screen_domain::{
-    AssetId, BlendMode, FrameClip, OverlayContent, OverlayId, OverlayItem, OverlayTrack,
-    PhysicalPoint, PhysicalRect, PhysicalSize, Rgba, ShapeKind, StrokePoint, TimeUs,
+    AssetId, BlendMode, FrameClip, FrameId, OverlayContent, OverlayId, OverlayTrack, PhysicalPoint,
+    PhysicalRect, PhysicalSize, Rgba, ShapeKind, StrokePoint, TimeUs, TimelineSpan,
 };
 
 use crate::{
@@ -24,19 +24,108 @@ pub struct RasterOverlayAsset {
 
 #[derive(Clone, Copy, Debug)]
 struct OverlayLayer<'a> {
-    item: &'a OverlayItem,
+    id: OverlayId,
+    content: &'a OverlayContent,
+    span: Option<TimelineSpan>,
+    z_index: i32,
     track_opacity: u8,
     blend_mode: BlendMode,
     track_index: usize,
     item_index: usize,
 }
 
+/// A detached, frame-specific drawing plan. Only active drawing content is copied;
+/// project timelines, authoring scopes, recipes and other frames are not retained.
+#[derive(Clone, Debug)]
+pub struct OverlayRenderPlan {
+    frame_id: FrameId,
+    sample_time: TimeUs,
+    layers: Vec<OwnedOverlayLayer>,
+}
+
+#[derive(Clone, Debug)]
+struct OwnedOverlayLayer {
+    id: OverlayId,
+    content: OverlayContent,
+    span: Option<TimelineSpan>,
+    track_opacity: u8,
+    blend_mode: BlendMode,
+}
+
+impl OverlayRenderPlan {
+    /// Resolves timed items and whole-frame marks through the same ordering used
+    /// by direct CPU rendering. Local authoring scopes never clip visible marks.
+    ///
+    /// # Errors
+    /// Returns errors for unsupported active content, invalid spans, cancellation
+    /// or a drawing-plan allocation failure.
+    pub fn for_frame<C: CancellationToken + ?Sized>(
+        tracks: &[OverlayTrack],
+        frame_id: FrameId,
+        sample_time: TimeUs,
+        cancellation: &C,
+    ) -> Result<Self, RenderError> {
+        let resolved = active_overlay_layers(tracks, Some(frame_id), sample_time, cancellation)?;
+        let mut layers = Vec::new();
+        layers.try_reserve_exact(resolved.len()).map_err(|_| {
+            RenderError::OverlayPlanAllocationFailed {
+                requested: resolved.len(),
+            }
+        })?;
+        for layer in resolved {
+            check_cancelled(cancellation)?;
+            layers.push(OwnedOverlayLayer {
+                id: layer.id,
+                content: layer.content.clone(),
+                span: layer.span,
+                track_opacity: layer.track_opacity,
+                blend_mode: layer.blend_mode,
+            });
+        }
+        Ok(Self {
+            frame_id,
+            sample_time,
+            layers,
+        })
+    }
+
+    /// Immutable assets in drawing order, retaining repeated asset identities.
+    pub fn raster_assets(&self) -> impl Iterator<Item = RasterOverlayAsset> + '_ {
+        self.layers.iter().filter_map(|layer| {
+            Some(RasterOverlayAsset {
+                overlay_id: layer.id,
+                asset_id: layer.content.referenced_asset()?,
+            })
+        })
+    }
+
+    fn layers(&self) -> impl Iterator<Item = OverlayLayer<'_>> {
+        self.layers
+            .iter()
+            .enumerate()
+            .map(|(index, layer)| OverlayLayer {
+                id: layer.id,
+                content: &layer.content,
+                span: layer.span,
+                // The detached plan has already been sorted. These fields are not
+                // consulted again by the compositor.
+                z_index: 0,
+                track_opacity: layer.track_opacity,
+                blend_mode: layer.blend_mode,
+                track_index: 0,
+                item_index: index,
+            })
+    }
+}
+
 impl CpuRenderer {
     /// Renders one clip and composites all supported overlays active at `sample_time`.
     ///
-    /// Overlay spans use half-open point sampling: an item is active when
+    /// Legacy overlay spans use half-open point sampling: an item is active when
     /// `span.start <= sample_time < span.end()`. Visible non-zero-opacity Raster, Shape, and Drawing
-    /// items are ordered globally by `(z_index, track order, item order)`. Raster images are
+    /// items and the matching `clip.id`'s frame-owned marks are ordered globally by
+    /// `(z_index, track order, item order)`. A frame-owned mark is painted once for the whole
+    /// frame, regardless of its authoring scopes or sample time. Raster images are
     /// nearest-neighbor sampled without a resized allocation. Shapes and drawings are hard-edged,
     /// clipped directly to the destination, and allocate no geometry-sized buffers. Track opacity
     /// and raster item opacity multiply source alpha. Normal, Multiply, and Screen use deterministic
@@ -66,10 +155,44 @@ impl CpuRenderer {
         C: CancellationToken + ?Sized,
     {
         let mut surface = self.render_clip(clip, provider, cancellation)?;
-        composite_active_overlays(
+        composite_overlay_layers(
             &mut surface,
-            tracks,
+            active_overlay_layers(tracks, Some(clip.id), sample_time, cancellation)?,
             sample_time,
+            provider,
+            self.limits(),
+            cancellation,
+        )?;
+        Ok(surface)
+    }
+
+    /// Renders a detached plan produced by [`OverlayRenderPlan::for_frame`].
+    ///
+    /// # Errors
+    /// Returns normal rendering errors, or rejects a plan belonging to another frame.
+    pub fn render_clip_with_overlay_plan<P, C>(
+        &self,
+        clip: &FrameClip,
+        plan: &OverlayRenderPlan,
+        provider: &P,
+        cancellation: &C,
+    ) -> Result<RgbaSurface, RenderError>
+    where
+        P: FrameAssetProvider + ?Sized,
+        C: CancellationToken + ?Sized,
+    {
+        check_cancelled(cancellation)?;
+        if clip.id != plan.frame_id {
+            return Err(RenderError::OverlayPlanFrameMismatch {
+                expected: plan.frame_id,
+                actual: clip.id,
+            });
+        }
+        let mut surface = self.render_clip(clip, provider, cancellation)?;
+        composite_overlay_layers(
+            &mut surface,
+            plan.layers(),
+            plan.sample_time,
             provider,
             self.limits(),
             cancellation,
@@ -79,8 +202,8 @@ impl CpuRenderer {
 
     /// Compatibility alias for [`Self::render_clip_with_overlays`].
     ///
-    /// Despite its historical name this now composites Raster, Shape, and Drawing items so existing
-    /// export and preview callers automatically share the complete timed-overlay path.
+    /// Despite its historical name this composites all supported content, including frame-owned
+    /// marks, through the complete shared overlay path.
     ///
     /// # Errors
     ///
@@ -110,7 +233,9 @@ impl CpuRenderer {
 /// # Errors
 ///
 /// Returns [`RenderError`] for an overflowing active span, plan size/allocation failure, or
-/// cancellation.
+/// cancellation. Visible frame-owned content returns
+/// [`RenderError::OverlayFrameIdentityRequired`]; callers handling new projects must use
+/// [`active_raster_overlay_assets_for_frame`] instead of guessing a frame from time.
 pub fn active_raster_overlay_assets<C>(
     tracks: &[OverlayTrack],
     sample_time: TimeUs,
@@ -119,7 +244,35 @@ pub fn active_raster_overlay_assets<C>(
 where
     C: CancellationToken + ?Sized,
 {
-    let layers = active_overlay_layers(tracks, sample_time, cancellation)?;
+    raster_assets_from_layers(active_overlay_layers(
+        tracks,
+        None,
+        sample_time,
+        cancellation,
+    )?)
+}
+
+/// Returns active raster assets for a specific frame, including its whole-frame marks.
+///
+/// # Errors
+/// Returns the same planning errors as [`OverlayRenderPlan::for_frame`].
+pub fn active_raster_overlay_assets_for_frame<C: CancellationToken + ?Sized>(
+    tracks: &[OverlayTrack],
+    frame_id: FrameId,
+    sample_time: TimeUs,
+    cancellation: &C,
+) -> Result<Vec<RasterOverlayAsset>, RenderError> {
+    raster_assets_from_layers(active_overlay_layers(
+        tracks,
+        Some(frame_id),
+        sample_time,
+        cancellation,
+    )?)
+}
+
+fn raster_assets_from_layers(
+    layers: Vec<OverlayLayer<'_>>,
+) -> Result<Vec<RasterOverlayAsset>, RenderError> {
     let mut assets = Vec::new();
     assets.try_reserve_exact(layers.len()).map_err(|_| {
         RenderError::OverlayPlanAllocationFailed {
@@ -127,18 +280,18 @@ where
         }
     })?;
     assets.extend(layers.into_iter().filter_map(|layer| {
-        let asset_id = layer.item.content.referenced_asset()?;
+        let asset_id = layer.content.referenced_asset()?;
         Some(RasterOverlayAsset {
-            overlay_id: layer.item.id,
+            overlay_id: layer.id,
             asset_id,
         })
     }));
     Ok(assets)
 }
 
-fn composite_active_overlays<P, C>(
+fn composite_overlay_layers<'a, P, C>(
     destination: &mut RgbaSurface,
-    tracks: &[OverlayTrack],
+    layers: impl IntoIterator<Item = OverlayLayer<'a>>,
     sample_time: TimeUs,
     provider: &P,
     limits: RenderLimits,
@@ -148,9 +301,9 @@ where
     P: FrameAssetProvider + ?Sized,
     C: CancellationToken + ?Sized,
 {
-    for layer in active_overlay_layers(tracks, sample_time, cancellation)? {
+    for layer in layers {
         check_cancelled(cancellation)?;
-        match &layer.item.content {
+        match layer.content {
             OverlayContent::Text {
                 position,
                 raster: Some(raster),
@@ -162,7 +315,7 @@ where
                 ..
             } => composite_raster_overlay(
                 destination,
-                layer.item.id,
+                layer.id,
                 raster.asset_id,
                 *position,
                 raster.size,
@@ -180,7 +333,7 @@ where
                 opacity,
             } => composite_raster_overlay(
                 destination,
-                layer.item.id,
+                layer.id,
                 *asset_id,
                 *position,
                 *size,
@@ -199,7 +352,7 @@ where
                 fill,
             } => composite_shape(
                 destination,
-                layer.item.id,
+                layer.id,
                 *kind,
                 *bounds,
                 *stroke_width,
@@ -215,7 +368,7 @@ where
                 color,
             } => composite_drawing(
                 destination,
-                layer.item.id,
+                layer.id,
                 points,
                 *width,
                 *color,
@@ -233,7 +386,7 @@ where
                 limits,
                 cancellation,
             )?,
-            content => return Err(unsupported_overlay(layer.item.id, content)),
+            content => return Err(unsupported_overlay(layer.id, content)),
         }
     }
     Ok(())
@@ -241,6 +394,7 @@ where
 
 fn active_overlay_layers<'a, C>(
     tracks: &'a [OverlayTrack],
+    frame_id: Option<FrameId>,
     sample_time: TimeUs,
     cancellation: &C,
 ) -> Result<Vec<OverlayLayer<'a>>, RenderError>
@@ -264,48 +418,106 @@ where
             if sample_time < item.span.start || sample_time >= end {
                 continue;
             }
-            if !matches!(
-                item.content,
-                OverlayContent::Raster { .. }
-                    | OverlayContent::Text {
-                        raster: Some(_),
-                        ..
-                    }
-                    | OverlayContent::KeyStroke {
-                        raster: Some(_),
-                        ..
-                    }
-                    | OverlayContent::Cursor { .. }
-                    | OverlayContent::MouseClick { .. }
-                    | OverlayContent::Progress {
-                        show_frame_number: false,
-                        ..
-                    }
-                    | OverlayContent::Progress { style: Some(_), .. }
-                    | OverlayContent::Shape { .. }
-                    | OverlayContent::Drawing { .. }
-            ) {
-                return Err(unsupported_overlay(item.id, &item.content));
+            push_layer(
+                &mut layers,
+                OverlayLayer {
+                    id: item.id,
+                    content: &item.content,
+                    span: Some(item.span),
+                    z_index: item.z_index,
+                    track_opacity: track.opacity,
+                    blend_mode: track.blend_mode,
+                    track_index,
+                    item_index,
+                },
+            )?;
+        }
+        let mut item_index = track.items.len();
+        for cell in track.frame_cells.iter().flatten() {
+            check_cancelled(cancellation)?;
+            if let Some(frame_id) = frame_id {
+                if cell.frame_id != frame_id {
+                    continue;
+                }
+            } else if cell
+                .marks
+                .iter()
+                .any(|mark| !matches!(mark.content, OverlayContent::Raster { opacity: 0, .. }))
+            {
+                return Err(RenderError::OverlayFrameIdentityRequired);
             }
-            let requested = layers
-                .len()
-                .checked_add(1)
-                .ok_or(RenderError::OverlayPlanSizeOverflow)?;
-            layers
-                .try_reserve(1)
-                .map_err(|_| RenderError::OverlayPlanAllocationFailed { requested })?;
-            layers.push(OverlayLayer {
-                item,
-                track_opacity: track.opacity,
-                blend_mode: track.blend_mode,
-                track_index,
-                item_index,
-            });
+            for mark in &cell.marks {
+                check_cancelled(cancellation)?;
+                push_layer(
+                    &mut layers,
+                    OverlayLayer {
+                        id: mark.id,
+                        content: &mark.content,
+                        span: None,
+                        z_index: mark.z_index,
+                        track_opacity: track.opacity,
+                        blend_mode: track.blend_mode,
+                        track_index,
+                        item_index,
+                    },
+                )?;
+                item_index = item_index
+                    .checked_add(1)
+                    .ok_or(RenderError::OverlayPlanSizeOverflow)?;
+            }
         }
     }
-    layers.sort_unstable_by_key(|layer| (layer.item.z_index, layer.track_index, layer.item_index));
+    layers.sort_unstable_by_key(|layer| (layer.z_index, layer.track_index, layer.item_index));
     check_cancelled(cancellation)?;
     Ok(layers)
+}
+
+fn push_layer<'a>(
+    layers: &mut Vec<OverlayLayer<'a>>,
+    layer: OverlayLayer<'a>,
+) -> Result<(), RenderError> {
+    if matches!(layer.content, OverlayContent::Raster { opacity: 0, .. }) {
+        return Ok(());
+    }
+    if layer.span.is_none() && matches!(layer.content, OverlayContent::Progress { style: None, .. })
+    {
+        return Err(RenderError::InvalidOverlayGeometry {
+            overlay_id: layer.id,
+            reason: "frame-owned progress requires a frozen style",
+        });
+    }
+    if !matches!(
+        layer.content,
+        OverlayContent::Raster { .. }
+            | OverlayContent::Text {
+                raster: Some(_),
+                ..
+            }
+            | OverlayContent::KeyStroke {
+                raster: Some(_),
+                ..
+            }
+            | OverlayContent::Cursor { .. }
+            | OverlayContent::MouseClick { .. }
+            | OverlayContent::Progress {
+                show_frame_number: false,
+                ..
+            }
+            | OverlayContent::Progress { style: Some(_), .. }
+            | OverlayContent::Shape { .. }
+            | OverlayContent::Drawing { .. }
+    ) {
+        return Err(unsupported_overlay(layer.id, layer.content));
+    }
+    let requested = layers
+        .len()
+        .checked_add(1)
+        .ok_or(RenderError::OverlayPlanSizeOverflow)?;
+    layers
+        .try_reserve(1)
+        .map_err(|_| RenderError::OverlayPlanAllocationFailed { requested })?;
+    layers.push(layer);
+    Ok(())
 }
 
 fn unsupported_overlay(overlay_id: OverlayId, content: &OverlayContent) -> RenderError {
@@ -936,11 +1148,12 @@ mod tests {
     };
 
     use gif_from_screen_domain::{
-        CaptureMetadata, ClipTransform, DurationUs, OverlayItem, PhysicalPx, TimelineSpan, TrackId,
+        CaptureMetadata, ClipTransform, DurationUs, FrameAuthoringSpan, FrameLocalSpan,
+        FrameOverlayCell, FrameOverlayMark, OverlayItem, PhysicalPx, TimelineSpan, TrackId,
     };
 
     use super::*;
-    use crate::NeverCancel;
+    use crate::{AssetProviderError, NeverCancel};
 
     fn asset(number: u8) -> AssetId {
         AssetId::from_digest([number; 32])
@@ -1005,6 +1218,7 @@ mod tests {
         items: Vec<OverlayItem>,
     ) -> OverlayTrack {
         OverlayTrack {
+            frame_cells: None,
             annotation: None,
             annotation_scope: None,
             id: TrackId::from_u128(number),
@@ -1022,6 +1236,281 @@ mod tests {
             green,
             blue,
             alpha,
+        }
+    }
+
+    fn owned_track(owner: FrameId, number: u128, items: Vec<OverlayItem>) -> OverlayTrack {
+        let mut result = track(number, true, 255, BlendMode::Normal, Vec::new());
+        result.frame_cells = Some(vec![FrameOverlayCell {
+            frame_id: owner,
+            // Two disjoint authoring intervals must still paint each mark only
+            // once, including at times outside both intervals.
+            scopes: vec![
+                FrameAuthoringSpan {
+                    run_id: 1,
+                    span: FrameLocalSpan::new(2, 3, DurationUs::new(10).unwrap()).unwrap(),
+                },
+                FrameAuthoringSpan {
+                    run_id: 2,
+                    span: FrameLocalSpan::new(7, 8, DurationUs::new(10).unwrap()).unwrap(),
+                },
+            ],
+            marks: items
+                .into_iter()
+                .map(|item| FrameOverlayMark {
+                    id: item.id,
+                    z_index: item.z_index,
+                    content: item.content,
+                })
+                .collect(),
+        }]);
+        result
+    }
+
+    #[test]
+    fn frame_marks_and_timed_items_share_stable_order_without_scope_double_paint() {
+        let one = PhysicalSize::new(1, 1).unwrap();
+        let owner = clip(asset(1));
+        let item =
+            |number, source| raster_item(number, asset(source), 0, 0, 10, point(0, 0), one, 255);
+        let tracks = vec![
+            track(1, true, 255, BlendMode::Normal, vec![item(1, 2)]),
+            owned_track(owner.id, 2, vec![item(2, 3), item(3, 4)]),
+        ];
+        let provider = |id| -> Result<RgbaSurface, AssetProviderError> {
+            let color = if id == asset(1) {
+                [255, 0, 0, 255]
+            } else if id == asset(2) {
+                [0, 255, 0, 255]
+            } else if id == asset(3) {
+                [0, 0, 255, 128]
+            } else {
+                [255, 0, 0, 128]
+            };
+            Ok(surface(1, 1, &color))
+        };
+        let renderer = CpuRenderer::default();
+        for time in [0, 2, 5, 7, 9] {
+            let time = TimeUs::new(time);
+            let direct = renderer
+                .render_clip_with_overlays(&owner, &tracks, time, &provider, &NeverCancel)
+                .unwrap();
+            assert_eq!(direct.pixels(), &[128, 63, 64, 255]);
+            let plan = OverlayRenderPlan::for_frame(&tracks, owner.id, time, &NeverCancel).unwrap();
+            assert_eq!(
+                plan.raster_assets()
+                    .map(|asset| asset.overlay_id)
+                    .collect::<Vec<_>>(),
+                vec![
+                    OverlayId::from_u128(1),
+                    OverlayId::from_u128(2),
+                    OverlayId::from_u128(3)
+                ]
+            );
+            assert_eq!(
+                renderer
+                    .render_clip_with_overlay_plan(&owner, &plan, &provider, &NeverCancel)
+                    .unwrap(),
+                direct
+            );
+        }
+    }
+
+    #[test]
+    fn frame_identity_not_sample_time_selects_marks_after_reverse_and_retime() {
+        let one = PhysicalSize::new(1, 1).unwrap();
+        let mut owner = clip(asset(1));
+        let tracks = vec![owned_track(
+            owner.id,
+            1,
+            vec![raster_item(1, asset(2), 0, 0, 10, point(0, 0), one, 255)],
+        )];
+        let other = FrameClip {
+            id: FrameId::from_u128(2),
+            ..owner.clone()
+        };
+        let provider = |id| -> Result<RgbaSurface, AssetProviderError> {
+            Ok(surface(
+                1,
+                1,
+                if id == asset(1) {
+                    &[0, 0, 0, 255]
+                } else {
+                    &[0, 255, 0, 255]
+                },
+            ))
+        };
+        owner.duration = DurationUs::new(1_000_000).unwrap();
+        let renderer = CpuRenderer::default();
+        for (frame, time, expected) in [
+            (&other, 0, [0, 0, 0, 255]),
+            (&owner, 10, [0, 255, 0, 255]),
+            (&owner, 1_000_001, [0, 255, 0, 255]),
+        ] {
+            assert_eq!(
+                renderer
+                    .render_clip_with_overlays(
+                        frame,
+                        &tracks,
+                        TimeUs::new(time),
+                        &provider,
+                        &NeverCancel
+                    )
+                    .unwrap()
+                    .pixels(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_planning_cannot_silently_omit_frame_marks_and_plan_rejects_wrong_owner() {
+        let owner = clip(asset(1));
+        let one = PhysicalSize::new(1, 1).unwrap();
+        let mut tracks = vec![owned_track(
+            owner.id,
+            1,
+            vec![raster_item(1, asset(2), 0, 0, 10, point(0, 0), one, 255)],
+        )];
+        assert!(matches!(
+            active_raster_overlay_assets(&tracks, TimeUs::ZERO, &NeverCancel),
+            Err(RenderError::OverlayFrameIdentityRequired)
+        ));
+        let plan =
+            OverlayRenderPlan::for_frame(&tracks, owner.id, TimeUs::ZERO, &NeverCancel).unwrap();
+        let never_load = |_id| -> Result<RgbaSurface, AssetProviderError> {
+            panic!("wrong-owner plan must not read pixels")
+        };
+        let other = FrameClip {
+            id: FrameId::from_u128(2),
+            ..owner.clone()
+        };
+        assert!(matches!(
+            CpuRenderer::default().render_clip_with_overlay_plan(
+                &other,
+                &plan,
+                &never_load,
+                &NeverCancel
+            ),
+            Err(RenderError::OverlayPlanFrameMismatch { .. })
+        ));
+        assert!(
+            active_raster_overlay_assets_for_frame(&tracks, other.id, TimeUs::ZERO, &NeverCancel)
+                .unwrap()
+                .is_empty()
+        );
+        tracks[0].visible = false;
+        assert!(
+            active_raster_overlay_assets(&tracks, TimeUs::ZERO, &NeverCancel)
+                .unwrap()
+                .is_empty()
+        );
+        tracks[0].visible = true;
+        tracks[0].opacity = 0;
+        assert!(
+            active_raster_overlay_assets(&tracks, TimeUs::ZERO, &NeverCancel)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            plan.raster_assets().count(),
+            1,
+            "detached plan retains its source revision"
+        );
+    }
+
+    #[test]
+    fn frame_progress_requires_frozen_style_but_legacy_time_progress_is_unchanged() {
+        let owner = clip(asset(1));
+        let item = OverlayItem {
+            id: OverlayId::from_u128(1),
+            z_index: 0,
+            span: TimelineSpan {
+                start: TimeUs::ZERO,
+                duration: DurationUs::new(10).unwrap(),
+            },
+            content: OverlayContent::Progress {
+                bounds: PhysicalRect::new(0, 0, 2, 1).unwrap(),
+                foreground: rgba(0, 255, 0, 255),
+                background: rgba(0, 0, 0, 255),
+                show_frame_number: false,
+                style: None,
+            },
+        };
+        let tracks = vec![owned_track(owner.id, 1, vec![item.clone()])];
+        assert!(matches!(
+            OverlayRenderPlan::for_frame(&tracks, owner.id, TimeUs::new(5), &NeverCancel),
+            Err(RenderError::InvalidOverlayGeometry { .. })
+        ));
+        let legacy = vec![track(1, true, 255, BlendMode::Normal, vec![item])];
+        let provider =
+            |_id| -> Result<RgbaSurface, AssetProviderError> { Ok(surface(2, 1, &[0; 8])) };
+        assert_eq!(
+            CpuRenderer::default()
+                .render_clip_with_overlays(&owner, &legacy, TimeUs::new(5), &provider, &NeverCancel)
+                .unwrap()
+                .pixels(),
+            &[0, 255, 0, 255, 0, 0, 0, 255]
+        );
+    }
+
+    #[test]
+    fn frame_progress_fraction_and_label_are_frozen_at_every_presentation_time() {
+        use gif_from_screen_domain::{
+            ProgressDirection, ProgressFraction, ProgressStyle, TextRaster,
+        };
+        let mut owner = clip(asset(1));
+        owner.duration = DurationUs::new(90_000).unwrap();
+        let item = OverlayItem {
+            id: OverlayId::from_u128(1),
+            z_index: 0,
+            span: TimelineSpan {
+                start: TimeUs::ZERO,
+                duration: DurationUs::new(10).unwrap(),
+            },
+            content: OverlayContent::Progress {
+                bounds: PhysicalRect::new(0, 0, 2, 1).unwrap(),
+                foreground: rgba(0, 255, 0, 255),
+                background: rgba(0, 0, 0, 255),
+                show_frame_number: true,
+                style: Some(ProgressStyle {
+                    amount_millionths: 500_000,
+                    fraction: ProgressFraction::new(1, 2),
+                    direction: ProgressDirection::LeftToRight,
+                    label: Some(TextRaster {
+                        asset_id: asset(2),
+                        size: PhysicalSize::new(1, 1).unwrap(),
+                    }),
+                    label_position: point(2, 0),
+                    label_text: "2 / 4".to_owned(),
+                }),
+            },
+        };
+        let tracks = vec![owned_track(owner.id, 1, vec![item])];
+        let provider = |id| -> Result<RgbaSurface, AssetProviderError> {
+            Ok(if id == asset(2) {
+                surface(1, 1, &[255, 0, 0, 255])
+            } else {
+                surface(3, 1, &[0, 0, 255, 255].repeat(3))
+            })
+        };
+        for time in [0, 5, 100, 90_000] {
+            let plan =
+                OverlayRenderPlan::for_frame(&tracks, owner.id, TimeUs::new(time), &NeverCancel)
+                    .unwrap();
+            assert_eq!(
+                plan.raster_assets()
+                    .map(|asset| asset.asset_id)
+                    .collect::<Vec<_>>(),
+                vec![asset(2)]
+            );
+            assert_eq!(
+                CpuRenderer::default()
+                    .render_clip_with_overlay_plan(&owner, &plan, &provider, &NeverCancel)
+                    .unwrap()
+                    .pixels(),
+                &[0, 255, 0, 255, 0, 0, 0, 255, 255, 0, 0, 255]
+            );
         }
     }
 

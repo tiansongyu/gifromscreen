@@ -85,6 +85,9 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [x] Separate fixed GIF playback delays from native sampling cadence; verify manual and periodic timing, changed-only omission, cumulative GIF quantization and recovery without rewriting source timestamps.
 - [x] Persist independent capture clocks through pause, movement, copy and insertion; require separate legacy clock confirmation and reject invalid clocks before fast journal append.
 - [x] Keep Wayland preparation actions accessible on small windows and enlarged fonts; explain monitor self-capture and hidden-window redraw limitations.
+- [x] Use a compact, zoom-aware Wayland controller with bounded geometry acknowledgements and responsive primary controls; restore the prior local window extent on stop or recorder close.
+- [x] Implement the schema-2 frame-owned core across validation, journal recovery, preview/GIF rendering, clipboard/Yoyo/project insertion, Save As and baking, with unchanged legacy timed-track behavior.
+- [ ] Connect normal frame-owned authoring, explicit legacy conversion and bounded input-aware regeneration; current frame-owned regeneration fails safely without changing existing marks.
 - [x] Save an independently identified project copy without switching the current editor, and retain a bounded recent-project list.
 - [x] Build and verify an Ubuntu-22-compatible x86_64 portable tarball with exact-file installation, checksums, license notices, and CI artifacts.
 

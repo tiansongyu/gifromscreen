@@ -9,8 +9,8 @@
 //! outside the canvas, clips the result to the canvas, and composites the
 //! original pixels over the colored mask. A zero shadow radius is a valid hard
 //! shadow, radii above [`MAX_BLUR_RADIUS`] are rejected, and every `i32` offset
-//! is accepted with overflow-free clipping. Timed Raster, Shape, and Drawing
-//! overlays are then composited in stable z/track/item order with hard-edged,
+//! is accepted with overflow-free clipping. Active timed items and matching
+//! frame-owned marks are then composited in stable z/track/item order with hard-edged,
 //! allocation-free vector rasterization and straight-alpha blend modes. Keeping
 //! this pipeline CPU-only gives exports a stable reference implementation across
 //! Linux machines and graphics drivers.
@@ -26,7 +26,10 @@ mod transition;
 
 pub use control::{CancellationToken, NeverCancel};
 pub use error::{RenderError, SurfaceError, UnsupportedEffect};
-pub use overlay::{RasterOverlayAsset, active_raster_overlay_assets};
+pub use overlay::{
+    OverlayRenderPlan, RasterOverlayAsset, active_raster_overlay_assets,
+    active_raster_overlay_assets_for_frame,
+};
 pub use renderer::{
     AssetProviderError, CpuRenderer, FrameAssetProvider, MAX_BLUR_RADIUS, RenderLimits,
 };

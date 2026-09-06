@@ -1222,6 +1222,7 @@ name = "gif-from-screen-editor"
 version = "0.1.0"
 dependencies = [
  "gif-from-screen-domain",
+ "serde_json",
  "thiserror 2.0.20",
 ]
 

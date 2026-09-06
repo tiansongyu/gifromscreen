@@ -11,6 +11,7 @@ use thiserror::Error;
 
 mod clip_transform;
 mod duplicates;
+mod frame_bundle;
 mod frame_clipboard;
 mod frame_effect;
 mod frame_selection;
@@ -24,6 +25,10 @@ pub use clip_transform::{ClipTransformEdit, edit_clip_transforms};
 pub use duplicates::{
     DuplicateDelayMode, DuplicateFrameRetention, FrameComparison, FrameSimilarityProvider,
     RemoveDuplicateFramesOptions, remove_duplicate_frames,
+};
+pub use frame_bundle::{
+    FrameBundle, FrameBundleError, FrameBundleIdentities, MAX_FRAME_BUNDLE_METADATA_BYTES,
+    MAX_FRAME_BUNDLE_TRACKS,
 };
 pub use frame_clipboard::{
     CutFrameSelection, DEFAULT_FRAME_CLIPBOARD_HISTORY_CAPACITY, FrameClipboard,
@@ -631,6 +636,9 @@ fn ensure_known_selection(
 /// Errors produced while building or applying editor commands.
 #[derive(Debug, Error)]
 pub enum EditorError {
+    /// Frozen frame-owned annotation metadata could not be copied safely.
+    #[error(transparent)]
+    FrameBundle(#[from] FrameBundleError),
     /// The project or command violated a domain invariant.
     #[error(transparent)]
     Domain(#[from] DomainError),
@@ -1367,6 +1375,7 @@ mod tests {
             let mut project = project_with_durations(&[100, 100, 100, 100]);
             let asset_id = project.timeline.frames[0].asset_id;
             project.timeline.overlay_tracks.push(OverlayTrack {
+                frame_cells: None,
                 annotation: None,
                 annotation_scope: None,
                 id: TrackId::from_u128(1),

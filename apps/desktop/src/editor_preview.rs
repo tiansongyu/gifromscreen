@@ -9,14 +9,13 @@ use std::{
 use eframe::egui;
 use gif_from_screen_application::{PresentationTransitionStep, transition_step_progress};
 use gif_from_screen_domain::{
-    AssetDescriptor, AssetId, AssetKind, FrameClip, FrameId, OverlayId, OverlayTrack, ProjectId,
-    ProjectRevision, RasterEncoding, TimeUs, Transition, TransitionId,
+    AssetDescriptor, AssetId, AssetKind, FrameClip, FrameId, OverlayId, ProjectId, ProjectRevision,
+    RasterEncoding, TimeUs, Transition, TransitionId,
 };
 use gif_from_screen_project::{ActiveProject, AssetStore, ProjectError};
 use gif_from_screen_render::{
     AssetProviderError, CancellationToken, CpuRenderer, FrameAssetProvider, NeverCancel,
-    RenderError, RenderLimits, RgbaSurface, SurfaceError, active_raster_overlay_assets,
-    render_transition,
+    OverlayRenderPlan, RenderError, RenderLimits, RgbaSurface, SurfaceError, render_transition,
 };
 use thiserror::Error;
 
@@ -541,7 +540,7 @@ pub(crate) fn render_frame_surface(
 pub(crate) struct PreviewRenderPlan {
     clip: FrameClip,
     sample_time: TimeUs,
-    tracks: Vec<OverlayTrack>,
+    overlays: OverlayRenderPlan,
     descriptors: BTreeMap<AssetId, AssetDescriptor>,
     store: AssetStore,
 }
@@ -553,8 +552,9 @@ impl PreviewRenderPlan {
         sample_time: TimeUs,
     ) -> Result<Self, EditorPreviewError> {
         let frame_id = clip.id;
-        let active_overlays = active_raster_overlay_assets(
+        let overlays = OverlayRenderPlan::for_frame(
             &project.manifest().timeline.overlay_tracks,
+            frame_id,
             sample_time,
             &NeverCancel,
         )
@@ -571,7 +571,7 @@ impl PreviewRenderPlan {
             },
         )?;
         descriptors.insert(clip.asset_id, descriptor.clone());
-        for overlay in active_overlays {
+        for overlay in overlays.raster_assets() {
             let descriptor = project.manifest().assets.get(&overlay.asset_id).ok_or(
                 EditorPreviewError::MissingOverlayAssetDescriptor {
                     overlay_id: overlay.overlay_id,
@@ -580,38 +580,10 @@ impl PreviewRenderPlan {
             )?;
             descriptors.insert(overlay.asset_id, descriptor.clone());
         }
-        let tracks = project
-            .manifest()
-            .timeline
-            .overlay_tracks
-            .iter()
-            .filter(|track| track.visible && track.opacity != 0)
-            .filter_map(|track| {
-                let items: Vec<_> = track
-                    .items
-                    .iter()
-                    .filter(|item| {
-                        item.span.start <= sample_time
-                            && item.span.end().is_some_and(|end| sample_time < end)
-                    })
-                    .cloned()
-                    .collect();
-                (!items.is_empty()).then(|| OverlayTrack {
-                    annotation: None,
-                    annotation_scope: None,
-                    id: track.id,
-                    name: String::new(),
-                    visible: track.visible,
-                    opacity: track.opacity,
-                    blend_mode: track.blend_mode,
-                    items,
-                })
-            })
-            .collect();
         Ok(Self {
             clip: clip.clone(),
             sample_time,
-            tracks,
+            overlays,
             descriptors,
             store: project.assets().clone(),
         })
@@ -635,14 +607,13 @@ impl PreviewRenderPlan {
         cancellation: &dyn CancellationToken,
     ) -> Result<RgbaSurface, EditorPreviewError> {
         let frame_id = self.clip.id;
-        let active_overlays =
-            active_raster_overlay_assets(&self.tracks, self.sample_time, cancellation).map_err(
-                |source| EditorPreviewError::OverlayPlan {
-                    frame_id,
-                    time_us: self.sample_time.get(),
-                    source,
-                },
-            )?;
+        if cancellation.is_cancelled() {
+            return Err(EditorPreviewError::OverlayPlan {
+                frame_id,
+                time_us: self.sample_time.get(),
+                source: RenderError::Cancelled,
+            });
+        }
         let mut provider = PreviewAssetProvider {
             assets: BTreeMap::new(),
         };
@@ -656,7 +627,13 @@ impl PreviewRenderPlan {
             &mut retained_bytes,
             &mut provider.assets,
         )?;
-        for overlay in active_overlays {
+        for overlay in self.overlays.raster_assets() {
+            if cancellation.is_cancelled() {
+                return Err(EditorPreviewError::Render {
+                    frame_id,
+                    source: RenderError::Cancelled,
+                });
+            }
             load_preview_raster(
                 &self.store,
                 &self.descriptors,
@@ -672,13 +649,7 @@ impl PreviewRenderPlan {
         CpuRenderer::with_limits(RenderLimits {
             max_surface_bytes: render_surface_limit_bytes,
         })
-        .render_clip_with_raster_overlays(
-            &self.clip,
-            &self.tracks,
-            self.sample_time,
-            &provider,
-            cancellation,
-        )
+        .render_clip_with_overlay_plan(&self.clip, &self.overlays, &provider, cancellation)
         .map_err(|source| EditorPreviewError::Render { frame_id, source })
     }
 }
@@ -942,10 +913,11 @@ mod tests {
     use super::*;
     use gif_from_screen_domain::{
         AssetDescriptor, BlendMode, Canvas, CanvasBackground, CaptureMetadata, ClipTransform,
-        ColorSpace, DurationUs, EditCommand, Effect, FrameClip, OverlayContent, OverlayId,
-        OverlayItem, OverlayTrack, PhysicalPoint, PhysicalPx, PhysicalRect, PhysicalSize,
-        ProjectManifest, Rgba, ShapeKind, SlideDirection, StrokePoint, TimelineSpan, TrackId,
-        Transition, TransitionKind, UnixTimeMs,
+        ColorSpace, DurationUs, EditCommand, Effect, FrameAuthoringSpan, FrameClip,
+        FrameDurationChange, FrameLocalSpan, FrameOverlayCell, FrameOverlayMark, OverlayContent,
+        OverlayId, OverlayItem, OverlayTrack, PhysicalPoint, PhysicalPx, PhysicalRect,
+        PhysicalSize, ProjectManifest, Rgba, ShapeKind, SlideDirection, StrokePoint, TimelineSpan,
+        TrackId, Transition, TransitionKind, UnixTimeMs,
     };
     use tempfile::{TempDir, tempdir};
 
@@ -1020,6 +992,7 @@ mod tests {
     ) -> (AssetId, OverlayTrack) {
         let asset_id = project.assets().put(pixels).unwrap();
         let track = OverlayTrack {
+            frame_cells: None,
             annotation: None,
             annotation_scope: None,
             id: TrackId::from_u128(1),
@@ -1188,6 +1161,121 @@ mod tests {
             let preview = render_transition_surface(&project, step, 1024).unwrap();
             assert_eq!(preview.pixels(), pixels);
         }
+    }
+
+    fn add_incoming_frame_mark(project: &mut ActiveProject) {
+        let mut track = project.manifest().timeline.overlay_tracks[0].clone();
+        track.id = TrackId::from_u128(2);
+        track.items.clear();
+        track.frame_cells = Some(vec![FrameOverlayCell {
+            frame_id: FrameId::from_u128(2),
+            scopes: vec![FrameAuthoringSpan {
+                run_id: 1,
+                span: FrameLocalSpan::new(15_000, 20_000, DurationUs::new(30_000).unwrap())
+                    .unwrap(),
+            }],
+            marks: vec![FrameOverlayMark {
+                id: OverlayId::from_u128(2),
+                z_index: 0,
+                content: OverlayContent::Raster {
+                    asset_id: project.manifest().timeline.frames[0].asset_id,
+                    position: PhysicalPoint::default(),
+                    size: PhysicalSize::new(1, 1).unwrap(),
+                    opacity: 255,
+                },
+            }],
+        }]);
+        project
+            .commit(EditCommand::UpsertOverlayTrack { track })
+            .unwrap();
+    }
+
+    #[test]
+    fn frame_owned_preview_and_gif_share_whole_frame_transition_endpoints() {
+        let (directory, mut project, step) = transition_project(TransitionKind::FadeToNext);
+        add_incoming_frame_mark(&mut project);
+        let first = render_frame_surface(&project, step.from_frame, 1024).unwrap();
+        let second = render_frame_surface(&project, step.to_frame, 1024).unwrap();
+        let transition = render_transition_surface(&project, step, 1024).unwrap();
+        assert_eq!(first.pixels(), &[255, 0, 0, 255, 0, 255, 0, 255]);
+        assert_eq!(second.pixels(), &[255, 0, 0, 255, 0, 0, 255, 255]);
+        assert_eq!(transition.pixels(), &[255, 0, 0, 255, 0, 128, 128, 255]);
+        let output = directory.path().join("frame-owned.gif");
+        gif_from_screen_application::export_project_snapshot_to_gif(
+            &gif_from_screen_application::ProjectExportSnapshot::from_active(&project),
+            &output,
+            &gif_from_screen_application::ProjectGifExportOptions::default(),
+            &gif_from_screen_gif::NeverCancel,
+            &mut gif_from_screen_application::NoopProjectExportProgress,
+        )
+        .unwrap();
+        let decoded = gif_from_screen_media::decode_gif(
+            fs::File::open(output).unwrap(),
+            &gif_from_screen_media::GifDecodeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(decoded.frames().len(), 3);
+        for (frame, expected) in decoded.frames().iter().zip([first, transition, second]) {
+            assert_eq!(frame.rgba(), expected.pixels());
+        }
+    }
+
+    #[test]
+    fn frame_owned_detached_preview_survives_reverse_retime_and_reopen() {
+        let (directory, mut project, step) = transition_project(TransitionKind::FadeToNext);
+        add_incoming_frame_mark(&mut project);
+        let plan = PreviewRenderPlan::new(
+            &project,
+            &project.manifest().timeline.frames[1],
+            TimeUs::new(10_000),
+        )
+        .unwrap();
+        let frozen = plan.render(1024, &NeverCancel).unwrap();
+        let original_cells = project.manifest().timeline.overlay_tracks[1]
+            .frame_cells
+            .clone();
+        project
+            .commit(EditCommand::SetTransitions {
+                transitions: Vec::new(),
+            })
+            .unwrap();
+        project
+            .commit(EditCommand::ReorderFrames {
+                order: vec![step.to_frame, step.from_frame],
+            })
+            .unwrap();
+        project
+            .commit(EditCommand::SetFrameDurations {
+                changes: vec![FrameDurationChange {
+                    frame_id: step.to_frame,
+                    duration: DurationUs::new(90_000).unwrap(),
+                }],
+            })
+            .unwrap();
+        assert_eq!(
+            original_cells,
+            project.manifest().timeline.overlay_tracks[1].frame_cells
+        );
+        // The old timed green mark remains at time zero; the red frame-owned
+        // mark follows frame 2. The detached earlier revision stays red/blue.
+        assert_eq!(
+            render_frame_surface(&project, step.to_frame, 1024)
+                .unwrap()
+                .pixels(),
+            &[255, 0, 0, 255, 0, 255, 0, 255]
+        );
+        assert_eq!(plan.render(1024, &NeverCancel).unwrap(), frozen);
+        let expected = render_frame_surface(&project, step.to_frame, 1024).unwrap();
+        drop(project);
+        let reopened = ActiveProject::open(
+            directory.path(),
+            gif_from_screen_project::LockPolicy::FailIfPresent,
+        )
+        .unwrap();
+        assert_eq!(
+            render_frame_surface(&reopened.project, step.to_frame, 1024).unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -1480,6 +1568,7 @@ mod tests {
             Vec::new(),
         );
         let track = OverlayTrack {
+            frame_cells: None,
             annotation: None,
             annotation_scope: None,
             id: TrackId::from_u128(1),
@@ -1593,6 +1682,7 @@ mod tests {
         project
             .commit(EditCommand::UpsertOverlayTrack {
                 track: OverlayTrack {
+                    frame_cells: None,
                     annotation: None,
                     annotation_scope: None,
                     id: TrackId::from_u128(1),

@@ -14,7 +14,7 @@ An annotation group's generated marks are not its authoring scope. A short key/c
 - Title insertion and destination-side project insertion split and shift scope around the inserted interval. Imported source groups shift their scope to the destination time. Baking removes the baked coverage from editable scope as well as from visible marks; remaining unmarked scope is not discarded just because no items remain.
 - Empty regenerated groups keep their authoring recipe and scope. New empty manual groups still produce a no-event notice rather than an empty edit.
 
-The current repository deliberately keeps ordinary overlays and authoring scopes **time-anchored when frames are reordered**. This is not full ScreenToGif parity: its baked annotations ordinarily move with the frame pixels. Also, deleting an unselected gap closes that gap; newly adjacent authoring intervals execute continuously, while their original capture clocks remain unchanged. Historical selection-run IDs are not persisted in this version. These are explicit current semantics, not claims of one-to-one upstream behavior.
+Ordinary authoring tools and existing timed tracks still keep overlays and scope **time-anchored when frames are reordered**. In this legacy representation, deleting an unselected gap closes it and no historical authoring-run IDs are stored. Schema 2 now also supports explicit frame-owned cells with stable per-track run IDs, whole-frame marks, and canonical local scope fractions. Their persistence, rendering, copying and baking are implemented; ordinary creation and input-aware re-authoring are still pending. Existing groups are never silently converted. See [frame-owned implementation and remaining work](FRAME-OWNED-OVERLAYS-PLAN.md).
 
 ## Recorded-input safety
 
@@ -34,12 +34,12 @@ Recorded key/click history only carries across matching nonempty identities with
 
 For legacy frames, moving/copying freezes an existing raw sampling timestamp, or the original source-frame start when no raw timestamp was saved. This preserves the previous per-frame interpretation without inventing a shared identity. The input-confirmation UI separately offers an explicit declaration that each selected continuous unknown-clock interval comes from one recording with trustworthy sampling times. Declared unknown intervals get separate fresh identities; existing known clocks and selection gaps are never merged. Pixel confirmation alone does not authorize cross-frame holds. Without trustworthy original timing, leave the declaration unchecked and use per-frame/manual annotations.
 
-The project remains at schema version 1; this is an additive read-compatibility change for the current reader, not a downgrade guarantee:
+Capture-clock metadata was introduced additively in schema 1 and remains readable there. Current new projects use schema 2 for the frame-owned rendering representation; reading schema 1 does not rewrite it. Before a v2 command is committed to a v1 project, the store durably stamps the previously committed state with a v2 header. This upgrade is sticky even after visual Undo, so older readers reject a new rendering format rather than silently losing marks. The capture-clock compatibility details remain:
 
 - Missing `FrameClip.capture_clock` deserializes as `None` and is omitted when serializing `None`. No source identity is inferred from a legacy timestamp, project ID, label or asset hash. Missing `capture_binding` still defaults to `LegacyUnknown`.
 - Missing `OverlayTrack.annotation_scope` remains `None`: use existing marker coverage, not a guessed original selection. `Some([])` remains distinct from missing scope and represents explicitly removed authored time.
 - When a clock is present, a nil identity is invalid; when a raw capture timestamp is also present, `sampled_at` must equal it. Clock-only commands do not copy or mutate raw event buffers. Current journal replay, undo and checkpoint/reopen preserve the context.
-- New journals may contain `SetCaptureClocks`. Older executables do not necessarily understand that command or preserve new optional fields when saving; do not use them to round-trip an edited project. Keep a backup when moving projects between application versions. The unchanged schema number does not promise backwards executable compatibility.
+- Journals may contain `SetCaptureClocks`. Older schema-1 executables do not necessarily understand that command or preserve optional capture fields when saving; do not use them to round-trip an edited project. Schema-2 projects are explicitly unsupported by those executables. Keep a backup when moving projects between application versions.
 
 ## Bounds and verification
 

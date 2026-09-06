@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use gif_from_screen_domain::{EditCommand, FrameClip, FrameId, ProjectManifest};
 
-use crate::{EditorError, ensure_known_selection};
+use crate::{EditorError, FrameBundle, FrameBundleIdentities, ensure_known_selection};
 
 /// Chooses the source range for a Yoyo operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,6 +38,8 @@ pub struct YoyoOptions {
 /// Every cloned clip receives a new identity from `generate_frame_id`; all other clip state is
 /// cloned exactly, including its immutable asset reference, duration, transform, capture metadata,
 /// and effects. Asset bytes and descriptors are never copied or registered.
+/// Frozen frame-owned annotations are cloned with fresh track/mark identities
+/// from the same injected 128-bit source. Legacy timed tracks remain unchanged.
 ///
 /// Existing transitions are retained only when their original endpoints remain adjacent after the
 /// insertion. Thus a transition crossing a selected range's insertion boundary is cleared.
@@ -78,6 +80,8 @@ where
     } else {
         &source[1..source.len() - 1]
     };
+    let selected_owners = reverse_sources.iter().map(|frame| frame.id).collect();
+    let bundle = FrameBundle::capture(project, &selected_owners)?;
 
     let mut occupied_ids: BTreeSet<_> = project
         .timeline
@@ -91,6 +95,7 @@ where
         source.len() - 2
     });
     let mut added_duration = 0_u64;
+    let mut frame_ids = BTreeMap::new();
 
     for source_frame in reverse_sources.iter().rev() {
         let generated_id = generate_frame_id();
@@ -106,6 +111,7 @@ where
             .ok_or(EditorError::InvalidDuration)?;
         let mut cloned_frame = source_frame.clone();
         cloned_frame.id = generated_id;
+        frame_ids.insert(source_frame.id, generated_id);
         reversed_frames.push(cloned_frame);
     }
 
@@ -128,6 +134,21 @@ where
         index: insertion_index,
         frames: reversed_frames,
     });
+    if !bundle.tracks().is_empty() {
+        let mut identities = FrameBundleIdentities::new(
+            project
+                .timeline
+                .overlay_tracks
+                .iter()
+                .chain(bundle.tracks()),
+        )?;
+        commands.extend(
+            bundle
+                .remap(&frame_ids, &mut identities, &mut generate_frame_id)?
+                .into_iter()
+                .map(|track| EditCommand::UpsertOverlayTrack { track }),
+        );
+    }
 
     Ok(EditCommand::Compound { commands })
 }

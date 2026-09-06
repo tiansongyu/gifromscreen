@@ -2481,10 +2481,10 @@ fn show_overlay_track_list(
                 track.id,
                 track.name.clone(),
                 track
-                    .items
-                    .first()
-                    .map(|item| overlay_content_label(&item.content)),
-                track.items.len(),
+                    .all_mark_contents()
+                    .next()
+                    .map(|(_, content)| overlay_content_label(content)),
+                track.mark_count(),
             )
         })
         .collect::<Vec<_>>();

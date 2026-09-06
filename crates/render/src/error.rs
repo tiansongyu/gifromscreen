@@ -1,4 +1,4 @@
-use gif_from_screen_domain::{AssetId, OverlayId, PhysicalRect};
+use gif_from_screen_domain::{AssetId, FrameId, OverlayId, PhysicalRect};
 use thiserror::Error;
 
 use crate::AssetProviderError;
@@ -56,6 +56,17 @@ impl std::fmt::Display for UnsupportedEffect {
 /// Errors produced by the deterministic CPU renderer.
 #[derive(Debug, Error)]
 pub enum RenderError {
+    /// Legacy time-only planning cannot decide which frame-owned marks to draw.
+    #[error("frame-owned overlays require frame identity; use frame-aware overlay planning")]
+    OverlayFrameIdentityRequired,
+    /// A detached drawing plan must not be applied to a different frame.
+    #[error("overlay plan belongs to frame {expected}, not {actual}")]
+    OverlayPlanFrameMismatch {
+        /// Frame whose marks were resolved.
+        expected: FrameId,
+        /// Frame the caller requested rendering.
+        actual: FrameId,
+    },
     /// An active overlay cannot yet be reproduced by the renderer.
     #[error(
         "overlay {overlay_id} uses unsupported {kind} content; hide or remove it before exporting"

@@ -592,6 +592,7 @@ fn finish_annotations(
         .collect();
     commands.push(EditCommand::UpsertOverlayTrack {
         track: OverlayTrack {
+            frame_cells: None,
             annotation: Some(request.clone()),
             annotation_scope: Some(scope),
             id: TrackId::from_u128(Uuid::new_v4().as_u128()),

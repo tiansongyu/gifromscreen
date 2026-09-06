@@ -222,8 +222,13 @@ impl EditorWorkspace {
         let spans = self
             .selected_timeline_spans()
             .map_err(|error| error.to_string())?;
-        let mut commands =
-            remove_baked_overlay_spans(&self.manifest().timeline.overlay_tracks, &spans)?;
+        let owners = selected.iter().map(|frame| frame.id).collect();
+        let mut commands = remove_baked_overlay_spans(
+            &self.manifest().timeline.overlay_tracks,
+            &spans,
+            &owners,
+            cancellation,
+        )?;
         let mut registered = BTreeSet::new();
         for (index, original) in selected.iter().enumerate() {
             check_cancelled(cancellation)?;
@@ -501,11 +506,20 @@ fn store_surface(
 fn remove_baked_overlay_spans(
     tracks: &[gif_from_screen_domain::OverlayTrack],
     selected: &[TimelineSpan],
+    owners: &BTreeSet<FrameId>,
+    cancellation: &AtomicBool,
 ) -> Result<Vec<EditCommand>, String> {
     let mut commands = Vec::new();
     let mut total_fragments = 0_usize;
     for track in tracks {
+        check_cancelled(cancellation)?;
         if !track.visible || track.opacity == 0 {
+            continue;
+        }
+        if track.frame_cells.is_some() {
+            if let Some(command) = remove_baked_frame_cells(track, owners, cancellation)? {
+                commands.push(command);
+            }
             continue;
         }
         let mut replacement = track.clone();
@@ -557,6 +571,45 @@ fn remove_baked_overlay_spans(
         }
     }
     Ok(commands)
+}
+
+/// Whole-frame marks have already been included in each selected owner's baked
+/// pixels. Authoring fractions do not describe visible sub-frame intervals.
+fn remove_baked_frame_cells(
+    track: &gif_from_screen_domain::OverlayTrack,
+    owners: &BTreeSet<FrameId>,
+    cancellation: &AtomicBool,
+) -> Result<Option<EditCommand>, String> {
+    let mut replacement = track.clone();
+    let cells = replacement
+        .frame_cells
+        .as_mut()
+        .expect("frame-owned branch");
+    for cell in cells.iter_mut() {
+        check_cancelled(cancellation)?;
+        if owners.contains(&cell.frame_id) {
+            // This mirrors the renderer's explicit per-mark visibility rule.
+            // Retained zero-opacity marks keep their shared authoring scopes;
+            // they were not part of the baked image and may be enabled later.
+            cell.marks.retain(|mark| {
+                matches!(
+                    mark.content,
+                    gif_from_screen_domain::OverlayContent::Raster { opacity: 0, .. }
+                )
+            });
+        }
+    }
+    cells.retain(|cell| !owners.contains(&cell.frame_id) || !cell.marks.is_empty());
+    let empty = cells.is_empty();
+    check_cancelled(cancellation)?;
+    if replacement == *track {
+        return Ok(None);
+    }
+    Ok(Some(if empty {
+        EditCommand::RemoveOverlayTrack { track_id: track.id }
+    } else {
+        EditCommand::UpsertOverlayTrack { track: replacement }
+    }))
 }
 
 fn subtract_spans(
