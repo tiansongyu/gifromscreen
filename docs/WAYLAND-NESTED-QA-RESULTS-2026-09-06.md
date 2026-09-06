@@ -1,6 +1,6 @@
 # Nested GNOME acceptance: execution record
 
-Status: **in progress; capture/export acceptance is not yet complete**.
+Status: **native window recording, pause/retarget/resume, Stop and GIF export passed on 2026-09-07; remaining platform gates are listed below**.
 
 This follows [the isolated acceptance plan](WAYLAND-NESTED-QA-PLAN.md). The environment now runs real nested GNOME Shell 42.9, xdg-desktop-portal 1.14.4, its GNOME 42.1 backend, PipeWire 0.3.48 and pipewire-media-session 0.4.1. It does not use a fake portal or pre-granted permissions. Application implementation remains Rust; the supervisor/GTK fixture and the native SPA interoperability probe are test infrastructure.
 
@@ -17,12 +17,12 @@ Commands (run from the repository; desktop binary must have been built first):
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m unittest discover -s scripts/qa -p 'test_*.py' -v
-/usr/bin/python3 scripts/qa/wayland_nested.py start --app target/debug/gif-from-screen --seconds 3600 --startup-timeout 45
+/usr/bin/python3 scripts/qa/wayland_nested.py start --app target/debug/gif-from-screen --seconds 14400 --startup-timeout 45
 ```
 
-The launcher prints the allocated `LAB_CREATED` directory. `status LAB` never launches a replacement. `exec LAB -- COMMAND...` injects only that live lab's connection environment and limits the command to 30 seconds. `run-app LAB --app PATH --seconds 600` attaches a separately supervised app without restarting any compositor, bus or portal. `stop LAB` requests orderly cleanup of the registered children. Do not substitute a stale directory or the host display.
+The launcher prints the allocated `LAB_CREATED` directory. `status LAB` never launches a replacement. `exec LAB -- COMMAND...` injects only that live lab's connection environment and limits the command to 30 seconds. `run-app LAB --app PATH --seconds 600` attaches a separately supervised app without restarting any compositor, bus or portal. Lifetimes are bounded to 1–14400 seconds; startup is separately bounded to 1–120 seconds. A longer bounded debugging session does not disable signals, extend existing processes or relax isolation. `stop LAB` requests orderly cleanup of the registered children. Stop promptly when testing ends; do not substitute a stale directory or the host display.
 
-Current harness tests: **5 passed**. CLI parsing and Python compilation passed; generated logs/environment files were observed with mode 0600 and lab/runtime directories with mode 0700. Native graph inspection found **zero `PipeWire:Interface:Device` objects**. Missing real system services produce expected GNOME warnings on the isolated bus; no host service was enabled to silence them.
+Current harness tests: **6 passed**. CLI parsing and Python compilation passed; generated logs/environment files were observed with mode 0600 and lab/runtime directories with mode 0700. Native graph inspection found **zero `PipeWire:Interface:Device` objects**. Missing real system services produce expected GNOME warnings on the isolated bus; no host service was enabled to silence them.
 
 ## Executed instances and evidence
 
@@ -31,7 +31,9 @@ Current harness tests: **5 passed**. CLI parsing and Python compilation passed; 
 | `/tmp/gfs-wayland-qa.557a8gpg` | GNOME created its Wayland socket, but Media Session 0.4.1 prefixed an absolute `-c` argument with `MEDIA_SESSION_CONFIG_DIR` again. Corrected the harness to pass `media-session.conf` as a basename. All registered children exited; cleanup complete. |
 | `/tmp/gfs-wayland-qa.pltsmnva` | Full environment ready on private Xvfb `:99`. Portal capabilities: source types `3`, cursor modes `7`. Real fixture and app visible. Exposed the dropped-runtime connection bug, then normal chooser Cancel/Share worked with a newly built debug app. Exposed actual SPA format negotiation failure. Reached its original 1200-second lifetime and cleaned up all registered children and its extra app. |
 | `/tmp/gfs-wayland-qa.69wjziev` | Fresh private instance with frozen debug binary, private Fontconfig and bounded software-renderer thread counts. Normal window chooser appeared. Outer supervisor received a termination signal and requested clean stop; signal sender was not captured. All registered children exited. Do not attribute this signal to another agent without evidence. |
-| `/tmp/gfs-wayland-qa.yovlpt81` | Current 3600-second instance, with the outer supervisor signal-traced into `/tmp/gfs-wayland-signals.5luxUa/outer.trace`. Real chooser visibly selected the uniquely titled fixture; Share exposed the fixed-choice decoding bug. A subsequent frozen debug app with both SPA fixes delivered a real first frame and accepted a 197×148 crop at 63,103. Opening the separate controller then stalled the app; diagnosis is ongoing. This instance is not yet a completed teardown gate. |
+| `/tmp/gfs-wayland-qa.yovlpt81` | 3600-second instance, with the outer supervisor signal-traced into `/tmp/gfs-wayland-signals.5luxUa/outer.trace`. Real chooser visibly selected the uniquely titled fixture; Share exposed the fixed-choice decoding bug. Both SPA fixes delivered a real first frame and a 197×148 crop at 63,103. Attempting the controller left the old preview visible; the later diagnosis below establishes an early error, not a GPU deadlock. At approximately 2026-09-07 00:14, its configured lifetime ended; main and extra-app supervisors and execution handles completed cleanup. The signal trace remained empty. |
+| `/tmp/gfs-wayland-qa.mv0g8aqa` | Fresh 1800-second instance, frozen no-resize SHA-256 `7ce8231379a589d83d920d4cad54e2d865b1d813c7a1960e62e39a34bba4d484`, default renderer, app PID 604965. Cancel, reauthorization, first frame and selection passed. Internal tracing proved controller opening returned early because Wayland has no global viewport origin. The final corrected build was reached just before the configured deadline; stale-session guards rejected subsequent clicks. Normal teardown and cleanup complete were verified before the next launch. |
+| `/tmp/gfs-wayland-qa.tqzedhq5` | Fresh 14400-second bounded lab with the same isolation, private Xvfb `:99`, supervisor 663781. Frozen SHA-256 `28b2cca80a7bd167c4830784932ecc6c3befbe850bbbe8f095e7594112ec7522` includes local-viewport controller repair and VideoCrop normalization, using the unchanged default renderer. Normal Cancel/retry/Share, a 692×509 effective window preview, 181×141 selection, recording/pause/movement/resume/Stop and GUI GIF export all passed. The lab remains live for the remaining bounded acceptance checks; teardown must be recorded separately. |
 
 Each lab retains `instance.json`, `launcher.json`, `status.json`, `children.json`, private connection metadata, startup properties, graph dump and bounded per-process logs. New instances freeze a copy of the selected executable under `bin/` and record its SHA-256; repository revision alone must not be mistaken for proof that an older binary contains uncommitted fixes.
 
@@ -73,25 +75,58 @@ Evidence: current lab's `logs/window-selected.png` shows the normal chooser's ch
 
 New cursor/input explanatory rows pushed the start control and error status below the visible recorder page at 1280×720. The page now has a vertical scroll area. Scrolling in the real nested desktop exposed both `Open recorder frame` and the native error notice. This usability fix has live UI evidence, independent of the still-pending capture acceptance.
 
-### 5. Separate controller handoff stalls before the controls appear
+### 5. Controller opening required a global origin that Wayland does not expose
 
-The visual selector accepted a 197×148 region at source-local 63,103. Clicking `Open source-local recorder controller` left the final main-window surface visible and unresponsive, with no usable separate controls. GNOME and the fixture kept updating; normal Activities overview showed the fixture and the old application surface. The process remained alive. `logs/crop-selected.png`, `logs/controller-opened.png`, `logs/controller-alt-tab.png` and `logs/controller-overview.png` preserve the boundary. Separate diagnosis collected two stacks waiting in Lavapipe presentation of the ROOT viewport; winit's Wayland visibility operation is a no-op. The root-to-child viewport handoff is being repaired and needs a fresh GUI test. This blocks recording/stop/export acceptance, not just visual polish.
+The visual selector accepted a 197×148 region at source-local 63,103. Clicking `Open source-local recorder controller` left the prepared preview visible, with no usable controls. `logs/crop-selected.png`, `logs/controller-opened.png`, `logs/controller-alt-tab.png` and `logs/controller-overview.png` preserve that symptom. Early debugger samples happened to show GPU presentation calls. They **do not establish a GPU deadlock**, and the earlier driver-hang hypothesis is withdrawn.
+
+On 2026-09-07 at approximately 00:03–00:08, a frozen dedicated-root-controller variant was also tested in the same lab with `WGPU_BACKEND=opengl`: SHA-256 `24201744deb18893e216eddf94eab792bce74160377a1ce6b0999a686977c2bf`, app 584059 / helper 584048. Its mappings included Mesa EGL/swrast and no libvulkan. Chooser, first frame and selection worked, but Start did not appear. This did not fix the application error and is not a renderer recommendation.
+
+Read-only debugger snapshots were detached after inspection; `logs/gl-controller-gdb.txt` and the GL screenshots remain historical observations, not a causal diagnosis. No system ptrace setting or global renderer policy was changed. Those attempts never reached recording.
+
+A later no-resize controller variant (SHA-256 `7ce8231379a589d83d920d4cad54e2d865b1d813c7a1960e62e39a34bba4d484`, helper 598495) was copied and launched just before the lab expired. Its first GUI command was rejected by the stale-lab guard after normal teardown. Therefore the no-resize variant has **no completed GUI acceptance result** in this instance. Both it and the GL helper reported cleanup complete; a fresh isolated lab is required for further testing.
+
+The subsequent `mv0g8aqa` instance supplied decisive internal evidence: the handler was entered but controller state was not installed. `viewport.inner_rect` was `None` because its global origin is unavailable on Wayland. The error returned early and the prepared page did not show the notice. The repair uses `input.screen_rect().size()` for local controller layout and displays preparation notices. It retains one dedicated root surface on Wayland without visibility/position assumptions; X11 retains its separate physical recorder frame. Regression tests cover missing global coordinates, root-only layout, pause/resume/Stop ordering and close-time project preservation.
+
+In `tqzedhq5`, `logs/working-controller.png` shows the repaired controller with Start/Cancel and other pages hidden. `logs/recording-start.png`, `logs/recording-active.png`, `logs/paused-retarget-confirmed.png`, `logs/resumed-green.png`, `logs/live-retarget-gold.png` and `logs/stopping.png` prove the completed workflow using the default renderer. No GPU switch was needed.
 
 ### 6. Valid window pixels are smaller than the negotiated buffer
 
 The same normally authorized fixture session exposes `org.gnome.Mutter.ScreenCast.Stream.Parameters` with size 1280×720. The captured window occupies only part of that black-backed buffer. This does not justify treating the entire padded buffer as the window's content.
 
-The saved live graph (`logs/pipewire-window-stream.json`) shows the producer's output Port 30 advertising `VideoCrop` metadata of size 16, while consumer Port 33 requests only `Busy`. Both negotiated BGRx 1280×720, nominal frame rate 0/1 and maximum 60/1. The current consumer does not request or decode `SPA_META_VideoCrop`.
+The saved pre-fix graph (`logs/pipewire-window-stream.json`) shows producer Port 30 advertising `VideoCrop` metadata of size 16, while consumer Port 33 requested only `Busy`. Both negotiated BGRx 1280×720, nominal frame rate 0/1 and maximum 60/1. The former consumer neither requested nor decoded `SPA_META_VideoCrop`.
 
-Mutter 42.9 intentionally allocates a monitor-sized window stream to accommodate window resizing; its window source separately supplies the current window-buffer bounds intersected with the stream rectangle through VideoCrop. Therefore effective-window-crop handling is a confirmed missing integration requirement, although this run has not decoded an actual per-buffer crop rectangle yet. [Window stream sizing](https://raw.githubusercontent.com/GNOME/mutter/42.9/src/backends/meta-screen-cast-window-stream.c), [VideoCrop calculation](https://raw.githubusercontent.com/GNOME/mutter/42.9/src/backends/meta-screen-cast-window-stream-src.c)
+Mutter 42.9 intentionally allocates a monitor-sized window stream to accommodate resizing; its window source separately supplies current window-buffer bounds intersected with the stream rectangle through VideoCrop. [Window stream sizing](https://raw.githubusercontent.com/GNOME/mutter/42.9/src/backends/meta-screen-cast-window-stream.c), [VideoCrop calculation](https://raw.githubusercontent.com/GNOME/mutter/42.9/src/backends/meta-screen-cast-window-stream-src.c)
+
+The consumer now requests `SPA_META_VideoCrop` before buffer allocation for the caller-validated Window source kind. A scoped native buffer guard copies and validates native metadata, including table bounds, duplicate entries, payload size, alignment and signed coordinates, and returns the buffer exactly once. Attached zero-size content is pending, never a fallback to padding. Truly absent metadata uses full transport bounds; malformed or out-of-bounds attached rectangles fail explicitly. Monitor sources do not mistake unused zero crop slots for empty windows.
+
+Source/output dimensions become ready only after the first valid owned content frame is successfully delivered. User crops are effective-content-local, then translated into transport coordinates only for pixel copying; authoring provenance stays content-local. Same-size content may move within a buffer. A later content-size change stops fixed-canvas capture with a source-lost error and requires a new recording rather than silently resizing/scaling or exposing padding. Copying retains stride/buffer validation and startup cancellation checks between rows.
+
+The frozen `tqzedhq5` app's actual first window preview is **692×509**, not 1280×720 (`logs/normalized-first-frame.png`). This includes the fixture's 640×420 GTK client plus legitimate client-side decorations/shadows; those are not transport padding. The subsequent project contains actual cropped pixels, verified below. Native and pure geometry fixture tests cover absent/zero/partial-zero/negative/overflow/out-of-bounds metadata, offsets, changing dimensions, padded strides, first-frame initialization and cancellation. Capture tests with **all native features** passed: **89 passed, 3 explicitly isolated tests ignored**; strict all-feature Clippy passed.
+
+### 7. Embedded cursor policy must survive without separate cursor metadata
+
+The first successful 419-frame project honestly retains a discovered omission: its frame metadata says `cursor_embedded: false` although Embedded was requested. It has not been rewritten. A subsequent patch carries the effective negotiated Embedded/Hidden policy into every delivered native frame even without a separately decoded cursor image. Automatic selects the supported effective policy first. Regression tests combine VideoCrop pixel/size/offset handoff with Automatic, explicit Embedded and Hidden. The flag prevents adding a second cursor; it does **not** assert that a pointer is visible in that frame. This follow-up still needs a fresh native saved-project check.
+
+## Successful native window project and GIF
+
+The repaired app recorded the normally authorized fixture through the visible controller:
+
+- A 3-second countdown, then continuous 10 FPS recording into fixed 181×141 output.
+- Pause confirmed before moving the crop from (60,111) to (396,111), then Resume.
+- While recording, another drag moved the same-sized crop to (396,325).
+- Stop returned to the editor, retaining 419 frames in `tqzedhq5/output/normalized-window.gfsproj`.
+- The GUI's Export GIF action produced `tqzedhq5/output/normalized-window.gif`, 898 bytes, confirmed by `logs/export-completed.png`.
+
+Read-only manifest inspection found 134, 182 and 103 frames at those three origins, respectively. Their immutable RGBA assets contain the intended red, green and gold fixture regions. The project duration is 41,879,732 microseconds. Across the pause/resume origin boundary, capture timestamps differ by only 63,240 microseconds; the maximum frame duration anywhere is 107,435 microseconds. The real pause is excluded, not encoded as a long hold.
+
+Independent ImageMagick decoding found three 181×141 GIF images after duplicate-frame merging. The colors include red `(209,56,61)`, green `(30,143,79)` with the fixture's white marker, and gold `(232,176,40)` with the fixture's dark text strip. Delays are 13.37, 18.21 and 10.30 seconds: total **41.88 seconds**, consistent with GIF centisecond quantization. No controller or transport padding appears in these selected regions. The GIF and manifest are both mode 0600. This is a real authorized PipeWire capture and GUI export, not generated substitute pixels.
 
 ## Remaining acceptance gates
 
-- First real fixture pixels and visual region selection passed; retain that evidence while resolving the controller handoff.
-- Request/decode VideoCrop, preserve exact source-kind/size metadata and verify effective window content without treating padding as content.
-- Window-source region selection, fixed-size movement while recording and paused, cadence/manual capture, active timing, stop/discard, native-source loss and recovery.
-- Reopen the captured project and inspect decoded exported GIFs for intended window content and no controller recursion.
+- Window preview normalization, controller opening, continuous recording, fixed-size movement while recording and paused, active timing, Stop and independently decoded GUI GIF export passed.
+- Reopen the saved project; verify manual capture, discard, native source-size change/loss and recovery against the real stack.
+- Verify the follow-up Embedded cursor provenance in a newly saved native project; do not retrofit the first successful fixture.
 - The real native pending-chooser cancellation check passed without a permission response or residual session; verify the complete application Cancel button path too.
 - Only after the window path succeeds: authorize the nested monitor and verify crop movement and intentional controller overlap behavior.
-- Complete and record final teardown of the current lab, retaining bounded owner-only evidence.
+- Teardown of all earlier labs and their GL/no-resize helpers passed; explicitly stop and verify the still-live `tqzedhq5` instance when testing ends.
 - Physical GNOME/KDE, multiple monitors, mixed DPI, real GPU/DMA-BUF and release-environment acceptance remain separate gates.

@@ -14,6 +14,13 @@ SPEC.loader.exec_module(lab_module)
 
 
 class HarnessTests(unittest.TestCase):
+    def test_four_hour_lifetime_is_bounded_without_weakening_startup_checks(self):
+        lab_module.validate_lifetime(1)
+        lab_module.validate_lifetime(14400)
+        for invalid in (0, -1, 14401, 2**63):
+            with self.assertRaises(ValueError):
+                lab_module.validate_lifetime(invalid)
+
     def test_environment_preserves_home_and_replaces_all_connection_names(self):
         lab = Path("/tmp/gfs-wayland-qa.example")
         original = {"HOME": "/original/home", "DISPLAY": ":0", "WAYLAND_DISPLAY": "wayland-0",

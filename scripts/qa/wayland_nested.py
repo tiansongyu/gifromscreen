@@ -20,6 +20,7 @@ from xml.sax.saxutils import escape
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOG_LIMIT = 2 * 1024 * 1024
+MAX_LIFETIME_SECONDS = 4 * 60 * 60
 STOP = threading.Event()
 STOP_SIGNAL = None
 REMOVED_ENV = (
@@ -45,6 +46,11 @@ def json_write(path, value):
 
 def read_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def validate_lifetime(seconds):
+    if not 1 <= seconds <= MAX_LIFETIME_SECONDS:
+        raise ValueError(f"lifetime must be 1–{MAX_LIFETIME_SECONDS} seconds")
 
 
 def valid_lab(value):
@@ -460,12 +466,12 @@ def main():
     child.add_argument("--seconds", type=int, default=1200)
     args = parser.parse_args()
     if args.action == "run-app":
-        if not 1 <= args.seconds <= 3600:
-            raise ValueError("app lifetime must be 1–3600 seconds")
+        validate_lifetime(args.seconds)
         return run_app(args)
     if args.action in ("start", "inner"):
-        if not 1 <= args.startup_timeout <= 120 or not 1 <= args.seconds <= 3600:
-            raise ValueError("startup timeout must be 1–120 seconds and lifetime 1–3600 seconds")
+        validate_lifetime(args.seconds)
+        if not 1 <= args.startup_timeout <= 120:
+            raise ValueError("startup timeout must be 1–120 seconds")
         return start(args) if args.action == "start" else inner(args)
     return existing(args)
 
