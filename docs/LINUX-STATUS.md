@@ -54,6 +54,10 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [x] Render asynchronous thumbnails only for the visible timeline range with bounded queues and cache.
 - [x] Loop the frame preview on an accumulated clock and skip late frames without timing drift.
 - [x] Group editing controls by task and preserve the OS light/dark theme.
+- [x] Keep the preview beside a bounded tool inspector on wide windows; put preview first on narrow windows.
+- [x] Re-edit saved text while preserving track/item identities, timing, z order, and blend settings.
+- [x] Insert undoable title frames at the beginning or after a chosen frame, excluding existing overlays from the title interval.
+- [x] Reuse validated raster assets across frame, overlay, and mask roles without changing their persisted descriptors.
 
 ## Delivery gates
 
@@ -83,7 +87,7 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [x] Manual and periodic snapshots.
 - [x] Duplicate removal, frame reduction, Yoyo, and delay scaling.
 - [x] Text-caption authoring, shaping, durable raster assets, preview, export, and undo/redo.
-- [ ] Existing-text editing and title-frame insertion.
+- [x] Existing-text editing and title-frame insertion.
 - [x] Raster-watermark authoring with bounded background decoding.
 - [x] Bounded free-drawing authoring on the rendered preview.
 - [x] Shape overlay authoring with bounds, stroke/fill, opacity, blend mode, and z-order.
