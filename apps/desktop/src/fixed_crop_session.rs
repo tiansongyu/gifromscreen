@@ -259,7 +259,9 @@ fn copy_cropped_metadata(
     if let Some(image) = source.cursor_image() {
         cropped = cropped.with_cursor_image(image.clone(), source.cursor_embedded());
     }
-    cropped = cropped.with_dropped_input_events(source.dropped_input_events());
+    cropped = cropped
+        .with_cursor_embedded(source.cursor_embedded())
+        .with_dropped_input_events(source.dropped_input_events());
     let source_origin = source.capture_origin().unwrap_or_default();
     cropped = cropped.with_capture_origin(PhysicalPosition {
         x: source_origin
@@ -532,6 +534,23 @@ mod tests {
                 frame.pixels(),
                 &[5, 6, 7, 8, 9, 10, 11, 12, 17, 18, 19, 20, 21, 22, 23, 24]
             );
+        }
+    }
+
+    #[test]
+    fn crop_preserves_embedded_policy_without_separate_cursor_metadata() {
+        let crop = PhysicalRect::new(1, 0, 2, 2).unwrap();
+        for embedded in [true, false] {
+            let source = source_frame(PixelFormat::Rgba8)
+                .with_cursor_embedded(embedded)
+                .with_capture_origin(PhysicalPosition { x: 0, y: 0 });
+            let cropped = crop_frame(&source, source.size(), crop).unwrap();
+            assert_eq!(cropped.cursor_embedded(), embedded);
+            assert!(cropped.cursor().is_none());
+            assert!(cropped.cursor_image().is_none());
+            assert_eq!(cropped.capture_origin(), Some(crop.origin()));
+            assert_eq!(cropped.size(), crop.size());
+            assert_eq!(cropped.captured_at(), source.captured_at());
         }
     }
 
