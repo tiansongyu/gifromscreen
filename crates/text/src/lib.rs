@@ -367,6 +367,19 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires installed fonts with Chinese and Arabic glyph coverage"]
+    fn system_fonts_shape_chinese_and_arabic() {
+        let mut input = request("你好，Linux\nمرحبا");
+        input.font_family = "sans-serif".to_owned();
+        input.alignment = HorizontalAlignment::Center;
+        input.size = PhysicalSize::new(520, 120).unwrap();
+        let image = TextRasterizer::with_system_fonts()
+            .rasterize(&input)
+            .unwrap();
+        assert!(image.rgba.as_chunks::<4>().0.iter().any(|p| p[3] != 0));
+    }
+
+    #[test]
     fn unknown_explicit_font_does_not_silently_substitute() {
         let mut input = request("Hi");
         input.font_family = "not-a-real-font-942793".to_owned();

@@ -2,11 +2,11 @@ use eframe::egui;
 use gif_from_screen_domain::{BlendMode, PhysicalPoint, PhysicalPx, PhysicalSize};
 
 use crate::{
-    editor_workspace::RasterOverlayEdit,
-    watermark_decode_job::{DecodedWatermark, WatermarkDecodeJobState},
+    editor_workspace::{EditorWorkspace, OverlaySelectionAnchor, RasterOverlayEdit},
+    watermark_decode_job::{DecodedWatermark, WatermarkDecodeJob, WatermarkDecodeJobState},
 };
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct WatermarkUiState {
     pub(crate) path: String,
     pub(crate) name: String,
@@ -18,6 +18,54 @@ pub(crate) struct WatermarkUiState {
     pub(crate) track_opacity: u8,
     pub(crate) blend_mode: BlendMode,
     pub(crate) z_index: i32,
+}
+
+/// A decode result may only be committed to the authoring target that requested it.
+pub(crate) struct PendingWatermark {
+    target: OverlaySelectionAnchor,
+    settings: WatermarkUiState,
+}
+
+impl PendingWatermark {
+    pub(crate) fn start(
+        settings: &WatermarkUiState,
+        workspace: &EditorWorkspace,
+        job: &mut WatermarkDecodeJob,
+    ) -> Result<Self, String> {
+        let target = workspace
+            .overlay_selection_anchor()
+            .map_err(|error| error.to_string())?;
+        if settings.name.trim().is_empty() {
+            return Err("Watermark name is required.".to_owned());
+        }
+        if settings.item_opacity == 0 || settings.track_opacity == 0 {
+            return Err("Watermark opacity must be greater than zero.".to_owned());
+        }
+        job.start(settings.path.trim().into())
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            target,
+            settings: settings.clone(),
+        })
+    }
+
+    pub(crate) fn commit(
+        self,
+        workspace: &mut EditorWorkspace,
+        decoded: &DecodedWatermark,
+    ) -> Result<(), String> {
+        if !self.target.matches(workspace) {
+            return Err(
+                "The project or selected frames changed while decoding. Select the intended frames and retry."
+                    .to_owned(),
+            );
+        }
+        let edit = build_raster_edit(&self.settings, decoded)?;
+        workspace
+            .add_raster_overlay_for_selection(edit, &decoded.rgba)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
 }
 
 impl Default for WatermarkUiState {

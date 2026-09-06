@@ -1,9 +1,5 @@
 //! Rendered editor-frame previews with a small revision-aware texture cache.
 
-// The root UI integration lands separately; remove this once the cache is held
-// by the editor view model.
-#![allow(dead_code)]
-
 use std::{
     collections::{BTreeMap, VecDeque},
     fs, io,
@@ -12,12 +8,13 @@ use std::{
 
 use eframe::egui;
 use gif_from_screen_domain::{
-    AssetId, AssetKind, FrameId, OverlayId, ProjectId, ProjectRevision, RasterEncoding, TimeUs,
+    AssetDescriptor, AssetId, AssetKind, FrameClip, FrameId, OverlayId, OverlayTrack, ProjectId,
+    ProjectRevision, RasterEncoding, TimeUs,
 };
-use gif_from_screen_project::{ActiveProject, ProjectError};
+use gif_from_screen_project::{ActiveProject, AssetStore, ProjectError};
 use gif_from_screen_render::{
-    AssetProviderError, CpuRenderer, FrameAssetProvider, NeverCancel, RenderError, RenderLimits,
-    RgbaSurface, SurfaceError, active_raster_overlay_assets,
+    AssetProviderError, CancellationToken, CpuRenderer, FrameAssetProvider, NeverCancel,
+    RenderError, RenderLimits, RgbaSurface, SurfaceError, active_raster_overlay_assets,
 };
 use thiserror::Error;
 
@@ -161,10 +158,10 @@ struct PreviewCacheKey {
 }
 
 #[derive(Clone)]
-struct PreparedPreview {
-    rendered_size: [u32; 2],
-    preview_size: [u32; 2],
-    rgba: Vec<u8>,
+pub(crate) struct PreparedPreview {
+    pub(crate) rendered_size: [u32; 2],
+    pub(crate) preview_size: [u32; 2],
+    pub(crate) rgba: Vec<u8>,
 }
 
 struct CacheEntry<K, V> {
@@ -173,7 +170,7 @@ struct CacheEntry<K, V> {
     bytes: usize,
 }
 
-struct BoundedLru<K, V> {
+pub(crate) struct BoundedLru<K, V> {
     entries: VecDeque<CacheEntry<K, V>>,
     max_entries: usize,
     max_bytes: usize,
@@ -181,7 +178,7 @@ struct BoundedLru<K, V> {
 }
 
 impl<K: Eq, V> BoundedLru<K, V> {
-    fn new(max_entries: usize, max_bytes: usize) -> Self {
+    pub(crate) fn new(max_entries: usize, max_bytes: usize) -> Self {
         Self {
             entries: VecDeque::new(),
             max_entries,
@@ -190,7 +187,7 @@ impl<K: Eq, V> BoundedLru<K, V> {
         }
     }
 
-    fn get(&mut self, key: &K) -> Option<&V> {
+    pub(crate) fn get(&mut self, key: &K) -> Option<&V> {
         let position = self.entries.iter().position(|entry| &entry.key == key)?;
         if position != 0 {
             let entry = self.entries.remove(position)?;
@@ -199,7 +196,7 @@ impl<K: Eq, V> BoundedLru<K, V> {
         self.entries.front().map(|entry| &entry.value)
     }
 
-    fn insert(&mut self, key: K, value: V, bytes: usize) {
+    pub(crate) fn insert(&mut self, key: K, value: V, bytes: usize) {
         if let Some(position) = self.entries.iter().position(|entry| entry.key == key)
             && let Some(replaced) = self.entries.remove(position)
         {
@@ -220,7 +217,7 @@ impl<K: Eq, V> BoundedLru<K, V> {
         self.entries.push_front(CacheEntry { key, value, bytes });
     }
 
-    fn retain(&mut self, mut keep: impl FnMut(&K) -> bool) {
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&K) -> bool) {
         self.entries.retain(|entry| keep(&entry.key));
         self.cached_bytes = self.entries.iter().map(|entry| entry.bytes).sum();
     }
@@ -295,39 +292,38 @@ impl EditorPreviewCache {
             self.cache.max_bytes,
         )?;
         let texture_bytes = prepared.rgba.len();
-        let color_image = egui::ColorImage::from_rgba_unmultiplied(
-            [
-                usize::try_from(prepared.preview_size[0]).map_err(|_| {
-                    EditorPreviewError::PreviewByteLengthOverflow {
-                        width: prepared.preview_size[0],
-                        height: prepared.preview_size[1],
-                    }
-                })?,
-                usize::try_from(prepared.preview_size[1]).map_err(|_| {
-                    EditorPreviewError::PreviewByteLengthOverflow {
-                        width: prepared.preview_size[0],
-                        height: prepared.preview_size[1],
-                    }
-                })?,
-            ],
-            &prepared.rgba,
-        );
-        let texture = context.load_texture(
+        let preview = upload_preview(
+            &prepared,
+            context,
             format!(
                 "editor-preview-{project_id}-{revision}-{frame_id}-{}x{}",
                 max_size[0], max_size[1]
             ),
-            color_image,
-            egui::TextureOptions::LINEAR,
-        );
-        let preview = EditorPreview {
-            texture,
-            rendered_size: prepared.rendered_size,
-            preview_size: prepared.preview_size,
-        };
+        )?;
         self.cache.insert(key, preview.clone(), texture_bytes);
         Ok(preview)
     }
+}
+
+pub(crate) fn upload_preview(
+    prepared: &PreparedPreview,
+    context: &egui::Context,
+    name: String,
+) -> Result<EditorPreview, EditorPreviewError> {
+    let overflow = || EditorPreviewError::PreviewByteLengthOverflow {
+        width: prepared.preview_size[0],
+        height: prepared.preview_size[1],
+    };
+    let size = [
+        usize::try_from(prepared.preview_size[0]).map_err(|_| overflow())?,
+        usize::try_from(prepared.preview_size[1]).map_err(|_| overflow())?,
+    ];
+    let image = egui::ColorImage::from_rgba_unmultiplied(size, &prepared.rgba);
+    Ok(EditorPreview {
+        texture: context.load_texture(name, image, egui::TextureOptions::LINEAR),
+        rendered_size: prepared.rendered_size,
+        preview_size: prepared.preview_size,
+    })
 }
 
 fn invalidate_stale_project_revisions<V>(
@@ -347,6 +343,14 @@ fn prepare_preview(
 ) -> Result<PreparedPreview, EditorPreviewError> {
     validate_preview_bounds(max_size)?;
     let rendered_surface = render_frame_surface(project, frame_id, render_surface_limit_bytes)?;
+    downsample_preview(rendered_surface, max_size, preview_limit_bytes)
+}
+
+fn downsample_preview(
+    rendered_surface: RgbaSurface,
+    max_size: [u32; 2],
+    preview_limit_bytes: usize,
+) -> Result<PreparedPreview, EditorPreviewError> {
     let rendered_size = [rendered_surface.width(), rendered_surface.height()];
     let preview_size = fit_preview_dimensions(rendered_size, max_size)?;
     let preview_bytes = checked_rgba_byte_len(preview_size)?;
@@ -378,82 +382,165 @@ pub(crate) fn render_frame_surface(
     frame_id: FrameId,
     render_surface_limit_bytes: usize,
 ) -> Result<RgbaSurface, EditorPreviewError> {
-    let (clip, sample_time, provider) =
-        load_frame_sources(project, frame_id, render_surface_limit_bytes)?;
-    let cpu_renderer = CpuRenderer::with_limits(RenderLimits {
-        max_surface_bytes: render_surface_limit_bytes,
-    });
-    cpu_renderer
-        .render_clip_with_raster_overlays(
-            &clip,
-            &project.manifest().timeline.overlay_tracks,
-            sample_time,
-            &provider,
-            &NeverCancel,
-        )
-        .map_err(|source| EditorPreviewError::Render { frame_id, source })
-}
-
-fn load_frame_sources(
-    project: &ActiveProject,
-    frame_id: FrameId,
-    render_surface_limit_bytes: usize,
-) -> Result<
-    (
-        gif_from_screen_domain::FrameClip,
-        TimeUs,
-        PreviewAssetProvider,
-    ),
-    EditorPreviewError,
-> {
     let clip = project
         .manifest()
         .timeline
         .frames
         .iter()
         .find(|clip| clip.id == frame_id)
-        .ok_or(EditorPreviewError::FrameNotFound { frame_id })?
-        .clone();
+        .ok_or(EditorPreviewError::FrameNotFound { frame_id })?;
     let sample_time = project
         .manifest()
         .timeline
         .frame_start(frame_id)
         .ok_or(EditorPreviewError::FrameTimeOverflow { frame_id })?;
-    let active_overlays = active_raster_overlay_assets(
-        &project.manifest().timeline.overlay_tracks,
-        sample_time,
-        &NeverCancel,
-    )
-    .map_err(|source| EditorPreviewError::OverlayPlan {
-        frame_id,
-        time_us: sample_time.get(),
-        source,
-    })?;
-    let mut provider = PreviewAssetProvider {
-        assets: BTreeMap::new(),
-    };
-    let mut retained_bytes = 0_u64;
-    load_preview_raster(
-        project,
-        clip.asset_id,
-        PreviewRasterRole::Frame { frame_id },
-        render_surface_limit_bytes,
-        &mut retained_bytes,
-        &mut provider.assets,
-    )?;
-    for overlay in active_overlays {
-        load_preview_raster(
-            project,
-            overlay.asset_id,
-            PreviewRasterRole::Overlay {
-                overlay_id: overlay.overlay_id,
+    PreviewRenderPlan::new(project, clip, sample_time)?
+        .render(render_surface_limit_bytes, &NeverCancel)
+}
+
+/// Immutable metadata for one frame. Creating a plan never reads pixel files
+/// and never clones the project timeline, so workers need no project lock.
+pub(crate) struct PreviewRenderPlan {
+    clip: FrameClip,
+    sample_time: TimeUs,
+    tracks: Vec<OverlayTrack>,
+    descriptors: BTreeMap<AssetId, AssetDescriptor>,
+    store: AssetStore,
+}
+
+impl PreviewRenderPlan {
+    pub(crate) fn new(
+        project: &ActiveProject,
+        clip: &FrameClip,
+        sample_time: TimeUs,
+    ) -> Result<Self, EditorPreviewError> {
+        let frame_id = clip.id;
+        let active_overlays = active_raster_overlay_assets(
+            &project.manifest().timeline.overlay_tracks,
+            sample_time,
+            &NeverCancel,
+        )
+        .map_err(|source| EditorPreviewError::OverlayPlan {
+            frame_id,
+            time_us: sample_time.get(),
+            source,
+        })?;
+        let mut descriptors = BTreeMap::new();
+        let descriptor = project.manifest().assets.get(&clip.asset_id).ok_or(
+            EditorPreviewError::MissingAssetDescriptor {
+                frame_id,
+                asset_id: clip.asset_id,
             },
+        )?;
+        descriptors.insert(clip.asset_id, descriptor.clone());
+        for overlay in active_overlays {
+            let descriptor = project.manifest().assets.get(&overlay.asset_id).ok_or(
+                EditorPreviewError::MissingOverlayAssetDescriptor {
+                    overlay_id: overlay.overlay_id,
+                    asset_id: overlay.asset_id,
+                },
+            )?;
+            descriptors.insert(overlay.asset_id, descriptor.clone());
+        }
+        let tracks = project
+            .manifest()
+            .timeline
+            .overlay_tracks
+            .iter()
+            .filter(|track| track.visible && track.opacity != 0)
+            .filter_map(|track| {
+                let items: Vec<_> = track
+                    .items
+                    .iter()
+                    .filter(|item| {
+                        item.span.start <= sample_time
+                            && item.span.end().is_some_and(|end| sample_time < end)
+                    })
+                    .cloned()
+                    .collect();
+                (!items.is_empty()).then(|| OverlayTrack {
+                    id: track.id,
+                    name: String::new(),
+                    visible: track.visible,
+                    opacity: track.opacity,
+                    blend_mode: track.blend_mode,
+                    items,
+                })
+            })
+            .collect();
+        Ok(Self {
+            clip: clip.clone(),
+            sample_time,
+            tracks,
+            descriptors,
+            store: project.assets().clone(),
+        })
+    }
+
+    pub(crate) fn prepare(
+        &self,
+        max_size: [u32; 2],
+        render_surface_limit_bytes: usize,
+        preview_limit_bytes: usize,
+        cancellation: &dyn CancellationToken,
+    ) -> Result<PreparedPreview, EditorPreviewError> {
+        validate_preview_bounds(max_size)?;
+        let surface = self.render(render_surface_limit_bytes, cancellation)?;
+        downsample_preview(surface, max_size, preview_limit_bytes)
+    }
+
+    fn render(
+        &self,
+        render_surface_limit_bytes: usize,
+        cancellation: &dyn CancellationToken,
+    ) -> Result<RgbaSurface, EditorPreviewError> {
+        let frame_id = self.clip.id;
+        let active_overlays =
+            active_raster_overlay_assets(&self.tracks, self.sample_time, cancellation).map_err(
+                |source| EditorPreviewError::OverlayPlan {
+                    frame_id,
+                    time_us: self.sample_time.get(),
+                    source,
+                },
+            )?;
+        let mut provider = PreviewAssetProvider {
+            assets: BTreeMap::new(),
+        };
+        let mut retained_bytes = 0_u64;
+        load_preview_raster(
+            &self.store,
+            &self.descriptors,
+            self.clip.asset_id,
+            PreviewRasterRole::Frame { frame_id },
             render_surface_limit_bytes,
             &mut retained_bytes,
             &mut provider.assets,
         )?;
+        for overlay in active_overlays {
+            load_preview_raster(
+                &self.store,
+                &self.descriptors,
+                overlay.asset_id,
+                PreviewRasterRole::Overlay {
+                    overlay_id: overlay.overlay_id,
+                },
+                render_surface_limit_bytes,
+                &mut retained_bytes,
+                &mut provider.assets,
+            )?;
+        }
+        CpuRenderer::with_limits(RenderLimits {
+            max_surface_bytes: render_surface_limit_bytes,
+        })
+        .render_clip_with_raster_overlays(
+            &self.clip,
+            &self.tracks,
+            self.sample_time,
+            &provider,
+            cancellation,
+        )
+        .map_err(|source| EditorPreviewError::Render { frame_id, source })
     }
-    Ok((clip, sample_time, provider))
 }
 
 #[derive(Clone, Copy)]
@@ -490,28 +577,25 @@ fn preview_raster_shape(
 }
 
 fn load_preview_raster(
-    project: &ActiveProject,
+    store: &AssetStore,
+    descriptors: &BTreeMap<AssetId, AssetDescriptor>,
     asset_id: AssetId,
     role: PreviewRasterRole,
     render_surface_limit_bytes: usize,
     retained_bytes: &mut u64,
     assets: &mut BTreeMap<AssetId, RgbaSurface>,
 ) -> Result<(), EditorPreviewError> {
-    let descriptor = project
-        .manifest()
-        .assets
-        .get(&asset_id)
-        .ok_or_else(|| match role {
-            PreviewRasterRole::Frame { frame_id } => {
-                EditorPreviewError::MissingAssetDescriptor { frame_id, asset_id }
+    let descriptor = descriptors.get(&asset_id).ok_or_else(|| match role {
+        PreviewRasterRole::Frame { frame_id } => {
+            EditorPreviewError::MissingAssetDescriptor { frame_id, asset_id }
+        }
+        PreviewRasterRole::Overlay { overlay_id } => {
+            EditorPreviewError::MissingOverlayAssetDescriptor {
+                overlay_id,
+                asset_id,
             }
-            PreviewRasterRole::Overlay { overlay_id } => {
-                EditorPreviewError::MissingOverlayAssetDescriptor {
-                    overlay_id,
-                    asset_id,
-                }
-            }
-        })?;
+        }
+    })?;
     if descriptor.id != asset_id {
         return Err(EditorPreviewError::DescriptorIdMismatch {
             asset_id,
@@ -557,7 +641,7 @@ fn load_preview_raster(
         });
     }
 
-    let asset_path = project.assets().asset_path(asset_id);
+    let asset_path = store.asset_path(asset_id);
     let file_bytes = fs::metadata(&asset_path)
         .map_err(|source| EditorPreviewError::AssetMetadata {
             asset_id,
@@ -583,8 +667,7 @@ fn load_preview_raster(
         });
     }
 
-    let pixels = project
-        .assets()
+    let pixels = store
         .read(asset_id)
         .map_err(|source| EditorPreviewError::AssetRead { asset_id, source })?;
     let source = RgbaSurface::new(source_size, pixels)
@@ -877,6 +960,73 @@ mod tests {
         assert!(matches!(
             resize_nearest_rgba(&source[..4], [4, 2], [2, 1]),
             Err(EditorPreviewError::ResizeSourceLengthMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn detached_plan_matches_final_preview_and_preserves_its_revision() {
+        let (_directory, mut project, frame_id, _) = project_with_frame(
+            &[10, 20, 30, 255, 40, 50, 60, 255],
+            PhysicalSize::new(2, 1).unwrap(),
+            ClipTransform::default(),
+            Vec::new(),
+        );
+        add_raster_overlay(
+            &mut project,
+            &[255, 0, 0, 128],
+            PhysicalSize::new(1, 1).unwrap(),
+        );
+        let plan = PreviewRenderPlan::new(
+            &project,
+            &project.manifest().timeline.frames[0],
+            TimeUs::ZERO,
+        )
+        .unwrap();
+        let expected = prepare_preview(&project, frame_id, [2, 1], 1024, 1024).unwrap();
+        let original = plan.prepare([2, 1], 1024, 1024, &NeverCancel).unwrap();
+        assert_eq!(original.rgba, expected.rgba);
+        project
+            .commit(EditCommand::RemoveOverlayTrack {
+                track_id: TrackId::from_u128(1),
+            })
+            .unwrap();
+        let unchanged = plan.prepare([2, 1], 1024, 1024, &NeverCancel).unwrap();
+        let edited = prepare_preview(&project, frame_id, [2, 1], 1024, 1024).unwrap();
+        assert_eq!(unchanged.rgba, original.rgba);
+        assert_ne!(unchanged.rgba, edited.rgba);
+    }
+
+    #[test]
+    fn planning_never_reads_pixels_and_cancelled_render_never_loads_missing_assets() {
+        struct Cancelled;
+        impl CancellationToken for Cancelled {
+            fn is_cancelled(&self) -> bool {
+                true
+            }
+        }
+        let (_directory, project, frame_id, asset_id) = project_with_frame(
+            &[1, 2, 3, 255],
+            PhysicalSize::new(1, 1).unwrap(),
+            ClipTransform::default(),
+            Vec::new(),
+        );
+        fs::remove_file(project.assets().asset_path(asset_id)).unwrap();
+        let plan = PreviewRenderPlan::new(
+            &project,
+            &project.manifest().timeline.frames[0],
+            TimeUs::ZERO,
+        )
+        .unwrap();
+        assert!(matches!(
+            plan.prepare([10, 10], 1024, 1024, &Cancelled),
+            Err(EditorPreviewError::OverlayPlan {
+                source: RenderError::Cancelled,
+                ..
+            })
+        ));
+        assert!(matches!(
+            render_frame_surface(&project, frame_id, 1024),
+            Err(EditorPreviewError::AssetMetadata { .. })
         ));
     }
 

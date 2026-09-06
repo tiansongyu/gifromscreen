@@ -12,9 +12,9 @@ use std::{
 
 use eframe::egui;
 use gif_from_screen_domain::{
-    BlendMode, DurationUs, EdgeWidths, Effect, FrameId, MAX_TRANSITION_STEPS, OverlayContent,
-    PhysicalRect, PhysicalSize, Rgba, ShapeKind, SlideDirection, StrokePoint, TimeUs, Transition,
-    TransitionKind,
+    BlendMode, DurationUs, EdgeWidths, Effect, FrameClip, FrameId, MAX_TRANSITION_STEPS,
+    OverlayContent, PhysicalRect, PhysicalSize, Rgba, ShapeKind, SlideDirection, StrokePoint,
+    TimeUs, Transition, TransitionKind,
 };
 use gif_from_screen_editor::{
     DuplicateDelayMode, DuplicateFrameRetention, FrameTransitionSettings,
@@ -22,7 +22,8 @@ use gif_from_screen_editor::{
     YoyoScope, parse_frame_expression,
 };
 
-use crate::editor_workspace::{EditorWorkspace, EditorWorkspaceError};
+use crate::editor_workspace::{EditorWorkspace, EditorWorkspaceError, OverlaySelectionAnchor};
+use crate::thumbnail_cache::ThumbnailCache;
 
 const FILMSTRIP_ITEM_WIDTH: f64 = 112.0;
 const FILMSTRIP_ITEM_GAP: f64 = 8.0;
@@ -30,6 +31,39 @@ const FILMSTRIP_ITEM_HEIGHT: f32 = 78.0;
 const FILMSTRIP_OVERSCAN: usize = 3;
 const MAX_VISIBLE_OVERLAY_TRACKS: usize = 64;
 pub(crate) const MAX_DRAWING_DRAFT_POINTS: usize = 4_096;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum EditorToolTab {
+    #[default]
+    Frames,
+    Timing,
+    Transform,
+    Effects,
+    Overlays,
+    Project,
+}
+
+impl EditorToolTab {
+    const ALL: [Self; 6] = [
+        Self::Frames,
+        Self::Timing,
+        Self::Transform,
+        Self::Effects,
+        Self::Overlays,
+        Self::Project,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Frames => "Frames",
+            Self::Timing => "Timing",
+            Self::Transform => "Transform",
+            Self::Effects => "Effects",
+            Self::Overlays => "Overlays",
+            Self::Project => "Project",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum EffectChoice {
@@ -119,6 +153,7 @@ pub(crate) enum DrawingDraftPhase {
 
 #[derive(Debug)]
 pub(crate) struct DrawingOverlayDraft {
+    target: Option<OverlaySelectionAnchor>,
     pub(crate) phase: DrawingDraftPhase,
     pub(crate) name: String,
     pub(crate) width: u16,
@@ -133,6 +168,7 @@ pub(crate) struct DrawingOverlayDraft {
 impl Default for DrawingOverlayDraft {
     fn default() -> Self {
         Self {
+            target: None,
             phase: DrawingDraftPhase::Idle,
             name: "Drawing".to_owned(),
             width: 4,
@@ -152,6 +188,27 @@ impl Default for DrawingOverlayDraft {
 }
 
 impl DrawingOverlayDraft {
+    pub(crate) fn begin_for_selection(
+        &mut self,
+        workspace: &EditorWorkspace,
+    ) -> Result<(), EditorWorkspaceError> {
+        let target = workspace.overlay_selection_anchor()?;
+        self.begin();
+        self.target = Some(target);
+        Ok(())
+    }
+
+    /// A draft belongs to the preview and selection on which drawing began.
+    pub(crate) fn reconcile(&mut self, workspace: &EditorWorkspace) {
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|target| !target.matches(workspace))
+        {
+            self.cancel();
+        }
+    }
+
     pub(crate) fn begin(&mut self) {
         self.points.clear();
         self.limit_reached = false;
@@ -159,6 +216,7 @@ impl DrawingOverlayDraft {
     }
 
     pub(crate) fn cancel(&mut self) {
+        self.target = None;
         self.points.clear();
         self.limit_reached = false;
         self.phase = DrawingDraftPhase::Idle;
@@ -186,6 +244,7 @@ impl DrawingOverlayDraft {
 /// Ephemeral editor controls and playback state retained between egui frames.
 #[derive(Debug)]
 pub(crate) struct EditorUiState {
+    active_tool: EditorToolTab,
     /// One-based frame-number input.
     pub(crate) frame_number_input: String,
     /// Project-relative time input in integer milliseconds.
@@ -262,6 +321,9 @@ pub(crate) struct EditorUiState {
     pub(crate) drawing_overlay: DrawingOverlayDraft,
     /// Monotonic playback clock when playback is active.
     pub(crate) playback: Option<PlaybackClock>,
+    /// Preview-only looping; GIF export repetition is configured separately.
+    pub(crate) loop_preview: bool,
+    thumbnail_cache: ThumbnailCache,
     filmstrip_scroll_offset: f64,
     reveal_current_frame: bool,
 }
@@ -269,6 +331,7 @@ pub(crate) struct EditorUiState {
 impl Default for EditorUiState {
     fn default() -> Self {
         Self {
+            active_tool: EditorToolTab::default(),
             frame_number_input: "1".into(),
             time_ms_input: "0".into(),
             time_range_start_ms_input: "0".into(),
@@ -319,9 +382,18 @@ impl Default for EditorUiState {
             shape_overlay: ShapeOverlayUiState::default(),
             drawing_overlay: DrawingOverlayDraft::default(),
             playback: None,
+            loop_preview: true,
+            thumbnail_cache: ThumbnailCache::default(),
             filmstrip_scroll_offset: 0.0,
             reveal_current_frame: false,
         }
+    }
+}
+
+impl EditorUiState {
+    /// Lets the application shell place text and raster tools in the same group.
+    pub(crate) fn overlays_selected(&self) -> bool {
+        self.active_tool == EditorToolTab::Overlays
     }
 }
 
@@ -350,6 +422,60 @@ impl PlaybackClock {
         self.duration
             .saturating_sub(now.saturating_duration_since(self.started_at))
     }
+
+    /// Resolve the wall-clock position without replaying missed frames. A long
+    /// stall costs at most two timeline scans, even across millions of loops.
+    fn advance(
+        self,
+        frames: &[FrameClip],
+        current_index: usize,
+        now: Instant,
+        repeat: bool,
+    ) -> Option<(FrameId, Option<Self>)> {
+        frames.get(current_index)?;
+        let order = (current_index..frames.len()).chain(0..if repeat { current_index } else { 0 });
+        let mut elapsed = now.saturating_duration_since(self.started_at).as_nanos();
+        let mut cycle_duration = 0_u128;
+        for index in order.clone() {
+            let frame = &frames[index];
+            let duration = u128::from(frame.duration.get()) * 1_000;
+            if elapsed < duration {
+                return clock_at_frame_age(frame, elapsed, now);
+            }
+            elapsed -= duration;
+            cycle_duration = cycle_duration.checked_add(duration)?;
+        }
+        if !repeat {
+            return Some((frames.last()?.id, None));
+        }
+
+        elapsed %= cycle_duration;
+        for index in order {
+            let frame = &frames[index];
+            let duration = u128::from(frame.duration.get()) * 1_000;
+            if elapsed < duration {
+                return clock_at_frame_age(frame, elapsed, now);
+            }
+            elapsed -= duration;
+        }
+        None
+    }
+}
+
+fn clock_at_frame_age(
+    frame: &FrameClip,
+    elapsed_nanos: u128,
+    now: Instant,
+) -> Option<(FrameId, Option<PlaybackClock>)> {
+    let elapsed = Duration::new(
+        (elapsed_nanos / 1_000_000_000).try_into().ok()?,
+        (elapsed_nanos % 1_000_000_000).try_into().ok()?,
+    );
+    let started_at = now.checked_sub(elapsed)?;
+    Some((
+        frame.id,
+        Some(PlaybackClock::new(frame.id, started_at, frame.duration)),
+    ))
 }
 
 /// User intent associated with an editor UI result.
@@ -444,11 +570,10 @@ pub(crate) struct EditorUiFailure {
 /// One successful action or recoverable failure produced during an egui frame.
 pub(crate) type EditorUiResult = Result<EditorUiAction, EditorUiFailure>;
 
-/// Draws the first interactive editor surface and returns all actions attempted this frame.
+/// Draws persistent navigation and the selected editing tool group.
 ///
 /// The filmstrip is virtualized: its `ScrollArea` creates widgets only for the range returned by
-/// [`VirtualFilmstripLayout::visible_range`]. Frame pixels and export controls are intentionally
-/// deferred.
+/// [`VirtualFilmstripLayout::visible_range`]. The shell owns preview and export surfaces.
 pub(crate) fn show_editor_ui(
     ui: &mut egui::Ui,
     workspace: &mut EditorWorkspace,
@@ -459,24 +584,56 @@ pub(crate) fn show_editor_ui(
     advance_playback(ui.ctx(), workspace, state, now, &mut results);
 
     show_editor_summary(ui, workspace);
-    show_clipboard_history(ui, workspace, &mut results);
-    show_project_storage_toolbar(ui, workspace, &mut results);
-    show_editor_statistics(ui, workspace, &mut results);
-    ui.separator();
     show_navigation_toolbar(ui, workspace, state, now, &mut results);
-    show_selection_toolbar(ui, workspace, state, now, &mut results);
-    show_time_range_toolbar(ui, workspace, state, now, &mut results);
-    show_edit_toolbar(ui, workspace, state, now, &mut results);
-    show_advanced_timing_toolbar(ui, workspace, state, now, &mut results);
-    show_transition_toolbar(ui, workspace, state, now, &mut results);
-    show_transform_toolbar(ui, workspace, state, now, &mut results);
-    show_effect_toolbar(ui, workspace, state, now, &mut results);
-    show_shape_overlay_toolbar(ui, workspace, state, now, &mut results);
-    ui.separator();
     show_virtual_filmstrip(ui, workspace, state, now, &mut results);
+    ui.add_space(8.0);
+    ui.horizontal_wrapped(|ui| {
+        for tool in EditorToolTab::ALL {
+            ui.selectable_value(&mut state.active_tool, tool, tool.label());
+        }
+        ui.separator();
+        show_history_buttons(ui, workspace, state, now, &mut results);
+    });
+    ui.separator();
+    egui::ScrollArea::vertical()
+        .id_salt(("editor-tool-inspector", state.active_tool.label()))
+        .max_height(220.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            show_active_tool(ui, workspace, state, now, &mut results);
+        });
 
     schedule_playback_repaint(ui.ctx(), state, now);
     results
+}
+
+fn show_active_tool(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    now: Instant,
+    results: &mut Vec<EditorUiResult>,
+) {
+    match state.active_tool {
+        EditorToolTab::Frames => {
+            show_selection_toolbar(ui, workspace, state, now, results);
+            show_edit_toolbar(ui, workspace, state, now, results);
+            show_clipboard_history(ui, workspace, results);
+        }
+        EditorToolTab::Timing => {
+            show_delay_toolbar(ui, workspace, state, now, results);
+            show_time_range_toolbar(ui, workspace, state, now, results);
+            show_advanced_timing_toolbar(ui, workspace, state, now, results);
+            show_transition_toolbar(ui, workspace, state, now, results);
+        }
+        EditorToolTab::Transform => show_transform_toolbar(ui, workspace, state, now, results),
+        EditorToolTab::Effects => show_effect_toolbar(ui, workspace, state, now, results),
+        EditorToolTab::Overlays => show_shape_overlay_toolbar(ui, workspace, state, now, results),
+        EditorToolTab::Project => {
+            show_project_storage_toolbar(ui, workspace, results);
+            show_editor_statistics(ui, workspace, results);
+        }
+    }
 }
 
 fn show_editor_summary(ui: &mut egui::Ui, workspace: &EditorWorkspace) {
@@ -826,6 +983,10 @@ fn show_navigation_toolbar(
                 result,
             );
         }
+        ui.checkbox(&mut state.loop_preview, "Loop preview")
+            .on_hover_text(
+                "Repeat editor playback. GIF export repetition is configured separately.",
+            );
 
         ui.separator();
         ui.label("Frame");
@@ -986,10 +1147,41 @@ fn show_time_range_toolbar(
     });
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "keeping the edit buttons together makes their workspace action mapping auditable"
-)]
+fn show_history_buttons(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    now: Instant,
+    results: &mut Vec<EditorUiResult>,
+) {
+    if ui
+        .add_enabled(workspace.can_undo(), egui::Button::new("Undo"))
+        .clicked()
+    {
+        record_history_result(
+            workspace,
+            state,
+            now,
+            results,
+            EditorUiOperation::Undo,
+            true,
+        );
+    }
+    if ui
+        .add_enabled(workspace.can_redo(), egui::Button::new("Redo"))
+        .clicked()
+    {
+        record_history_result(
+            workspace,
+            state,
+            now,
+            results,
+            EditorUiOperation::Redo,
+            false,
+        );
+    }
+}
+
 fn show_edit_toolbar(
     ui: &mut egui::Ui,
     workspace: &mut EditorWorkspace,
@@ -998,33 +1190,6 @@ fn show_edit_toolbar(
     results: &mut Vec<EditorUiResult>,
 ) {
     ui.horizontal_wrapped(|ui| {
-        ui.label("Edit");
-        if ui
-            .add_enabled(workspace.can_undo(), egui::Button::new("Undo"))
-            .clicked()
-        {
-            record_history_result(
-                workspace,
-                state,
-                now,
-                results,
-                EditorUiOperation::Undo,
-                true,
-            );
-        }
-        if ui
-            .add_enabled(workspace.can_redo(), egui::Button::new("Redo"))
-            .clicked()
-        {
-            record_history_result(
-                workspace,
-                state,
-                now,
-                results,
-                EditorUiOperation::Redo,
-                false,
-            );
-        }
         if ui.button("Cut").clicked() {
             let result = workspace.cut_selection().map(|_| ());
             record_project_result(
@@ -1123,7 +1288,15 @@ fn show_edit_toolbar(
             );
         }
     });
+}
 
+fn show_delay_toolbar(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    now: Instant,
+    results: &mut Vec<EditorUiResult>,
+) {
     ui.horizontal_wrapped(|ui| {
         ui.label("Delay µs");
         ui.add(egui::TextEdit::singleline(&mut state.duration_us_input).desired_width(92.0));
@@ -2089,6 +2262,7 @@ fn show_drawing_overlay_controls(
     now: Instant,
     results: &mut Vec<EditorUiResult>,
 ) {
+    state.drawing_overlay.reconcile(workspace);
     ui.separator();
     ui.horizontal_wrapped(|ui| {
         ui.strong("Free drawing");
@@ -2123,8 +2297,9 @@ fn show_drawing_overlay_controls(
                         egui::Button::new("Draw one stroke on preview"),
                     )
                     .clicked()
+                    && let Err(error) = state.drawing_overlay.begin_for_selection(workspace)
                 {
-                    state.drawing_overlay.begin();
+                    push_failure(results, EditorUiOperation::AddDrawingOverlay, error);
                 }
             }
             DrawingDraftPhase::Capturing => {
@@ -2424,6 +2599,12 @@ fn show_virtual_filmstrip(
                         return;
                     }
                 };
+            state.thumbnail_cache.set_visible(
+                workspace.active_project(),
+                visible.clone(),
+                ui.ctx(),
+                [100, 48],
+            );
             let content_origin = ui.min_rect().min;
             for index in visible {
                 let x = match layout.x_for_index(index).and_then(|value| {
@@ -2441,10 +2622,8 @@ fn show_virtual_filmstrip(
                 };
                 let is_selected = workspace.selection().contains(frame_id);
                 let is_current = workspace.selection().current() == Some(frame_id);
-                let marker = if is_current { "\nCurrent" } else { "" };
-                let label =
-                    egui::RichText::new(format!("Frame {}\n{} µs{marker}", index + 1, duration_us));
-                let mut button = egui::Button::new(label)
+                let label = format!("Frame {} · {} µs", index + 1, duration_us);
+                let mut button = egui::Button::new("")
                     .min_size(egui::vec2(item_width, FILMSTRIP_ITEM_HEIGHT))
                     .selected(is_selected);
                 if is_current {
@@ -2457,9 +2636,56 @@ fn show_virtual_filmstrip(
                     egui::pos2(content_origin.x + x, content_origin.y),
                     egui::vec2(item_width, FILMSTRIP_ITEM_HEIGHT),
                 );
-                let response = ui
+                let mut response = ui
                     .push_id(("editor-frame-card", index), |ui| ui.put(rect, button))
                     .inner;
+                response.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::WidgetType::Button,
+                        ui.is_enabled(),
+                        is_selected,
+                        &label,
+                    )
+                });
+                let image_bounds = egui::Rect::from_min_max(
+                    rect.min + egui::vec2(6.0, 4.0),
+                    egui::pos2(rect.right() - 6.0, rect.top() + 47.0),
+                );
+                match state.thumbnail_cache.get(frame_id) {
+                    Some(Ok(preview)) => {
+                        let natural = preview.texture.size_vec2();
+                        let scale = (image_bounds.width() / natural.x)
+                            .min(image_bounds.height() / natural.y);
+                        let image_rect =
+                            egui::Rect::from_center_size(image_bounds.center(), natural * scale);
+                        ui.painter().image(
+                            preview.texture.id(),
+                            image_rect,
+                            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                        response = response.on_hover_text(&label);
+                    }
+                    Some(Err(error)) => {
+                        paint_thumbnail_placeholder(ui, image_bounds, "Unavailable");
+                        response = response.on_hover_text(format!("{label}\n{error}"));
+                    }
+                    None => paint_thumbnail_placeholder(ui, image_bounds, "Loading…"),
+                }
+                ui.painter().text(
+                    egui::pos2(rect.center().x, rect.top() + 53.0),
+                    egui::Align2::CENTER_CENTER,
+                    format!("Frame {}", index + 1),
+                    egui::FontId::proportional(11.0),
+                    ui.visuals().text_color(),
+                );
+                ui.painter().text(
+                    egui::pos2(rect.center().x, rect.top() + 68.0),
+                    egui::Align2::CENTER_CENTER,
+                    format!("{}.{:03} ms", duration_us / 1_000, duration_us % 1_000),
+                    egui::FontId::proportional(10.0),
+                    ui.visuals().weak_text_color(),
+                );
                 if response.clicked() {
                     let modifiers = ui.input(|input| input.modifiers);
                     let operation = frame_click_operation(modifiers.ctrl, modifiers.shift);
@@ -2475,6 +2701,18 @@ fn show_virtual_filmstrip(
             }
         });
     state.filmstrip_scroll_offset = f64::from(output.state.offset.x.max(0.0));
+}
+
+fn paint_thumbnail_placeholder(ui: &egui::Ui, bounds: egui::Rect, text: &str) {
+    ui.painter()
+        .rect_filled(bounds, 2.0, ui.visuals().faint_bg_color);
+    ui.painter().text(
+        bounds.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        egui::FontId::proportional(10.0),
+        ui.visuals().weak_text_color(),
+    );
 }
 
 fn filmstrip_layout(frame_count: usize) -> Result<VirtualFilmstripLayout, VirtualFilmstripError> {
@@ -2760,27 +2998,38 @@ fn advance_playback(
         schedule_playback_repaint(context, state, now);
         return;
     }
-    if index.checked_add(1) == Some(workspace.manifest().timeline.frames.len()) {
+    let Some((frame_id, next_clock)) = clock.advance(
+        &workspace.manifest().timeline.frames,
+        index,
+        now,
+        state.loop_preview,
+    ) else {
         state.playback = None;
+        push_failure(
+            results,
+            EditorUiOperation::PlaybackStep,
+            "Playback timing is out of range.",
+        );
         results.push(Ok(EditorUiAction::Playback { playing: false }));
         return;
-    }
-
-    match workspace.select_next() {
-        Ok(_) => {
-            results.push(Ok(EditorUiAction::Selection(
-                EditorUiOperation::PlaybackStep,
-            )));
-            state.reveal_current_frame = true;
-            state.playback = playback_clock_for_current(workspace, now);
-            schedule_playback_repaint(context, state, now);
-        }
-        Err(error) => {
+    };
+    if frame_id != current_id {
+        if let Err(error) = workspace.select_only(frame_id) {
             state.playback = None;
             push_failure(results, EditorUiOperation::PlaybackStep, error);
             results.push(Ok(EditorUiAction::Playback { playing: false }));
+            return;
         }
+        results.push(Ok(EditorUiAction::Selection(
+            EditorUiOperation::PlaybackStep,
+        )));
+        state.reveal_current_frame = true;
     }
+    state.playback = next_clock;
+    if next_clock.is_none() {
+        results.push(Ok(EditorUiAction::Playback { playing: false }));
+    }
+    schedule_playback_repaint(context, state, now);
 }
 
 fn synchronize_playback_after_selection(
@@ -2814,9 +3063,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use gif_from_screen_domain::{
-        BlendMode, DurationUs, Effect, FrameId, MAX_TRANSITION_STEPS, OverlayContent,
-        PhysicalPoint, PhysicalPx, PhysicalRect, PhysicalSize, Rgba, ShapeKind, SlideDirection,
-        StrokePoint, TimeUs, TransitionKind,
+        AssetId, BlendMode, CaptureMetadata, ClipTransform, DurationUs, Effect, FrameClip, FrameId,
+        MAX_TRANSITION_STEPS, OverlayContent, PhysicalPoint, PhysicalPx, PhysicalRect,
+        PhysicalSize, Rgba, ShapeKind, SlideDirection, StrokePoint, TimeUs, TransitionKind,
     };
     use gif_from_screen_editor::{
         DuplicateDelayMode, DuplicateFrameRetention, ReduceDelayMode, YoyoScope,
@@ -3356,6 +3605,88 @@ mod tests {
                 .remaining(started_at + Duration::from_micros(2_001))
                 .is_zero()
         );
+    }
+
+    fn playback_frames(durations: &[u64]) -> Vec<FrameClip> {
+        durations
+            .iter()
+            .enumerate()
+            .map(|(index, duration)| FrameClip {
+                id: FrameId::from_u128(index as u128 + 1),
+                asset_id: AssetId::from_digest([1; 32]),
+                duration: DurationUs::new(*duration).unwrap(),
+                transform: ClipTransform::default(),
+                capture_metadata: CaptureMetadata::default(),
+                effects: Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn playback_skips_late_frames_and_keeps_original_deadlines_after_wrapping() {
+        let frames = playback_frames(&[10_000, 30_000, 20_000]);
+        let start = Instant::now();
+        let clock = PlaybackClock::new(frames[0].id, start, frames[0].duration);
+
+        let (id, clock) = clock
+            .advance(&frames, 0, start + Duration::from_millis(45), true)
+            .unwrap();
+        assert_eq!(id, frames[2].id);
+        let clock = clock.unwrap();
+        assert_eq!(clock.started_at, start + Duration::from_millis(40));
+        assert_eq!(
+            clock.remaining(start + Duration::from_millis(45)),
+            Duration::from_millis(15)
+        );
+
+        let (id, clock) = clock
+            .advance(&frames, 2, start + Duration::from_millis(60), true)
+            .unwrap();
+        assert_eq!(id, frames[0].id);
+        let clock = clock.unwrap();
+        assert_eq!(clock.started_at, start + Duration::from_millis(60));
+        let (id, clock) = clock
+            .advance(&frames, 0, start + Duration::from_millis(72), true)
+            .unwrap();
+        assert_eq!(id, frames[1].id);
+        assert_eq!(clock.unwrap().started_at, start + Duration::from_millis(70));
+    }
+
+    #[test]
+    fn playback_skips_millions_of_complete_loops_and_retains_submicrosecond_age() {
+        let frames = playback_frames(&[1, 2, 3]);
+        let start = Instant::now();
+        let clock = PlaybackClock::new(frames[1].id, start, frames[1].duration);
+        let now = start + Duration::from_nanos(6_000_000_003_500);
+        let (id, clock) = clock.advance(&frames, 1, now, true).unwrap();
+        assert_eq!(id, frames[2].id);
+        assert_eq!(clock.unwrap().remaining(now), Duration::from_nanos(1_500));
+    }
+
+    #[test]
+    fn one_shot_playback_holds_the_last_frame_after_a_long_stall() {
+        let frames = playback_frames(&[10_000, 30_000, 20_000]);
+        let start = Instant::now();
+        let clock = PlaybackClock::new(frames[0].id, start, frames[0].duration);
+        let (id, next) = clock
+            .advance(&frames, 0, start + Duration::from_secs(2), false)
+            .unwrap();
+        assert_eq!(id, frames[2].id);
+        assert!(next.is_none());
+        assert!(EditorUiState::default().loop_preview);
+    }
+
+    #[test]
+    fn single_frame_preview_repeats_or_stops_at_its_exact_boundary() {
+        let frames = playback_frames(&[1_000]);
+        let start = Instant::now();
+        let now = start + Duration::from_millis(1);
+        let clock = PlaybackClock::new(frames[0].id, start, frames[0].duration);
+        let (id, next) = clock.advance(&frames, 0, now, true).unwrap();
+        assert_eq!(id, frames[0].id);
+        assert_eq!(next.unwrap().started_at, now);
+        assert!(clock.advance(&frames, 0, now, false).unwrap().1.is_none());
+        assert!(clock.advance(&[], 0, now, true).is_none());
     }
 
     #[test]
