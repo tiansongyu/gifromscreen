@@ -17,6 +17,7 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+blake3.workspace = true
 
 [dev-dependencies]
 gif-from-screen-capture = { path = "../capture" }

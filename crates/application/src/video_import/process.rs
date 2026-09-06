@@ -17,7 +17,7 @@ const STDERR_LIMIT: usize = 8192;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Clone, Copy)]
-pub(super) enum OutputMode {
+pub(crate) enum OutputMode {
     Probe { limit: usize },
     Frames { bytes: usize, limit: usize },
 }
@@ -33,14 +33,32 @@ impl Drop for OwnedChild {
 }
 
 pub(super) fn run(
-    mut command: Command,
+    command: Command,
     program: &'static str,
     mode: OutputMode,
     cancelled: &AtomicBool,
     timeout: Duration,
+    consume: impl FnMut(Vec<u8>) -> Result<(), VideoImportError>,
+) -> Result<(), VideoImportError> {
+    run_with_check(
+        command,
+        program,
+        mode,
+        || cancelled.load(Ordering::Relaxed),
+        timeout,
+        consume,
+    )
+}
+
+pub(crate) fn run_with_check(
+    mut command: Command,
+    program: &'static str,
+    mode: OutputMode,
+    is_cancelled: impl Fn() -> bool,
+    timeout: Duration,
     mut consume: impl FnMut(Vec<u8>) -> Result<(), VideoImportError>,
 ) -> Result<(), VideoImportError> {
-    if cancelled.load(Ordering::Relaxed) {
+    if is_cancelled() {
         return Err(VideoImportError::Cancelled);
     }
     let child = command
@@ -60,7 +78,7 @@ pub(super) fn run(
     let started = Instant::now();
     let mut output_closed = false;
     let result = loop {
-        if cancelled.load(Ordering::Relaxed) {
+        if is_cancelled() {
             break Err(VideoImportError::Cancelled);
         }
         if started.elapsed() >= timeout {

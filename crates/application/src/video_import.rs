@@ -1,6 +1,6 @@
 //! Local-video import through a supervised system `FFmpeg` process.
 
-mod process;
+pub(crate) mod process;
 
 use std::{
     fs, io,

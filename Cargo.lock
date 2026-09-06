@@ -974,6 +974,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1122,6 +1132,7 @@ name = "gif-from-screen"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "fs2",
  "gif-from-screen-application",
  "gif-from-screen-capture",
  "gif-from-screen-capture-linux",
@@ -1134,6 +1145,8 @@ dependencies = [
  "gif-from-screen-text",
  "gif-from-screen-workflow",
  "rfd",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "uuid",
@@ -1144,6 +1157,7 @@ dependencies = [
 name = "gif-from-screen-application"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "gif",
  "gif-from-screen-capture",
  "gif-from-screen-domain",

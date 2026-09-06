@@ -3,7 +3,15 @@
 //! Application-level state machines and use-case orchestration.
 
 mod blank_project;
+mod board;
+mod project_copy;
+pub use project_copy::{
+    ProjectCopyProgress, ProjectCopyReport, ProjectCopySnapshot, SaveProjectCopyOptions,
+    save_project_copy,
+};
+mod camera_capture;
 mod import_project;
+mod live_rgba_recording;
 mod presentation_plan;
 mod project_export;
 mod recording_project;
@@ -12,9 +20,20 @@ mod static_image_project;
 mod static_image_sequence_project;
 mod video_import;
 
+pub use board::{BoardBrush, BoardCanvas, BoardPoint};
+pub use live_rgba_recording::{
+    LiveFrameSubmission, LiveRecordingOptions, LiveRecordingOutcome, LiveRecordingProgress,
+    LiveRgbaRecorder,
+};
+
 pub use video_import::{
     VideoImportError, VideoImportLimits, VideoImportOptions, VideoImportProgress,
     import_video_project,
+};
+
+pub use camera_capture::{
+    CameraCaptureOptions, CameraCaptureProgress, CameraControl, CameraDevice, CameraPhase,
+    CameraPreviewFrame, enumerate_camera_devices, run_camera_capture,
 };
 
 pub use blank_project::{
