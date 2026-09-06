@@ -10,11 +10,12 @@ use gif_from_screen_domain::{
 };
 use gif_from_screen_gif::RgbaFrame;
 use gif_from_screen_project::{ActiveProject, ProjectError};
-use gif_from_screen_workflow::CollectedRecording;
+use gif_from_screen_workflow::{CollectedRecording, RecordingMetadata};
 use thiserror::Error;
 
 use crate::rgba_project::{
-    PersistRgbaProjectError, RgbaProjectFrame, RgbaProjectOptions, persist_rgba_project,
+    PersistRgbaProjectError, RgbaProjectFrame, RgbaProjectOptions,
+    persist_rgba_project_with_metadata,
 };
 
 /// Deterministic identifiers and user-facing metadata for a captured project.
@@ -112,6 +113,10 @@ pub enum IncrementalRecordingProjectError {
         /// Zero-based position rejected by the writer.
         frame_index: usize,
     },
+
+    /// Content-identical raster bytes were already registered with incompatible dimensions.
+    #[error("cursor image content conflicts with an existing raster asset's dimensions")]
+    CursorAssetConflict,
 
     /// The supplied frame duration could not be represented by the project model.
     #[error("frame {frame_index} has invalid duration {duration_us} microseconds")]
@@ -253,6 +258,20 @@ impl IncrementalRecordingProject {
         frame_id: FrameId,
         frame: &RgbaFrame,
     ) -> Result<(), IncrementalRecordingProjectError> {
+        self.append_frame_with_metadata(frame_id, frame, None)
+    }
+
+    /// Appends a frame together with its native input events and immutable cursor image.
+    /// Native event timestamps retain the original active recording clock, excluding pauses.
+    ///
+    /// # Errors
+    /// Returns validation, asset-storage, or journal errors without mutating the active timeline.
+    pub fn append_frame_with_metadata(
+        &mut self,
+        frame_id: FrameId,
+        frame: &RgbaFrame,
+        metadata: Option<&RecordingMetadata>,
+    ) -> Result<(), IncrementalRecordingProjectError> {
         let frame_index = self.project.manifest().timeline.frames.len();
         if frame_id.is_nil() {
             return Err(IncrementalRecordingProjectError::NilFrameId { frame_index });
@@ -296,12 +315,14 @@ impl IncrementalRecordingProject {
                 frame_index,
                 source,
             })?;
+        let (capture_metadata, new_cursor_asset) =
+            self.store_cursor_metadata(metadata, asset_id, frame_index)?;
         let clip = FrameClip {
             id: frame_id,
             asset_id,
             duration,
             transform: ClipTransform::default(),
-            capture_metadata: CaptureMetadata::default(),
+            capture_metadata,
             effects: Vec::new(),
         };
         let new_asset =
@@ -314,7 +335,7 @@ impl IncrementalRecordingProject {
                 },
             });
         self.project
-            .commit_recording_append(new_asset, clip)
+            .commit_recording_append_with_cursor(new_asset, new_cursor_asset, clip)
             .map_err(|source| IncrementalRecordingProjectError::Commit { source })?;
         self.frame_durations.insert(frame_id, duration);
         self.duration_us = next_duration_us;
@@ -328,6 +349,55 @@ impl IncrementalRecordingProject {
                 .map_err(|source| IncrementalRecordingProjectError::Checkpoint { source })?;
         }
         Ok(())
+    }
+
+    fn store_cursor_metadata(
+        &self,
+        metadata: Option<&RecordingMetadata>,
+        asset_id: gif_from_screen_domain::AssetId,
+        frame_index: usize,
+    ) -> Result<(CaptureMetadata, Option<AssetDescriptor>), IncrementalRecordingProjectError> {
+        let mut capture_metadata = metadata.map(domain_capture_metadata).unwrap_or_default();
+        let mut new_cursor_asset = None;
+        if let Some(image) = metadata.and_then(|metadata| metadata.cursor_image.as_ref()) {
+            let size = PhysicalSize {
+                width: gif_from_screen_domain::PhysicalPx::new(image.size().width()),
+                height: gif_from_screen_domain::PhysicalPx::new(image.size().height()),
+            };
+            let cursor_id = gif_from_screen_project::AssetStore::id_for_bytes(image.pixels());
+            if self
+                .project
+                .manifest()
+                .assets
+                .get(&cursor_id)
+                .is_some_and(|asset| {
+                    asset.kind.raster_descriptor() != Some((size, RasterEncoding::Rgba8))
+                })
+                || (cursor_id == asset_id && size != self.canvas)
+            {
+                return Err(IncrementalRecordingProjectError::CursorAssetConflict);
+            }
+            let cursor_id = self
+                .project
+                .assets()
+                .put(image.pixels())
+                .map_err(|source| IncrementalRecordingProjectError::StoreAsset {
+                    frame_index,
+                    source,
+                })?;
+            capture_metadata.cursor_asset = Some(cursor_id);
+            if !self.project.manifest().assets.contains_key(&cursor_id) && cursor_id != asset_id {
+                new_cursor_asset = Some(AssetDescriptor {
+                    id: cursor_id,
+                    byte_len: image.pixels().len() as u64,
+                    kind: AssetKind::OverlayImage {
+                        size,
+                        encoding: RasterEncoding::Rgba8,
+                    },
+                });
+            }
+        }
+        Ok((capture_metadata, new_cursor_asset))
     }
 
     /// Replaces the duration of a previously journaled frame.
@@ -567,7 +637,7 @@ pub fn persist_collected_recording(
     recording: CollectedRecording,
     options: RecordingProjectOptions,
 ) -> Result<ActiveProject, PersistRecordingError> {
-    let recording_frames = recording.into_frames();
+    let (recording_frames, metadata) = recording.into_parts();
     let frames: Vec<_> = recording_frames
         .iter()
         .map(|frame| RgbaProjectFrame {
@@ -577,7 +647,7 @@ pub fn persist_collected_recording(
             pixels: frame.pixels(),
         })
         .collect();
-    persist_rgba_project(
+    persist_rgba_project_with_metadata(
         root,
         &frames,
         RgbaProjectOptions {
@@ -590,6 +660,7 @@ pub fn persist_collected_recording(
             }],
             export_presets: BTreeMap::new(),
         },
+        &metadata,
     )
     .map_err(map_persist_error)
 }
@@ -678,6 +749,92 @@ fn map_persist_error(error: PersistRgbaProjectError) -> PersistRecordingError {
     }
 }
 
+pub(crate) fn domain_capture_metadata(metadata: &RecordingMetadata) -> CaptureMetadata {
+    use gif_from_screen_capture::{
+        ButtonState, InputEvent, KeyState, PhysicalPosition, PointerButton,
+    };
+    use gif_from_screen_domain::{KeyStroke, MouseButton, MouseInputEvent, PhysicalPoint, TimeUs};
+    let point = |position: PhysicalPosition| {
+        Some(PhysicalPoint {
+            x: gif_from_screen_domain::PhysicalPx::new(u32::try_from(position.x).ok()?),
+            y: gif_from_screen_domain::PhysicalPx::new(u32::try_from(position.y).ok()?),
+        })
+    };
+    let mut result = CaptureMetadata {
+        captured_at: Some(TimeUs::new(metadata.captured_at.as_micros())),
+        capture_origin: metadata.capture_origin.map(|point| {
+            gif_from_screen_domain::CaptureOrigin {
+                x: point.x,
+                y: point.y,
+            }
+        }),
+        cursor_position: metadata
+            .cursor
+            .as_ref()
+            .and_then(|cursor| point(cursor.position)),
+        cursor_hotspot: metadata
+            .cursor
+            .as_ref()
+            .and_then(|cursor| point(cursor.hotspot)),
+        cursor_visible: metadata
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.visible),
+        cursor_embedded: metadata.cursor_embedded,
+        dropped_input_events: metadata.dropped_input_events,
+        ..CaptureMetadata::default()
+    };
+    for event in &metadata.input_events {
+        match event {
+            InputEvent::Key {
+                at,
+                native_code,
+                text,
+                state,
+                repeat,
+                modifiers,
+            } => {
+                result.key_strokes.push(KeyStroke {
+                    physical_key: format!("x11:{native_code}"),
+                    display_text: text.clone(),
+                    pressed: *state == KeyState::Pressed,
+                    at: TimeUs::new(at.as_micros()),
+                    repeat: *repeat,
+                    modifiers: *modifiers,
+                });
+            }
+            InputEvent::PointerButton {
+                at,
+                button,
+                state,
+                position,
+            } => {
+                let button = match button {
+                    PointerButton::Primary => MouseButton::Left,
+                    PointerButton::Middle => MouseButton::Middle,
+                    PointerButton::Secondary => MouseButton::Right,
+                    PointerButton::Other(8) => MouseButton::Back,
+                    PointerButton::Other(9) => MouseButton::Forward,
+                    PointerButton::Other(number) => MouseButton::Other(*number),
+                    _ => continue,
+                };
+                let pressed = *state == ButtonState::Pressed;
+                if pressed && !result.pressed_mouse_buttons.contains(&button) {
+                    result.pressed_mouse_buttons.push(button);
+                }
+                result.mouse_events.push(MouseInputEvent {
+                    at: TimeUs::new(at.as_micros()),
+                    button,
+                    pressed,
+                    position: position.and_then(point),
+                });
+            }
+            _ => {}
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -718,6 +875,149 @@ mod tests {
             created_at: UnixTimeMs::new(1_234),
             source_label: Some("Synthetic display".to_owned()),
         }
+    }
+
+    #[test]
+    fn recording_metadata_and_deduplicated_cursor_survive_journal_recovery() {
+        use gif_from_screen_capture::{
+            ButtonState, CursorImage, CursorMetadata, InputEvent, KeyState, PhysicalPosition,
+            PointerButton,
+        };
+        use gif_from_screen_domain::{MouseButton, TimeUs};
+        let directory = tempdir().unwrap();
+        let mut writer = IncrementalRecordingProject::create(
+            directory.path(),
+            PhysicalSize::new(1, 1).unwrap(),
+            incremental_options(9),
+        )
+        .unwrap();
+        let cursor = CursorImage::new(
+            CaptureSize::new(2, 1).unwrap(),
+            vec![255, 255, 255, 255, 0, 0, 0, 0],
+        )
+        .unwrap();
+        let metadata = RecordingMetadata {
+            captured_at: CaptureTimestamp::from_micros(20_000),
+            capture_origin: Some(PhysicalPosition { x: -100, y: 50 }),
+            cursor: Some(CursorMetadata {
+                position: PhysicalPosition { x: 0, y: 0 },
+                hotspot: PhysicalPosition { x: 1, y: 0 },
+                visible: true,
+                shape_id: Some("shape-1".into()),
+            }),
+            cursor_image: Some(cursor.clone()),
+            cursor_embedded: true,
+            dropped_input_events: 3,
+            input_events: vec![
+                InputEvent::Key {
+                    at: CaptureTimestamp::from_micros(19_000),
+                    native_code: 38,
+                    text: Some("Ctrl+a".into()),
+                    state: KeyState::Pressed,
+                    repeat: true,
+                    modifiers: 2,
+                },
+                InputEvent::PointerButton {
+                    at: CaptureTimestamp::from_micros(19_500),
+                    button: PointerButton::Primary,
+                    state: ButtonState::Pressed,
+                    position: Some(PhysicalPosition { x: 0, y: 0 }),
+                },
+            ],
+        };
+        let frame = RgbaFrame::new(1, 1, vec![255, 0, 0, 255], 10_000).unwrap();
+        writer
+            .append_frame_with_metadata(FrameId::from_u128(1), &frame, Some(&metadata))
+            .unwrap();
+        writer
+            .append_frame_with_metadata(FrameId::from_u128(2), &frame, Some(&metadata))
+            .unwrap();
+        assert_eq!(writer.project.manifest().assets.len(), 2);
+        assert_eq!(writer.project.manifest().revision, ProjectRevision::new(2));
+        drop(writer);
+        let opened = ActiveProject::open(directory.path(), LockPolicy::FailIfPresent).unwrap();
+        let metadata = &opened.project.manifest().timeline.frames[0].capture_metadata;
+        assert_eq!(metadata.captured_at, Some(TimeUs::new(20_000)));
+        assert_eq!(metadata.capture_origin.unwrap().x, -100);
+        assert!(metadata.cursor_embedded);
+        assert!(metadata.cursor_visible);
+        assert_eq!(metadata.cursor_hotspot.unwrap().x.get(), 1);
+        assert!(metadata.key_strokes[0].repeat);
+        assert_eq!(metadata.key_strokes[0].modifiers, 2);
+        assert_eq!(metadata.key_strokes[0].at, TimeUs::new(19_000));
+        assert_eq!(metadata.mouse_events[0].button, MouseButton::Left);
+        assert_eq!(metadata.dropped_input_events, 3);
+        assert_eq!(
+            opened
+                .project
+                .assets()
+                .read(metadata.cursor_asset.unwrap())
+                .unwrap(),
+            cursor.pixels()
+        );
+    }
+
+    #[test]
+    fn batch_recording_preserves_native_metadata_in_one_commit() {
+        use gif_from_screen_capture::{
+            CursorImage, CursorMetadata, InputEvent, KeyState, PhysicalPosition,
+        };
+        let directory = tempdir().unwrap();
+        let cursor_image =
+            CursorImage::new(CaptureSize::new(1, 1).unwrap(), vec![0, 0, 0, 255]).unwrap();
+        let capture = CapturedFrame::new(
+            1,
+            CaptureTimestamp::from_micros(20_000),
+            CaptureSize::new(1, 1).unwrap(),
+            4,
+            PixelFormat::Rgba8,
+            vec![255, 255, 255, 255],
+        )
+        .unwrap()
+        .with_cursor(CursorMetadata {
+            position: PhysicalPosition::default(),
+            hotspot: PhysicalPosition::default(),
+            visible: true,
+            shape_id: Some("batch-cursor".into()),
+        })
+        .with_cursor_image(cursor_image.clone(), false)
+        .with_input_events(vec![InputEvent::Key {
+            at: CaptureTimestamp::from_micros(19_000),
+            native_code: 38,
+            text: Some("a".into()),
+            state: KeyState::Pressed,
+            repeat: false,
+            modifiers: 0,
+        }]);
+        let backend = SyntheticCaptureBackend::new(vec![capture]);
+        let recording = collect(
+            &backend,
+            CaptureRequest::new(
+                CaptureTarget::Monitor(CaptureSourceId::new("synthetic:monitor:0").unwrap()),
+                CaptureCadence::Manual,
+            ),
+            &CollectOptions {
+                limit: CollectionLimit::MaxFrames(1),
+                ..CollectOptions::default()
+            },
+            &NeverCancel,
+            &mut NoopWorkflowProgress,
+        )
+        .unwrap();
+        assert_eq!(recording.metadata()[0].input_events.len(), 1);
+        let project =
+            persist_collected_recording(directory.path(), recording, options(9, &[1])).unwrap();
+        assert_eq!(project.manifest().revision, ProjectRevision::new(1));
+        let metadata = &project.manifest().timeline.frames[0].capture_metadata;
+        assert_eq!(metadata.key_strokes[0].display_text.as_deref(), Some("a"));
+        assert_eq!(metadata.captured_at.unwrap().get(), 20_000);
+        assert_eq!(
+            project
+                .assets()
+                .read(metadata.cursor_asset.unwrap())
+                .unwrap(),
+            cursor_image.pixels()
+        );
     }
 
     fn collected(

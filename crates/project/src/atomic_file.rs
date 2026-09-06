@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -17,7 +17,7 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ProjectError
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent"),
         )
     })?;
-    fs::create_dir_all(parent)
+    crate::private_fs::create_dir_all(parent)
         .map_err(|error| ProjectError::io("create directory", parent, error))?;
 
     let (mut file, temp_path) = create_temporary_file(path)?;
@@ -41,7 +41,11 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ProjectError
 fn create_temporary_file(target: &Path) -> Result<(File, PathBuf), ProjectError> {
     loop {
         let path = unique_temp_path(target);
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        match crate::private_fs::file_options()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
             Ok(file) => return Ok((file, path)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {

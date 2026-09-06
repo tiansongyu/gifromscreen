@@ -167,17 +167,21 @@ pub enum PointerButton {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum InputEvent {
-    /// A keyboard transition. `native_code` is adapter-specific and optional
-    /// text is the interpreted text at event time.
+    /// A keyboard transition. `native_code` is adapter-specific; optional text
+    /// is a native key/chord label, not a guarantee of IME-composed text.
     Key {
         /// Session-relative event timestamp.
         at: CaptureTimestamp,
         /// Native scan/key code.
         native_code: u32,
-        /// Interpreted text, if any.
+        /// Display label from the native keymap, if any.
         text: Option<String>,
         /// Press or release state.
         state: KeyState,
+        /// Whether the server identifies this press as an auto-repeat.
+        repeat: bool,
+        /// Modifier bits: Shift=1, Control=2, Alt=4, Super=8.
+        modifiers: u8,
     },
     /// A pointer-button transition.
     PointerButton {
@@ -205,6 +209,41 @@ pub struct CursorMetadata {
     pub shape_id: Option<String>,
 }
 
+/// Immutable, tightly packed straight-alpha RGBA8 cursor pixels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorImage {
+    size: PhysicalSize,
+    pixels: Arc<[u8]>,
+}
+
+impl CursorImage {
+    /// Validates an owned cursor image. Images are bounded to 512 × 512 pixels.
+    ///
+    /// # Errors
+    /// Returns an invalid-frame error for an oversized or incorrectly sized buffer.
+    pub fn new(size: PhysicalSize, pixels: impl Into<Arc<[u8]>>) -> Result<Self, CaptureError> {
+        let pixels = pixels.into();
+        if size.width() > 512
+            || size.height() > 512
+            || u64::from(size.width()) * u64::from(size.height()) * 4 != pixels.len() as u64
+        {
+            return Err(CaptureError::invalid_frame(
+                "invalid or oversized RGBA cursor image",
+            ));
+        }
+        Ok(Self { size, pixels })
+    }
+
+    /// Returns the physical dimensions.
+    pub const fn size(&self) -> PhysicalSize {
+        self.size
+    }
+    /// Returns tightly packed straight-alpha RGBA8 pixels.
+    pub fn pixels(&self) -> &[u8] {
+        &self.pixels
+    }
+}
+
 /// One immutable native capture frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedFrame {
@@ -217,6 +256,10 @@ pub struct CapturedFrame {
     damage: Vec<PhysicalRect>,
     cursor: Option<CursorMetadata>,
     input_events: Vec<InputEvent>,
+    cursor_image: Option<CursorImage>,
+    cursor_embedded: bool,
+    dropped_input_events: u32,
+    capture_origin: Option<PhysicalPosition>,
 }
 
 impl CapturedFrame {
@@ -265,6 +308,10 @@ impl CapturedFrame {
             damage: Vec::new(),
             cursor: None,
             input_events: Vec::new(),
+            cursor_image: None,
+            cursor_embedded: false,
+            dropped_input_events: 0,
+            capture_origin: None,
         })
     }
 
@@ -300,6 +347,44 @@ impl CapturedFrame {
     #[must_use]
     pub fn with_input_events(mut self, input_events: Vec<InputEvent>) -> Self {
         self.input_events = input_events;
+        self
+    }
+
+    /// Attaches an immutable cursor image and records whether it is already in the frame pixels.
+    #[must_use]
+    pub fn with_cursor_image(mut self, image: CursorImage, embedded: bool) -> Self {
+        self.cursor_image = Some(image);
+        self.cursor_embedded = embedded;
+        self
+    }
+
+    /// Records event loss from a bounded native queue.
+    #[must_use]
+    pub const fn with_dropped_input_events(mut self, count: u32) -> Self {
+        self.dropped_input_events = count;
+        self
+    }
+
+    /// Returns the separate cursor image, when available.
+    pub const fn cursor_image(&self) -> Option<&CursorImage> {
+        self.cursor_image.as_ref()
+    }
+    /// Whether cursor pixels have already been composited into the frame.
+    pub const fn cursor_embedded(&self) -> bool {
+        self.cursor_embedded
+    }
+    /// Number of input events lost before this frame because of the queue bound.
+    pub const fn dropped_input_events(&self) -> u32 {
+        self.dropped_input_events
+    }
+    /// Root/source-local physical origin of the captured rectangle.
+    pub const fn capture_origin(&self) -> Option<PhysicalPosition> {
+        self.capture_origin
+    }
+    /// Attaches the physical origin for retarget-aware input annotations.
+    #[must_use]
+    pub const fn with_capture_origin(mut self, origin: PhysicalPosition) -> Self {
+        self.capture_origin = Some(origin);
         self
     }
 

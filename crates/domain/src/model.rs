@@ -143,16 +143,55 @@ pub struct KeyStroke {
     pub physical_key: String,
     pub display_text: Option<String>,
     pub pressed: bool,
+    /// Original session active time when captured_at is present; legacy projects
+    /// without a capture clock used timeline-relative timestamps.
     pub at: TimeUs,
+    #[serde(default)]
+    pub repeat: bool,
+    /// Shift=1, Control=2, Alt=4, Super=8.
+    #[serde(default)]
+    pub modifiers: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MouseInputEvent {
+    /// Original session active time, on the same clock as `CaptureMetadata::captured_at`.
+    pub at: TimeUs,
+    pub button: MouseButton,
+    pub pressed: bool,
+    pub position: Option<PhysicalPoint>,
+}
+
+/// Signed source/root coordinates; monitor layouts may extend left/above the origin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CaptureOrigin {
+    pub x: i32,
+    pub y: i32,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CaptureMetadata {
+    /// Original capture clock with pauses excluded; retained when clips are edited.
+    #[serde(default)]
+    pub captured_at: Option<TimeUs>,
+    #[serde(default)]
+    pub capture_origin: Option<CaptureOrigin>,
     pub cursor_position: Option<PhysicalPoint>,
     pub cursor_asset: Option<AssetId>,
+    #[serde(default)]
+    pub cursor_hotspot: Option<PhysicalPoint>,
+    #[serde(default)]
+    pub cursor_visible: bool,
+    #[serde(default)]
+    pub cursor_embedded: bool,
+    /// Legacy per-frame press markers. Ordered press/release transitions live in mouse_events.
     pub pressed_mouse_buttons: Vec<MouseButton>,
     pub key_strokes: Vec<KeyStroke>,
     pub dropped_frames_before: u32,
+    #[serde(default)]
+    pub mouse_events: Vec<MouseInputEvent>,
+    #[serde(default)]
+    pub dropped_input_events: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -273,6 +312,29 @@ pub struct TextRaster {
     pub size: PhysicalSize,
 }
 
+/// Direction in which an authored progress bar fills.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressDirection {
+    #[default]
+    LeftToRight,
+    RightToLeft,
+    TopToBottom,
+    BottomToTop,
+}
+
+/// Per-frame progress frozen at authoring time, like other time-anchored annotations.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProgressStyle {
+    /// 0 through 1,000,000. Rendering clamps values from old or externally edited projects.
+    pub amount_millionths: u32,
+    pub direction: ProgressDirection,
+    pub label: Option<TextRaster>,
+    pub label_position: PhysicalPoint,
+    /// Editable source label; pixels never depend on fonts installed during export.
+    pub label_text: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OverlayContent {
@@ -310,10 +372,15 @@ pub enum OverlayContent {
     KeyStroke {
         text: String,
         position: PhysicalPoint,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raster: Option<TextRaster>,
     },
     Cursor {
         cursor_asset: Option<AssetId>,
         position: PhysicalPoint,
+        /// Offset from image origin to pointer position; negative placement is clipped.
+        #[serde(default)]
+        hotspot: PhysicalPoint,
     },
     MouseClick {
         position: PhysicalPoint,
@@ -326,6 +393,8 @@ pub enum OverlayContent {
         foreground: Rgba,
         background: Rgba,
         show_frame_number: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        style: Option<ProgressStyle>,
     },
 }
 
@@ -335,6 +404,18 @@ impl OverlayContent {
             Self::Raster { asset_id, .. } => Some(*asset_id),
             Self::Text {
                 raster: Some(raster),
+                ..
+            }
+            | Self::KeyStroke {
+                raster: Some(raster),
+                ..
+            } => Some(raster.asset_id),
+            Self::Progress {
+                style:
+                    Some(ProgressStyle {
+                        label: Some(raster),
+                        ..
+                    }),
                 ..
             } => Some(raster.asset_id),
             Self::Cursor {
@@ -365,6 +446,9 @@ pub enum BlendMode {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OverlayTrack {
     pub id: TrackId,
+    /// Optional authoring recipe for a regenerable annotation group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotation: Option<crate::AnnotationRequest>,
     pub name: String,
     pub visible: bool,
     pub opacity: u8,
@@ -493,6 +577,8 @@ pub struct ProjectManifest {
     pub timeline: Timeline,
     pub assets: BTreeMap<AssetId, AssetDescriptor>,
     pub export_presets: BTreeMap<String, GifExportPreset>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_runs: Vec<crate::EditTaskRun>,
     pub source_provenance: Vec<SourceProvenance>,
 }
 
@@ -513,6 +599,7 @@ impl ProjectManifest {
             timeline: Timeline::default(),
             assets: BTreeMap::new(),
             export_presets: BTreeMap::new(),
+            task_runs: Vec::new(),
             source_provenance: Vec::new(),
         };
         manifest.validate()?;
@@ -563,6 +650,21 @@ impl ProjectManifest {
             }
             if !frame_ids.insert(frame.id) {
                 issues.push(ValidationIssue::DuplicateFrameId { frame_id: frame.id });
+            }
+            if let Some(asset_id) = frame.capture_metadata.cursor_asset {
+                match self.assets.get(&asset_id) {
+                    None => issues.push(ValidationIssue::MissingCursorAsset {
+                        frame_id: frame.id,
+                        asset_id,
+                    }),
+                    Some(asset) if asset.kind.raster_descriptor().is_none() => {
+                        issues.push(ValidationIssue::IncompatibleCursorAsset {
+                            frame_id: frame.id,
+                            asset_id,
+                        })
+                    }
+                    _ => {}
+                }
             }
             match self.assets.get(&frame.asset_id) {
                 None => issues.push(ValidationIssue::MissingFrameAsset {
@@ -730,6 +832,11 @@ impl ProjectManifest {
         }
         if let Err(reason) = crate::validate_export_presets(&self.export_presets) {
             issues.push(ValidationIssue::InvalidExportPresets {
+                reason: reason.to_owned(),
+            });
+        }
+        if let Err(reason) = crate::validate_edit_task_runs(&self.task_runs) {
+            issues.push(ValidationIssue::InvalidEditTaskRuns {
                 reason: reason.to_owned(),
             });
         }

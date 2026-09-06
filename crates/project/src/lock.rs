@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, OpenOptions},
+    fs,
     io::Write,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -36,7 +36,7 @@ pub(crate) struct ProjectLock {
 
 impl ProjectLock {
     pub(crate) fn acquire(root: &Path, policy: LockPolicy) -> Result<Self, ProjectError> {
-        fs::create_dir_all(root)
+        crate::private_fs::create_dir_all(root)
             .map_err(|error| ProjectError::io("create project directory", root, error))?;
         let path = root.join("project.lock");
         match Self::create(&path) {
@@ -78,7 +78,7 @@ impl ProjectLock {
         };
         let bytes = serde_json::to_vec(&info)
             .map_err(|error| ProjectError::json("serialize project lock", path, error))?;
-        let mut file = OpenOptions::new()
+        let mut file = crate::private_fs::file_options()
             .create_new(true)
             .write(true)
             .open(path)

@@ -84,7 +84,7 @@ pub fn edit_clip_transforms(
             apply_transform_edit(&mut replacement.transform, edit);
             EditCommand::ReplaceFrame {
                 frame_id: frame.id,
-                replacement,
+                replacement: Box::new(replacement),
             }
         })
         .collect();
@@ -277,6 +277,7 @@ mod tests {
             },
             assets,
             export_presets: BTreeMap::new(),
+            task_runs: Vec::new(),
             source_provenance: Vec::new(),
         }
     }

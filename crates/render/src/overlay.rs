@@ -10,6 +10,9 @@ use crate::{
 
 const CANCELLATION_PIXEL_INTERVAL: u32 = 1_024;
 
+#[path = "event_overlay.rs"]
+mod events;
+
 /// Stable identity pair for one active raster overlay and its immutable asset.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RasterOverlayAsset {
@@ -124,14 +127,7 @@ where
         }
     })?;
     assets.extend(layers.into_iter().filter_map(|layer| {
-        let asset_id = match &layer.item.content {
-            OverlayContent::Raster { asset_id, .. } => *asset_id,
-            OverlayContent::Text {
-                raster: Some(raster),
-                ..
-            } => raster.asset_id,
-            _ => return None,
-        };
+        let asset_id = layer.item.content.referenced_asset()?;
         Some(RasterOverlayAsset {
             overlay_id: layer.item.id,
             asset_id,
@@ -156,6 +152,11 @@ where
         check_cancelled(cancellation)?;
         match &layer.item.content {
             OverlayContent::Text {
+                position,
+                raster: Some(raster),
+                ..
+            }
+            | OverlayContent::KeyStroke {
                 position,
                 raster: Some(raster),
                 ..
@@ -222,6 +223,16 @@ where
                 layer.blend_mode,
                 cancellation,
             )?,
+            OverlayContent::Progress { .. }
+            | OverlayContent::MouseClick { .. }
+            | OverlayContent::Cursor { .. } => events::composite_event(
+                destination,
+                layer,
+                sample_time,
+                provider,
+                limits,
+                cancellation,
+            )?,
             content => return Err(unsupported_overlay(layer.item.id, content)),
         }
     }
@@ -260,6 +271,17 @@ where
                         raster: Some(_),
                         ..
                     }
+                    | OverlayContent::KeyStroke {
+                        raster: Some(_),
+                        ..
+                    }
+                    | OverlayContent::Cursor { .. }
+                    | OverlayContent::MouseClick { .. }
+                    | OverlayContent::Progress {
+                        show_frame_number: false,
+                        ..
+                    }
+                    | OverlayContent::Progress { style: Some(_), .. }
                     | OverlayContent::Shape { .. }
                     | OverlayContent::Drawing { .. }
             ) {
@@ -981,6 +1003,7 @@ mod tests {
         items: Vec<OverlayItem>,
     ) -> OverlayTrack {
         OverlayTrack {
+            annotation: None,
             id: TrackId::from_u128(number),
             name: format!("track {number}"),
             visible,
@@ -1146,6 +1169,7 @@ mod tests {
             content: OverlayContent::KeyStroke {
                 text: "Ctrl+C".to_owned(),
                 position: point(0, 0),
+                raster: None,
             },
         };
         let mut tracks = vec![track(1, true, 255, BlendMode::Normal, vec![item])];

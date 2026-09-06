@@ -9,6 +9,10 @@ use gif_from_screen_capture::{CursorMetadata, PhysicalPosition, PhysicalRect, Ph
 use std::time::{Duration, Instant};
 
 #[cfg(all(target_os = "linux", feature = "native-x11"))]
+#[path = "x11_input.rs"]
+mod input;
+
+#[cfg(all(target_os = "linux", feature = "native-x11"))]
 mod native {
     use std::collections::{HashSet, VecDeque};
     use std::fmt::{Debug, Formatter};
@@ -59,6 +63,8 @@ mod native {
         xfixes_version: Option<(u32, u32)>,
         connected_at: Instant,
         direct_sequence: AtomicU64,
+        display: Option<String>,
+        input_available: bool,
     }
 
     #[derive(Clone)]
@@ -134,6 +140,7 @@ mod native {
                 inspect_setup(&connection, screen_index)?;
             let atoms = X11Atoms::intern(&connection)?;
             let xfixes_version = negotiate_xfixes(&connection)?;
+            let input_available = super::input::available(&connection);
             Ok(Self {
                 inner: Arc::new(X11Inner {
                     connection,
@@ -146,6 +153,8 @@ mod native {
                     xfixes_version,
                     connected_at: Instant::now(),
                     direct_sequence: AtomicU64::new(0),
+                    display: display.map(str::to_owned),
+                    input_available,
                 }),
             })
         }
@@ -213,10 +222,10 @@ mod native {
                     .ok()
                     .and_then(|width| width.checked_mul(4))
                     .ok_or_else(|| CaptureError::invalid_frame("RGBA stride overflow"))?;
-                let cursor_metadata = match (cursor_mode, cursor) {
+                let cursor_metadata = match (cursor_mode, &cursor) {
                     (CursorCaptureMode::Embedded, Some(cursor)) => {
-                        composite_cursor(&mut rgba, stride, resolved.root_region, &cursor)?;
-                        None
+                        composite_cursor(&mut rgba, stride, resolved.root_region, cursor)?;
+                        Some(cursor.metadata(resolved.root_region)?)
                     }
                     (CursorCaptureMode::Metadata, Some(cursor)) => {
                         Some(cursor.metadata(resolved.root_region)?)
@@ -230,7 +239,7 @@ mod native {
                         ));
                     }
                 };
-                let frame = CapturedFrame::new(
+                let mut frame = CapturedFrame::new(
                     sequence,
                     timestamp,
                     size,
@@ -238,6 +247,13 @@ mod native {
                     PixelFormat::Rgba8,
                     rgba,
                 )?;
+                if let Some(cursor) = &cursor {
+                    frame = frame.with_cursor_image(
+                        cursor.image()?,
+                        cursor_mode == CursorCaptureMode::Embedded,
+                    );
+                }
+                frame = frame.with_capture_origin(resolved.root_region.origin());
                 return Ok(match cursor_metadata {
                     Some(cursor) => frame.with_cursor(cursor),
                     None => frame,
@@ -434,15 +450,14 @@ mod native {
             Ok(region)
         }
 
-        /// Resolves `Automatic` to separately editable metadata whenever
-        /// `XFixes` is usable. This deliberately prefers metadata over embedding
-        /// so callers retain pointer position/hotspot information. If `XFixes`
+        /// Resolves `Automatic` to embedded pixels while retaining metadata and
+        /// the immutable shape for inspection. If `XFixes`
         /// is absent, automatic capture degrades to a hidden pointer while an
         /// explicit metadata/embedded request is rejected by validation.
         fn effective_cursor_mode(&self, requested: CursorCaptureMode) -> CursorCaptureMode {
             match requested {
                 CursorCaptureMode::Automatic if self.inner.xfixes_version.is_some() => {
-                    CursorCaptureMode::Metadata
+                    CursorCaptureMode::Embedded
                 }
                 CursorCaptureMode::Automatic => CursorCaptureMode::Hidden,
                 mode => mode,
@@ -494,6 +509,13 @@ mod native {
                     RecoveryHint::ChangeRequest,
                 ));
             }
+            if request.input_events && !self.inner.input_available {
+                return Err(CaptureError::new(
+                    CaptureErrorKind::UnsupportedCapability,
+                    "input recording requires XInput 2 on the selected X11 server",
+                    RecoveryHint::ChangeRequest,
+                ));
+            }
             Ok(target_size)
         }
     }
@@ -511,7 +533,14 @@ mod native {
         }
 
         fn capabilities(&self) -> CaptureCapabilities {
-            get_image_capabilities(self.inner.xfixes_version)
+            let mut capabilities = get_image_capabilities(self.inner.xfixes_version);
+            if self.inner.input_available {
+                capabilities.passive_keyboard = CapabilityStatus::Limited(
+                    "Opt-in, recording-only XI2 physical key transitions and modifiers. Server-generated auto-repeat and IME/composed text are unavailable; labels use the core keymap.".into());
+                capabilities.passive_mouse_buttons = CapabilityStatus::Limited(
+                    "Opt-in, recording-only XI2 button events. Positions are queried when dispatched, not hardware-event coordinates; queue is bounded to 512 events.".into());
+            }
+            capabilities
         }
 
         fn list_sources(&self) -> Result<Vec<CaptureSource>, CaptureError> {
@@ -536,16 +565,28 @@ mod native {
             request: CaptureRequest,
         ) -> Result<Box<dyn CaptureSession>, CaptureError> {
             let canvas_size = self.validate_request(&request)?;
+            let started_at = Instant::now();
+            let input = request
+                .input_events
+                .then(|| {
+                    super::input::InputRecorder::start(
+                        self.inner.display.as_deref(),
+                        started_at,
+                        Duration::ZERO,
+                    )
+                })
+                .transpose()?;
             Ok(Box::new(X11CaptureSession {
                 backend: self.clone(),
                 request,
                 canvas_size,
                 state: CaptureSessionState::Recording,
                 sequence: 0,
-                started_at: Instant::now(),
+                started_at,
                 next_due: Instant::now(),
                 paused_at: None,
                 accumulated_pause: Duration::ZERO,
+                input,
             }))
         }
     }
@@ -560,6 +601,7 @@ mod native {
         next_due: Instant,
         paused_at: Option<Instant>,
         accumulated_pause: Duration,
+        input: Option<super::input::InputRecorder>,
     }
 
     impl X11CaptureSession {
@@ -615,6 +657,7 @@ mod native {
                 return Err(self.invalid_transition("pause"));
             }
             self.paused_at = Some(Instant::now());
+            self.input = None;
             self.state = CaptureSessionState::Paused;
             Ok(())
         }
@@ -624,12 +667,24 @@ mod native {
                 return Err(self.invalid_transition("resume"));
             }
             let now = Instant::now();
-            if let Some(paused_at) = self.paused_at.take() {
-                self.accumulated_pause = self
-                    .accumulated_pause
-                    .saturating_add(now.saturating_duration_since(paused_at));
-            }
+            let accumulated_pause = self.paused_at.map_or(self.accumulated_pause, |paused_at| {
+                self.accumulated_pause
+                    .saturating_add(now.saturating_duration_since(paused_at))
+            });
+            let input = if self.request.input_events {
+                Some(super::input::InputRecorder::start(
+                    self.backend.inner.display.as_deref(),
+                    self.started_at,
+                    accumulated_pause,
+                )?)
+            } else {
+                None
+            };
+            // Failed re-subscription leaves the complete paused clock untouched.
+            self.accumulated_pause = accumulated_pause;
+            self.paused_at = None;
             self.next_due = now;
+            self.input = input;
             self.state = CaptureSessionState::Recording;
             Ok(())
         }
@@ -642,6 +697,7 @@ mod native {
                 return Err(self.invalid_transition("stop"));
             }
             self.state = CaptureSessionState::Stopped;
+            self.input = None;
             Ok(())
         }
 
@@ -655,6 +711,7 @@ mod native {
                 return Err(self.invalid_transition("discard"));
             }
             self.state = CaptureSessionState::Discarded;
+            self.input = None;
             Ok(())
         }
 
@@ -686,13 +743,34 @@ mod native {
                 .as_micros();
             let timestamp =
                 CaptureTimestamp::from_micros(u64::try_from(elapsed).unwrap_or(u64::MAX));
-            match self.backend.capture_target(
-                &self.request.target,
-                self.request.cursor,
-                self.sequence,
-                timestamp,
-                Some(self.canvas_size),
-            ) {
+            let captured = self
+                .backend
+                .capture_target(
+                    &self.request.target,
+                    self.request.cursor,
+                    self.sequence,
+                    timestamp,
+                    Some(self.canvas_size),
+                )
+                .and_then(|mut frame| {
+                    if let Some(input) = &self.input {
+                        let origin = frame
+                            .capture_origin()
+                            .expect("X11 captures retain their resolved origin");
+                        let region = PhysicalRect::new(
+                            origin.x,
+                            origin.y,
+                            frame.size().width(),
+                            frame.size().height(),
+                        )?;
+                        let (events, dropped) = input.drain(region, frame.captured_at())?;
+                        frame = frame
+                            .with_input_events(events)
+                            .with_dropped_input_events(dropped);
+                    }
+                    Ok(frame)
+                });
+            match captured {
                 Ok(frame) => {
                     self.sequence = self.sequence.checked_add(1).ok_or_else(|| {
                         CaptureError::new(
@@ -705,6 +783,7 @@ mod native {
                 }
                 Err(error) => {
                     self.state = CaptureSessionState::Failed;
+                    self.input = None;
                     Err(error)
                 }
             }
@@ -1157,10 +1236,7 @@ mod native {
             (
                 CapabilityStatus::Available,
                 CapabilityStatus::Limited(format!(
-                    "XFixes {major}.{minor} returns editable position, hotspot, and a stable shape hash; \
-                     the shared CapturedFrame model needs an optional immutable RGBA8 cursor image \
-                     keyed by shape_id to carry separate cursor pixels. \
-                     Automatic mode prefers this metadata representation"
+                    "XFixes {major}.{minor} returns editable position, hotspot and immutable RGBA8 shape pixels. Automatic embeds pixels and preserves metadata; Metadata leaves screen pixels unchanged."
                 )),
             )
         } else {
@@ -1490,6 +1566,11 @@ impl X11CursorSnapshot {
                 "XFixes returned an empty cursor image",
             ));
         }
+        if width > 512 || height > 512 {
+            return Err(CaptureError::invalid_frame(
+                "XFixes cursor exceeds the 512 × 512 image limit",
+            ));
+        }
         let expected_pixels = usize::try_from(width)
             .ok()
             .and_then(|width| {
@@ -1524,10 +1605,6 @@ impl X11CursorSnapshot {
     }
 
     fn metadata(&self, capture_region: PhysicalRect) -> Result<CursorMetadata, CaptureError> {
-        // Compatibility note: the shared frame model has no cursor bitmap
-        // field. The smallest future extension is an optional immutable RGBA8
-        // image (size, stride, pixels) on CursorMetadata, keyed by shape_id so
-        // unchanged shapes need not duplicate pixel storage on every frame.
         let relative_x = i64::from(self.position_root.x) - i64::from(capture_region.origin().x);
         let relative_y = i64::from(self.position_root.y) - i64::from(capture_region.origin().y);
         let position = PhysicalPosition {
@@ -1548,6 +1625,26 @@ impl X11CursorSnapshot {
                 cursor_shape_hash(self)
             )),
         })
+    }
+
+    fn image(&self) -> Result<gif_from_screen_capture::CursorImage, CaptureError> {
+        let mut pixels = Vec::with_capacity(self.premultiplied_argb.len() * 4);
+        for &pixel in &self.premultiplied_argb {
+            let alpha = (pixel >> 24) & 0xff;
+            for channel in [(pixel >> 16) & 0xff, (pixel >> 8) & 0xff, pixel & 0xff] {
+                pixels.push(
+                    (channel * 255 + alpha / 2)
+                        .checked_div(alpha)
+                        .unwrap_or(0)
+                        .min(255) as u8,
+                );
+            }
+            pixels.push(alpha as u8);
+        }
+        gif_from_screen_capture::CursorImage::new(
+            PhysicalSize::new(self.width, self.height)?,
+            pixels,
+        )
     }
 
     fn pointer_inside(&self, capture_region: PhysicalRect) -> bool {
@@ -2188,6 +2285,201 @@ mod tests {
     }
 
     #[test]
+    fn cursor_image_unpremultiplies_rgba_and_preserves_transparency() {
+        let cursor = cursor(0, 0, 2, 1, 0, 0, vec![0x8040_2010, 0x0000_0000]);
+        let image = cursor.image().unwrap();
+        assert_eq!(image.pixels(), &[128, 64, 32, 128, 0, 0, 0, 0]);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-x11"))]
+    #[test]
+    #[ignore = "requires an isolated Xvfb display in GFS_X11_INPUT_TEST_DISPLAY"]
+    #[allow(clippy::too_many_lines)] // One isolated native lifecycle, including privacy boundaries.
+    fn isolated_x11_input_records_only_active_sessions() {
+        use gif_from_screen_capture::{ButtonState, InputEvent, KeyState, PointerButton};
+        use x11rb::{
+            connection::Connection,
+            protocol::{
+                xproto::{ConnectionExt as _, CreateWindowAux, InputFocus, WindowClass},
+                xtest::ConnectionExt as _,
+            },
+        };
+        let display =
+            std::env::var("GFS_X11_INPUT_TEST_DISPLAY").expect("isolated Xvfb display required");
+        let (connection, screen) = x11rb::connect(Some(&display)).unwrap();
+        let root = connection.setup().roots[screen].root;
+        let window = connection.generate_id().unwrap();
+        connection
+            .create_window(
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                window,
+                root,
+                100,
+                50,
+                300,
+                150,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &CreateWindowAux::new(),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        connection.map_window(window).unwrap().check().unwrap();
+        connection
+            .set_input_focus(InputFocus::PARENT, window, x11rb::CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
+        let backend = X11CaptureBackend::connect(Some(&display)).unwrap();
+        let source = backend
+            .list_sources()
+            .unwrap()
+            .into_iter()
+            .find(|source| source.kind() == CaptureSourceKind::Monitor)
+            .unwrap();
+        let target = CaptureTarget::Region {
+            source: source.id().clone(),
+            region: PhysicalRect::new(100, 50, 100, 100).unwrap(),
+        };
+        let emit = |event_type, detail| {
+            connection
+                .xtest_fake_input(event_type, detail, 0, root, 0, 0, 0)
+                .unwrap()
+                .check()
+                .unwrap();
+        };
+        let sample = |session: &mut dyn CaptureSession| {
+            std::thread::sleep(Duration::from_millis(25));
+            let FramePoll::Frame(frame) = session.poll_frame(Duration::ZERO).unwrap() else {
+                panic!("expected capture")
+            };
+            frame
+        };
+        let mut disabled = backend
+            .start_session(CaptureRequest::new(target.clone(), CaptureCadence::Manual))
+            .unwrap();
+        emit(2, 38);
+        emit(3, 38);
+        assert!(sample(disabled.as_mut()).input_events().is_empty());
+        disabled.stop().unwrap();
+        let mut request = CaptureRequest::new(target, CaptureCadence::Manual);
+        request.input_events = true;
+        let mut session = backend.start_session(request).unwrap();
+        connection
+            .warp_pointer(0u32, root, 0, 0, 0, 0, 140, 90)
+            .unwrap()
+            .check()
+            .unwrap();
+        emit(2, 50);
+        emit(2, 38);
+        emit(3, 38);
+        emit(3, 50);
+        emit(4, 1);
+        emit(5, 1);
+        let frame = sample(session.as_mut());
+        assert_eq!(frame.input_events().len(), 6, "{:#?}", frame.input_events());
+        assert!(frame.input_events().iter().any(|event| matches!(
+            event,
+            InputEvent::Key {
+                native_code: 38,
+                state: KeyState::Pressed,
+                modifiers: 1,
+                ..
+            }
+        )));
+        assert!(frame.input_events().iter().any(|event| matches!(
+            event,
+            InputEvent::PointerButton {
+                button: PointerButton::Primary,
+                state: ButtonState::Pressed,
+                position: Some(PhysicalPosition { x: 40, y: 40 }),
+                ..
+            }
+        )));
+        session.pause().unwrap();
+        emit(2, 56);
+        emit(3, 56);
+        std::thread::sleep(Duration::from_millis(80));
+        session.resume().unwrap();
+        assert!(
+            sample(session.as_mut()).input_events().is_empty(),
+            "paused input leaked into resumed recording"
+        );
+        session
+            .update_target(CaptureTarget::Region {
+                source: source.id().clone(),
+                region: PhysicalRect::new(200, 50, 100, 100).unwrap(),
+            })
+            .unwrap();
+        connection
+            .warp_pointer(0u32, root, 0, 0, 0, 0, 240, 90)
+            .unwrap()
+            .check()
+            .unwrap();
+        emit(4, 1);
+        emit(5, 1);
+        let retargeted = sample(session.as_mut());
+        assert!(retargeted.input_events().iter().all(|event| matches!(
+            event,
+            InputEvent::PointerButton {
+                position: Some(PhysicalPosition { x: 40, y: 40 }),
+                ..
+            }
+        )));
+        assert_eq!(retargeted.input_events().len(), 2);
+        assert!(
+            retargeted.captured_at().as_micros() - frame.captured_at().as_micros() < 80_000,
+            "pause leaked into active timestamps"
+        );
+        emit(2, 38);
+        std::thread::sleep(Duration::from_millis(900));
+        emit(3, 38);
+        let repeated = sample(session.as_mut());
+        // Raw XI2 reports physical transitions, not the server's synthesized
+        // repeat presses. The capability advertises this limitation explicitly.
+        assert_eq!(repeated.input_events().len(), 2);
+        assert!(repeated.input_events().iter().all(|event| matches!(
+            event,
+            InputEvent::Key {
+                native_code: 38,
+                repeat: false,
+                ..
+            }
+        )));
+        session.stop().unwrap();
+        emit(2, 40);
+        emit(3, 40);
+        assert_eq!(
+            session.poll_frame(Duration::ZERO).unwrap(),
+            FramePoll::EndOfStream
+        );
+        let mut blocked_request = CaptureRequest::new(
+            CaptureTarget::Region {
+                source: source.id().clone(),
+                region: PhysicalRect::new(100, 50, 100, 100).unwrap(),
+            },
+            CaptureCadence::Manual,
+        );
+        blocked_request.input_events = true;
+        let mut blocked_session = backend.start_session(blocked_request).unwrap();
+        connection.grab_server().unwrap().check().unwrap();
+        emit(4, 1);
+        std::thread::sleep(Duration::from_millis(20));
+        let stopping = Instant::now();
+        blocked_session.stop().unwrap();
+        let stop_elapsed = stopping.elapsed();
+        emit(5, 1);
+        connection.ungrab_server().unwrap().check().unwrap();
+        assert!(
+            stop_elapsed < Duration::from_millis(250),
+            "input shutdown waited for a blocked X server"
+        );
+        connection.destroy_window(window).unwrap().check().unwrap();
+    }
+
+    #[test]
     fn translates_source_local_region_to_root_coordinates() {
         let source = PhysicalRect::new(100, 50, 800, 600).unwrap();
         let local = PhysicalRect::new(10, 20, 30, 40).unwrap();
@@ -2438,7 +2730,7 @@ mod tests {
             };
             let cursor = frame
                 .cursor()
-                .expect("Automatic must prefer XFixes cursor metadata");
+                .expect("Automatic must retain XFixes cursor metadata");
             assert!(
                 cursor
                     .shape_id
@@ -2452,7 +2744,9 @@ mod tests {
             let FramePoll::Frame(frame) = session.poll_frame(Duration::ZERO).unwrap() else {
                 panic!("embedded-cursor X11 session did not produce its first frame");
             };
-            assert!(frame.cursor().is_none());
+            assert!(frame.cursor().is_some());
+            assert!(frame.cursor_image().is_some());
+            assert!(frame.cursor_embedded());
         }
 
         exercise_live_region_retarget(&backend, root, &target);

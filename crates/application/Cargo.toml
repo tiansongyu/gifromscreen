@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+gif-from-screen-capture = { path = "../capture" }
 gif-from-screen-domain = { path = "../domain" }
 gif-from-screen-gif = { path = "../gif" }
 gif-from-screen-media = { path = "../media" }
@@ -20,7 +21,6 @@ uuid.workspace = true
 blake3.workspace = true
 
 [dev-dependencies]
-gif-from-screen-capture = { path = "../capture" }
 gif.workspace = true
 
 [lints]

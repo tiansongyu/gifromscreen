@@ -20,7 +20,7 @@ impl AssetStore {
 
     pub fn open(project_root: impl AsRef<Path>) -> Result<Self, ProjectError> {
         let directory = project_root.as_ref().join("assets");
-        fs::create_dir_all(&directory)
+        crate::private_fs::create_dir_all(&directory)
             .map_err(|error| ProjectError::io("create asset directory", &directory, error))?;
         Ok(Self { directory })
     }

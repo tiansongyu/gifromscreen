@@ -25,7 +25,9 @@ pub use control::{
     TargetUpdateStatus,
 };
 pub use error::WorkflowError;
-pub use frame_sink::{RecordingFrameSink, RecordingFrameSinkError, RecordingFrameSinkOperation};
+pub use frame_sink::{
+    RecordingFrameSink, RecordingFrameSinkError, RecordingFrameSinkOperation, RecordingMetadata,
+};
 pub use output::{
     RecordToGifOptions, RecordToGifReport, partial_output_path, record_to_gif,
     record_to_gif_controlled, record_to_gif_with_encoder,

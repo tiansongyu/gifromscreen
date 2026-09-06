@@ -130,6 +130,7 @@ mod tests {
             })
             .collect();
         project.timeline.overlay_tracks.push(OverlayTrack {
+            annotation: None,
             id: TrackId::from_u128(1),
             name: "Watermarks".to_owned(),
             visible: true,
@@ -156,6 +157,38 @@ mod tests {
         });
         project.validate().unwrap();
         project
+    }
+
+    #[test]
+    fn same_duration_frame_effect_edit_does_not_copy_overlay_timing_into_inverse() {
+        let mut project = project(&[10, 20], &[(2, 17)]);
+        let before = project.clone();
+        let mut replacement = project.timeline.frames[0].clone();
+        replacement.effects.push(crate::Effect::Shadow {
+            offset_x: 1,
+            offset_y: 1,
+            blur_radius: 0,
+            color: crate::Rgba {
+                red: 0,
+                green: 0,
+                blue: 0,
+                alpha: 255,
+            },
+        });
+        let applied = project
+            .apply_command(&EditCommand::ReplaceFrame {
+                frame_id: replacement.id,
+                replacement: Box::new(replacement),
+            })
+            .unwrap();
+        assert!(matches!(applied.inverse, EditCommand::ReplaceFrame { .. }));
+        assert_eq!(
+            project.timeline.overlay_tracks,
+            before.timeline.overlay_tracks
+        );
+        project.apply_command(&applied.inverse).unwrap();
+        project.revision = before.revision;
+        assert_eq!(project, before);
     }
 
     fn spans(project: &ProjectManifest) -> Vec<(u64, u64, u128)> {

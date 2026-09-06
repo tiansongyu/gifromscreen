@@ -20,7 +20,7 @@ pub use backend::{
 pub use capabilities::{CapabilityStatus, CaptureCapabilities, CaptureCapability};
 pub use error::{CaptureError, CaptureErrorKind, RecoveryHint};
 pub use frame::{
-    ButtonState, CaptureTimestamp, CapturedFrame, CursorMetadata, InputEvent, KeyState,
-    PhysicalPosition, PhysicalRect, PhysicalSize, PixelFormat, PointerButton,
+    ButtonState, CaptureTimestamp, CapturedFrame, CursorImage, CursorMetadata, InputEvent,
+    KeyState, PhysicalPosition, PhysicalRect, PhysicalSize, PixelFormat, PointerButton,
 };
 pub use synthetic::{SyntheticCaptureBackend, SyntheticCaptureSession};

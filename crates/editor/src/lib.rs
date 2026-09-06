@@ -931,6 +931,7 @@ mod tests {
             },
             assets,
             export_presets: BTreeMap::new(),
+            task_runs: Vec::new(),
             source_provenance: Vec::new(),
         }
     }
@@ -1364,6 +1365,7 @@ mod tests {
             let mut project = project_with_durations(&[100, 100, 100, 100]);
             let asset_id = project.timeline.frames[0].asset_id;
             project.timeline.overlay_tracks.push(OverlayTrack {
+                annotation: None,
                 id: TrackId::from_u128(1),
                 name: "Selected frame watermarks".to_owned(),
                 visible: true,

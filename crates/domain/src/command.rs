@@ -51,7 +51,7 @@ pub enum EditCommand {
     },
     ReplaceFrame {
         frame_id: FrameId,
-        replacement: FrameClip,
+        replacement: Box<FrameClip>,
     },
     SetFrameDurations {
         changes: Vec<FrameDurationChange>,
@@ -81,6 +81,9 @@ pub enum EditCommand {
     },
     RemoveExportPreset {
         name: String,
+    },
+    SetTaskRuns {
+        runs: Vec<crate::EditTaskRun>,
     },
     /// Commands in a compound edit are one revision and are atomic. Inverses
     /// are stored in reverse order.
@@ -148,6 +151,21 @@ impl EditCommand {
         }
 
         if !self.changes_frame_timing() || project.timeline.overlay_tracks.is_empty() {
+            return self.apply_without_retiming(project);
+        }
+        let unchanged_duration = match self {
+            Self::ReplaceFrame {
+                frame_id,
+                replacement,
+            } => project
+                .timeline
+                .frames
+                .iter()
+                .find(|frame| frame.id == *frame_id)
+                .is_some_and(|frame| frame.duration == replacement.duration),
+            _ => false,
+        };
+        if unchanged_duration {
             return self.apply_without_retiming(project);
         }
 
@@ -304,10 +322,10 @@ impl EditCommand {
                     .iter_mut()
                     .find(|frame| frame.id == *frame_id)
                     .ok_or(DomainError::UnknownFrame(*frame_id))?;
-                let previous = std::mem::replace(frame, replacement.clone());
+                let previous = std::mem::replace(frame, replacement.as_ref().clone());
                 Ok(Self::ReplaceFrame {
                     frame_id: *frame_id,
-                    replacement: previous,
+                    replacement: Box::new(previous),
                 })
             }
             Self::SetFrameDurations { changes } => {
@@ -436,6 +454,9 @@ impl EditCommand {
                     preset,
                 })
             }
+            Self::SetTaskRuns { runs } => Ok(Self::SetTaskRuns {
+                runs: std::mem::replace(&mut project.task_runs, runs.clone()),
+            }),
             Self::Compound { commands } => {
                 if commands.is_empty() {
                     return Err(DomainError::EmptyCommand);

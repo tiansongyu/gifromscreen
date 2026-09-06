@@ -125,6 +125,13 @@ impl CaptureBackend for WaylandCaptureBackend {
             ));
         }
         let target = resolve_portal_target(&request.target, self.portal_capabilities)?;
+        if request.input_events {
+            return Err(CaptureError::new(
+                CaptureErrorKind::UnsupportedCapability,
+                "Wayland screen-cast portals do not provide passive keyboard or mouse-button input recording",
+                RecoveryHint::ChangeRequest,
+            ));
+        }
         request.cursor = self.effective_cursor_mode(request.cursor)?;
         let portal = WaylandPortal::connect()?;
         let portal_session = portal.start_session(target.source_kind, request.cursor)?;

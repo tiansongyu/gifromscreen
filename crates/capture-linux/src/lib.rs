@@ -637,6 +637,7 @@ mod tests {
             cadence: CaptureCadence::fixed_fps(15).unwrap(),
             cursor: CursorCaptureMode::Embedded,
             prefer_damage: true,
+            input_events: false,
         };
         let error = backend
             .start_session(request)

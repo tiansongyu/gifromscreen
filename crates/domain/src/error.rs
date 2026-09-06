@@ -56,6 +56,14 @@ impl Error for UnitError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ValidationIssue {
+    MissingCursorAsset {
+        frame_id: FrameId,
+        asset_id: AssetId,
+    },
+    IncompatibleCursorAsset {
+        frame_id: FrameId,
+        asset_id: AssetId,
+    },
     UnsupportedSchema {
         found: u32,
         current: u32,
@@ -147,6 +155,9 @@ pub enum ValidationIssue {
         transition_id: TransitionId,
     },
     InvalidExportPresetName,
+    InvalidEditTaskRuns {
+        reason: String,
+    },
     InvalidExportPresets {
         reason: String,
     },

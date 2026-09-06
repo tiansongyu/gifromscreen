@@ -13,6 +13,7 @@ mod atomic_file;
 mod error;
 mod journal;
 mod lock;
+mod private_fs;
 
 pub use active::{
     ActiveProject, AssetCheck, AssetIssue, CommitReceipt, OpenedProject, ProjectLayout,

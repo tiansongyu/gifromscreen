@@ -229,6 +229,9 @@ pub struct CaptureRequest {
     pub cursor: CursorCaptureMode,
     /// Whether native damage information should be requested when available.
     pub prefer_damage: bool,
+    /// Explicit opt-in to session-scoped passive keyboard/button recording.
+    /// This may capture sensitive input from other applications. Never enabled implicitly.
+    pub input_events: bool,
 }
 
 impl CaptureRequest {
@@ -239,6 +242,7 @@ impl CaptureRequest {
             cadence,
             cursor: CursorCaptureMode::Automatic,
             prefer_damage: true,
+            input_events: false,
         }
     }
 }

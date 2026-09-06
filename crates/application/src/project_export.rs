@@ -1797,6 +1797,7 @@ mod tests {
         size: PhysicalSize,
     ) -> OverlayTrack {
         OverlayTrack {
+            annotation: None,
             id: TrackId::from_u128(1),
             name: "watermark".to_owned(),
             visible: true,
@@ -2058,6 +2059,7 @@ mod tests {
             .timeline
             .overlay_tracks
             .push(OverlayTrack {
+                annotation: None,
                 id: TrackId::from_u128(1),
                 name: "vector watermark".to_owned(),
                 visible: true,
@@ -2183,6 +2185,7 @@ mod tests {
                 },
             });
         ignored.manifest.timeline.overlay_tracks.push(OverlayTrack {
+            annotation: None,
             id: TrackId::from_u128(2),
             name: "hidden missing watermark".to_owned(),
             visible: false,

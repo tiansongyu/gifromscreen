@@ -153,10 +153,21 @@ enum SinkEvent {
 #[derive(Default)]
 struct TestFrameSink {
     events: Vec<SinkEvent>,
+    metadata: Vec<gif_from_screen_workflow::RecordingMetadata>,
     fail: Option<(RecordingFrameSinkOperation, u64)>,
 }
 
 impl RecordingFrameSink for TestFrameSink {
+    fn append_provisional_frame_with_metadata(
+        &mut self,
+        frame_index: u64,
+        frame: &gif_from_screen_gif::RgbaFrame,
+        metadata: &gif_from_screen_workflow::RecordingMetadata,
+    ) -> Result<(), RecordingFrameSinkError> {
+        self.append_provisional_frame(frame_index, frame)?;
+        self.metadata.push(metadata.clone());
+        Ok(())
+    }
     fn append_provisional_frame(
         &mut self,
         frame_index: u64,
@@ -694,6 +705,57 @@ fn changes_only_frame_limit_counts_retained_changes() {
     assert_eq!(recording.frames()[0].duration_us(), 20_000);
     assert_eq!(recording.frames()[1].duration_us(), 10_000);
     assert_eq!(recording.summary().duration_us, 30_000);
+}
+
+#[test]
+fn changes_only_retains_native_events_and_separate_cursor_changes_in_sink() {
+    use gif_from_screen_capture::{
+        CursorImage, CursorMetadata, InputEvent, KeyState, PhysicalPosition,
+    };
+    let red = vec![255, 0, 0, 255];
+    let event = InputEvent::Key {
+        at: CaptureTimestamp::from_micros(9_000),
+        native_code: 38,
+        text: Some("Shift+A".into()),
+        state: KeyState::Pressed,
+        repeat: false,
+        modifiers: 1,
+    };
+    let image =
+        CursorImage::new(PhysicalSize::new(1, 1).unwrap(), vec![255, 255, 255, 255]).unwrap();
+    let backend = SyntheticCaptureBackend::new(vec![
+        frame(1, 0, 1, 1, 4, PixelFormat::Rgba8, red.clone()),
+        frame(2, 10_000, 1, 1, 4, PixelFormat::Rgba8, red.clone())
+            .with_input_events(vec![event.clone()]),
+        frame(3, 20_000, 1, 1, 4, PixelFormat::Rgba8, red)
+            .with_cursor(CursorMetadata {
+                position: PhysicalPosition { x: 0, y: 0 },
+                hotspot: PhysicalPosition { x: 0, y: 0 },
+                visible: true,
+                shape_id: Some("cursor".into()),
+            })
+            .with_cursor_image(image.clone(), false),
+    ]);
+    let (controller, mut control) = RecordingController::channel();
+    drop(controller);
+    let mut sink = TestFrameSink::default();
+    let recording = collect_controlled_with_sink(
+        &backend,
+        request(),
+        &CollectOptions {
+            limit: CollectionLimit::UntilStopped,
+            frame_retention: FrameRetention::ChangesOnly,
+            ..CollectOptions::default()
+        },
+        &mut control,
+        &mut sink,
+        &NeverCancel,
+        &mut NoopWorkflowProgress,
+    )
+    .unwrap();
+    assert_eq!(recording.frames().len(), 3);
+    assert_eq!(sink.metadata[1].input_events, vec![event]);
+    assert_eq!(sink.metadata[2].cursor_image, Some(image));
 }
 
 #[test]

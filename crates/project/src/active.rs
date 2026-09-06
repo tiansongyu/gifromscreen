@@ -44,7 +44,7 @@ impl ProjectLayout {
 
     fn create_directories(&self) -> Result<(), ProjectError> {
         for directory in [&self.root, &self.assets, &self.thumbnails, &self.previews] {
-            fs::create_dir_all(directory).map_err(|error| {
+            crate::private_fs::create_dir_all(directory).map_err(|error| {
                 ProjectError::io("create project layout directory", directory, error)
             })?;
         }
@@ -228,39 +228,21 @@ impl ActiveProject {
         new_asset: Option<AssetDescriptor>,
         frame: FrameClip,
     ) -> Result<CommitReceipt, ProjectError> {
-        self.ensure_writable()?;
-        if frame.id.is_nil() {
-            return Err(ProjectError::InvalidRecordingMutation(
-                "recording frame identity must not be nil".to_owned(),
-            ));
-        }
-        if self.frame_positions.contains_key(&frame.id) {
-            return Err(DomainError::DuplicateFrameId(frame.id).into());
-        }
-        if frame.transform != Default::default() || !frame.effects.is_empty() {
-            return Err(ProjectError::InvalidRecordingMutation(
-                "fast recording append requires an untransformed frame without effects".to_owned(),
-            ));
-        }
-        let descriptor = match &new_asset {
-            Some(descriptor) => {
-                if descriptor.id != frame.asset_id {
-                    return Err(ProjectError::InvalidRecordingMutation(
-                        "new asset identity differs from the appended frame asset".to_owned(),
-                    ));
-                }
-                if self.manifest.assets.contains_key(&descriptor.id) {
-                    return Err(DomainError::DuplicateAssetId(descriptor.id).into());
-                }
-                descriptor
-            }
-            None => self
-                .manifest
-                .assets
-                .get(&frame.asset_id)
-                .ok_or(DomainError::UnknownAsset(frame.asset_id))?,
-        };
-        validate_raw_recording_asset(&self.manifest, descriptor)?;
+        self.commit_recording_append_with_cursor(new_asset, None, frame)
+    }
+
+    /// Atomically registers a changed cursor shape alongside a newly captured frame.
+    /// This retains the indexed recording fast path even for animated cursor shapes.
+    ///
+    /// # Errors
+    /// Returns recording validation, descriptor, allocation, or journal errors.
+    pub fn commit_recording_append_with_cursor(
+        &mut self,
+        new_asset: Option<AssetDescriptor>,
+        new_cursor: Option<AssetDescriptor>,
+        frame: FrameClip,
+    ) -> Result<CommitReceipt, ProjectError> {
+        self.validate_recording_append(new_asset.as_ref(), new_cursor.as_ref(), &frame)?;
         let next_duration = self
             .timeline_duration_us
             .checked_add(frame.duration.get())
@@ -283,8 +265,9 @@ impl ActiveProject {
             }
         })?;
 
-        let mut commands = Vec::with_capacity(2);
-        if let Some(asset) = &new_asset {
+        let assets = [new_asset, new_cursor];
+        let mut commands = Vec::with_capacity(3);
+        for asset in assets.iter().flatten() {
             commands.push(EditCommand::RegisterAsset {
                 asset: asset.clone(),
             });
@@ -297,7 +280,7 @@ impl ActiveProject {
         let mut inverse_commands = vec![EditCommand::RemoveFrames {
             frame_ids: vec![frame.id],
         }];
-        if let Some(asset) = &new_asset {
+        for asset in assets.iter().flatten() {
             inverse_commands.push(EditCommand::UnregisterAsset { asset_id: asset.id });
         }
         let inverse = EditCommand::Compound {
@@ -306,7 +289,7 @@ impl ActiveProject {
         let record = JournalRecord::new(from_revision, to_revision, command)?;
         self.append_record(&record, to_revision)?;
 
-        if let Some(asset) = new_asset {
+        for asset in assets.into_iter().flatten() {
             self.manifest.assets.insert(asset.id, asset);
         }
         self.frame_positions.insert(frame.id, insertion_index);
@@ -318,6 +301,87 @@ impl ActiveProject {
             to_revision,
             inverse,
         })
+    }
+
+    fn validate_recording_append(
+        &self,
+        new_asset: Option<&AssetDescriptor>,
+        new_cursor: Option<&AssetDescriptor>,
+        frame: &FrameClip,
+    ) -> Result<(), ProjectError> {
+        self.ensure_writable()?;
+        if frame.id.is_nil() {
+            return Err(ProjectError::InvalidRecordingMutation(
+                "recording frame identity must not be nil".to_owned(),
+            ));
+        }
+        if self.frame_positions.contains_key(&frame.id) {
+            return Err(DomainError::DuplicateFrameId(frame.id).into());
+        }
+        if frame.transform != Default::default() || !frame.effects.is_empty() {
+            return Err(ProjectError::InvalidRecordingMutation(
+                "fast recording append requires an untransformed frame without effects".to_owned(),
+            ));
+        }
+        let descriptor = match new_asset {
+            Some(descriptor) => {
+                if descriptor.id != frame.asset_id {
+                    return Err(ProjectError::InvalidRecordingMutation(
+                        "new asset identity differs from the appended frame asset".to_owned(),
+                    ));
+                }
+                if self.manifest.assets.contains_key(&descriptor.id) {
+                    return Err(DomainError::DuplicateAssetId(descriptor.id).into());
+                }
+                descriptor
+            }
+            None => self
+                .manifest
+                .assets
+                .get(&frame.asset_id)
+                .ok_or(DomainError::UnknownAsset(frame.asset_id))?,
+        };
+        validate_raw_recording_asset(&self.manifest, descriptor)?;
+        if let Some(cursor) = new_cursor {
+            let valid_raster = cursor
+                .kind
+                .raster_descriptor()
+                .is_some_and(|(size, encoding)| {
+                    encoding == RasterEncoding::Rgba8
+                        && size.validate().is_ok()
+                        && size.area().and_then(|area| area.checked_mul(4)) == Some(cursor.byte_len)
+                });
+            if frame.capture_metadata.cursor_asset != Some(cursor.id)
+                || cursor.id == frame.asset_id
+                || !valid_raster
+            {
+                return Err(ProjectError::InvalidRecordingMutation(
+                    "new cursor must be a distinct valid RGBA asset referenced by the frame"
+                        .to_owned(),
+                ));
+            }
+            if self.manifest.assets.contains_key(&cursor.id) {
+                return Err(DomainError::DuplicateAssetId(cursor.id).into());
+            }
+        }
+        if let Some(cursor_id) = frame.capture_metadata.cursor_asset {
+            let cursor = if let Some(cursor) = new_cursor {
+                cursor
+            } else if cursor_id == descriptor.id {
+                descriptor
+            } else {
+                self.manifest
+                    .assets
+                    .get(&cursor_id)
+                    .ok_or(DomainError::UnknownAsset(cursor_id))?
+            };
+            if cursor.kind.raster_descriptor().is_none() {
+                return Err(ProjectError::InvalidRecordingMutation(
+                    "recording cursor asset must be a raster".to_owned(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Updates one recording-frame duration through an indexed journal fast path.
@@ -628,6 +692,41 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn new_project_pixels_snapshots_and_event_journals_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("private.gfsproj");
+        let mut project = ActiveProject::create(&root, manifest()).unwrap();
+        let bytes = b"private recorded metadata";
+        let asset_id = project.assets().put(bytes).unwrap();
+        project
+            .commit(register(asset_id, bytes.len() as u64))
+            .unwrap();
+        let layout = project.layout();
+        for path in [
+            &layout.root,
+            &layout.assets,
+            &layout.manifest,
+            &layout.journal,
+            &layout.lock,
+        ] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o077,
+                0,
+                "{}",
+                path.display()
+            );
+        }
+        for file in fs::read_dir(&layout.assets).unwrap() {
+            assert_eq!(
+                file.unwrap().metadata().unwrap().permissions().mode() & 0o077,
+                0
+            );
+        }
+    }
+
+    #[test]
     fn journal_recovers_commit_newer_than_snapshot() {
         let directory = tempdir().unwrap();
         let mut active = ActiveProject::create(directory.path(), manifest()).unwrap();
@@ -743,6 +842,51 @@ mod tests {
         assert_eq!(opened.journal_recovery.replayed_records, 5);
         assert_eq!(opened.project.manifest().revision, ProjectRevision::new(5));
         assert_eq!(opened.project.manifest().timeline.frames.len(), 2);
+    }
+
+    #[test]
+    fn cursor_recording_append_is_atomic_validated_and_undoable() {
+        let directory = tempdir().unwrap();
+        let mut active = ActiveProject::create(directory.path(), manifest()).unwrap();
+        let asset_id = active.assets().put(&[7_u8; 16]).unwrap();
+        let cursor_id = active.assets().put(&[255_u8; 4]).unwrap();
+        let cursor = AssetDescriptor {
+            id: cursor_id,
+            byte_len: 4,
+            kind: gif_from_screen_domain::AssetKind::OverlayImage {
+                size: gif_from_screen_domain::PhysicalSize::new(1, 1).unwrap(),
+                encoding: RasterEncoding::Rgba8,
+            },
+        };
+        let mut frame = recording_frame(1, asset_id, 10);
+        frame.capture_metadata.cursor_asset = Some(cursor_id);
+        assert!(matches!(
+            active.commit_recording_append(Some(recording_asset(asset_id)), frame.clone()),
+            Err(ProjectError::Domain(DomainError::UnknownAsset(_)))
+        ));
+        let mut invalid = cursor.clone();
+        invalid.byte_len = 3;
+        assert!(
+            active
+                .commit_recording_append_with_cursor(
+                    Some(recording_asset(asset_id)),
+                    Some(invalid),
+                    frame.clone()
+                )
+                .is_err()
+        );
+        assert_eq!(active.manifest().revision, ProjectRevision::ZERO);
+        let receipt = active
+            .commit_recording_append_with_cursor(
+                Some(recording_asset(asset_id)),
+                Some(cursor),
+                frame,
+            )
+            .unwrap();
+        assert_eq!(active.manifest().assets.len(), 2);
+        active.commit(receipt.inverse).unwrap();
+        assert!(active.manifest().assets.is_empty());
+        assert!(active.manifest().timeline.frames.is_empty());
     }
 
     #[test]

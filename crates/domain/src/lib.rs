@@ -6,19 +6,25 @@
 
 #![forbid(unsafe_code)]
 
+mod annotation_options;
 mod command;
+mod editing_task;
 mod error;
 mod export_preset;
 mod id;
 mod model;
 mod overlay_timing;
+mod task_run;
 mod units;
 
+pub use annotation_options::*;
 pub use command::{AppliedEdit, EditCommand, FrameDurationChange, IndexedFrame};
+pub use editing_task::*;
 pub use error::{DomainError, IdParseError, UnitError, ValidationIssue};
 pub use export_preset::*;
 pub use id::{AssetId, FrameId, OverlayId, ProjectId, TrackId, TransitionId};
 pub use model::*;
+pub use task_run::*;
 pub use units::*;
 
 /// Current on-disk manifest schema understood by this version of the domain.

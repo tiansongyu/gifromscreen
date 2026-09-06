@@ -221,6 +221,7 @@ mod tests {
             },
             assets,
             export_presets: BTreeMap::new(),
+            task_runs: Vec::new(),
             source_provenance: Vec::new(),
         }
     }

@@ -113,6 +113,22 @@ pub(crate) fn persist_rgba_project(
     frames: &[RgbaProjectFrame<'_>],
     options: RgbaProjectOptions,
 ) -> Result<ActiveProject, PersistRgbaProjectError> {
+    persist_rgba_project_with_metadata(root, frames, options, &[])
+}
+
+pub(crate) fn persist_rgba_project_with_metadata(
+    root: impl AsRef<Path>,
+    frames: &[RgbaProjectFrame<'_>],
+    options: RgbaProjectOptions,
+    metadata: &[gif_from_screen_workflow::RecordingMetadata],
+) -> Result<ActiveProject, PersistRgbaProjectError> {
+    if !metadata.is_empty() && metadata.len() != frames.len() {
+        return Err(PersistRgbaProjectError::CommitTimeline {
+            source: ProjectError::InvalidRecordingMutation(
+                "native metadata count differs from frame count".into(),
+            ),
+        });
+    }
     let validated = validate_rgba_frames_inner(frames, &options)?;
     let mut manifest = ProjectManifest::new(
         options.project_id,
@@ -149,20 +165,30 @@ pub(crate) fn persist_rgba_project(
         })?;
         let byte_len = u64::try_from(frame.pixels.len())
             .map_err(|_| PersistRgbaProjectError::AssetLengthOutOfRange { frame_index })?;
-        descriptors.entry(asset_id).or_insert(AssetDescriptor {
-            id: asset_id,
-            byte_len,
-            kind: AssetKind::Frame {
-                size: validated.canvas,
-                encoding: RasterEncoding::Rgba8,
+        register_raster_descriptor(
+            &mut descriptors,
+            AssetDescriptor {
+                id: asset_id,
+                byte_len,
+                kind: AssetKind::Frame {
+                    size: validated.canvas,
+                    encoding: RasterEncoding::Rgba8,
+                },
             },
-        });
+            frame_index,
+        )?;
+        let capture_metadata = store_frame_metadata(
+            &project,
+            &mut descriptors,
+            metadata.get(frame_index),
+            frame_index,
+        )?;
         clips.push(FrameClip {
             id: frame_id,
             asset_id,
             duration,
             transform: ClipTransform::default(),
-            capture_metadata: CaptureMetadata::default(),
+            capture_metadata,
             effects: Vec::new(),
         });
     }
@@ -182,6 +208,62 @@ pub(crate) fn persist_rgba_project(
         .checkpoint_and_compact()
         .map_err(|source| PersistRgbaProjectError::CheckpointAndCompact { source })?;
     Ok(project)
+}
+
+fn register_raster_descriptor(
+    descriptors: &mut BTreeMap<gif_from_screen_domain::AssetId, AssetDescriptor>,
+    descriptor: AssetDescriptor,
+    frame_index: usize,
+) -> Result<(), PersistRgbaProjectError> {
+    if descriptors.get(&descriptor.id).is_some_and(|previous| {
+        previous.kind.raster_descriptor() != descriptor.kind.raster_descriptor()
+    }) {
+        return Err(PersistRgbaProjectError::StoreAsset {
+            frame_index,
+            source: ProjectError::InvalidRecordingMutation(
+                "content-identical RGBA assets have incompatible dimensions".into(),
+            ),
+        });
+    }
+    descriptors.entry(descriptor.id).or_insert(descriptor);
+    Ok(())
+}
+
+fn store_frame_metadata(
+    project: &ActiveProject,
+    descriptors: &mut BTreeMap<gif_from_screen_domain::AssetId, AssetDescriptor>,
+    metadata: Option<&gif_from_screen_workflow::RecordingMetadata>,
+    frame_index: usize,
+) -> Result<CaptureMetadata, PersistRgbaProjectError> {
+    let mut capture = metadata
+        .map(crate::recording_project::domain_capture_metadata)
+        .unwrap_or_default();
+    if let Some(image) = metadata.and_then(|metadata| metadata.cursor_image.as_ref()) {
+        let asset_id = project.assets().put(image.pixels()).map_err(|source| {
+            PersistRgbaProjectError::StoreAsset {
+                frame_index,
+                source,
+            }
+        })?;
+        let size = PhysicalSize {
+            width: gif_from_screen_domain::PhysicalPx::new(image.size().width()),
+            height: gif_from_screen_domain::PhysicalPx::new(image.size().height()),
+        };
+        register_raster_descriptor(
+            descriptors,
+            AssetDescriptor {
+                id: asset_id,
+                byte_len: image.pixels().len() as u64,
+                kind: AssetKind::OverlayImage {
+                    size,
+                    encoding: RasterEncoding::Rgba8,
+                },
+            },
+            frame_index,
+        )?;
+        capture.cursor_asset = Some(asset_id);
+    }
+    Ok(capture)
 }
 
 #[cfg(test)]

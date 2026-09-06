@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, OpenOptions},
+    fs,
     io::{BufRead, BufReader, Write},
     path::Path,
 };
@@ -153,7 +153,7 @@ pub(crate) fn append(path: &Path, record: &JournalRecord) -> Result<(), ProjectE
         .map_err(|error| ProjectError::json("serialize journal record", path, error))?;
     bytes.push(b'\n');
 
-    let mut journal = OpenOptions::new()
+    let mut journal = crate::private_fs::file_options()
         .create(true)
         .append(true)
         .open(path)

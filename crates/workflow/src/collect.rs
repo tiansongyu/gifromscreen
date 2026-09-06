@@ -89,6 +89,7 @@ pub struct CollectionSummary {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollectedRecording {
     frames: Vec<RgbaFrame>,
+    metadata: Vec<crate::RecordingMetadata>,
     summary: CollectionSummary,
 }
 
@@ -96,6 +97,16 @@ impl CollectedRecording {
     /// Returns all frames in presentation order.
     pub fn frames(&self) -> &[RgbaFrame] {
         &self.frames
+    }
+
+    /// Returns native metadata in exactly the same order as the normalized frames.
+    pub fn metadata(&self) -> &[crate::RecordingMetadata] {
+        &self.metadata
+    }
+
+    /// Consumes the collection without discarding native input or cursor metadata.
+    pub fn into_parts(self) -> (Vec<RgbaFrame>, Vec<crate::RecordingMetadata>) {
+        (self.frames, self.metadata)
     }
 
     /// Returns aggregate collection metadata.
@@ -115,6 +126,7 @@ struct NormalizedCapture {
     width: u16,
     height: u16,
     pixels: Vec<u8>,
+    metadata: crate::RecordingMetadata,
 }
 
 struct CollectionFinishState {
@@ -539,6 +551,13 @@ fn collect_session(
         }
         if let Some(started) = paused_at.take() {
             extend_duration_deadline(&mut options.limit, started.elapsed())?;
+            report_collection_progress(
+                progress,
+                WorkflowPhase::Capturing,
+                captures.len(),
+                first_timestamp,
+                last_observed_timestamp,
+            );
         }
         if duration_deadline_reached(options.limit) {
             break StopReason::DurationReached;
@@ -576,6 +595,9 @@ fn collect_session(
                 let normalized = normalize_frame(&frame, stream_index, captures.first())?;
                 let retain = controlled_manual
                     || options.frame_retention == FrameRetention::All
+                    || normalized
+                        .metadata
+                        .requires_retention(captures.last().map(|previous| &previous.metadata))
                     || captures
                         .last()
                         .is_none_or(|previous| previous.pixels != normalized.pixels);
@@ -663,6 +685,13 @@ fn collect_session_to_sink(
         }
         if let Some(started) = paused_at.take() {
             extend_duration_deadline(&mut options.limit, started.elapsed())?;
+            report_collection_progress(
+                progress,
+                WorkflowPhase::Capturing,
+                state.retained_frames,
+                state.first_timestamp,
+                state.last_observed_timestamp,
+            );
         }
         if duration_deadline_reached(options.limit) {
             break StopReason::DurationReached;
@@ -735,6 +764,11 @@ impl SinkOnlyCollectionState {
         let normalized = normalize_frame(frame, self.stream_index, self.last_retained.as_ref())?;
         let retain = force_retain
             || options.frame_retention == FrameRetention::All
+            || normalized.metadata.requires_retention(
+                self.last_retained
+                    .as_ref()
+                    .map(|previous| &previous.metadata),
+            )
             || self
                 .last_retained
                 .as_ref()
@@ -953,7 +987,7 @@ fn append_sink_frame(
         capture.pixels.clone(),
         provisional_duration_us,
     )?;
-    sink.append_provisional_frame(frame_index, &frame)
+    sink.append_provisional_frame_with_metadata(frame_index, &frame, &capture.metadata)
         .map_err(|source| WorkflowError::FrameSink {
             operation: RecordingFrameSinkOperation::AppendProvisionalFrame,
             frame_index,
@@ -1190,6 +1224,7 @@ fn normalize_frame(
         width,
         height,
         pixels,
+        metadata: crate::RecordingMetadata::from_frame(frame),
     })
 }
 
@@ -1232,6 +1267,7 @@ fn finish_collection(
     }
 
     let mut frames = Vec::with_capacity(captures.len());
+    let mut metadata = Vec::with_capacity(captures.len());
     let mut duration_us = 0_u64;
     let mut captures = captures.into_iter().peekable();
     while let Some(capture) = captures.next() {
@@ -1249,13 +1285,18 @@ fn finish_collection(
             capture.pixels,
             frame_duration,
         )?);
+        metadata.push(capture.metadata);
     }
     let summary = CollectionSummary {
         frames: u64::try_from(frames.len()).unwrap_or(u64::MAX),
         duration_us,
         rgba_bytes,
     };
-    Ok(CollectedRecording { frames, summary })
+    Ok(CollectedRecording {
+        frames,
+        metadata,
+        summary,
+    })
 }
 
 fn calculate_last_duration(

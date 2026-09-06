@@ -589,6 +589,7 @@ mod tests {
             },
             assets,
             export_presets: BTreeMap::new(),
+            task_runs: Vec::new(),
             source_provenance: Vec::new(),
         }
     }
@@ -712,6 +713,36 @@ mod tests {
             commands.last(),
             Some(EditCommand::InsertFrames { index: 4, .. })
         ));
+    }
+
+    #[test]
+    fn paste_preserves_original_native_event_and_capture_clocks() {
+        use gif_from_screen_domain::{KeyStroke, MouseButton, MouseInputEvent, TimeUs};
+        let mut source = project(3);
+        let metadata = &mut source.timeline.frames[1].capture_metadata;
+        metadata.captured_at = Some(TimeUs::new(20_000));
+        metadata.key_strokes.push(KeyStroke {
+            physical_key: "x11:38".into(),
+            display_text: Some("a".into()),
+            pressed: true,
+            at: TimeUs::new(19_000),
+            repeat: false,
+            modifiers: 0,
+        });
+        metadata.mouse_events.push(MouseInputEvent {
+            at: TimeUs::new(19_500),
+            button: MouseButton::Left,
+            pressed: true,
+            position: None,
+        });
+        let clipboard = copy_selected_frames(&source, [FrameId::from_u128(2)]).unwrap();
+        let command =
+            paste_frame_clipboard(&source, &clipboard, None, || FrameId::from_u128(9)).unwrap();
+        source.apply_command(&command).unwrap();
+        assert_eq!(
+            source.timeline.frames[3].capture_metadata,
+            source.timeline.frames[1].capture_metadata
+        );
     }
 
     #[test]
