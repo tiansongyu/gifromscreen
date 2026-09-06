@@ -804,6 +804,9 @@ impl eframe::App for GifFromScreenApp {
                         .add_enabled(back_enabled, egui::Button::new("Back"))
                         .clicked()
                 {
+                    if self.view == AppView::Editor {
+                        self.editor_ui_state.pause_preview();
+                    }
                     if self.view == AppView::ScreenRecorder && self.wayland_prepare_job.is_active()
                     {
                         let _ = self.wayland_prepare_job.cancel();
@@ -894,6 +897,9 @@ impl GifFromScreenApp {
                 return;
             }
         };
+        if self.view == AppView::Editor {
+            self.editor_ui_state.pause_preview();
+        }
         if let Err(error) = self.start_file_drop_route(route) {
             self.notice = Some(format!("Could not start dropped-file operation: {error}"));
         }
@@ -1013,6 +1019,7 @@ impl GifFromScreenApp {
             ui.add_space(48.0);
             ui.heading("Create an animated GIF");
             ui.label("Capture, edit frame by frame, and export locally.");
+            self.show_resume_editor(ui);
             ui.add_space(28.0);
 
             ui.columns(LANDING_COLUMN_COUNT, |columns| {
@@ -1103,6 +1110,29 @@ impl GifFromScreenApp {
                 ui.label(notice);
             }
         });
+    }
+
+    fn show_resume_editor(&mut self, ui: &mut egui::Ui) {
+        let Some(workspace) = &self.editor_workspace else {
+            return;
+        };
+        let name = workspace
+            .project_root()
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        if ui.button(format!("Continue editing {name}")).clicked() {
+            self.resume_editor();
+        }
+    }
+
+    fn resume_editor(&mut self) -> bool {
+        if self.editor_workspace.is_none() {
+            return false;
+        }
+        self.view = AppView::Editor;
+        self.notice = None;
+        true
     }
 
     fn show_open_project(&mut self, ui: &mut egui::Ui) {
@@ -7534,6 +7564,22 @@ mod tests {
         assert_eq!(app.view, AppView::ImportVideo);
         assert!(!app.video_import.is_running());
         assert_eq!(app.video_import.input, "/tmp/clip.mkv");
+    }
+
+    #[test]
+    fn resume_editor_keeps_the_existing_workspace_and_lock() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("resume.gfsproj");
+        let mut app = GifFromScreenApp::default();
+        assert!(!app.resume_editor());
+        let project = single_frame_project(&root);
+        activate_editor(&mut app.view, &mut app.editor_workspace, project).unwrap();
+        let before = app.editor_workspace.as_ref().unwrap().manifest().clone();
+        app.view = AppView::Landing;
+        assert!(app.resume_editor());
+        assert_eq!(app.view, AppView::Editor);
+        assert_eq!(app.editor_workspace.as_ref().unwrap().manifest(), &before);
+        assert_eq!(app.editor_workspace.as_ref().unwrap().project_root(), root);
     }
 
     #[test]

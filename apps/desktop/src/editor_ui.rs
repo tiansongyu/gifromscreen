@@ -412,6 +412,13 @@ impl Default for EditorUiState {
 }
 
 impl EditorUiState {
+    /// Leaving the editor must not let its playback clock run behind another page.
+    pub(crate) fn pause_preview(&mut self) {
+        if let Some(clock) = self.playback.take() {
+            self.paused_position_nanos = Some(clock.position_nanos(Instant::now()));
+        }
+    }
+
     /// Lets the application shell place text and raster tools in the same group.
     pub(crate) fn overlays_selected(&self) -> bool {
         self.active_tool == EditorToolTab::Overlays
