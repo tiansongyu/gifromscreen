@@ -36,6 +36,9 @@ mod thumbnail_cache;
 mod video_import_ui;
 mod watermark_decode_job;
 mod watermark_ui;
+#[cfg(test)]
+#[path = "wayland_controller_tests.rs"]
+mod wayland_controller_tests;
 mod wayland_prepare_job;
 
 use std::{
@@ -670,6 +673,8 @@ struct RecorderOverlay {
 struct MainWindowSnapshot {
     position: Option<egui::Pos2>,
     size: egui::Vec2,
+    maximized: Option<bool>,
+    restore_geometry: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -844,8 +849,15 @@ impl Drop for GifFromScreenApp {
 
 impl eframe::App for GifFromScreenApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        let closing_controller = self.wayland_crop_controller.is_some()
+            && context.input(|input| input.viewport().close_requested());
+        if closing_controller {
+            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
         self.receive_background_messages(context);
-        self.handle_worker_shutdown(context);
+        if !closing_controller {
+            self.handle_worker_shutdown(context);
+        }
         let dropped_paths = context.input(|input| {
             input
                 .raw
@@ -858,26 +870,14 @@ impl eframe::App for GifFromScreenApp {
             self.handle_dropped_paths(&dropped_paths);
         }
         self.advance_recording_countdown(context);
-        if self.restore_main_window {
-            if let Some(snapshot) = self.main_window_snapshot.take() {
-                context.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
-                context.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-                    680.0, 440.0,
-                )));
-                context.send_viewport_cmd(egui::ViewportCommand::InnerSize(snapshot.size));
-                if let Some(position) = snapshot.position {
-                    context.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
-                }
-            }
-            context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            context.send_viewport_cmd(egui::ViewportCommand::Focus);
-            self.restore_main_window = false;
-        }
+        self.restore_main_window_if_requested(context);
         if self.recorder_overlay.is_some() {
             self.show_recorder_overlay(context);
         }
         if self.wayland_crop_controller.is_some() {
             self.show_wayland_crop_controller(context);
+            context.request_repaint_after(Duration::from_millis(33));
+            return;
         }
         if self.job.is_some()
             || self.recorder_overlay.is_some()
@@ -938,6 +938,33 @@ impl eframe::App for GifFromScreenApp {
 }
 
 impl GifFromScreenApp {
+    fn restore_main_window_if_requested(&mut self, context: &egui::Context) {
+        if !self.restore_main_window {
+            return;
+        }
+        context.send_viewport_cmd(egui::ViewportCommand::Title(APP_NAME.to_owned()));
+        if let Some(snapshot) = self
+            .main_window_snapshot
+            .take()
+            .filter(|snapshot| snapshot.restore_geometry)
+        {
+            context.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+            context.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+                680.0, 440.0,
+            )));
+            context.send_viewport_cmd(egui::ViewportCommand::InnerSize(snapshot.size));
+            if let Some(maximized) = snapshot.maximized {
+                context.send_viewport_cmd(egui::ViewportCommand::Maximized(maximized));
+            }
+            if let Some(position) = snapshot.position {
+                context.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
+            }
+        }
+        // Neither the off-screen X11 shell nor the dedicated Wayland shell is hidden.
+        context.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.restore_main_window = false;
+    }
+
     fn show_app_header(&mut self, context: &egui::Context) {
         egui::TopBottomPanel::top("app_header").show(context, |ui| {
             ui.horizontal(|ui| {
@@ -2161,6 +2188,8 @@ impl GifFromScreenApp {
                 Some(MainWindowSnapshot {
                     position: Some(viewport.outer_rect?.min),
                     size: viewport.inner_rect?.size(),
+                    maximized: viewport.maximized,
+                    restore_geometry: true,
                 })
             })
             .ok_or_else(|| "Could not read the main window geometry.".to_owned())?;
@@ -2370,12 +2399,28 @@ impl GifFromScreenApp {
                     self.notice = Some("Stopping and finalizing recoverable project…".into());
                 }
             }
-            RecorderOverlayAction::Discard | RecorderOverlayAction::Close => {
+            RecorderOverlayAction::Discard => {
                 if let Some(job) = &mut self.job {
                     job.stop_retargeting();
                     let _ = job.controller.discard();
                     job.cancellation.cancel();
                     self.notice = Some("Discarding recording…".into());
+                } else {
+                    self.close_recorder_overlay();
+                }
+            }
+            RecorderOverlayAction::Close => {
+                if let Some(job) = &mut self.job {
+                    context.send_viewport_cmd_to(
+                        recorder_viewport_id(),
+                        egui::ViewportCommand::CancelClose,
+                    );
+                    job.stop_retargeting();
+                    let _ = job.controller.stop();
+                    self.notice = Some(
+                        "Closing the recorder: stopping and saving the captured project…"
+                            .to_owned(),
+                    );
                 } else {
                     self.close_recorder_overlay();
                 }
@@ -2776,21 +2821,21 @@ impl GifFromScreenApp {
                     .to_owned(),
             );
         }
+        if let Some(notice) = &self.notice {
+            ui.label(notice);
+        }
     }
 
     fn open_wayland_crop_controller(&mut self, context: &egui::Context) -> Result<(), String> {
+        trace_wayland_controller("open entered");
         if self.wayland_prepare_job.state() != WaylandPrepareJobState::Prepared {
             return Err("The Wayland source is not ready yet.".to_owned());
         }
-        let snapshot = context
-            .input(|input| {
-                let viewport = input.viewport();
-                Some(MainWindowSnapshot {
-                    position: viewport.outer_rect.map(|rect| rect.min),
-                    size: viewport.inner_rect?.size(),
-                })
-            })
-            .ok_or_else(|| "Could not read the main window size.".to_owned())?;
+        self.enter_wayland_crop_controller(context)
+    }
+
+    fn enter_wayland_crop_controller(&mut self, context: &egui::Context) -> Result<(), String> {
+        let snapshot = wayland_window_snapshot(context);
         let preview = self
             .wayland_frozen_preview
             .take()
@@ -2804,16 +2849,22 @@ impl GifFromScreenApp {
             drag_initial_region: None,
         });
         self.main_window_snapshot = Some(snapshot);
+        trace_wayland_controller("controller state installed");
         self.notice = Some(
-            "Source-local recorder controller opened. Its preview rectangle controls the crop; the window itself is not physically aligned to the desktop."
+            "Recorder controls are active in this window; other pages are hidden. The preview rectangle controls source-local cropping, not a physical desktop frame."
                 .to_owned(),
         );
-        context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        // Wayland cannot hide/unhide a toplevel. Reuse this surface and render
+        // only recorder controls, retaining the launcher/editor state in memory.
+        context.send_viewport_cmd(egui::ViewportCommand::Title(
+            "GifFromScreen — Recorder".to_owned(),
+        ));
         context.request_repaint();
         Ok(())
     }
 
     fn show_wayland_crop_controller(&mut self, context: &egui::Context) {
+        trace_wayland_controller("controller draw entered");
         let stage = self.recorder_stage();
         if stage == RecorderStage::Finalizing
             && let Some(job) = &mut self.job
@@ -2835,25 +2886,16 @@ impl GifFromScreenApp {
         };
         let progress = self.progress;
         let manual_snapshots = self.settings.cadence == RecordingCadenceChoice::Manual;
-        let frame = context.show_viewport_immediate(
-            recorder_viewport_id(),
-            egui::ViewportBuilder::default()
-                .with_title("GifFromScreen Wayland crop controller")
-                .with_inner_size([920.0, 650.0])
-                .with_min_inner_size([420.0, 320.0])
-                .with_decorations(true)
-                .with_resizable(true)
-                .with_always_on_top()
-                .with_taskbar(false),
-            |viewport_context, _class| {
-                draw_wayland_crop_controller(
-                    viewport_context,
-                    stage,
-                    progress,
-                    &mut controller,
-                    manual_snapshots,
-                )
-            },
+        let frame = draw_wayland_crop_controller(
+            context,
+            stage,
+            progress,
+            &mut controller,
+            manual_snapshots,
+            self.notice.as_deref(),
+            self.sources
+                .get(self.selected_source)
+                .is_some_and(|source| source.kind() == CaptureSourceKind::Monitor),
         );
         let region = frame.region.unwrap_or(controller.region);
         controller.region = region;
@@ -2912,12 +2954,24 @@ impl GifFromScreenApp {
                     self.notice = Some("Stopping and finalizing recoverable project…".to_owned());
                 }
             }
-            RecorderOverlayAction::Discard | RecorderOverlayAction::Close => {
+            RecorderOverlayAction::Discard => {
                 if let Some(job) = &mut self.job {
                     job.stop_retargeting();
                     let _ = job.controller.discard();
                     job.cancellation.cancel();
                     self.notice = Some("Discarding recording…".to_owned());
+                } else {
+                    self.close_wayland_crop_controller();
+                }
+            }
+            RecorderOverlayAction::Close => {
+                if let Some(job) = &mut self.job {
+                    job.stop_retargeting();
+                    let _ = job.controller.stop();
+                    self.notice = Some(
+                        "Closing the recorder: stopping and saving the captured project…"
+                            .to_owned(),
+                    );
                 } else {
                     self.close_wayland_crop_controller();
                 }
@@ -2954,6 +3008,9 @@ impl GifFromScreenApp {
         };
         let messages: Vec<_> = job.receiver.try_iter().collect();
         for message in messages {
+            if self.job.is_none() {
+                break;
+            }
             match message {
                 JobMessage::Progress(progress) => {
                     if let Some(job) = &mut self.job {
@@ -3374,6 +3431,7 @@ impl GifFromScreenApp {
 
     fn finish_recording_job(&mut self) {
         self.job = None;
+        self.progress = None;
         self.recording_countdown.cancel();
         self.recorder_overlay = None;
         self.wayland_crop_controller = None;
@@ -3952,7 +4010,10 @@ fn draw_wayland_crop_controller(
     progress: Option<WorkflowProgress>,
     controller: &mut WaylandCropController,
     manual_snapshots: bool,
+    notice: Option<&str>,
+    monitor_source: bool,
 ) -> RecorderOverlayFrame {
+    trace_wayland_controller("controller panels draw");
     let mut action =
         draw_wayland_controller_toolbar(context, stage, progress, controller, manual_snapshots);
     let region = egui::CentralPanel::default()
@@ -3961,6 +4022,13 @@ fn draw_wayland_crop_controller(
             ui.label(
                 "Frozen source-local preview — this controller window is not a physical desktop frame.",
             );
+            if monitor_source {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "Monitor capture includes this controller if it overlaps the crop. Move it outside the recorded area before Start, or choose a window source. This app cannot exclude itself from monitor capture.",
+                );
+            }
+            if let Some(notice) = notice { ui.label(notice); }
             draw_source_region_selector(
                 ui,
                 &controller.texture,
@@ -3974,9 +4042,34 @@ fn draw_wayland_crop_controller(
         })
         .inner;
     if context.input(|input| input.viewport().close_requested()) {
+        context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         action = RecorderOverlayAction::Close;
     }
     RecorderOverlayFrame { action, region }
+}
+
+fn trace_wayland_controller(marker: &'static str) {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("GFS_WAYLAND_CONTROLLER_TRACE").is_some() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static LINES: AtomicUsize = AtomicUsize::new(0);
+        if LINES.fetch_add(1, Ordering::Relaxed) < 64 {
+            eprintln!("wayland-controller: {marker}");
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = marker;
+}
+
+fn wayland_window_snapshot(context: &egui::Context) -> MainWindowSnapshot {
+    context.input(|input| MainWindowSnapshot {
+        position: input.viewport().outer_rect.map(|rect| rect.min),
+        // ViewportInfo.inner_rect requires a desktop position, unavailable on
+        // Wayland. InputState.screen_rect is the local drawable extent instead.
+        size: input.screen_rect.size(),
+        maximized: input.viewport().maximized,
+        restore_geometry: false,
+    })
 }
 
 fn draw_wayland_controller_toolbar(
@@ -4061,10 +4154,31 @@ fn draw_wayland_controller_toolbar(
 }
 
 fn show_wayland_crop_nudges(ui: &mut egui::Ui, controller: &mut WaylandCropController) {
-    for (label, dx, dy) in [("←", -10, 0), ("→", 10, 0), ("↑", 0, -10), ("↓", 0, 10)] {
-        if ui.small_button(label).clicked() {
-            controller.region =
-                translate_source_region(controller.region, controller.source_size, dx, dy);
+    for (label, dx, dy) in [
+        ("Move left 10 source pixels", -10_i16, 0_i16),
+        ("Move right 10 source pixels", 10, 0),
+        ("Move up 10 source pixels", 0, -10),
+        ("Move down 10 source pixels", 0, 10),
+    ] {
+        let response = ui
+            .add(egui::Button::new("").min_size(egui::vec2(26.0, 24.0)))
+            .on_hover_text(label);
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+        });
+        let direction = egui::vec2(f32::from(dx), f32::from(dy)).normalized();
+        ui.painter().arrow(
+            response.rect.center() - direction * 6.0,
+            direction * 12.0,
+            ui.style().interact(&response).fg_stroke,
+        );
+        if response.clicked() {
+            controller.region = translate_source_region(
+                controller.region,
+                controller.source_size,
+                i32::from(dx),
+                i32::from(dy),
+            );
         }
     }
     ui.weak("10 px source-local");
