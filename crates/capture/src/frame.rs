@@ -358,6 +358,15 @@ impl CapturedFrame {
         self
     }
 
+    /// Records the negotiated embedded-cursor pixel policy without requiring a
+    /// separate cursor image. This does not imply the pointer is visible in
+    /// this frame; consumers must not add a second cursor to embedded video.
+    #[must_use]
+    pub const fn with_cursor_embedded(mut self, embedded: bool) -> Self {
+        self.cursor_embedded = embedded;
+        self
+    }
+
     /// Records event loss from a bounded native queue.
     #[must_use]
     pub const fn with_dropped_input_events(mut self, count: u32) -> Self {
@@ -369,7 +378,8 @@ impl CapturedFrame {
     pub const fn cursor_image(&self) -> Option<&CursorImage> {
         self.cursor_image.as_ref()
     }
-    /// Whether cursor pixels have already been composited into the frame.
+    /// Whether capture uses embedded cursor pixels, even if the pointer is
+    /// currently hidden or outside this frame's visible bounds.
     pub const fn cursor_embedded(&self) -> bool {
         self.cursor_embedded
     }

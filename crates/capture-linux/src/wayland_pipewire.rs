@@ -1,5 +1,16 @@
 //! Native `PipeWire` video delivery for XDG `ScreenCast` sessions.
 
+#[path = "wayland_video_crop.rs"]
+mod video_crop;
+
+#[path = "wayland_native_buffer.rs"]
+mod native_buffer;
+
+use native_buffer::NativeVideoBuffer;
+#[cfg(test)]
+use video_crop::VideoCrop;
+use video_crop::resolve_frame_region;
+
 use std::{
     cell::{Cell, RefCell},
     io::Cursor,
@@ -261,6 +272,10 @@ impl WaylandCaptureSession {
         let (init_tx, init_rx) = mpsc::sync_channel(1);
         let cadence = CadenceGate::from_request(request.cadence)?;
         let requested_crop = target.crop;
+        let policy = NativeCapturePolicy {
+            source_kind: target.source_kind,
+            cursor_embedded: request.cursor == CursorCaptureMode::Embedded,
+        };
         let worker_cancellation = Arc::clone(startup_cancellation);
         let worker = thread::Builder::new()
             .name("gif-from-screen-pipewire".to_owned())
@@ -272,10 +287,12 @@ impl WaylandCaptureSession {
                     portal,
                     requested_crop,
                     cadence,
+                    policy,
                     &command_rx,
                     frame_tx,
                     &status_tx,
                     &init_tx,
+                    &worker_cancellation,
                 );
                 if let Err(error) = &result {
                     let _ = init_tx.try_send(Err(error.clone()));
@@ -779,9 +796,18 @@ impl ActiveClock {
     }
 }
 
+#[derive(Clone, Copy)]
+struct NativeCapturePolicy {
+    source_kind: CaptureSourceKind,
+    // The negotiated pixel policy, not proof that a cursor is visible in any
+    // particular frame. Consumers must not draw an additional cursor over it.
+    cursor_embedded: bool,
+}
+
 struct WorkerData {
     negotiated: Option<NegotiatedFormat>,
-    requested_crop: Option<PhysicalRect>,
+    source_size: Option<PhysicalSize>,
+    policy: NativeCapturePolicy,
     crop: Rc<RefCell<Option<PhysicalRect>>>,
     clock: Rc<RefCell<ActiveClock>>,
     cadence: Rc<RefCell<CadenceGate>>,
@@ -793,16 +819,23 @@ struct WorkerData {
     terminal: Arc<AtomicBool>,
     manual_gate_enabled: Rc<Cell<bool>>,
     manual_permits: Rc<Cell<u64>>,
+    startup_cancellation: Arc<AtomicBool>,
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the native worker owns distinct frame/status/startup channels and a startup cancellation scope"
+)]
 fn run_pipewire_worker(
     mut portal: WaylandPortalSession,
     requested_crop: Option<PhysicalRect>,
     cadence: CadenceGate,
+    policy: NativeCapturePolicy,
     commands: &Receiver<WorkerCommand>,
     frames: SyncSender<CapturedFrame>,
     status: &Sender<WorkerStatus>,
     initialized: &SyncSender<Result<WorkerInitialized, CaptureError>>,
+    startup_cancellation: &Arc<AtomicBool>,
 ) -> Result<(), CaptureError> {
     let node_id = portal.stream().node_id();
     let remote = portal.take_pipewire_remote().ok_or_else(|| {
@@ -842,7 +875,8 @@ fn run_pipewire_worker(
     // data type so this remains compatible with PipeWire 0.3.48.
     let worker_data = Rc::new(RefCell::new(WorkerData {
         negotiated: None,
-        requested_crop,
+        source_size: None,
+        policy,
         crop: crop.clone(),
         clock: clock.clone(),
         cadence: cadence.clone(),
@@ -854,6 +888,7 @@ fn run_pipewire_worker(
         terminal: terminal.clone(),
         manual_gate_enabled: manual_gate_enabled.clone(),
         manual_permits: manual_permits.clone(),
+        startup_cancellation: Arc::clone(startup_cancellation),
     }));
     let listener = register_stream_listener(
         &mut stream,
@@ -864,20 +899,24 @@ fn run_pipewire_worker(
         status.clone(),
     )?;
 
-    let negotiation = serialize_format_offer(preferred_frame_rate(*cadence.borrow()))?;
-    let mut parameters = [spa_pod_pointer(&negotiation)?];
-    stream
-        .connect(
-            libspa::Direction::Input,
-            Some(node_id),
-            pipewire::stream::StreamFlags::AUTOCONNECT
-                | pipewire::stream::StreamFlags::MAP_BUFFERS
-                | pipewire::stream::StreamFlags::DONT_RECONNECT,
-            &mut parameters,
-        )
-        .map_err(|error| pipewire_error("connect video stream", &error))?;
+    connect_video_stream(
+        &stream,
+        node_id,
+        policy.source_kind,
+        preferred_frame_rate(*cadence.borrow()),
+    )?;
 
     while !terminal.load(Ordering::Acquire) {
+        if !init_sent.load(Ordering::Acquire) && startup_cancellation.load(Ordering::Acquire) {
+            signal_terminal(
+                &terminal,
+                &init_sent,
+                initialized,
+                status,
+                crate::wayland::cancelled_error(),
+            );
+            break;
+        }
         handle_worker_commands(
             commands,
             &stream,
@@ -900,6 +939,35 @@ fn run_pipewire_worker(
     drop(main_loop);
     portal.close()?;
     let _ = status.send(WorkerStatus::Stopped);
+    Ok(())
+}
+
+fn connect_video_stream(
+    stream: &pipewire::stream::Stream<()>,
+    node_id: u32,
+    source_kind: CaptureSourceKind,
+    frame_rate: u32,
+) -> Result<(), CaptureError> {
+    let negotiation = serialize_format_offer(frame_rate)?;
+    // Advertise metadata before initial buffer allocation, so no full padded
+    // frame can race an after-Format metadata request and initialize the source.
+    let video_crop_metadata = (source_kind == CaptureSourceKind::Window)
+        .then(serialize_video_crop_metadata)
+        .transpose()?;
+    let mut parameters = vec![spa_pod_pointer(&negotiation)?];
+    if let Some(metadata) = &video_crop_metadata {
+        parameters.push(spa_pod_pointer(metadata)?);
+    }
+    stream
+        .connect(
+            libspa::Direction::Input,
+            Some(node_id),
+            pipewire::stream::StreamFlags::AUTOCONNECT
+                | pipewire::stream::StreamFlags::MAP_BUFFERS
+                | pipewire::stream::StreamFlags::DONT_RECONNECT,
+            &mut parameters,
+        )
+        .map_err(|error| pipewire_error("connect video stream", &error))?;
     Ok(())
 }
 
@@ -965,24 +1033,10 @@ fn handle_format_parameter(
     }
     let mut data = worker_data.borrow_mut();
     let result = parse_negotiated_format(parameter).and_then(|format| {
-        validate_negotiated_format(format, data.requested_crop)?;
-        if let Some(previous) = data.negotiated
-            && previous != format
-        {
-            return Err(CaptureError::new(
-                CaptureErrorKind::SourceLost,
-                "PipeWire changed video format during a fixed-canvas session",
-                RecoveryHint::Retry,
-            ));
-        }
+        // This describes the transport allocation, not the visible window.
+        // A complete content frame establishes (and later checks) the canvas.
+        validate_negotiated_format(format, None)?;
         data.negotiated = Some(format);
-        let output_size = data.requested_crop.map_or(format.size, PhysicalRect::size);
-        if !data.init_sent.swap(true, Ordering::AcqRel) {
-            let _ = data.initialized.try_send(Ok(WorkerInitialized {
-                source_size: format.size,
-                output_size,
-            }));
-        }
         Ok(())
     });
     if let Err(error) = result {
@@ -1000,9 +1054,9 @@ fn process_pipewire_frame(
     stream: &pipewire::stream::Stream<()>,
     worker_data: &RefCell<WorkerData>,
 ) {
-    // Every delivered buffer must be dequeued and returned, including frames
-    // rejected by the manual gate. Buffer::drop returns it to PipeWire's pool.
-    let Some(mut buffer) = stream.dequeue_buffer() else {
+    // The native guard returns every buffer, including empty/zero-crop frames,
+    // manual-gated buffers, validation failures and full Rust output channels.
+    let Some(mut buffer) = NativeVideoBuffer::dequeue(stream) else {
         return;
     };
     let mut data = worker_data.borrow_mut();
@@ -1016,29 +1070,21 @@ fn process_pipewire_frame(
     if manual_gated && data.manual_permits.get() == 0 {
         return;
     }
-    let Some(plane) = buffer.datas_mut().first_mut() else {
-        signal_terminal(
-            &data.terminal,
-            &data.init_sent,
-            &data.initialized,
-            &data.status,
-            CaptureError::invalid_frame("PipeWire video buffer has no data plane"),
-        );
-        return;
+    let result = owned_content_frame(&mut buffer, format, &data);
+    let frame = match result {
+        Ok(Some(frame)) => frame,
+        Ok(None) => return,
+        Err(error) => {
+            signal_terminal(
+                &data.terminal,
+                &data.init_sent,
+                &data.initialized,
+                &data.status,
+                error,
+            );
+            return;
+        }
     };
-    let now = Instant::now();
-    let elapsed = data.clock.borrow().elapsed(now);
-    if !data.cadence.borrow_mut().should_emit(elapsed) {
-        return;
-    }
-    let crop = *data.crop.borrow();
-    let result = mapped_plane_to_frame(
-        plane,
-        format,
-        crop,
-        data.sequence,
-        CaptureTimestamp::from_micros(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)),
-    );
     let Some(sequence) = data.sequence.checked_add(1) else {
         signal_terminal(
             &data.terminal,
@@ -1054,25 +1100,76 @@ fn process_pipewire_frame(
         return;
     };
     data.sequence = sequence;
-    match result {
-        Ok(frame) => match try_deliver_frame(&data.frames, frame) {
-            FrameDelivery::Delivered => {
-                if manual_gated {
-                    data.manual_permits
-                        .set(data.manual_permits.get().saturating_sub(1));
+    let (frame, source_size) = frame;
+    deliver_content_frame(&mut data, frame, source_size);
+}
+
+fn deliver_content_frame(data: &mut WorkerData, frame: CapturedFrame, source_size: PhysicalSize) {
+    let frame = frame.with_cursor_embedded(data.policy.cursor_embedded);
+    let output_size = frame.size();
+    match try_deliver_frame(&data.frames, frame) {
+        FrameDelivery::Delivered => {
+            if data.source_size.is_none() {
+                data.source_size = Some(source_size);
+                if !data.init_sent.swap(true, Ordering::AcqRel) {
+                    let _ = data.initialized.try_send(Ok(WorkerInitialized {
+                        source_size,
+                        output_size,
+                    }));
                 }
             }
-            FrameDelivery::Dropped => {}
-            FrameDelivery::Disconnected => data.terminal.store(true, Ordering::Release),
-        },
-        Err(error) => signal_terminal(
-            &data.terminal,
-            &data.init_sent,
-            &data.initialized,
-            &data.status,
-            error,
-        ),
+            if data.manual_gate_enabled.get() {
+                data.manual_permits
+                    .set(data.manual_permits.get().saturating_sub(1));
+            }
+        }
+        FrameDelivery::Dropped => {}
+        FrameDelivery::Disconnected => data.terminal.store(true, Ordering::Release),
     }
+}
+
+fn owned_content_frame(
+    buffer: &mut NativeVideoBuffer<'_>,
+    format: NegotiatedFormat,
+    data: &WorkerData,
+) -> Result<Option<(CapturedFrame, PhysicalSize)>, CaptureError> {
+    // Source kind comes from the caller's validated target, not the optional
+    // portal response. Some monitor producers expose unused zero-valued crop
+    // slots; these do not turn a full monitor frame into an empty window.
+    let metadata = if data.policy.source_kind == CaptureSourceKind::Window {
+        buffer.video_crop()?
+    } else {
+        None
+    };
+    let requested_crop = *data.crop.borrow();
+    let Some(region) =
+        resolve_frame_region(format.size, metadata, requested_crop, data.source_size)?
+    else {
+        return Ok(None);
+    };
+    let plane = buffer.plane_mut()?;
+    if plane.chunk().size() == 0 && !plane.chunk().flags().contains(ChunkFlags::CORRUPTED) {
+        return Ok(None);
+    }
+    let elapsed = data.clock.borrow().elapsed(Instant::now());
+    if !data.cadence.borrow_mut().should_emit(elapsed) {
+        return Ok(None);
+    }
+    let frame = mapped_plane_to_frame(
+        plane,
+        format,
+        Some(region.output),
+        data.sequence,
+        CaptureTimestamp::from_micros(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)),
+        &|| {
+            !data.init_sent.load(Ordering::Acquire)
+                && data.startup_cancellation.load(Ordering::Acquire)
+        },
+    )?
+    // Padding offsets belong only to the transport buffer. Authoring/input
+    // provenance stays in the effective source's coordinates when it moves.
+    .with_capture_origin(requested_crop.map_or_else(Default::default, PhysicalRect::origin));
+    Ok(Some((frame, region.content.size())))
 }
 
 fn try_deliver_frame(frames: &SyncSender<CapturedFrame>, frame: CapturedFrame) -> FrameDelivery {
@@ -1194,6 +1291,7 @@ fn mapped_plane_to_frame(
     crop: Option<PhysicalRect>,
     sequence: u64,
     captured_at: CaptureTimestamp,
+    cancelled: &impl Fn() -> bool,
 ) -> Result<CapturedFrame, CaptureError> {
     match plane.type_() {
         DataType::MemPtr | DataType::MemFd => {}
@@ -1249,7 +1347,8 @@ fn mapped_plane_to_frame(
     let bytes = mapped.get(offset..end).ok_or_else(|| {
         CaptureError::invalid_frame("PipeWire chunk range exceeds its mapped buffer")
     })?;
-    let (pixels, output_size) = convert_raw_frame(bytes, stride, format, crop)?;
+    let (pixels, output_size) =
+        convert_raw_frame_cancellable(bytes, stride, format, crop, cancelled)?;
     let output_stride = usize::try_from(output_size.width())
         .ok()
         .and_then(|width| width.checked_mul(4))
@@ -1264,12 +1363,26 @@ fn mapped_plane_to_frame(
     )
 }
 
+#[cfg(test)]
 fn convert_raw_frame(
     bytes: &[u8],
     source_stride: usize,
     format: NegotiatedFormat,
     crop: Option<PhysicalRect>,
 ) -> Result<(Vec<u8>, PhysicalSize), CaptureError> {
+    convert_raw_frame_cancellable(bytes, source_stride, format, crop, &|| false)
+}
+
+fn convert_raw_frame_cancellable(
+    bytes: &[u8],
+    source_stride: usize,
+    format: NegotiatedFormat,
+    crop: Option<PhysicalRect>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<(Vec<u8>, PhysicalSize), CaptureError> {
+    if cancelled() {
+        return Err(crate::wayland::cancelled_error());
+    }
     let source_width = usize::try_from(format.size.width())
         .map_err(|_| CaptureError::invalid_frame("source width exceeds usize"))?;
     let source_height = usize::try_from(format.size.height())
@@ -1329,6 +1442,9 @@ fn convert_raw_frame(
         .checked_mul(4)
         .ok_or_else(|| CaptureError::invalid_frame("crop row length overflowed"))?;
     for y in 0..output_height {
+        if cancelled() {
+            return Err(crate::wayland::cancelled_error());
+        }
         let row_start = (crop_y + y)
             .checked_mul(source_stride)
             .and_then(|row| row.checked_add(crop_byte_x))
@@ -1478,6 +1594,36 @@ fn serialize_format_offer(frame_rate: u32) -> Result<Vec<u8>, CaptureError> {
         })
 }
 
+fn serialize_video_crop_metadata() -> Result<Vec<u8>, CaptureError> {
+    let value = Value::Object(Object {
+        type_: libspa_sys::SPA_TYPE_OBJECT_ParamMeta,
+        id: libspa_sys::SPA_PARAM_Meta,
+        properties: vec![
+            Property {
+                key: libspa_sys::SPA_PARAM_META_type,
+                flags: PropertyFlags::empty(),
+                value: Value::Id(Id(libspa_sys::SPA_META_VideoCrop)),
+            },
+            Property {
+                key: libspa_sys::SPA_PARAM_META_size,
+                flags: PropertyFlags::empty(),
+                value: Value::Int(
+                    i32::try_from(std::mem::size_of::<libspa_sys::spa_meta_region>()).map_err(
+                        |_| CaptureError::invalid_frame("SPA VideoCrop metadata size exceeds i32"),
+                    )?,
+                ),
+            },
+        ],
+    });
+    libspa::pod::serialize::PodSerializer::serialize(Cursor::new(Vec::new()), &value)
+        .map(|(cursor, _)| cursor.into_inner())
+        .map_err(|error| {
+            CaptureError::invalid_frame(format!(
+                "could not serialize SPA VideoCrop request: {error:?}"
+            ))
+        })
+}
+
 #[allow(
     clippy::cast_ptr_alignment,
     reason = "the serializer returns bytes, so alignment is checked before exposing its pod pointer"
@@ -1623,6 +1769,212 @@ fn platform_error(operation: &str, error: &impl std::fmt::Display) -> CaptureErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_worker_data() -> (
+        RefCell<WorkerData>,
+        Receiver<Result<WorkerInitialized, CaptureError>>,
+        Receiver<CapturedFrame>,
+    ) {
+        let (initialized, init_receiver) = mpsc::sync_channel(1);
+        let (frames, frame_receiver) = mpsc::sync_channel(FRAME_CHANNEL_CAPACITY);
+        let (status, _) = mpsc::channel();
+        (
+            RefCell::new(WorkerData {
+                negotiated: None,
+                source_size: None,
+                policy: NativeCapturePolicy {
+                    source_kind: CaptureSourceKind::Window,
+                    cursor_embedded: false,
+                },
+                crop: Rc::new(RefCell::new(None)),
+                clock: Rc::new(RefCell::new(ActiveClock::new())),
+                cadence: Rc::new(RefCell::new(CadenceGate::EveryFrame)),
+                sequence: 0,
+                frames,
+                status,
+                initialized,
+                init_sent: Arc::new(AtomicBool::new(false)),
+                terminal: Arc::new(AtomicBool::new(false)),
+                manual_gate_enabled: Rc::new(Cell::new(false)),
+                manual_permits: Rc::new(Cell::new(0)),
+                startup_cancellation: Arc::new(AtomicBool::new(false)),
+            }),
+            init_receiver,
+            frame_receiver,
+        )
+    }
+
+    #[test]
+    fn source_is_initialized_only_after_a_delivered_content_frame() {
+        let (data, initialized, frames) = test_worker_data();
+        let property = |key, value| Property {
+            key,
+            flags: PropertyFlags::empty(),
+            value,
+        };
+        let transport = Value::Object(Object {
+            type_: libspa_sys::SPA_TYPE_OBJECT_Format,
+            id: libspa_sys::SPA_PARAM_Format,
+            properties: vec![
+                property(
+                    libspa_sys::SPA_FORMAT_mediaType,
+                    Value::Id(Id(libspa_sys::SPA_MEDIA_TYPE_video)),
+                ),
+                property(
+                    libspa_sys::SPA_FORMAT_mediaSubtype,
+                    Value::Id(Id(libspa_sys::SPA_MEDIA_SUBTYPE_raw)),
+                ),
+                property(
+                    libspa_sys::SPA_FORMAT_VIDEO_format,
+                    Value::Id(Id(libspa_sys::SPA_VIDEO_FORMAT_BGRx)),
+                ),
+                property(
+                    libspa_sys::SPA_FORMAT_VIDEO_size,
+                    Value::Rectangle(Rectangle {
+                        width: 1280,
+                        height: 720,
+                    }),
+                ),
+            ],
+        });
+        let pod =
+            libspa::pod::serialize::PodSerializer::serialize(Cursor::new(Vec::new()), &transport)
+                .unwrap()
+                .0
+                .into_inner();
+        handle_format_parameter(
+            &data,
+            libspa_sys::SPA_PARAM_Format,
+            spa_pod_pointer(&pod).unwrap(),
+        );
+        assert!(matches!(initialized.try_recv(), Err(TryRecvError::Empty)));
+        assert!(data.borrow().source_size.is_none());
+        let visible = PhysicalSize::new(4, 2).unwrap();
+        let frame = CapturedFrame::new(
+            0,
+            CaptureTimestamp::from_micros(10),
+            visible,
+            16,
+            PixelFormat::Rgba8,
+            vec![77; 32],
+        )
+        .unwrap();
+        deliver_content_frame(&mut data.borrow_mut(), frame.clone(), visible);
+        let ready = initialized.try_recv().unwrap().unwrap();
+        assert_eq!(ready.source_size, visible);
+        assert_eq!(ready.output_size, visible);
+        assert_eq!(frames.try_recv().unwrap(), frame);
+    }
+
+    #[test]
+    fn video_content_crop_then_user_crop_preserves_pixels_and_strides() {
+        let transport = PhysicalSize::new(4, 3).unwrap();
+        let metadata = VideoCrop {
+            x: 1,
+            y: 1,
+            width: 2,
+            height: 2,
+        };
+        let requested = PhysicalRect::new(1, 0, 1, 2).unwrap();
+        let region = resolve_frame_region(transport, Some(metadata), Some(requested), None)
+            .unwrap()
+            .unwrap();
+        let mut pixels = vec![99; 60]; // 4 RGBA pixels and 4 padding bytes per row.
+        pixels[24..32].copy_from_slice(&[10, 20, 30, 255, 40, 50, 60, 255]);
+        pixels[44..52].copy_from_slice(&[70, 80, 90, 255, 100, 110, 120, 255]);
+        let (owned, size) = convert_raw_frame(
+            &pixels,
+            20,
+            format(transport, RawVideoFormat::Rgba),
+            Some(region.output),
+        )
+        .unwrap();
+        assert_eq!(size, PhysicalSize::new(1, 2).unwrap());
+        assert_eq!(owned, [40, 50, 60, 255, 100, 110, 120, 255]);
+        assert_eq!(
+            region.output.origin(),
+            gif_from_screen_capture::PhysicalPosition { x: 2, y: 1 }
+        );
+        let backend = WaylandCaptureBackend {
+            portal_capabilities: capabilities(),
+            startup_cancellation: Arc::new(AtomicBool::new(false)),
+        };
+        for cursor_mode in [
+            CursorCaptureMode::Automatic,
+            CursorCaptureMode::Embedded,
+            CursorCaptureMode::Hidden,
+        ] {
+            let effective = backend.effective_cursor_mode(cursor_mode).unwrap();
+            let (worker, initialized, frames) = test_worker_data();
+            worker.borrow_mut().policy.cursor_embedded = effective == CursorCaptureMode::Embedded;
+            let frame = CapturedFrame::new(
+                7,
+                CaptureTimestamp::from_micros(123),
+                size,
+                4,
+                PixelFormat::Rgba8,
+                owned.clone(),
+            )
+            .unwrap()
+            .with_capture_origin(requested.origin());
+            deliver_content_frame(&mut worker.borrow_mut(), frame, region.content.size());
+            let delivered = frames.try_recv().unwrap();
+            assert_eq!(
+                delivered.cursor_embedded(),
+                cursor_mode != CursorCaptureMode::Hidden
+            );
+            assert!(delivered.cursor().is_none());
+            assert_eq!(delivered.pixels(), owned);
+            assert_eq!(delivered.capture_origin(), Some(requested.origin()));
+            let initialized = initialized.try_recv().unwrap().unwrap();
+            assert_eq!(initialized.source_size, region.content.size());
+            assert_eq!(initialized.output_size, size);
+        }
+    }
+
+    #[test]
+    fn video_crop_request_uses_native_meta_type_and_sized_region() {
+        let bytes = serialize_video_crop_metadata().unwrap();
+        let (_, Value::Object(object)) =
+            PodDeserializer::deserialize_from::<Value>(&bytes).unwrap()
+        else {
+            panic!("meta request object")
+        };
+        assert_eq!(object.type_, libspa_sys::SPA_TYPE_OBJECT_ParamMeta);
+        assert_eq!(object.id, libspa_sys::SPA_PARAM_Meta);
+        assert!(
+            object
+                .properties
+                .iter()
+                .any(|p| p.key == libspa_sys::SPA_PARAM_META_type
+                    && p.value == Value::Id(Id(libspa_sys::SPA_META_VideoCrop)))
+        );
+        assert!(
+            object
+                .properties
+                .iter()
+                .any(|p| p.key == libspa_sys::SPA_PARAM_META_size && p.value == Value::Int(16))
+        );
+    }
+
+    #[test]
+    fn content_copy_observes_startup_cancellation_between_rows() {
+        let polls = Cell::new(0);
+        let cancelled = || {
+            let before = polls.get();
+            polls.set(before + 1);
+            before >= 2
+        };
+        let result = convert_raw_frame_cancellable(
+            &[33; 64],
+            16,
+            format(PhysicalSize::new(4, 4).unwrap(), RawVideoFormat::Rgba),
+            None,
+            &cancelled,
+        );
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert_eq!(polls.get(), 3);
+    }
 
     fn compile_spa_filter_probe(directory: &std::path::Path) -> std::path::PathBuf {
         use std::process::Command;
