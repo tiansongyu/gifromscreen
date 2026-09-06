@@ -62,8 +62,14 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [x] Insert a same-canvas recorded/imported project with remapped identities, overlays, transitions, and journal-backed undo/redo.
 - [x] Browse for projects, GIFs, images, and videos using native Linux file dialogs while retaining manual-path fallback.
 - [x] Stream local-palette GIF exports through a bounded frame/transition working set instead of retaining the whole rendered animation.
+- [x] Stream global-palette project exports through replayable analysis/encoding passes while retaining the original palette and sampling behavior.
 - [x] Save/load/update/rename/delete complete project-local GIF export presets with undo/redo, without restoring file paths or overwrite authorization.
 - [x] Return to an already-open editor from the launcher; pause preview when leaving the editor.
+- [x] Record a drawing board using pen/highlighter/eraser, automatic or completed-stroke sampling, pause/resume, stop/save, and explicit discard.
+- [x] Enumerate Linux V4L2 cameras and provide opt-in preview, recording, pause/resume, stop/save, and discard (simulated-source acceptance; physical cameras still need verification).
+- [x] Bake rectangular Cinemagraph motion regions and append Smooth-loop crossfades in an exclusive background edit with exact undo/redo.
+- [x] Save an independently identified project copy without switching the current editor, and retain a bounded recent-project list.
+- [x] Build and verify an Ubuntu-22-compatible x86_64 portable tarball with exact-file installation, checksums, license notices, and CI artifacts.
 
 ## Delivery gates
 
@@ -109,12 +115,14 @@ Export presets are implemented; reusable editing-action presets/automatic tasks 
 
 ### M3 — complete content sources
 
-- [ ] Webcam recorder.
-- [ ] Drawing-board recorder.
+- [x] Webcam recorder implementation and simulated-source control tests.
+- [ ] Physical webcam device/mode/permission acceptance.
+- [x] Drawing-board recorder, including native pointer-drawing acceptance.
 - [x] Insert recording/media into an existing project via its saved .gfsproj (same canvas, 1,000 source frames, 512 MiB referenced raster budget).
 - [x] Video import (local whitelisted formats through system FFmpeg; bounded duration and disk usage).
 - [ ] Cursor, keyboard, and mouse-event metadata with capability fallbacks.
-- [ ] Cinemagraph, progress overlays, Smooth Loop, and automatic tasks.
+- [x] Rectangular baked Cinemagraph and baked Smooth Loop, with limits and undo/redo.
+- [ ] Freeform Cinemagraph masks, progress overlays, and automatic tasks.
 
 ### M4 — Linux release
 
