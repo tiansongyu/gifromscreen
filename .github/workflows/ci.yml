@@ -65,7 +65,9 @@ jobs:
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
             libxcb-shape0-dev \
-            libxcb-xfixes0-dev
+            libxcb-xfixes0-dev \
+            xvfb \
+            xauth
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -91,3 +93,8 @@ jobs:
         run: >-
           cargo clippy --locked -p gif-from-screen-capture-linux --all-targets
           --no-default-features --features native-wayland,native-x11 -- -D warnings
+
+      - name: Test opt-in X11 input lifecycle on an isolated server
+        run: |
+          xvfb-run --auto-servernum --server-args='-screen 0 1024x768x24 -nolisten tcp' \
+            sh -c 'GFS_X11_INPUT_TEST_DISPLAY="$DISPLAY" cargo test --locked -p gif-from-screen-capture-linux --lib --no-default-features --features native-wayland,native-x11 isolated_x11_input_records_only_active_sessions -- --ignored'

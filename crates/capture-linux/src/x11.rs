@@ -2350,19 +2350,30 @@ mod tests {
                 .check()
                 .unwrap();
         };
-        let sample = |session: &mut dyn CaptureSession| {
-            std::thread::sleep(Duration::from_millis(25));
-            let FramePoll::Frame(frame) = session.poll_frame(Duration::ZERO).unwrap() else {
-                panic!("expected capture")
-            };
-            frame
+        let sample = |session: &mut dyn CaptureSession, expected: usize| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut events = Vec::new();
+            loop {
+                let FramePoll::Frame(frame) = session.poll_frame(Duration::ZERO).unwrap() else {
+                    panic!("expected capture")
+                };
+                events.extend_from_slice(frame.input_events());
+                if events.len() >= expected {
+                    break (frame, events);
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out collecting {expected} input events; got {events:?}"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
         };
         let mut disabled = backend
             .start_session(CaptureRequest::new(target.clone(), CaptureCadence::Manual))
             .unwrap();
         emit(2, 38);
         emit(3, 38);
-        assert!(sample(disabled.as_mut()).input_events().is_empty());
+        assert!(sample(disabled.as_mut(), 0).1.is_empty());
         disabled.stop().unwrap();
         let mut request = CaptureRequest::new(target, CaptureCadence::Manual);
         request.input_events = true;
@@ -2378,9 +2389,9 @@ mod tests {
         emit(3, 50);
         emit(4, 1);
         emit(5, 1);
-        let frame = sample(session.as_mut());
-        assert_eq!(frame.input_events().len(), 6, "{:#?}", frame.input_events());
-        assert!(frame.input_events().iter().any(|event| matches!(
+        let (frame, events) = sample(session.as_mut(), 6);
+        assert_eq!(events.len(), 6, "{events:#?}");
+        assert!(events.iter().any(|event| matches!(
             event,
             InputEvent::Key {
                 native_code: 38,
@@ -2389,7 +2400,7 @@ mod tests {
                 ..
             }
         )));
-        assert!(frame.input_events().iter().any(|event| matches!(
+        assert!(events.iter().any(|event| matches!(
             event,
             InputEvent::PointerButton {
                 button: PointerButton::Primary,
@@ -2401,10 +2412,24 @@ mod tests {
         session.pause().unwrap();
         emit(2, 56);
         emit(3, 56);
-        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            session.poll_frame(Duration::ZERO).unwrap(),
+            FramePoll::Pending
+        );
         session.resume().unwrap();
+        // A new-session marker forms a delivery barrier: an older paused key
+        // leaking from a stale queue cannot hide behind a short sleep window.
+        emit(2, 54);
+        emit(3, 54);
+        let (_, resumed) = sample(session.as_mut(), 2);
         assert!(
-            sample(session.as_mut()).input_events().is_empty(),
+            resumed.iter().all(|event| matches!(
+                event,
+                InputEvent::Key {
+                    native_code: 54,
+                    ..
+                }
+            )) && resumed.len() == 2,
             "paused input leaked into resumed recording"
         );
         session
@@ -2420,27 +2445,26 @@ mod tests {
             .unwrap();
         emit(4, 1);
         emit(5, 1);
-        let retargeted = sample(session.as_mut());
-        assert!(retargeted.input_events().iter().all(|event| matches!(
+        let (retargeted_frame, retargeted) = sample(session.as_mut(), 2);
+        assert!(retargeted.iter().all(|event| matches!(
             event,
             InputEvent::PointerButton {
                 position: Some(PhysicalPosition { x: 40, y: 40 }),
                 ..
             }
         )));
-        assert_eq!(retargeted.input_events().len(), 2);
-        assert!(
-            retargeted.captured_at().as_micros() - frame.captured_at().as_micros() < 80_000,
-            "pause leaked into active timestamps"
-        );
+        assert_eq!(retargeted.len(), 2);
+        // Exact pause subtraction is tested with injected durations below;
+        // scheduler latency must not be mistaken for recorded pause time.
+        assert!(retargeted_frame.captured_at() > frame.captured_at());
         emit(2, 38);
         std::thread::sleep(Duration::from_millis(900));
         emit(3, 38);
-        let repeated = sample(session.as_mut());
+        let (_, repeated) = sample(session.as_mut(), 2);
         // Raw XI2 reports physical transitions, not the server's synthesized
         // repeat presses. The capability advertises this limitation explicitly.
-        assert_eq!(repeated.input_events().len(), 2);
-        assert!(repeated.input_events().iter().all(|event| matches!(
+        assert_eq!(repeated.len(), 2);
+        assert!(repeated.iter().all(|event| matches!(
             event,
             InputEvent::Key {
                 native_code: 38,
@@ -2466,16 +2490,20 @@ mod tests {
         let mut blocked_session = backend.start_session(blocked_request).unwrap();
         connection.grab_server().unwrap().check().unwrap();
         emit(4, 1);
-        std::thread::sleep(Duration::from_millis(20));
-        let stopping = Instant::now();
-        blocked_session.stop().unwrap();
-        let stop_elapsed = stopping.elapsed();
-        emit(5, 1);
-        connection.ungrab_server().unwrap().check().unwrap();
-        assert!(
-            stop_elapsed < Duration::from_millis(250),
-            "input shutdown waited for a blocked X server"
-        );
+        std::thread::scope(|scope| {
+            let (sender, stopped) = std::sync::mpsc::sync_channel(1);
+            scope.spawn(move || {
+                let _ = sender.send(blocked_session.stop());
+            });
+            let result = stopped.recv_timeout(Duration::from_secs(5));
+            // Always release the server before asserting, including a failed
+            // shutdown regression. This lets the worker exit instead of hanging CI.
+            emit(5, 1);
+            connection.ungrab_server().unwrap().check().unwrap();
+            result
+                .expect("input shutdown waited for the blocked X server")
+                .unwrap();
+        });
         connection.destroy_window(window).unwrap().check().unwrap();
     }
 
@@ -2501,6 +2529,21 @@ mod tests {
 
     #[test]
     fn active_session_time_excludes_accumulated_pauses() {
+        let first_active = Duration::from_millis(150);
+        let first_pause = Duration::from_secs(100);
+        assert_eq!(
+            active_session_elapsed(first_active + first_pause, first_pause),
+            first_active
+        );
+        let second_active = Duration::from_millis(35);
+        let second_pause = Duration::from_secs(800);
+        assert_eq!(
+            active_session_elapsed(
+                first_active + first_pause + second_active + second_pause,
+                first_pause + second_pause
+            ),
+            first_active + second_active
+        );
         assert_eq!(
             active_session_elapsed(Duration::from_secs(9), Duration::from_secs(4)),
             Duration::from_secs(5)
