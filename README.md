@@ -11,6 +11,8 @@ GifFromScreen 是一个使用 Rust 实现的本地 GIF 录制与逐帧编辑工�
 - [ADR-0001：Rust 桌面技术栈](docs/ADR-0001-RUST-DESKTOP-STACK.md)
 - [Linux 实现状态](docs/LINUX-STATUS.md)
 - [Linux 性能证据](docs/LINUX-BENCHMARKS.md)
+- [实际功能差距审计](docs/PARITY-AUDIT.md)
+- [视频导入、工程插入与转场验收](docs/LINUX-ITERATION-VIDEO.md)
 
 ## 当前范围
 
@@ -28,7 +30,7 @@ GifFromScreen 是一个使用 Rust 实现的本地 GIF 录制与逐帧编辑工�
 - 编辑器可对选中帧进行精确裁剪、缩放、90° 旋转和水平/垂直翻转，操作会写入可恢复的项目历史。
 - 可按毫秒时间范围选择、保留或删除片段，并可降帧、调整时长、生成 Yoyo 往返序列和清理最终渲染结果中的重复帧。
 - 支持帧级 Cut/Copy/Paste、可选择/删除的有界剪贴板历史、折叠统计面板，以及把项目、GIF 或静态图片直接拖入窗口。
-- 可为相邻帧创建 Fade、RGBA 颜色 Fade 和四方向 Slide，导出时按指定步数与总时长确定性生成中间帧。
+- 可为相邻帧创建 Fade、RGBA 颜色 Fade 和四方向 Slide；预览播放与导出共用中间帧和时间规则，暂停可保留转场位置。
 - 编辑器可在后台导出全部或选中帧，支持颜色数、循环、局部/全局/自定义调色板、Wu 等量化器、完整抖动选项、透明和差分矩形。
 - 可新建透明/实色空白动画，也可把一组有序、同尺寸的 PNG/JPEG/BMP/WebP 按自定义帧时长与循环策略导入项目。
 - 可打开已有 `.gfsproj`，也可从界面或启动参数把 GIF、PNG、JPEG、BMP、WebP 安全解码成新项目。
@@ -36,6 +38,12 @@ GifFromScreen 是一个使用 Rust 实现的本地 GIF 录制与逐帧编辑工�
 - 编辑器可在所选帧跨度上创建线、箭头、矩形或椭圆轨道，设置边界、描边/填充、透明度、混合模式和层级，并通过 Undo/Redo 管理。
 - 可直接在当前帧预览上拖出一条有界自由笔迹，提交为带宽度、RGBA、透明度、混合模式和层级的定时 Drawing 轨道。
 - 可异步解码 PNG/JPEG/BMP/WebP 水印并设置位置、尺寸、双层透明度、混合模式和层级；素材注册与轨道创建可一起撤销。
+- 可添加多语言字幕、重新编辑文字或插入标题帧；保存原文字参数与已排版像素，换机重开不因字体不同改变已有画面。
+- 可用系统 FFmpeg/ffprobe 导入视频，设置起点、时长、FPS 和尺寸；后台流式落盘，取消后保留可恢复工程。
+- 可将同画布的录制/导入工程插入当前时间线，连同源字幕和转场一起保留，并可完整撤销。
+- 局部调色板导出逐帧渲染，不随整个视频的原始像素总量积累内存；全局调色板仍有完整工作集上限。
+- 可在工程内保存、加载、更新、重命名和删除导出预设；预设不会恢复输出路径或覆盖文件授权。
+- 原生文件选择器与手工路径输入均可用；从启动页可继续编辑仍然打开的工程。
 
 ## 开发命令
 
@@ -51,5 +59,8 @@ cargo run -p gif-from-screen
 cargo run -p gif-from-screen -- --project /path/to/animation.gfsproj
 cargo run -p gif-from-screen -- --import-gif /path/to/animation.gif
 cargo run -p gif-from-screen -- --import-image /path/to/image.png
+cargo run -p gif-from-screen -- --import-video /path/to/video.mp4
 cargo test -p gif-from-screen-capture-linux --lib --no-default-features --features native-wayland,native-x11
 ```
+
+视频输入需要可用的 `ffmpeg` 和 `ffprobe`。例如 Ubuntu/Debian 可安装系统 `ffmpeg` 包；没有该依赖时，屏幕录制、图片/GIF 编辑与内置 GIF 导出仍可使用。Linux 版仍处于持续开发与验收阶段，尚未宣称完整一比一复刻或零缺陷。

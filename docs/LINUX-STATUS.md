@@ -61,6 +61,9 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [x] Import local video intervals through supervised FFmpeg/ffprobe with start, duration, FPS, size, progress, cancellation, and partial-project recovery.
 - [x] Insert a same-canvas recorded/imported project with remapped identities, overlays, transitions, and journal-backed undo/redo.
 - [x] Browse for projects, GIFs, images, and videos using native Linux file dialogs while retaining manual-path fallback.
+- [x] Stream local-palette GIF exports through a bounded frame/transition working set instead of retaining the whole rendered animation.
+- [x] Save/load/update/rename/delete complete project-local GIF export presets with undo/redo, without restoring file paths or overwrite authorization.
+- [x] Return to an already-open editor from the launcher; pause preview when leaving the editor.
 
 ## Delivery gates
 
@@ -101,6 +104,8 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [x] PNG/JPEG/BMP/WebP/GIF import.
 - [x] Bounded multi-entry frame clipboard history and project statistics.
 - [ ] Reusable editing/export presets.
+
+Export presets are implemented; reusable editing-action presets/automatic tasks remain pending.
 
 ### M3 — complete content sources
 
