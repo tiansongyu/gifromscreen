@@ -47,6 +47,9 @@ pub(crate) use insert::{
     PreparedProjectInsertion, ProjectInsertionTarget, prepare_project_insertion_from_path,
 };
 
+#[path = "editor_presets.rs"]
+mod presets;
+
 const MAX_SYNCHRONOUS_DUPLICATE_SCAN_FRAMES: usize = 256;
 const DUPLICATE_RENDER_SURFACE_LIMIT_BYTES: usize = 128 * 1024 * 1024;
 

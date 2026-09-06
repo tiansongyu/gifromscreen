@@ -9,6 +9,7 @@ mod blank_project_ui;
 mod capture_source_job;
 mod countdown;
 mod custom_palette_input;
+mod editor_export_presets;
 mod editor_preview;
 mod editor_ui;
 mod editor_workspace;
@@ -344,12 +345,7 @@ struct CompletedProjectSummary {
     project_path: PathBuf,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum ExportFrameScope {
-    #[default]
-    All,
-    Selected,
-}
+type ExportFrameScope = gif_from_screen_domain::GifPresetFrameScope;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum ExportPaletteChoice {
@@ -358,39 +354,8 @@ enum ExportPaletteChoice {
     Global,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum ExportQuantizerChoice {
-    #[default]
-    MedianCut,
-    Octree,
-    Wu,
-    Grayscale,
-    MostUsed,
-    NeuQuant,
-    WebSafe216,
-    Monochrome,
-    Windows16,
-    Custom,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum ExportDitherChoice {
-    #[default]
-    None,
-    Bayer,
-    Dotted,
-    BlueNoise,
-    InterleavedNoise,
-    FloydSteinberg,
-    Atkinson,
-    Burkes,
-    Sierra,
-    SierraLite,
-    TwoRowSierra,
-    JarvisJudiceNinke,
-    Stucki,
-    StevensonArce,
-}
+type ExportQuantizerChoice = gif_from_screen_domain::GifPresetQuantizer;
+type ExportDitherChoice = gif_from_screen_domain::GifPresetDither;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum ExportLoopChoice {
@@ -1512,7 +1477,7 @@ impl GifFromScreenApp {
 
     fn show_editor_contents(&mut self, ui: &mut egui::Ui) {
         self.show_editor_work_area(ui);
-        let Some(workspace) = &self.editor_workspace else {
+        let Some(workspace) = &mut self.editor_workspace else {
             return;
         };
         self.project_insert.show(ui, workspace);
@@ -1525,8 +1490,7 @@ impl GifFromScreenApp {
                     &mut self.settings.output,
                     &mut self.editor_export_settings,
                     &self.export_job,
-                    workspace.selection().len(),
-                    workspace.asset_issues().len(),
+                    workspace,
                     self.watermark_job.state() == WatermarkDecodeJobState::Running,
                 )
             })
@@ -3048,6 +3012,12 @@ enum EditorExportAction {
 fn editor_result_notice(result: EditorUiResult) -> Option<String> {
     match result {
         Ok(EditorUiAction::Notice { message, .. }) => Some(message),
+        Ok(EditorUiAction::Project(editor_ui::EditorUiOperation::Undo)) => {
+            Some("Undid the previous edit.".to_owned())
+        }
+        Ok(EditorUiAction::Project(editor_ui::EditorUiOperation::Redo)) => {
+            Some("Reapplied the edit.".to_owned())
+        }
         Err(failure) => Some(format!(
             "Editor {:?} failed: {}",
             failure.operation, failure.message
@@ -3308,13 +3278,15 @@ fn show_export_panel(
     output: &mut String,
     settings: &mut EditorExportSettings,
     job: &ExportJob,
-    selected_count: usize,
-    asset_issue_count: usize,
+    workspace: &mut EditorWorkspace,
     editor_mutation_active: bool,
 ) -> EditorExportAction {
     ui.heading("Export GIF");
+    let selected_count = workspace.selection().len();
+    let asset_issue_count = workspace.asset_issues().len();
     let active = export_job_is_active(job.state());
     ui.add_enabled_ui(!active && !editor_mutation_active, |ui| {
+        editor_export_presets::show_export_presets(ui, settings, workspace);
         show_export_configuration(ui, output, settings, selected_count);
     });
     if editor_mutation_active {

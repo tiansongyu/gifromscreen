@@ -232,6 +232,7 @@ mod tests {
                     palette: GifPaletteStrategy::Adaptive,
                     repeat: GifLoop::Finite(1),
                     alpha_threshold: 1,
+                    options: None,
                 }
             );
         }

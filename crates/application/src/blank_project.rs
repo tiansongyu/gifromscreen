@@ -187,6 +187,7 @@ pub fn create_blank_animation_project(
             palette: GifPaletteStrategy::Adaptive,
             repeat: GifLoop::Finite(1),
             alpha_threshold: 1,
+            options: None,
         },
     )]);
     manifest
@@ -305,6 +306,7 @@ mod tests {
                 palette: GifPaletteStrategy::Adaptive,
                 repeat: GifLoop::Finite(1),
                 alpha_threshold: 1,
+                options: None,
             }
         );
         let asset_id = manifest.timeline.frames[0].asset_id;

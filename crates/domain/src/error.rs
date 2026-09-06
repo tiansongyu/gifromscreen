@@ -147,6 +147,9 @@ pub enum ValidationIssue {
         transition_id: TransitionId,
     },
     InvalidExportPresetName,
+    InvalidExportPresets {
+        reason: String,
+    },
     InvalidExportColorCount {
         preset: String,
         colors: u16,
@@ -161,6 +164,7 @@ pub enum DomainError {
     UnknownFrame(FrameId),
     UnknownAsset(AssetId),
     UnknownTrack(TrackId),
+    UnknownExportPreset(String),
     DuplicateTrackId(TrackId),
     TrackIndexOutOfBounds { index: usize, len: usize },
     DuplicateFrameInCommand(FrameId),
@@ -194,6 +198,7 @@ impl fmt::Display for DomainError {
             Self::UnknownFrame(id) => write!(formatter, "unknown frame {id}"),
             Self::UnknownAsset(id) => write!(formatter, "unknown asset {id}"),
             Self::UnknownTrack(id) => write!(formatter, "unknown overlay track {id}"),
+            Self::UnknownExportPreset(name) => write!(formatter, "unknown export preset {name}"),
             Self::DuplicateTrackId(id) => write!(formatter, "overlay track {id} already exists"),
             Self::TrackIndexOutOfBounds { index, len } => {
                 write!(

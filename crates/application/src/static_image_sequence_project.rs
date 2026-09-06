@@ -151,6 +151,7 @@ pub fn persist_decoded_static_image_sequence(
             palette: GifPaletteStrategy::Adaptive,
             repeat,
             alpha_threshold: 1,
+            options: None,
         },
     )]);
     persist_rgba_project(

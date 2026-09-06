@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AssetDescriptor, AssetId, Canvas, DomainError, DurationUs, FrameClip, FrameId, OverlayTrack,
-    ProjectManifest, ProjectRevision, TrackId, Transition,
+    AssetDescriptor, AssetId, Canvas, DomainError, DurationUs, FrameClip, FrameId, GifExportPreset,
+    OverlayTrack, ProjectManifest, ProjectRevision, TrackId, Transition,
 };
 
 /// A frame and its original stable timeline position, used by inverse delete
@@ -74,6 +74,13 @@ pub enum EditCommand {
     },
     SetTransitions {
         transitions: Vec<Transition>,
+    },
+    UpsertExportPreset {
+        name: String,
+        preset: GifExportPreset,
+    },
+    RemoveExportPreset {
+        name: String,
     },
     /// Commands in a compound edit are one revision and are atomic. Inverses
     /// are stored in reverse order.
@@ -408,6 +415,25 @@ impl EditCommand {
                     std::mem::replace(&mut project.timeline.transitions, transitions.clone());
                 Ok(Self::SetTransitions {
                     transitions: previous,
+                })
+            }
+            Self::UpsertExportPreset { name, preset } => {
+                match project.export_presets.insert(name.clone(), preset.clone()) {
+                    Some(previous) => Ok(Self::UpsertExportPreset {
+                        name: name.clone(),
+                        preset: previous,
+                    }),
+                    None => Ok(Self::RemoveExportPreset { name: name.clone() }),
+                }
+            }
+            Self::RemoveExportPreset { name } => {
+                let preset = project
+                    .export_presets
+                    .remove(name)
+                    .ok_or_else(|| DomainError::UnknownExportPreset(name.clone()))?;
+                Ok(Self::UpsertExportPreset {
+                    name: name.clone(),
+                    preset,
                 })
             }
             Self::Compound { commands } => {

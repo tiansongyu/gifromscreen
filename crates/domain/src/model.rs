@@ -461,6 +461,9 @@ pub struct GifExportPreset {
     pub palette: GifPaletteStrategy,
     pub repeat: GifLoop,
     pub alpha_threshold: u8,
+    /// Complete desktop settings. Absent in projects saved before editable presets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<crate::GifPresetOptions>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -724,6 +727,11 @@ impl ProjectManifest {
                     colors: preset.colors,
                 });
             }
+        }
+        if let Err(reason) = crate::validate_export_presets(&self.export_presets) {
+            issues.push(ValidationIssue::InvalidExportPresets {
+                reason: reason.to_owned(),
+            });
         }
 
         if issues.is_empty() {

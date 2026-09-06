@@ -8,8 +8,6 @@ description = "Pure project, timeline, and edit-command domain model for GifFrom
 
 [dependencies]
 serde.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true
 
 [lints.rust]

@@ -225,6 +225,7 @@ pub(crate) fn persist_imported_animation(
             palette: GifPaletteStrategy::Adaptive,
             repeat,
             alpha_threshold: 1,
+            options: None,
         },
     );
     persist_rgba_project(
@@ -491,6 +492,7 @@ mod tests {
                 palette: GifPaletteStrategy::Adaptive,
                 repeat: GifLoop::Infinite,
                 alpha_threshold: 1,
+                options: None,
             }
         );
         let stored_frames = manifest
