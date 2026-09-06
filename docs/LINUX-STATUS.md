@@ -103,7 +103,8 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [ ] GNOME hardware-rendered capture and physical display acceptance.
 - [ ] KDE Wayland Portal + PipeWire capture.
 - [x] Bounded queue and dropped-frame timing compensation.
-- [ ] Long-recording frame-store benchmark.
+- [x] Opt-in 1,000-frame 1280×720 sink/store recovery benchmark: 3.43 GiB of independent assets, bounded resident growth, full digest checks and temporary-data cleanup; [measured scope and results](FULL-RESOLUTION-STORE-QA-2026-09-07.md).
+- [ ] Native full-resolution, real-time long-recording reliability and performance acceptance; the unpaced synthetic store benchmark is not this gate.
 - [x] Initial GIF timing, loop, transparency, delta and disposal round-trip corpus.
 - [x] 50,000-frame virtualized timeline prototype.
 
