@@ -129,7 +129,7 @@ fn write_demo_project(
             },
         };
         let clip = FrameClip {
-            capture_binding: gif_from_screen_domain::CaptureBinding::Original,
+            capture_binding: gif_from_screen_domain::CaptureBinding::NotRecorded,
             id: FrameId::from_u128(unique_u128()),
             asset_id,
             duration: DurationUs::new(frame.duration_us()).ok_or("zero frame duration")?,
