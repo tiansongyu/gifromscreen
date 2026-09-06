@@ -124,12 +124,17 @@ where
         }
     })?;
     assets.extend(layers.into_iter().filter_map(|layer| {
-        let OverlayContent::Raster { asset_id, .. } = &layer.item.content else {
-            return None;
+        let asset_id = match &layer.item.content {
+            OverlayContent::Raster { asset_id, .. } => *asset_id,
+            OverlayContent::Text {
+                raster: Some(raster),
+                ..
+            } => raster.asset_id,
+            _ => return None,
         };
         Some(RasterOverlayAsset {
             overlay_id: layer.item.id,
-            asset_id: *asset_id,
+            asset_id,
         })
     }));
     Ok(assets)
@@ -150,6 +155,23 @@ where
     for layer in active_overlay_layers(tracks, sample_time, cancellation)? {
         check_cancelled(cancellation)?;
         match &layer.item.content {
+            OverlayContent::Text {
+                position,
+                raster: Some(raster),
+                ..
+            } => composite_raster_overlay(
+                destination,
+                layer.item.id,
+                raster.asset_id,
+                *position,
+                raster.size,
+                255,
+                layer.track_opacity,
+                layer.blend_mode,
+                provider,
+                limits,
+                cancellation,
+            )?,
             OverlayContent::Raster {
                 asset_id,
                 position,
@@ -234,6 +256,10 @@ where
             if !matches!(
                 item.content,
                 OverlayContent::Raster { .. }
+                    | OverlayContent::Text {
+                        raster: Some(_),
+                        ..
+                    }
                     | OverlayContent::Shape { .. }
                     | OverlayContent::Drawing { .. }
             ) {
@@ -1056,6 +1082,55 @@ mod tests {
             active_raster_overlay_assets(&tracks, TimeUs::new(20), &NeverCancel)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn frozen_text_loads_its_immutable_pixels_without_resolving_fonts() {
+        let size = PhysicalSize::new(1, 1).unwrap();
+        let item = OverlayItem {
+            id: OverlayId::from_u128(42),
+            span: TimelineSpan {
+                start: TimeUs::ZERO,
+                duration: DurationUs::new(10).unwrap(),
+            },
+            z_index: 0,
+            content: OverlayContent::Text {
+                text: "你好".to_owned(),
+                font_family: "Font missing on this computer".to_owned(),
+                font_size_px: 20,
+                position: point(0, 0),
+                max_width: Some(size.width),
+                foreground: rgba(255, 0, 0, 255),
+                background: None,
+                alignment: gif_from_screen_domain::HorizontalAlignment::Start,
+                raster: Some(gif_from_screen_domain::TextRaster {
+                    asset_id: asset(2),
+                    size,
+                }),
+            },
+        };
+        let tracks = [track(1, true, 255, BlendMode::Normal, vec![item])];
+        let provider = |id| -> Result<RgbaSurface, crate::AssetProviderError> {
+            Ok(if id == asset(2) {
+                surface(1, 1, &[255, 0, 0, 255])
+            } else {
+                surface(1, 1, &[0, 0, 0, 255])
+            })
+        };
+        let output = CpuRenderer::default()
+            .render_clip_with_overlays(
+                &clip(asset(1)),
+                &tracks,
+                TimeUs::ZERO,
+                &provider,
+                &NeverCancel,
+            )
+            .unwrap();
+        assert_eq!(output.pixels(), [255, 0, 0, 255]);
+        assert_eq!(
+            active_raster_overlay_assets(&tracks, TimeUs::ZERO, &NeverCancel).unwrap()[0].asset_id,
+            asset(2)
         );
     }
 

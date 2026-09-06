@@ -16,6 +16,7 @@ gif-from-screen-gif = { path = "../../crates/gif" }
 gif-from-screen-media = { path = "../../crates/media" }
 gif-from-screen-project = { path = "../../crates/project" }
 gif-from-screen-render = { path = "../../crates/render" }
+gif-from-screen-text = { path = "../../crates/text" }
 gif-from-screen-workflow = { path = "../../crates/workflow" }
 thiserror.workspace = true
 uuid.workspace = true

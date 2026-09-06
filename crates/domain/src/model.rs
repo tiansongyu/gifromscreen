@@ -249,6 +249,17 @@ pub struct StrokePoint {
     pub pressure_milli: u16,
 }
 
+/// Frozen shaped text pixels; the original text attributes remain editable in the overlay.
+///
+/// Persisting these pixels makes preview and export independent of installed fonts after authoring.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TextRaster {
+    /// Immutable straight-alpha RGBA8 overlay asset.
+    pub asset_id: AssetId,
+    /// Raster dimensions before placement on the canvas.
+    pub size: PhysicalSize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OverlayContent {
@@ -267,6 +278,9 @@ pub enum OverlayContent {
         foreground: Rgba,
         background: Option<Rgba>,
         alignment: HorizontalAlignment,
+        /// Optional for reading older projects; unprepared text is rejected during rendering.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raster: Option<TextRaster>,
     },
     Shape {
         kind: ShapeKind,
@@ -306,6 +320,10 @@ impl OverlayContent {
     pub const fn referenced_asset(&self) -> Option<AssetId> {
         match self {
             Self::Raster { asset_id, .. } => Some(*asset_id),
+            Self::Text {
+                raster: Some(raster),
+                ..
+            } => Some(raster.asset_id),
             Self::Cursor {
                 cursor_asset: Some(asset_id),
                 ..

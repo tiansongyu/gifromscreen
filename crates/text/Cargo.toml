@@ -1,0 +1,16 @@
+[package]
+name = "gif-from-screen-text"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded text shaping and rasterization for persistent GIF overlays"
+
+[dependencies]
+cosmic-text = "0.14.2"
+epaint_default_fonts = "0.32"
+gif-from-screen-domain = { path = "../domain" }
+thiserror.workspace = true
+
+[lints]
+workspace = true
