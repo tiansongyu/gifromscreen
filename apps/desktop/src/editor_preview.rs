@@ -554,19 +554,15 @@ fn preview_raster_shape(
     role: PreviewRasterRole,
     asset_id: AssetId,
 ) -> Result<(gif_from_screen_domain::PhysicalSize, RasterEncoding), EditorPreviewError> {
-    match (role, kind) {
-        (PreviewRasterRole::Frame { .. }, AssetKind::Frame { size, encoding })
-        | (
-            PreviewRasterRole::Overlay { .. },
-            AssetKind::Frame { size, encoding }
-            | AssetKind::OverlayImage { size, encoding }
-            | AssetKind::Mask { size, encoding },
-        ) => Ok((*size, *encoding)),
-        (PreviewRasterRole::Frame { .. }, kind) => Err(EditorPreviewError::InvalidAssetKind {
+    if let Some(descriptor) = kind.raster_descriptor() {
+        return Ok(descriptor);
+    }
+    match role {
+        PreviewRasterRole::Frame { .. } => Err(EditorPreviewError::InvalidAssetKind {
             asset_id,
             kind: kind.clone(),
         }),
-        (PreviewRasterRole::Overlay { overlay_id }, kind) => {
+        PreviewRasterRole::Overlay { overlay_id } => {
             Err(EditorPreviewError::InvalidOverlayAssetKind {
                 overlay_id,
                 asset_id,
@@ -1190,6 +1186,70 @@ mod tests {
 
         let rendered = render_frame_surface(&project, frame_id, 16).unwrap();
         assert_eq!(rendered.pixels(), [255, 0, 0, 255, 255, 0, 0, 255]);
+        let mut plan = PreviewRenderPlan::new(
+            &project,
+            &project.manifest().timeline.frames[0],
+            TimeUs::ZERO,
+        )
+        .unwrap();
+        for kind in [
+            AssetKind::OverlayImage {
+                size,
+                encoding: RasterEncoding::Rgba8,
+            },
+            AssetKind::Mask {
+                size,
+                encoding: RasterEncoding::Rgba8,
+            },
+        ] {
+            plan.descriptors.get_mut(&frame_asset).unwrap().kind = kind;
+            assert_eq!(
+                plan.render(16, &NeverCancel).unwrap().pixels(),
+                rendered.pixels()
+            );
+        }
+    }
+
+    #[test]
+    fn preview_raster_role_reuse_preserves_kind_encoding_and_byte_validation() {
+        let size = PhysicalSize::new(1, 1).unwrap();
+        let (_scratch, project, _, asset_id) = project_with_frame(
+            &[12, 34, 56, 255],
+            size,
+            ClipTransform::default(),
+            Vec::new(),
+        );
+        let mut plan = PreviewRenderPlan::new(
+            &project,
+            &project.manifest().timeline.frames[0],
+            TimeUs::ZERO,
+        )
+        .unwrap();
+        for media_type in ["image/png", "video/mp4", "audio/wav", "font/ttf"] {
+            plan.descriptors.get_mut(&asset_id).unwrap().kind = AssetKind::ImportedSource {
+                media_type: media_type.into(),
+            };
+            assert!(matches!(
+                plan.render(16, &NeverCancel),
+                Err(EditorPreviewError::InvalidAssetKind { .. })
+            ));
+        }
+        plan.descriptors.get_mut(&asset_id).unwrap().kind = AssetKind::OverlayImage {
+            size,
+            encoding: RasterEncoding::Qoi,
+        };
+        assert!(matches!(
+            plan.render(16, &NeverCancel),
+            Err(EditorPreviewError::UnsupportedAssetEncoding { .. })
+        ));
+        plan.descriptors.get_mut(&asset_id).unwrap().kind = AssetKind::Mask {
+            size: PhysicalSize::new(2, 1).unwrap(),
+            encoding: RasterEncoding::Rgba8,
+        };
+        assert!(matches!(
+            plan.render(16, &NeverCancel),
+            Err(EditorPreviewError::DescriptorByteLengthMismatch { .. })
+        ));
     }
 
     #[test]

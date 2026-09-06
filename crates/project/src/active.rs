@@ -6,7 +6,7 @@ use std::{
 };
 
 use gif_from_screen_domain::{
-    AppliedEdit, AssetDescriptor, AssetId, AssetKind, DomainError, EditCommand, FrameClip,
+    AppliedEdit, AssetDescriptor, AssetId, DomainError, EditCommand, FrameClip,
     FrameDurationChange, FrameId, ProjectManifest, ProjectRevision, RasterEncoding,
 };
 
@@ -514,9 +514,9 @@ fn validate_raw_recording_asset(
                 "recording canvas RGBA byte length overflowed".to_owned(),
             )
         })?;
-    let AssetKind::Frame { size, encoding } = descriptor.kind else {
+    let Some((size, encoding)) = descriptor.kind.raster_descriptor() else {
         return Err(ProjectError::InvalidRecordingMutation(
-            "recording asset must be a frame raster".to_owned(),
+            "recording asset must be a raster".to_owned(),
         ));
     };
     if size != manifest.canvas.size || encoding != RasterEncoding::Rgba8 {
@@ -743,6 +743,33 @@ mod tests {
         assert_eq!(opened.journal_recovery.replayed_records, 5);
         assert_eq!(opened.project.manifest().revision, ProjectRevision::new(5));
         assert_eq!(opened.project.manifest().timeline.frames.len(), 2);
+    }
+
+    #[test]
+    fn recording_fast_path_reuses_existing_overlay_raster_without_relabeling() {
+        let directory = tempdir().unwrap();
+        let mut active = ActiveProject::create(directory.path(), manifest()).unwrap();
+        let asset_id = active.assets().put(&[7_u8; 16]).unwrap();
+        let mut descriptor = recording_asset(asset_id);
+        descriptor.kind = AssetKind::OverlayImage {
+            size: PhysicalSize::new(2, 2).unwrap(),
+            encoding: RasterEncoding::Rgba8,
+        };
+        active
+            .commit(EditCommand::RegisterAsset {
+                asset: descriptor.clone(),
+            })
+            .unwrap();
+        active
+            .commit_recording_append(None, recording_frame(1, asset_id, 10))
+            .unwrap();
+        drop(active);
+        let opened = ActiveProject::open(directory.path(), LockPolicy::FailIfPresent).unwrap();
+        assert_eq!(opened.project.manifest().assets[&asset_id], descriptor);
+        assert_eq!(
+            opened.project.manifest().timeline.frames[0].asset_id,
+            asset_id
+        );
     }
 
     #[test]

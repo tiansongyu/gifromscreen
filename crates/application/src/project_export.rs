@@ -1332,18 +1332,18 @@ fn load_selected_assets(
                 asset_id: clip.asset_id,
             },
         )?;
-        let AssetKind::Frame { size, encoding } = &descriptor.kind else {
+        let Some((size, encoding)) = descriptor.kind.raster_descriptor() else {
             return Err(ProjectGifExportError::InvalidAssetKind {
                 frame_id: clip.id,
                 asset_id: clip.asset_id,
                 kind: descriptor.kind.clone(),
             });
         };
-        if *encoding != RasterEncoding::Rgba8 {
+        if encoding != RasterEncoding::Rgba8 {
             return Err(ProjectGifExportError::UnsupportedAssetEncoding {
                 frame_id: clip.id,
                 asset_id: clip.asset_id,
-                encoding: *encoding,
+                encoding,
             });
         }
         let asset_path = snapshot.assets.asset_path(clip.asset_id);
@@ -1366,7 +1366,7 @@ fn load_selected_assets(
             });
         }
         let pixels = read_asset(snapshot, clip)?;
-        let surface = RgbaSurface::new(*size, pixels).map_err(|source| {
+        let surface = RgbaSurface::new(size, pixels).map_err(|source| {
             ProjectGifExportError::InvalidAssetSurface {
                 frame_id: clip.id,
                 asset_id: clip.asset_id,
@@ -1410,17 +1410,12 @@ fn load_selected_assets(
                 asset_id,
             },
         )?;
-        let (size, encoding) = match &descriptor.kind {
-            AssetKind::Frame { size, encoding }
-            | AssetKind::OverlayImage { size, encoding }
-            | AssetKind::Mask { size, encoding } => (*size, *encoding),
-            AssetKind::ImportedSource { .. } => {
-                return Err(ProjectGifExportError::InvalidOverlayAssetKind {
-                    overlay_id,
-                    asset_id,
-                    kind: descriptor.kind.clone(),
-                });
-            }
+        let Some((size, encoding)) = descriptor.kind.raster_descriptor() else {
+            return Err(ProjectGifExportError::InvalidOverlayAssetKind {
+                overlay_id,
+                asset_id,
+                kind: descriptor.kind.clone(),
+            });
         };
         if encoding != RasterEncoding::Rgba8 {
             return Err(ProjectGifExportError::UnsupportedOverlayAssetEncoding {
@@ -1884,6 +1879,116 @@ mod tests {
                 },
             }],
         }
+    }
+
+    #[test]
+    fn raster_roles_reopen_and_export_one_shared_frame_and_overlay_asset() {
+        let size = PhysicalSize::new(1, 1).unwrap();
+        let pixel = [12, 34, 56, 255];
+        for kind in [
+            AssetKind::Frame {
+                size,
+                encoding: RasterEncoding::Rgba8,
+            },
+            AssetKind::OverlayImage {
+                size,
+                encoding: RasterEncoding::Rgba8,
+            },
+            AssetKind::Mask {
+                size,
+                encoding: RasterEncoding::Rgba8,
+            },
+        ] {
+            let directory = tempdir().unwrap();
+            let (mut source, ids) = snapshot(
+                &directory.path().join("fixture"),
+                size,
+                &[TestClip::rgba(1, &pixel, 10_000)],
+            );
+            source.manifest.assets.get_mut(&ids[0]).unwrap().kind = kind.clone();
+            source
+                .manifest
+                .timeline
+                .overlay_tracks
+                .push(raster_overlay_track(
+                    ids[0],
+                    TimelineSpan {
+                        start: TimeUs::ZERO,
+                        duration: DurationUs::new(10_000).unwrap(),
+                    },
+                    PhysicalPoint::default(),
+                    size,
+                ));
+            let root = directory.path().join("shared.gfsproj");
+            let project = ActiveProject::create(&root, source.manifest).unwrap();
+            assert_eq!(project.assets().put(&pixel).unwrap(), ids[0]);
+            drop(project);
+            let reopened = ActiveProject::open(&root, LockPolicy::FailIfPresent).unwrap();
+            assert!(reopened.asset_issues.is_empty());
+            assert_eq!(reopened.project.manifest().assets.len(), 1);
+            assert_eq!(reopened.project.manifest().assets[&ids[0]].kind, kind);
+            let snapshot = ProjectExportSnapshot::from_active(&reopened.project);
+            let output = directory.path().join("shared.gif");
+            export(
+                &snapshot,
+                &output,
+                &ProjectGifExportOptions {
+                    render_buffer_limit_bytes: 8,
+                    ..ProjectGifExportOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(decode_rgba(&output), vec![(1, pixel.to_vec())]);
+        }
+    }
+
+    #[test]
+    fn shared_raster_roles_still_reject_non_rasters_encoding_and_size_mismatches() {
+        let directory = tempdir().unwrap();
+        let size = PhysicalSize::new(1, 1).unwrap();
+        let (mut snapshot, ids) = snapshot(
+            &directory.path().join("project"),
+            size,
+            &[TestClip::rgba(1, &[12, 34, 56, 255], 10_000)],
+        );
+        let output = directory.path().join("invalid.gif");
+        for media_type in ["image/png", "video/mp4", "audio/wav", "font/ttf"] {
+            snapshot.manifest.assets.get_mut(&ids[0]).unwrap().kind = AssetKind::ImportedSource {
+                media_type: media_type.into(),
+            };
+            assert!(matches!(
+                export(&snapshot, &output, &ProjectGifExportOptions::default()),
+                Err(ProjectGifExportError::InvalidAssetKind { .. })
+            ));
+        }
+        snapshot.manifest.assets.get_mut(&ids[0]).unwrap().kind = AssetKind::OverlayImage {
+            size,
+            encoding: RasterEncoding::Png,
+        };
+        assert!(matches!(
+            export(&snapshot, &output, &ProjectGifExportOptions::default()),
+            Err(ProjectGifExportError::UnsupportedAssetEncoding { .. })
+        ));
+        snapshot.manifest.assets.get_mut(&ids[0]).unwrap().kind = AssetKind::Mask {
+            size: PhysicalSize::new(2, 1).unwrap(),
+            encoding: RasterEncoding::Rgba8,
+        };
+        assert!(matches!(
+            export(&snapshot, &output, &ProjectGifExportOptions::default()),
+            Err(ProjectGifExportError::InvalidAssetSurface { .. })
+        ));
+        let descriptor = snapshot.manifest.assets.get_mut(&ids[0]).unwrap();
+        descriptor.kind = AssetKind::OverlayImage {
+            size,
+            encoding: RasterEncoding::Rgba8,
+        };
+        descriptor.byte_len = 8;
+        assert!(matches!(
+            export(&snapshot, &output, &ProjectGifExportOptions::default()),
+            Err(ProjectGifExportError::AssetLengthMismatch { .. })
+        ));
+        assert!(!output.exists());
+        assert_eq!(partial_files(directory.path()), 0);
     }
 
     #[test]

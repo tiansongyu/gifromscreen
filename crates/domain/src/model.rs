@@ -74,15 +74,28 @@ pub enum AssetKind {
 }
 
 impl AssetKind {
-    pub const fn raster_size(&self) -> Option<PhysicalSize> {
+    /// Returns the storage representation shared by all raster roles.
+    ///
+    /// Frame, overlay and mask labels preserve project provenance, not distinct
+    /// byte formats. A mask's interpretation belongs to its effect consumer;
+    /// the stored raster still uses the declared size and encoding.
+    pub const fn raster_descriptor(&self) -> Option<(PhysicalSize, RasterEncoding)> {
         match self {
-            Self::Frame { size, .. }
-            | Self::OverlayImage { size, .. }
-            | Self::Mask { size, .. } => Some(*size),
+            Self::Frame { size, encoding }
+            | Self::OverlayImage { size, encoding }
+            | Self::Mask { size, encoding } => Some((*size, *encoding)),
             Self::ImportedSource { .. } => None,
         }
     }
 
+    pub const fn raster_size(&self) -> Option<PhysicalSize> {
+        match self.raster_descriptor() {
+            Some((size, _)) => Some(size),
+            None => None,
+        }
+    }
+
+    /// Returns the original role label, not whether a frame can consume this raster.
     pub const fn is_frame(&self) -> bool {
         matches!(self, Self::Frame { .. })
     }
@@ -553,7 +566,7 @@ impl ProjectManifest {
                     frame_id: frame.id,
                     asset_id: frame.asset_id,
                 }),
-                Some(asset) if !asset.kind.is_frame() => {
+                Some(asset) if asset.kind.raster_descriptor().is_none() => {
                     issues.push(ValidationIssue::IncompatibleFrameAsset {
                         frame_id: frame.id,
                         asset_id: frame.asset_id,
@@ -781,6 +794,61 @@ pub(crate) mod test_fixtures {
 #[cfg(test)]
 mod tests {
     use super::{test_fixtures::*, *};
+
+    #[test]
+    fn frame_references_accept_raster_roles_without_changing_serialized_labels() {
+        let size = PhysicalSize::new(320, 200).unwrap();
+        for kind in [
+            AssetKind::Frame {
+                size,
+                encoding: RasterEncoding::Rgba8,
+            },
+            AssetKind::OverlayImage {
+                size,
+                encoding: RasterEncoding::Rgba8,
+            },
+            AssetKind::Mask {
+                size,
+                encoding: RasterEncoding::Rgba8,
+            },
+        ] {
+            let mut descriptor = asset(1);
+            descriptor.kind = kind.clone();
+            let mut project = manifest();
+            project.timeline.frames.push(frame(1, descriptor.id));
+            project.assets.insert(descriptor.id, descriptor);
+            project.validate().unwrap();
+            let decoded: ProjectManifest =
+                serde_json::from_slice(&serde_json::to_vec(&project).unwrap()).unwrap();
+            assert_eq!(decoded, project);
+            assert_eq!(
+                kind.raster_descriptor(),
+                Some((size, RasterEncoding::Rgba8))
+            );
+        }
+    }
+
+    #[test]
+    fn imported_sources_cannot_masquerade_as_frame_rasters_by_mime_type() {
+        for media_type in ["image/png", "video/mp4", "audio/wav", "font/ttf"] {
+            let mut descriptor = asset(1);
+            descriptor.kind = AssetKind::ImportedSource {
+                media_type: media_type.into(),
+            };
+            assert_eq!(descriptor.kind.raster_descriptor(), None);
+            let mut project = manifest();
+            project.timeline.frames.push(frame(1, descriptor.id));
+            project.assets.insert(descriptor.id, descriptor);
+            let DomainError::InvalidManifest(issues) = project.validate().unwrap_err() else {
+                panic!("wrong validation error")
+            };
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| matches!(issue, ValidationIssue::IncompatibleFrameAsset { .. }))
+            );
+        }
+    }
 
     #[test]
     fn detects_duplicate_frame_identity_and_missing_assets() {

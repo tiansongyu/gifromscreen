@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use gif_from_screen_domain::{
-    AssetKind, ClipTransform, EditCommand, FrameClip, FrameId, PhysicalRect, PhysicalSize,
-    ProjectManifest, QuarterTurn,
+    ClipTransform, EditCommand, FrameClip, FrameId, PhysicalRect, PhysicalSize, ProjectManifest,
+    QuarterTurn,
 };
 
 use crate::{EditorError, ensure_known_selection};
@@ -119,7 +119,7 @@ fn validate_crop_for_frame(
             frame_id: frame.id,
             asset_id: frame.asset_id,
         })?;
-    let AssetKind::Frame { size, .. } = asset.kind else {
+    let Some((size, _)) = asset.kind.raster_descriptor() else {
         return Err(EditorError::UnsupportedFrameAsset {
             frame_id: frame.id,
             asset_id: frame.asset_id,
@@ -183,7 +183,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use gif_from_screen_domain::{
-        AssetDescriptor, AssetId, Canvas, CanvasBackground, CaptureMetadata, ColorSpace,
+        AssetDescriptor, AssetId, AssetKind, Canvas, CanvasBackground, CaptureMetadata, ColorSpace,
         DurationUs, Effect, MouseButton, PhysicalPoint, PhysicalPx, ProjectId, ProjectRevision,
         RasterEncoding, Rgba, UnixTimeMs,
     };
@@ -446,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn crop_rejects_missing_and_non_frame_assets() {
+    fn crop_rejects_missing_and_non_raster_assets() {
         let crop = PhysicalRect::new(0, 0, 1, 1).unwrap();
         let mut missing = project();
         let missing_asset = missing.timeline.frames[0].asset_id;
@@ -474,6 +474,40 @@ mod tests {
             Err(EditorError::UnsupportedFrameAsset { asset_id, .. })
                 if asset_id == unsupported_asset
         ));
+    }
+
+    #[test]
+    fn frame_crop_and_clipboard_reuse_overlay_and_mask_asset_roles() {
+        let mut project = project();
+        let first_id = project.timeline.frames[0].id;
+        for (index, asset) in project.assets.values_mut().enumerate() {
+            let (size, encoding) = asset.kind.raster_descriptor().unwrap();
+            asset.kind = if index == 0 {
+                AssetKind::OverlayImage { size, encoding }
+            } else {
+                AssetKind::Mask { size, encoding }
+            };
+        }
+        let command = edit_clip_transforms(
+            &project,
+            project.timeline.frames.iter().map(|frame| frame.id),
+            ClipTransformEdit::SetCrop(PhysicalRect::new(0, 0, 1, 1).unwrap()),
+        )
+        .unwrap();
+        project.apply_command(&command).unwrap();
+        let clipboard = crate::copy_selected_frames(&project, [first_id]).unwrap();
+        let paste = crate::paste_frame_clipboard(&project, &clipboard, Some(first_id), || {
+            FrameId::from_u128(99)
+        })
+        .unwrap();
+        project.apply_command(&paste).unwrap();
+        assert_eq!(
+            project.timeline.frames[0].asset_id,
+            project.timeline.frames[1].asset_id
+        );
+        assert_eq!(project.assets.len(), 2);
+        assert!(project.assets.values().all(|asset| !asset.kind.is_frame()));
+        project.validate().unwrap();
     }
 
     #[test]

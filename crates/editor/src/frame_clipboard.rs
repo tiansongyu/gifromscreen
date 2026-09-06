@@ -459,7 +459,7 @@ fn validate_clipboard_assets(
                 frame_id: frame.id,
                 asset_id: frame.asset_id,
             })?;
-        if !asset.kind.is_frame() {
+        if asset.kind.raster_descriptor().is_none() {
             return Err(EditorError::UnsupportedFrameAsset {
                 frame_id: frame.id,
                 asset_id: frame.asset_id,
