@@ -17,21 +17,26 @@ use gif_from_screen_gif::{CancellationFlag, NeverCancel};
 use gif_from_screen_workflow::{
     CollectOptions, CollectionLimit, FrameRetention, NoopWorkflowProgress, RecordToGifOptions,
     RecordingController, RecordingFrameSink, RecordingFrameSinkError, RecordingFrameSinkOperation,
-    SnapshotTriggerRejection, SnapshotTriggerRequest, SnapshotTriggerStatus, WorkflowError,
-    WorkflowPhase, WorkflowProgress, collect, collect_controlled, collect_controlled_to_sink,
-    collect_controlled_with_sink, collect_prestarted_controlled_to_sink, partial_output_path,
-    record_to_gif, record_to_gif_controlled,
+    SnapshotTriggerRejection, SnapshotTriggerRequest, SnapshotTriggerStatus, TargetUpdateStatus,
+    WorkflowError, WorkflowPhase, WorkflowProgress, collect, collect_controlled,
+    collect_controlled_to_sink, collect_controlled_with_sink,
+    collect_prestarted_controlled_to_sink, partial_output_path, record_to_gif,
+    record_to_gif_controlled,
 };
 
 #[derive(Default)]
 struct SessionCallCounts {
+    pauses: AtomicUsize,
     resumes: AtomicUsize,
     discards: AtomicUsize,
+    snapshots: AtomicUsize,
+    polls: AtomicUsize,
 }
 
 struct TrackingSession {
     inner: Box<dyn CaptureSession>,
     calls: Arc<SessionCallCounts>,
+    stalled: bool,
 }
 
 impl CaptureSession for TrackingSession {
@@ -48,7 +53,15 @@ impl CaptureSession for TrackingSession {
     }
 
     fn pause(&mut self) -> Result<(), CaptureError> {
-        self.inner.pause()
+        self.inner.pause()?;
+        self.calls.pauses.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn prepare_snapshot(&mut self) -> Result<(), CaptureError> {
+        self.inner.prepare_snapshot()?;
+        self.calls.snapshots.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     fn resume(&mut self) -> Result<(), CaptureError> {
@@ -66,6 +79,11 @@ impl CaptureSession for TrackingSession {
     }
 
     fn poll_frame(&mut self, timeout: Duration) -> Result<FramePoll, CaptureError> {
+        self.calls.polls.fetch_add(1, Ordering::Relaxed);
+        if self.stalled {
+            std::thread::sleep(timeout);
+            return Ok(FramePoll::Pending);
+        }
         self.inner.poll_frame(timeout)
     }
 }
@@ -74,6 +92,7 @@ struct CountingBackend {
     inner: SyntheticCaptureBackend,
     starts: Arc<AtomicUsize>,
     session_calls: Arc<SessionCallCounts>,
+    stalled: bool,
 }
 
 impl CountingBackend {
@@ -82,6 +101,7 @@ impl CountingBackend {
             inner: SyntheticCaptureBackend::new(frames),
             starts: Arc::new(AtomicUsize::new(0)),
             session_calls: Arc::new(SessionCallCounts::default()),
+            stalled: false,
         }
     }
 }
@@ -112,6 +132,7 @@ impl CaptureBackend for CountingBackend {
         Ok(Box::new(TrackingSession {
             inner,
             calls: Arc::clone(&self.session_calls),
+            stalled: self.stalled,
         }))
     }
 }
@@ -408,6 +429,121 @@ fn pending_manual_snapshot_reports_sink_failure_and_cancellation() {
         wait_for_snapshot(&mut cancelled_request),
         SnapshotTriggerStatus::Rejected(SnapshotTriggerRejection::Cancelled)
     );
+}
+
+fn wait_until(mut predicate: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !predicate() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    true
+}
+
+#[test]
+fn stalled_manual_source_keeps_movement_pause_and_terminal_controls_responsive() {
+    for sink_only in [false, true] {
+        for discard in [false, true] {
+            check_stalled_manual_controls(sink_only, discard);
+        }
+    }
+}
+
+fn check_stalled_manual_controls(sink_only: bool, discard: bool) {
+    let mut backend = CountingBackend::new(Vec::new());
+    backend.stalled = true;
+    let calls = Arc::clone(&backend.session_calls);
+    let (controller, mut control) = RecordingController::channel();
+    let mut first = controller.trigger_snapshot();
+    let mut second = controller.trigger_snapshot();
+    let cancellation = CancellationFlag::default();
+    let worker_cancellation = cancellation.clone();
+    let (completed, completion) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let request = CaptureRequest::new(
+            CaptureTarget::Region {
+                source: CaptureSourceId::new("synthetic:monitor:0").unwrap(),
+                region: gif_from_screen_capture::PhysicalRect::new(0, 0, 1, 1).unwrap(),
+            },
+            CaptureCadence::Manual,
+        );
+        let options = CollectOptions {
+            poll_interval: Duration::from_millis(1),
+            ..max_frames_options(2, 5_000)
+        };
+        let result = if sink_only {
+            collect_controlled_to_sink(
+                &backend,
+                request,
+                &options,
+                &mut control,
+                &mut TestFrameSink::default(),
+                &worker_cancellation,
+                &mut NoopWorkflowProgress,
+            )
+            .map(|_| ())
+        } else {
+            collect_controlled(
+                &backend,
+                request,
+                &options,
+                &mut control,
+                &worker_cancellation,
+                &mut NoopWorkflowProgress,
+            )
+            .map(|_| ())
+        };
+        let _ = completed.send(result);
+    });
+
+    let started = wait_until(|| calls.polls.load(Ordering::Relaxed) > 0);
+    let initial_boundaries = calls.snapshots.load(Ordering::Relaxed);
+    let mut movement = controller.update_target(CaptureTarget::Region {
+        source: CaptureSourceId::new("synthetic:monitor:0").unwrap(),
+        region: gif_from_screen_capture::PhysicalRect::new(1, 1, 1, 1).unwrap(),
+    });
+    let moved = wait_until(|| movement.status() != TargetUpdateStatus::Pending);
+    let move_status = movement.status();
+    controller.pause();
+    let paused = wait_until(|| calls.pauses.load(Ordering::Relaxed) == 1);
+    controller.resume();
+    let resumed = wait_until(|| calls.snapshots.load(Ordering::Relaxed) == 3);
+    if discard {
+        controller.discard();
+    } else {
+        controller.stop();
+    }
+    let result = completion.recv_timeout(Duration::from_secs(2));
+    // Always release a regressed worker before asserting, so a failure cannot
+    // leave a permanently stalled collection thread behind.
+    cancellation.cancel();
+    worker.join().unwrap();
+
+    assert!(started);
+    assert_eq!(
+        initial_boundaries, 1,
+        "burst requests share no native permit"
+    );
+    assert!(moved && move_status == TargetUpdateStatus::Applied);
+    assert!(paused && resumed);
+    let result = result.expect("stalled source must not block terminal commands");
+    if discard {
+        assert!(matches!(result, Err(WorkflowError::Discarded)));
+    } else {
+        assert!(matches!(result, Err(WorkflowError::EmptyCapture)));
+    }
+    for snapshot in [&mut first, &mut second] {
+        assert_eq!(
+            snapshot.status(),
+            SnapshotTriggerStatus::Rejected(if discard {
+                SnapshotTriggerRejection::Discarded
+            } else {
+                SnapshotTriggerRejection::Stopped
+            })
+        );
+    }
 }
 
 #[test]

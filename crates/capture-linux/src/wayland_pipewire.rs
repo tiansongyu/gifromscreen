@@ -192,7 +192,6 @@ pub struct WaylandCaptureSession {
     frames: Receiver<CapturedFrame>,
     status: Receiver<WorkerStatus>,
     worker: Option<JoinHandle<Result<(), CaptureError>>>,
-    manual_gate_active: bool,
 }
 
 impl std::fmt::Debug for WaylandCaptureSession {
@@ -289,7 +288,6 @@ impl WaylandCaptureSession {
             frames: frame_rx,
             status: status_rx,
             worker: Some(worker),
-            manual_gate_active: false,
         })
     }
 
@@ -435,11 +433,10 @@ impl CaptureSession for WaylandCaptureSession {
         if self.state != CaptureSessionState::Recording {
             return Err(self.invalid_transition("prepare a snapshot for"));
         }
-        if !self.manual_gate_active {
-            self.send_command(|reply| WorkerCommand::EnterManualSnapshotMode { reply })?;
-            drain_queued_frames(&self.frames);
-            self.manual_gate_active = true;
-        }
+        // Close the producer gate before draining. Repeating this sequence also
+        // replaces an unfulfilled request after a target move or pause/resume.
+        self.send_command(|reply| WorkerCommand::EnterManualSnapshotMode { reply })?;
+        drain_queued_frames(&self.frames);
         self.send_command(|reply| WorkerCommand::RequestManualSnapshot { reply })?;
         Ok(())
     }
@@ -941,6 +938,11 @@ fn process_pipewire_frame(
     stream: &pipewire::stream::Stream<()>,
     worker_data: &RefCell<WorkerData>,
 ) {
+    // Every delivered buffer must be dequeued and returned, including frames
+    // rejected by the manual gate. Buffer::drop returns it to PipeWire's pool.
+    let Some(mut buffer) = stream.dequeue_buffer() else {
+        return;
+    };
     let mut data = worker_data.borrow_mut();
     if data.terminal.load(Ordering::Acquire) {
         return;
@@ -952,9 +954,6 @@ fn process_pipewire_frame(
     if manual_gated && data.manual_permits.get() == 0 {
         return;
     }
-    let Some(mut buffer) = stream.dequeue_buffer() else {
-        return;
-    };
     let Some(plane) = buffer.datas_mut().first_mut() else {
         signal_terminal(
             &data.terminal,
@@ -1086,6 +1085,10 @@ fn handle_worker_commands(
                         RecoveryHint::None,
                     ))
                 } else {
+                    // Commands and process callbacks share the worker thread.
+                    // Recycle buffers already ready before granting the permit;
+                    // draining only the Rust frame channel misses this queue.
+                    while stream.dequeue_buffer().is_some() {}
                     manual_permits.set(1);
                     Ok(())
                 };
@@ -1606,7 +1609,6 @@ mod tests {
             frames: frame_rx,
             status: status_rx,
             worker: Some(worker),
-            manual_gate_active: false,
         }
     }
 
@@ -1921,7 +1923,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_snapshot_boundary_drops_setup_frames_before_accepting_a_fresh_frame() {
+    fn manual_snapshot_boundary_replaces_pending_requests_and_drops_stale_frames() {
         let source_id = CaptureSourceId::new(MONITOR_SOURCE_ID).unwrap();
         let request = CaptureRequest::new(
             CaptureTarget::Monitor(source_id.clone()),
@@ -1972,7 +1974,6 @@ mod tests {
             frames: frame_rx,
             status: status_rx,
             worker: Some(worker),
-            manual_gate_active: false,
         };
 
         session.prepare_snapshot().unwrap();
@@ -1991,7 +1992,23 @@ mod tests {
         assert_eq!(fresh.captured_at().as_micros(), 90);
 
         session.prepare_snapshot().unwrap();
+        assert_eq!(observed_rx.recv().unwrap(), "enter");
         assert_eq!(observed_rx.recv().unwrap(), "request");
+        // The preceding request produced a frame while a region move or resume
+        // was being applied. Replacing that boundary must discard its pixels.
+        frame_tx.send(captured_frame(10, 100)).unwrap();
+        session.prepare_snapshot().unwrap();
+        assert_eq!(observed_rx.recv().unwrap(), "enter");
+        assert_eq!(observed_rx.recv().unwrap(), "request");
+        assert!(matches!(
+            session.poll_frame(Duration::ZERO).unwrap(),
+            FramePoll::Pending
+        ));
+        frame_tx.send(captured_frame(11, 110)).unwrap();
+        let FramePoll::Frame(replaced) = session.poll_frame(Duration::ZERO).unwrap() else {
+            panic!("replacement boundary did not admit its fresh frame");
+        };
+        assert_eq!(replaced.sequence(), 11);
         assert!(observed_rx.try_recv().is_err());
     }
 
@@ -2000,7 +2017,6 @@ mod tests {
         let mut session = fake_session(PhysicalRect::new(0, 0, 10, 10).unwrap());
         let error = session.prepare_snapshot().unwrap_err();
         assert_eq!(error.kind(), CaptureErrorKind::InvalidRequest);
-        assert!(!session.manual_gate_active);
     }
 
     #[test]

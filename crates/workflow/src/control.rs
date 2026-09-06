@@ -60,6 +60,7 @@ pub struct RecordingController {
 pub struct RecordingControl {
     receiver: Receiver<RecordingCommand>,
     pending_snapshots: VecDeque<SnapshotCompletion>,
+    snapshot_armed: bool,
 }
 
 /// Receipt for one native frame accepted by a manual snapshot trigger.
@@ -230,6 +231,7 @@ impl RecordingController {
             RecordingControl {
                 receiver,
                 pending_snapshots: VecDeque::new(),
+                snapshot_armed: false,
             },
         )
     }
@@ -269,12 +271,13 @@ impl RecordingController {
         }
     }
 
-    /// Queues one snapshot in the same total order as pause, target, and
-    /// terminal commands.
+    /// Queues one snapshot without blocking later recording controls.
     ///
     /// Paused and non-manual sessions reject the command through its
     /// acknowledgement. Burst triggers are not coalesced: every accepted
-    /// command consumes exactly one subsequent native frame.
+    /// command consumes exactly one subsequent native frame. Pending snapshots
+    /// use the current target, wait through pauses, and are cancelled by stop
+    /// or discard. Moving the target or resuming establishes a fresh boundary.
     pub fn trigger_snapshot(&self) -> SnapshotTriggerRequest {
         let (completion, receiver) = mpsc::channel();
         if self
@@ -334,6 +337,7 @@ impl RecordingControl {
 
     pub(crate) fn complete_snapshot(&mut self, frame: &CapturedFrame, retained: bool) {
         if let Some(completion) = self.pending_snapshots.pop_front() {
+            self.snapshot_armed = false;
             completion.finish(Ok(SnapshotReceipt {
                 sequence: frame.sequence(),
                 captured_at: frame.captured_at(),
@@ -343,6 +347,7 @@ impl RecordingControl {
     }
 
     pub(crate) fn reject_pending_snapshots(&mut self, reason: &SnapshotTriggerRejection) {
+        self.snapshot_armed = false;
         for completion in self.pending_snapshots.drain(..) {
             completion.finish(Err(reason.clone()));
         }
@@ -366,7 +371,7 @@ impl RecordingControl {
             let command = match self.receiver.try_recv() {
                 Ok(command) => command,
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
-                    return Ok(outcome);
+                    break;
                 }
             };
             match command {
@@ -375,6 +380,7 @@ impl RecordingControl {
                         && session.state() == CaptureSessionState::Recording =>
                 {
                     session.pause()?;
+                    self.snapshot_armed = false;
                 }
                 RecordingCommand::Resume
                     if outcome == ControlOutcome::Continue
@@ -397,6 +403,9 @@ impl RecordingControl {
                             RecoveryHint::None,
                         )),
                     };
+                    if result.is_ok() {
+                        self.snapshot_armed = false;
+                    }
                     let _ = completion.send(result);
                 }
                 RecordingCommand::Snapshot { completion } => {
@@ -426,15 +435,7 @@ impl RecordingControl {
                         completion.finish(Err(SnapshotTriggerRejection::AllocationFailed));
                         continue;
                     }
-                    if let Err(error) = session.prepare_snapshot() {
-                        completion
-                            .finish(Err(SnapshotTriggerRejection::CaptureFailed(error.clone())));
-                        return Err(error.into());
-                    }
                     self.pending_snapshots.push_back(completion);
-                    // A snapshot is an ordering barrier. Later commands must
-                    // not overtake the frame promised to this trigger.
-                    return Ok(ControlOutcome::Continue);
                 }
                 RecordingCommand::Stop => {
                     if outcome == ControlOutcome::Continue && !session.state().is_terminal() {
@@ -457,6 +458,16 @@ impl RecordingControl {
                 }
             }
         }
+        // Only one native request may be armed at a time, but controls must
+        // keep flowing even if the source never supplies the promised frame.
+        if !self.snapshot_armed
+            && self.has_pending_snapshot()
+            && session.state() == CaptureSessionState::Recording
+        {
+            session.prepare_snapshot()?;
+            self.snapshot_armed = true;
+        }
+        Ok(outcome)
     }
 }
 

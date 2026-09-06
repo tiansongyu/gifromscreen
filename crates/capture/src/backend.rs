@@ -346,7 +346,8 @@ pub trait CaptureSession: Send {
     /// [`CaptureSession::poll_frame`] performs the actual capture. Buffered
     /// adapters should discard frames sampled before this call, without
     /// changing the public session state. This method does not itself consume
-    /// the snapshot frame.
+    /// the snapshot frame. Repeated calls replace an earlier boundary, even
+    /// when its frame has not yet arrived (for example after moving a region).
     ///
     /// # Errors
     ///

@@ -518,11 +518,7 @@ fn collect_session(
 
     let stop_reason = loop {
         ensure_not_cancelled(cancellation)?;
-        let may_apply_commands = !controlled_manual
-            || control
-                .as_ref()
-                .is_some_and(|control| !control.has_pending_snapshot());
-        if may_apply_commands && let Some(control) = control.as_deref_mut() {
+        if let Some(control) = control.as_deref_mut() {
             match control.apply_pending(session)? {
                 ControlOutcome::Continue => {}
                 ControlOutcome::Stop => break StopReason::UserStopped,
@@ -648,12 +644,10 @@ fn collect_session_to_sink(
     );
     let stop_reason = loop {
         ensure_not_cancelled(cancellation)?;
-        if !controlled_manual || !control.has_pending_snapshot() {
-            match control.apply_pending(session)? {
-                ControlOutcome::Continue => {}
-                ControlOutcome::Stop => break StopReason::UserStopped,
-                ControlOutcome::Discard => return Err(WorkflowError::Discarded),
-            }
+        match control.apply_pending(session)? {
+            ControlOutcome::Continue => {}
+            ControlOutcome::Stop => break StopReason::UserStopped,
+            ControlOutcome::Discard => return Err(WorkflowError::Discarded),
         }
         if session.state() == CaptureSessionState::Paused {
             paused_at.get_or_insert_with(Instant::now);
