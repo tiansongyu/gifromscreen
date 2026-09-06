@@ -1,6 +1,6 @@
 # Linux implementation status
 
-This file is the delivery ledger for the Linux-first implementation. A feature is marked complete only after its acceptance tests pass on the relevant backend.
+This file is the delivery ledger for the Linux-first implementation. Checked implementation items describe the stated scope, not complete ScreenToGif parity or release certification. See [the evidence-based parity audit](PARITY-AUDIT.md) for GUI/API distinctions and platform validation gaps.
 
 ## Current iteration
 
@@ -34,7 +34,8 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Cut, copy, and paste bounded frame selections with immutable-asset reuse.
 - [x] Show overflow-safe timing, selection, canvas, and asset statistics.
 - [x] Route dropped project, GIF, PNG, JPEG, BMP, and WebP paths into background jobs.
-- [x] Create, replace, remove, preview-render, and GIF-export Fade/Slide transitions.
+- [x] Create, replace, remove, and GIF-export Fade/Slide transitions.
+- [ ] Play the export-expanded Fade/Slide sequence in the editor preview.
 - [x] Create transparent or solid blank animations from a bounded desktop form.
 - [x] Import ordered static-image sequences with timing, loop, reordering, and multi-file drop controls.
 - [x] Retain, select, remove, and clear a bounded multi-entry frame clipboard history.
@@ -45,6 +46,14 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Author and remove timed line, arrow, rectangle, and ellipse overlay tracks with journal-backed undo/redo.
 - [x] Draw a bounded freehand stroke directly on the frame preview and commit it as a timed, undoable overlay track.
 - [x] Decode and author bounded raster-watermark tracks with atomic asset registration and undo/redo.
+- [x] Keep manual capture controls responsive while a source stalls; return unused PipeWire buffers.
+- [x] Retime overlays through frame insertion/deletion/duration changes with exact undo/redo.
+- [x] Apply overlays only to the actual contiguous selected spans, leaving selection gaps untouched.
+- [x] Anchor asynchronous watermark/text authoring and drawing drafts to their original project and selection.
+- [x] Author shaped multilingual text with persistent source attributes and immutable raster pixels.
+- [x] Render asynchronous thumbnails only for the visible timeline range with bounded queues and cache.
+- [x] Loop the frame preview on an accumulated clock and skip late frames without timing drift.
+- [x] Group editing controls by task and preserve the OS light/dark theme.
 
 ## Delivery gates
 
@@ -73,7 +82,8 @@ This file is the delivery ledger for the Linux-first implementation. A feature i
 - [x] Window capture and capture-only-changes.
 - [x] Manual and periodic snapshots.
 - [x] Duplicate removal, frame reduction, Yoyo, and delay scaling.
-- [ ] Text and title-frame authoring UI.
+- [x] Text-caption authoring, shaping, durable raster assets, preview, export, and undo/redo.
+- [ ] Existing-text editing and title-frame insertion.
 - [x] Raster-watermark authoring with bounded background decoding.
 - [x] Bounded free-drawing authoring on the rendered preview.
 - [x] Shape overlay authoring with bounds, stroke/fill, opacity, blend mode, and z-order.
