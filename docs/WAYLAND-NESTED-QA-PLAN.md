@@ -1,6 +1,6 @@
 # Isolated nested GNOME / Portal / PipeWire acceptance plan
 
-Status: **planned, not executed**. The 2026-09-06 investigation only inspected installed packages, help output, configuration and upstream documentation. It did not launch GNOME, PipeWire, a portal backend, a session manager or another D-Bus session. The commands below are a harness design, not an acceptance result; the proposed scripts and configuration templates do not exist yet.
+Status: **original planning snapshot**. The initial 2026-09-06 investigation was read-only. The harness has since been implemented and run; actual outcomes are recorded separately in [the native acceptance results](WAYLAND-NESTED-QA-RESULTS-2026-09-06.md). The proposal below is retained as planning evidence, not as a current statement that the scripts are absent or the tests are unexecuted.
 
 This is the next stage after the current source, native X11 checks and Linux package are frozen. First capture one dedicated test window. Only after that succeeds, test monitor capture and controller occlusion. Nested acceptance cannot replace GNOME/KDE hardware, mixed-DPI, multi-monitor or DMA-BUF acceptance.
 

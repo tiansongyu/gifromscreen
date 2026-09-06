@@ -154,6 +154,10 @@ Final explicit-stop verification found every registered child exited and no proc
 - Saved-project reopen, native source-size-change recovery, manual snapshot lifecycle and explicit scoped Discard passed; additional physical source-loss paths remain separate tests.
 - Embedded cursor provenance passed in a new normally authorized, cropped native project; the older fixtures have not been retrofitted.
 - The native pending-chooser test and complete application Cancel button path passed without a permission response; continue to preserve the no-residual-session boundary.
-- Nested monitor authorization, crop movement, real controller overlap, timed Stop and independently decoded export passed. Add clear monitor-occlusion guidance; no automatic self-exclusion is claimed.
+- Nested monitor authorization, crop movement, real controller overlap, timed Stop and independently decoded export passed. The controller now displays monitor-overlap guidance and font-independent directional buttons; a compact-control workflow remains future work. No automatic self-exclusion is claimed.
 - Teardown of all recorded labs and their extra-app helpers passed, including the explicit final stop of `rfs2o6g2`. No recorded lab is still live.
 - Physical GNOME/KDE, multiple monitors, mixed DPI, real GPU/DMA-BUF and release-environment acceptance remain separate gates.
+
+## Final controller regression checkpoint
+
+At `a9e8dae`, the workspace run passed 935 tests with six opt-in cases excluded from that default run. Rust 1.98 strict workspace/all-target/all-feature Clippy, formatting checks and Rust 1.88 workspace/all-target/all-feature checking passed. The isolated X11 input lifecycle and installed-font Chinese/Arabic shaping were run explicitly and passed; the real Portal lifecycle/cancellation evidence is recorded above. Controller-specific regressions cover missing global geometry, local viewport sizing, close/save, explicit discard, stale progress after failure, late-message handling and monitor warning rendering. These checks do not close the distinct [remaining fidelity work](NEXT-LINUX-ITERATION.md).

@@ -74,6 +74,14 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [x] Author/re-edit durable progress, key, click and cursor annotations; preserve selection gaps, original capture timing and exact cursor frame transforms.
 - [x] Persist ordered automatic editing presets; trigger only on eligible new projects, await startup settings, report task outcomes, and undo a whole chain atomically.
 - [x] Create new project directories and metadata/assets with owner-only Unix permissions; leave existing opened-file permissions unchanged.
+- [x] Persist annotation authoring scope independently of visible marks; preserve partial/gapped scopes through duration edits, insertions, deletion and undo/reopen.
+- [x] Keep raw capture metadata after mixed-pixel edits while archiving its replay association; preserve hidden overlays and provide explicit undoable confirmation for legacy recording intervals.
+- [x] Distinguish non-recorded/generated frames and prevent recorded-input holds from crossing those or baked frames.
+- [x] Fix actual Portal connection lifetime and SPA enumeration/fixated-value interoperability; verify native chooser cancellation without a permission response in an isolated GNOME session.
+- [x] Normalize window VideoCrop metadata before declaring capture dimensions; retain source-local origins and embedded-cursor policy through the crop adapter.
+- [x] Use local viewport dimensions on Wayland, surface preparation errors, and render dedicated recorder controls without requiring global window positions or hide/unhide support.
+- [x] Stop and save on recorder-window close, retain explicit Discard, and clear stale live progress after recording failures.
+- [x] Complete isolated GNOME window/monitor recording, pause/movement, manual snapshots, cancellation, GIF export, size-change recovery, discard and close/save acceptance; physical desktop gates remain open.
 - [x] Save an independently identified project copy without switching the current editor, and retain a bounded recent-project list.
 - [x] Build and verify an Ubuntu-22-compatible x86_64 portable tarball with exact-file installation, checksums, license notices, and CI artifacts.
 
@@ -82,14 +90,15 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 ### S0 — architecture validation
 
 - [x] X11 real screen/region capture through GetImage.
-- [ ] GNOME Wayland Portal + PipeWire capture.
+- [x] GNOME Wayland Portal + PipeWire native protocol capture on nested GNOME 42.9 with software rendering.
+- [ ] GNOME hardware-rendered capture and physical display acceptance.
 - [ ] KDE Wayland Portal + PipeWire capture.
 - [x] Bounded queue and dropped-frame timing compensation.
 - [ ] Long-recording frame-store benchmark.
 - [x] Initial GIF timing, loop, transparency, delta and disposal round-trip corpus.
 - [x] 50,000-frame virtualized timeline prototype.
 
-The next reproducible compositor check is the [isolated nested GNOME plan](WAYLAND-NESTED-QA-PLAN.md). It is not yet executed and cannot replace the physical GNOME/KDE gates above.
+The [isolated nested GNOME plan](WAYLAND-NESTED-QA-PLAN.md) has been executed; see the [native results](WAYLAND-NESTED-QA-RESULTS-2026-09-06.md). Those results do not replace physical GNOME/KDE, hardware-rendering or mixed-display gates.
 
 ### M1 — usable alpha
 
@@ -105,6 +114,7 @@ The next reproducible compositor check is the [isolated nested GNOME plan](WAYLA
 
 - [x] Window capture and capture-only-changes.
 - [x] Manual and periodic snapshots.
+- [ ] Independent fixed GIF playback delay for manual/periodic capture, matching upstream's timing controls (see [next fidelity work](NEXT-LINUX-ITERATION.md)).
 - [x] Duplicate removal, frame reduction, Yoyo, and delay scaling.
 - [x] Text-caption authoring, shaping, durable raster assets, preview, export, and undo/redo.
 - [x] Existing-text editing and title-frame insertion.
