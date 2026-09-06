@@ -36,6 +36,7 @@ mod thumbnail_cache;
 mod video_import_ui;
 mod watermark_decode_job;
 mod watermark_ui;
+mod wayland_controller_layout;
 #[cfg(test)]
 #[path = "wayland_controller_tests.rs"]
 mod wayland_controller_tests;
@@ -695,7 +696,17 @@ struct MainWindowSnapshot {
     position: Option<egui::Pos2>,
     size: egui::Vec2,
     maximized: Option<bool>,
-    restore_geometry: bool,
+    restore: MainWindowRestore,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MainWindowRestore {
+    X11Geometry,
+    Wayland {
+        pending: Option<wayland_controller_layout::GeometryTransition>,
+        restoring: bool,
+        zoom_factor: f32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -966,6 +977,57 @@ impl eframe::App for GifFromScreenApp {
 
 impl GifFromScreenApp {
     fn restore_main_window_if_requested(&mut self, context: &egui::Context) {
+        if let Some(snapshot) = &mut self.main_window_snapshot
+            && let MainWindowRestore::Wayland {
+                pending,
+                restoring,
+                zoom_factor,
+            } = &mut snapshot.restore
+        {
+            let now = Instant::now();
+            if self.restore_main_window && !*restoring {
+                // Replace an unfinished compact request before processing any
+                // more geometry, so a late acknowledgement cannot shrink the editor.
+                *pending = Some(wayland_controller_layout::GeometryTransition::restore(
+                    snapshot.size * *zoom_factor,
+                    snapshot.maximized,
+                    now,
+                ));
+                *restoring = true;
+                context.send_viewport_cmd(egui::ViewportCommand::Title(APP_NAME.to_owned()));
+            }
+            if let Some(transition) = pending {
+                let current_zoom = context.zoom_factor();
+                let (size, maximized) = context.input(|input| {
+                    (
+                        input.screen_rect.size() * current_zoom,
+                        input.viewport().maximized,
+                    )
+                });
+                let update = transition.advance(size, maximized, current_zoom, now);
+                for command in update.commands {
+                    context.send_viewport_cmd(command);
+                }
+                if update.timed_out {
+                    let warning = "The compositor did not confirm the requested window size or maximized state. Adjust or restore it manually; the app remains usable.";
+                    self.notice = Some(self.notice.take().map_or_else(
+                        || warning.to_owned(),
+                        |notice| format!("{notice} {warning}"),
+                    ));
+                }
+                if update.finished {
+                    *pending = None;
+                }
+            }
+            if pending.is_some() {
+                context.request_repaint_after(Duration::from_millis(16));
+            } else if self.restore_main_window {
+                self.main_window_snapshot = None;
+                self.restore_main_window = false;
+                context.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+            return;
+        }
         if !self.restore_main_window {
             return;
         }
@@ -973,7 +1035,7 @@ impl GifFromScreenApp {
         if let Some(snapshot) = self
             .main_window_snapshot
             .take()
-            .filter(|snapshot| snapshot.restore_geometry)
+            .filter(|snapshot| matches!(snapshot.restore, MainWindowRestore::X11Geometry))
         {
             context.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
             context.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
@@ -2215,7 +2277,7 @@ impl GifFromScreenApp {
                     position: Some(viewport.outer_rect?.min),
                     size: viewport.inner_rect?.size(),
                     maximized: viewport.maximized,
-                    restore_geometry: true,
+                    restore: MainWindowRestore::X11Geometry,
                 })
             })
             .ok_or_else(|| "Could not read the main window geometry.".to_owned())?;
@@ -2886,11 +2948,24 @@ impl GifFromScreenApp {
     }
 
     fn enter_wayland_crop_controller(&mut self, context: &egui::Context) -> Result<(), String> {
-        let snapshot = wayland_window_snapshot(context);
+        let mut snapshot = wayland_window_snapshot(context);
         let preview = self
             .wayland_frozen_preview
             .take()
             .ok_or_else(|| "The frozen Wayland preview is no longer available.".to_owned())?;
+        if let Some(previous) = self.main_window_snapshot
+            && let MainWindowRestore::Wayland {
+                restoring: true,
+                zoom_factor: original_zoom,
+                ..
+            } = previous.restore
+        {
+            snapshot.size = previous.size;
+            snapshot.maximized = previous.maximized;
+            if let MainWindowRestore::Wayland { zoom_factor, .. } = &mut snapshot.restore {
+                *zoom_factor = original_zoom;
+            }
+        }
         self.wayland_crop_controller = Some(WaylandCropController {
             texture: preview.texture,
             source_size: preview.source_size,
@@ -2900,6 +2975,7 @@ impl GifFromScreenApp {
             drag_initial_region: None,
         });
         self.main_window_snapshot = Some(snapshot);
+        self.restore_main_window = false;
         trace_wayland_controller("controller state installed");
         self.notice = Some(
             "Recorder controls are active in this window; other pages are hidden. The preview rectangle controls source-local cropping, not a physical desktop frame."
@@ -2910,6 +2986,7 @@ impl GifFromScreenApp {
         context.send_viewport_cmd(egui::ViewportCommand::Title(
             "GifFromScreen — Recorder".to_owned(),
         ));
+        self.restore_main_window_if_requested(context);
         context.request_repaint();
         Ok(())
     }
@@ -4115,13 +4192,21 @@ fn trace_wayland_controller(marker: &'static str) {
 }
 
 fn wayland_window_snapshot(context: &egui::Context) -> MainWindowSnapshot {
+    let zoom_factor = context.zoom_factor();
     context.input(|input| MainWindowSnapshot {
-        position: input.viewport().outer_rect.map(|rect| rect.min),
+        position: None,
         // ViewportInfo.inner_rect requires a desktop position, unavailable on
         // Wayland. InputState.screen_rect is the local drawable extent instead.
         size: input.screen_rect.size(),
         maximized: input.viewport().maximized,
-        restore_geometry: false,
+        restore: MainWindowRestore::Wayland {
+            pending: Some(wayland_controller_layout::GeometryTransition::compact(
+                input.screen_rect.size() * zoom_factor,
+                Instant::now(),
+            )),
+            restoring: false,
+            zoom_factor,
+        },
     })
 }
 
@@ -4132,77 +4217,133 @@ fn draw_wayland_controller_toolbar(
     controller: &mut WaylandCropController,
     manual_snapshots: bool,
 ) -> RecorderOverlayAction {
+    let available = context.available_rect().size();
+    let margin = 16.0;
+    let content_width =
+        (available.x - margin - context.style().spacing.scroll.allocated_width()).max(1.0);
+    // A disabled, invisible sizing pass follows the actual font metrics and
+    // wrapped rows; it cannot trigger buttons or move the source region.
+    let mut measuring = egui::Ui::new(
+        context.clone(),
+        egui::Id::new("wayland-toolbar-measure"),
+        egui::UiBuilder::new()
+            .max_rect(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(content_width, f32::INFINITY),
+            ))
+            .invisible()
+            .sizing_pass(),
+    );
+    let _ = draw_wayland_toolbar_contents(
+        &mut measuring,
+        stage,
+        progress,
+        controller,
+        manual_snapshots,
+    );
+    let height = (measuring.min_size().y + margin).min((available.y - 32.0).max(1.0));
     let mut action = RecorderOverlayAction::None;
     egui::TopBottomPanel::bottom("wayland_crop_controls")
-        .exact_height(92.0)
+        .exact_height(height)
         .frame(
             egui::Frame::new()
                 .fill(egui::Color32::from_rgb(28, 30, 34))
                 .inner_margin(8),
         )
         .show(context, |ui| {
-            ui.horizontal(|ui| {
-                ui.strong(format!(
-                    "Crop {}×{} at {},{}",
-                    controller.region.size().width(),
-                    controller.region.size().height(),
-                    controller.region.origin().x,
-                    controller.region.origin().y
-                ));
-                show_wayland_crop_nudges(ui, controller);
-            });
-            ui.horizontal(|ui| match stage {
-                RecorderStage::Ready => {
-                    ui.label("Drag a new rectangle to resize before recording.");
-                    if ui.button("Start").clicked() {
-                        action = RecorderOverlayAction::Start;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        action = RecorderOverlayAction::Close;
-                    }
-                }
-                RecorderStage::Countdown(remaining) => {
-                    ui.strong(format!("Recording starts in {remaining}s"));
-                    if ui.button("Cancel countdown").clicked() {
-                        action = RecorderOverlayAction::CancelCountdown;
-                    }
-                }
-                RecorderStage::Recording => {
-                    show_overlay_progress(ui, progress);
-                    if manual_snapshots && ui.button("Take snapshot").clicked() {
-                        action = RecorderOverlayAction::Snapshot;
-                    }
-                    if ui.button("Pause").clicked() {
-                        action = RecorderOverlayAction::Pause;
-                    }
-                    if ui.button("Stop").clicked() {
-                        action = RecorderOverlayAction::Stop;
-                    }
-                    if ui.button("Discard").clicked() {
-                        action = RecorderOverlayAction::Discard;
-                    }
-                }
-                RecorderStage::Paused => {
-                    ui.label("Paused");
-                    if ui.button("Resume").clicked() {
-                        action = RecorderOverlayAction::Resume;
-                    }
-                    if ui.button("Stop").clicked() {
-                        action = RecorderOverlayAction::Stop;
-                    }
-                    if ui.button("Discard").clicked() {
-                        action = RecorderOverlayAction::Discard;
-                    }
-                }
-                RecorderStage::Finalizing => {
-                    ui.spinner();
-                    ui.label("Finalizing recoverable project…");
-                    if ui.button("Cancel").clicked() {
-                        action = RecorderOverlayAction::Discard;
-                    }
-                }
-            });
+            egui::ScrollArea::vertical()
+                .id_salt("wayland-toolbar-scroll")
+                .auto_shrink([false, false])
+                .max_height((height - margin).max(1.0))
+                .show(ui, |ui| {
+                    action = draw_wayland_toolbar_contents(
+                        ui,
+                        stage,
+                        progress,
+                        controller,
+                        manual_snapshots,
+                    );
+                });
         });
+    action
+}
+
+fn draw_wayland_toolbar_contents(
+    ui: &mut egui::Ui,
+    stage: RecorderStage,
+    progress: Option<WorkflowProgress>,
+    controller: &mut WaylandCropController,
+    manual_snapshots: bool,
+) -> RecorderOverlayAction {
+    let mut action = RecorderOverlayAction::None;
+    ui.horizontal_wrapped(|ui| match stage {
+        RecorderStage::Ready => {
+            if ui.button("Start").clicked() {
+                action = RecorderOverlayAction::Start;
+            }
+            if ui.button("Cancel").clicked() {
+                action = RecorderOverlayAction::Close;
+            }
+        }
+        RecorderStage::Countdown(remaining) => {
+            if ui.button("Cancel countdown").clicked() {
+                action = RecorderOverlayAction::CancelCountdown;
+            }
+            ui.strong(format!("Recording starts in {remaining}s"));
+        }
+        RecorderStage::Recording => {
+            if manual_snapshots && ui.button("Take snapshot").clicked() {
+                action = RecorderOverlayAction::Snapshot;
+            }
+            if ui.button("Pause").clicked() {
+                action = RecorderOverlayAction::Pause;
+            }
+            if ui.button("Stop").clicked() {
+                action = RecorderOverlayAction::Stop;
+            }
+            if ui.button("Discard").clicked() {
+                action = RecorderOverlayAction::Discard;
+            }
+        }
+        RecorderStage::Paused => {
+            if ui.button("Resume").clicked() {
+                action = RecorderOverlayAction::Resume;
+            }
+            if ui.button("Stop").clicked() {
+                action = RecorderOverlayAction::Stop;
+            }
+            if ui.button("Discard").clicked() {
+                action = RecorderOverlayAction::Discard;
+            }
+        }
+        RecorderStage::Finalizing => {
+            if ui.button("Cancel").clicked() {
+                action = RecorderOverlayAction::Discard;
+            }
+            ui.spinner();
+            ui.label("Finalizing recoverable project…");
+        }
+    });
+    match stage {
+        RecorderStage::Ready => {
+            ui.weak("Drag the preview to resize before recording.");
+        }
+        RecorderStage::Recording => show_overlay_progress(ui, progress),
+        RecorderStage::Paused => {
+            ui.label("Paused");
+        }
+        RecorderStage::Countdown(_) | RecorderStage::Finalizing => {}
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.strong(format!(
+            "Crop {}×{} at {},{}",
+            controller.region.size().width(),
+            controller.region.size().height(),
+            controller.region.origin().x,
+            controller.region.origin().y
+        ));
+        show_wayland_crop_nudges(ui, controller);
+    });
     action
 }
 

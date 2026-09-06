@@ -17,6 +17,501 @@ fn controller(context: &egui::Context) -> WaylandCropController {
     }
 }
 
+fn geometry_input(size: egui::Vec2, maximized: Option<bool>) -> egui::RawInput {
+    let mut input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+        ..egui::RawInput::default()
+    };
+    input
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .maximized = maximized;
+    input
+}
+
+fn geometry_frame(
+    context: &egui::Context,
+    app: &mut GifFromScreenApp,
+    size: egui::Vec2,
+    maximized: Option<bool>,
+) -> Vec<egui::ViewportCommand> {
+    context
+        .run(geometry_input(size, maximized), |context| {
+            app.restore_main_window_if_requested(context);
+        })
+        .viewport_output[&egui::ViewportId::ROOT]
+        .commands
+        .clone()
+}
+
+#[test]
+fn compact_geometry_is_bounded_and_waits_for_the_unmaximize_configuration() {
+    use super::wayland_controller_layout::{GeometryTransition, compact_size};
+    for (available, expected) in [
+        (egui::vec2(1280.0, 720.0), egui::vec2(720.0, 480.0)),
+        (egui::vec2(640.0, 360.0), egui::vec2(640.0, 360.0)),
+        (egui::vec2(280.0, 200.0), egui::vec2(280.0, 200.0)),
+    ] {
+        assert_eq!(compact_size(available), expected);
+    }
+    let now = Instant::now();
+    let original = egui::vec2(1280.0, 720.0);
+    let compact = egui::vec2(720.0, 480.0);
+    let mut transition = GeometryTransition::compact(original, now);
+    let first = transition.advance(original, Some(true), 1.0, now);
+    assert_eq!(
+        first.commands,
+        [
+            egui::ViewportCommand::MinInnerSize(egui::vec2(320.0, 240.0)),
+            egui::ViewportCommand::Maximized(false)
+        ]
+    );
+    assert!(!first.finished);
+    assert!(
+        transition
+            .advance(original, Some(true), 1.0, now + Duration::from_millis(10))
+            .commands
+            .is_empty()
+    );
+    let resize = transition.advance(original, Some(false), 1.0, now + Duration::from_millis(20));
+    assert_eq!(resize.commands, [egui::ViewportCommand::InnerSize(compact)]);
+    assert!(!resize.finished);
+    let acknowledged =
+        transition.advance(compact, Some(false), 1.0, now + Duration::from_millis(30));
+    assert!(acknowledged.finished && !acknowledged.timed_out);
+    assert!(acknowledged.commands.is_empty());
+}
+
+#[test]
+fn pending_geometry_uses_stable_native_logical_units_across_ui_zoom_changes() {
+    use super::wayland_controller_layout::GeometryTransition;
+    let now = Instant::now();
+    let original = egui::vec2(1040.0, 760.0);
+    let compact = egui::vec2(720.0, 480.0);
+    let mut entry = GeometryTransition::compact(original, now);
+    let first = entry.advance(original, Some(true), 2.0, now);
+    assert!(
+        first
+            .commands
+            .contains(&egui::ViewportCommand::MinInnerSize(egui::vec2(
+                160.0, 120.0
+            )))
+    );
+    let resized = entry.advance(original, Some(false), 1.5, now + Duration::from_millis(10));
+    assert_eq!(
+        resized.commands,
+        [egui::ViewportCommand::InnerSize(compact / 1.5)]
+    );
+    assert!(
+        entry
+            .advance(compact, Some(false), 0.75, now + Duration::from_millis(20))
+            .finished
+    );
+    let mut restore = GeometryTransition::restore(original, Some(false), now);
+    assert!(
+        restore
+            .advance(compact, Some(false), 2.0, now)
+            .commands
+            .contains(&egui::ViewportCommand::InnerSize(original / 2.0))
+    );
+    assert!(
+        restore
+            .advance(original, Some(false), 1.25, now + Duration::from_millis(10))
+            .finished
+    );
+}
+
+#[test]
+fn restoring_a_zoomed_snapshot_does_not_multiply_in_monitor_dpi() {
+    let context = egui::Context::default();
+    let mut app = GifFromScreenApp::default();
+    app.main_window_snapshot = Some(MainWindowSnapshot {
+        position: None,
+        size: egui::vec2(520.0, 380.0),
+        maximized: Some(false),
+        restore: MainWindowRestore::Wayland {
+            pending: None,
+            restoring: false,
+            zoom_factor: 2.0,
+        },
+    });
+    app.restore_main_window = true;
+    let mut input = geometry_input(egui::vec2(720.0, 480.0), Some(false));
+    input
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .native_pixels_per_point = Some(3.0);
+    let output = context.run(input, |context| {
+        assert!((context.zoom_factor() - 1.0).abs() < f32::EPSILON);
+        app.restore_main_window_if_requested(context);
+    });
+    assert!(
+        output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::InnerSize(egui::vec2(1040.0, 760.0)))
+    );
+}
+
+#[test]
+fn compact_timeout_is_visible_nonblocking_and_does_not_repeat_window_requests() {
+    let context = egui::Context::default();
+    let mut app = GifFromScreenApp::default();
+    let size = egui::vec2(1280.0, 720.0);
+    app.wayland_crop_controller = Some(controller(&context));
+    app.notice = Some("Existing recording status.".to_owned());
+    app.main_window_snapshot = Some(MainWindowSnapshot {
+        position: None,
+        size,
+        maximized: Some(true),
+        restore: MainWindowRestore::Wayland {
+            pending: Some(wayland_controller_layout::GeometryTransition::compact(
+                size,
+                Instant::now().checked_sub(Duration::from_secs(3)).unwrap(),
+            )),
+            restoring: false,
+            zoom_factor: 1.0,
+        },
+    });
+    let _ = geometry_frame(&context, &mut app, size, Some(true));
+    let notice = app.notice.as_deref().unwrap();
+    assert!(notice.contains("Existing recording status."));
+    assert!(notice.contains("did not confirm") && notice.contains("manually"));
+    assert!(app.wayland_crop_controller.is_some());
+    assert!(matches!(
+        app.main_window_snapshot.unwrap().restore,
+        MainWindowRestore::Wayland { pending: None, .. }
+    ));
+    assert!(geometry_frame(&context, &mut app, size, Some(true)).is_empty());
+}
+
+#[test]
+fn restoration_timeout_releases_the_pending_request_without_blocking_the_editor() {
+    let context = egui::Context::default();
+    let mut app = GifFromScreenApp::default();
+    let original = egui::vec2(1040.0, 760.0);
+    let compact = egui::vec2(720.0, 480.0);
+    app.view = AppView::Editor;
+    app.restore_main_window = true;
+    app.main_window_snapshot = Some(MainWindowSnapshot {
+        position: None,
+        size: original,
+        maximized: Some(true),
+        restore: MainWindowRestore::Wayland {
+            pending: Some(wayland_controller_layout::GeometryTransition::restore(
+                original,
+                Some(true),
+                Instant::now().checked_sub(Duration::from_secs(3)).unwrap(),
+            )),
+            restoring: true,
+            zoom_factor: 1.0,
+        },
+    });
+    let commands = geometry_frame(&context, &mut app, compact, Some(false));
+    assert!(commands.contains(&egui::ViewportCommand::Maximized(true)));
+    assert_eq!(app.view, AppView::Editor);
+    assert!(!app.restore_main_window && app.main_window_snapshot.is_none());
+    assert!(app.notice.as_deref().unwrap().contains("did not confirm"));
+    assert!(geometry_frame(&context, &mut app, compact, Some(false)).is_empty());
+}
+
+#[test]
+fn exiting_at_each_compact_phase_restores_original_geometry_without_late_shrink() {
+    for acknowledged_frames in 0..=2 {
+        for maximized in [Some(true), Some(false), None] {
+            check_exit_during_compact(acknowledged_frames, maximized);
+        }
+    }
+}
+
+fn check_exit_during_compact(acknowledged_frames: u8, maximized: Option<bool>) {
+    let original = egui::vec2(1040.0, 760.0);
+    let compact = egui::vec2(720.0, 480.0);
+    let (context, mut app) = preparation_fixture(1.0);
+    let _ = context.run(geometry_input(original, maximized), |context| {
+        app.enter_wayland_crop_controller(context).unwrap();
+    });
+    if acknowledged_frames >= 1 {
+        let _ = geometry_frame(&context, &mut app, original, Some(false));
+    }
+    if acknowledged_frames >= 2 {
+        let _ = geometry_frame(&context, &mut app, compact, Some(false));
+    }
+    app.close_wayland_crop_controller();
+    let first = geometry_frame(&context, &mut app, compact, Some(false));
+    assert!(first.contains(&egui::ViewportCommand::InnerSize(original)));
+    assert!(!first.iter().any(
+        |command| matches!(command, egui::ViewportCommand::InnerSize(size) if *size == compact)
+    ));
+    // Repeat an exit while restoration is pending, followed by a late compact
+    // configure. It must not restart the old transition or reset its deadline.
+    app.close_wayland_crop_controller();
+    assert!(geometry_frame(&context, &mut app, compact, Some(false)).is_empty());
+    assert!(app.restore_main_window);
+    let acknowledged = geometry_frame(&context, &mut app, original, Some(false));
+    if maximized == Some(true) {
+        assert!(acknowledged.contains(&egui::ViewportCommand::Maximized(true)));
+        assert!(app.restore_main_window);
+        let _ = geometry_frame(&context, &mut app, original, Some(true));
+    }
+    assert!(!app.restore_main_window);
+    assert!(app.main_window_snapshot.is_none());
+    assert!(geometry_frame(&context, &mut app, original, maximized).is_empty());
+    assert!(first.iter().all(|command| !matches!(
+        command,
+        egui::ViewportCommand::Visible(_) | egui::ViewportCommand::OuterPosition(_)
+    )));
+}
+
+#[test]
+fn completed_compact_transition_does_not_override_manual_window_resizing() {
+    let original = egui::vec2(1040.0, 760.0);
+    let compact = egui::vec2(720.0, 480.0);
+    let (context, mut app) = preparation_fixture(1.0);
+    let _ = context.run(geometry_input(original, Some(false)), |context| {
+        app.enter_wayland_crop_controller(context).unwrap();
+    });
+    let _ = geometry_frame(&context, &mut app, compact, Some(false));
+    assert!(geometry_frame(&context, &mut app, egui::vec2(530.0, 350.0), Some(false)).is_empty());
+}
+
+#[test]
+fn a_new_controller_during_restoration_keeps_the_original_launcher_snapshot() {
+    let original = egui::vec2(1040.0, 760.0);
+    let compact = egui::vec2(720.0, 480.0);
+    let (context, mut app) = preparation_fixture(1.0);
+    let _ = context.run(geometry_input(original, Some(true)), |context| {
+        app.enter_wayland_crop_controller(context).unwrap();
+    });
+    app.close_wayland_crop_controller();
+    let _ = geometry_frame(&context, &mut app, compact, Some(false));
+    let (_, mut next) = preparation_fixture(1.0);
+    app.wayland_frozen_preview = next.wayland_frozen_preview.take();
+    let _ = context.run(geometry_input(compact, Some(false)), |context| {
+        app.enter_wayland_crop_controller(context).unwrap();
+    });
+    let snapshot = app.main_window_snapshot.unwrap();
+    assert_eq!(snapshot.size, original);
+    assert_eq!(snapshot.maximized, Some(true));
+    assert!(!app.restore_main_window);
+    assert!(matches!(
+        snapshot.restore,
+        MainWindowRestore::Wayland {
+            restoring: false,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn x11_shell_restoration_keeps_its_existing_position_and_decoration_commands() {
+    let context = egui::Context::default();
+    let mut app = GifFromScreenApp::default();
+    let original = egui::vec2(960.0, 640.0);
+    let position = egui::pos2(17.0, 23.0);
+    app.main_window_snapshot = Some(MainWindowSnapshot {
+        position: Some(position),
+        size: original,
+        maximized: Some(true),
+        restore: MainWindowRestore::X11Geometry,
+    });
+    app.restore_main_window = true;
+    assert_eq!(
+        geometry_frame(&context, &mut app, egui::vec2(720.0, 480.0), Some(false)),
+        [
+            egui::ViewportCommand::Title(APP_NAME.to_owned()),
+            egui::ViewportCommand::Decorations(true),
+            egui::ViewportCommand::MinInnerSize(egui::vec2(680.0, 440.0)),
+            egui::ViewportCommand::InnerSize(original),
+            egui::ViewportCommand::Maximized(true),
+            egui::ViewportCommand::OuterPosition(position),
+            egui::ViewportCommand::Focus,
+        ]
+    );
+    assert!(!app.restore_main_window && app.main_window_snapshot.is_none());
+}
+
+fn toolbar_frame(
+    context: &egui::Context,
+    controller: &mut WaylandCropController,
+    stage: RecorderStage,
+    size: egui::Vec2,
+    events: Vec<egui::Event>,
+) -> (egui::FullOutput, RecorderOverlayAction) {
+    let mut action = RecorderOverlayAction::None;
+    let mut input = geometry_input(size, Some(false));
+    input.events = events;
+    let output = context.run(input, |context| {
+        action = draw_wayland_crop_controller(
+            context,
+            stage,
+            Some(WorkflowProgress {
+                phase: WorkflowPhase::Capturing,
+                frames_captured: 7,
+                capture_duration: Duration::from_secs(30),
+                playback_duration: Duration::from_millis(700),
+                encode: None,
+            }),
+            controller,
+            true,
+            None,
+            false,
+        )
+        .action;
+    });
+    (output, action)
+}
+
+#[test]
+fn compact_controller_buttons_remain_visible_and_clickable_with_wrapped_large_fonts() {
+    for size in [
+        egui::vec2(720.0, 480.0),
+        egui::vec2(480.0, 360.0),
+        egui::vec2(320.0, 240.0),
+    ] {
+        for font_scale in [1.0, 2.0] {
+            for (stage, label, action) in [
+                (RecorderStage::Ready, "Start", RecorderOverlayAction::Start),
+                (RecorderStage::Ready, "Cancel", RecorderOverlayAction::Close),
+                (
+                    RecorderStage::Countdown(3),
+                    "Cancel countdown",
+                    RecorderOverlayAction::CancelCountdown,
+                ),
+                (
+                    RecorderStage::Recording,
+                    "Take snapshot",
+                    RecorderOverlayAction::Snapshot,
+                ),
+                (
+                    RecorderStage::Recording,
+                    "Pause",
+                    RecorderOverlayAction::Pause,
+                ),
+                (
+                    RecorderStage::Recording,
+                    "Stop",
+                    RecorderOverlayAction::Stop,
+                ),
+                (
+                    RecorderStage::Recording,
+                    "Discard",
+                    RecorderOverlayAction::Discard,
+                ),
+                (
+                    RecorderStage::Paused,
+                    "Resume",
+                    RecorderOverlayAction::Resume,
+                ),
+                (RecorderStage::Paused, "Stop", RecorderOverlayAction::Stop),
+                (
+                    RecorderStage::Paused,
+                    "Discard",
+                    RecorderOverlayAction::Discard,
+                ),
+                (
+                    RecorderStage::Finalizing,
+                    "Cancel",
+                    RecorderOverlayAction::Discard,
+                ),
+            ] {
+                check_compact_toolbar_hit(size, font_scale, stage, label, action);
+            }
+        }
+    }
+}
+
+fn check_compact_toolbar_hit(
+    size: egui::Vec2,
+    font_scale: f32,
+    stage: RecorderStage,
+    label: &str,
+    expected: RecorderOverlayAction,
+) {
+    check_compact_toolbar_hit_with_zoom(size, font_scale, 1.0, stage, label, expected);
+}
+
+#[test]
+fn compact_toolbar_hit_targets_fit_the_same_native_budget_after_ui_zoom() {
+    for size in [egui::vec2(720.0, 480.0), egui::vec2(320.0, 240.0)] {
+        for zoom in [1.25, 2.0] {
+            for (label, action) in [
+                ("Take snapshot", RecorderOverlayAction::Snapshot),
+                ("Pause", RecorderOverlayAction::Pause),
+                ("Stop", RecorderOverlayAction::Stop),
+                ("Discard", RecorderOverlayAction::Discard),
+            ] {
+                check_compact_toolbar_hit_with_zoom(
+                    size,
+                    1.0,
+                    zoom,
+                    RecorderStage::Recording,
+                    label,
+                    action,
+                );
+            }
+        }
+    }
+}
+
+fn check_compact_toolbar_hit_with_zoom(
+    native_size: egui::Vec2,
+    font_scale: f32,
+    zoom: f32,
+    stage: RecorderStage,
+    label: &str,
+    expected: RecorderOverlayAction,
+) {
+    let context = egui::Context::default();
+    context.set_zoom_factor(zoom);
+    let size = native_size / zoom;
+    let _ = context.run(geometry_input(size, Some(false)), |_| {});
+    context.style_mut(|style| {
+        for font in style.text_styles.values_mut() {
+            font.size *= font_scale;
+        }
+    });
+    let mut controller = controller(&context);
+    let original_region = controller.region;
+    let _ = toolbar_frame(&context, &mut controller, stage, size, Vec::new());
+    let (output, _) = toolbar_frame(&context, &mut controller, stage, size, Vec::new());
+    let (text, clip) = preparation_text_rect(&output, label);
+    let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+    assert!(
+        viewport.contains_rect(text) && clip.contains_rect(text),
+        "{label} clipped at {size:?}, font {font_scale}: text {text:?}, clip {clip:?}"
+    );
+    let pos = text.center();
+    let mut clicked_action = RecorderOverlayAction::None;
+    for pressed in [true, false] {
+        clicked_action = toolbar_frame(
+            &context,
+            &mut controller,
+            stage,
+            size,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        )
+        .1;
+    }
+    assert_eq!(
+        clicked_action, expected,
+        "{label} must receive its click at {size:?}, font {font_scale}"
+    );
+    assert_eq!(
+        controller.region, original_region,
+        "the invisible sizing pass must not move the capture area"
+    );
+}
+
 fn preparation_fixture(font_scale: f32) -> (egui::Context, GifFromScreenApp) {
     let context = egui::Context::default();
     context.style_mut(|style| {
@@ -336,16 +831,22 @@ fn wayland_handoff_accepts_local_extent_when_desktop_window_positions_are_privat
     let snapshot = app.main_window_snapshot.as_ref().unwrap();
     assert_eq!(snapshot.size, egui::vec2(960.0, 640.0));
     assert!(snapshot.position.is_none());
-    assert!(!snapshot.restore_geometry);
+    assert!(matches!(
+        snapshot.restore,
+        MainWindowRestore::Wayland {
+            restoring: false,
+            ..
+        }
+    ));
+    let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+    assert!(commands.contains(&egui::ViewportCommand::InnerSize(egui::vec2(720.0, 480.0))));
     assert!(
         output.viewport_output[&egui::ViewportId::ROOT]
             .commands
             .iter()
             .all(|command| !matches!(
                 command,
-                egui::ViewportCommand::Visible(_)
-                    | egui::ViewportCommand::InnerSize(_)
-                    | egui::ViewportCommand::Maximized(_)
+                egui::ViewportCommand::Visible(_) | egui::ViewportCommand::OuterPosition(_)
             ))
     );
 }
@@ -425,7 +926,11 @@ fn wayland_controller_renders_only_the_root_surface_and_close_restores_the_shell
             position: None,
             size: egui::vec2(1040.0, 760.0),
             maximized: Some(true),
-            restore_geometry: false,
+            restore: MainWindowRestore::Wayland {
+                pending: None,
+                restoring: false,
+                zoom_factor: 1.0,
+            },
         });
         let output = context.run(egui::RawInput::default(), |context| {
             app.show_wayland_crop_controller(context);
@@ -457,12 +962,22 @@ fn wayland_controller_renders_only_the_root_surface_and_close_restores_the_shell
         assert!(commands.contains(&egui::ViewportCommand::Title(APP_NAME.to_owned())));
         assert!(!commands.iter().any(|command| matches!(
             command,
-            egui::ViewportCommand::Visible(_)
-                | egui::ViewportCommand::OuterPosition(_)
-                | egui::ViewportCommand::InnerSize(_)
-                | egui::ViewportCommand::MinInnerSize(_)
-                | egui::ViewportCommand::Maximized(_)
+            egui::ViewportCommand::Visible(_) | egui::ViewportCommand::OuterPosition(_)
         )));
+        assert!(commands.contains(&egui::ViewportCommand::InnerSize(egui::vec2(1040.0, 760.0))));
+        let input = geometry_input(egui::vec2(1040.0, 760.0), Some(false));
+        let output = context.run(input, |context| {
+            app.restore_main_window_if_requested(context);
+        });
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Maximized(true))
+        );
+        let _ = context.run(
+            geometry_input(egui::vec2(1040.0, 760.0), Some(true)),
+            |context| app.restore_main_window_if_requested(context),
+        );
         assert!(!app.restore_main_window);
     })
     .join()
