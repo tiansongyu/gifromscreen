@@ -82,6 +82,9 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [x] Use local viewport dimensions on Wayland, surface preparation errors, and render dedicated recorder controls without requiring global window positions or hide/unhide support.
 - [x] Stop and save on recorder-window close, retain explicit Discard, and clear stale live progress after recording failures.
 - [x] Complete isolated GNOME window/monitor recording, pause/movement, manual snapshots, cancellation, GIF export, size-change recovery, discard and close/save acceptance; physical desktop gates remain open.
+- [x] Separate fixed GIF playback delays from native sampling cadence; verify manual and periodic timing, changed-only omission, cumulative GIF quantization and recovery without rewriting source timestamps.
+- [x] Persist independent capture clocks through pause, movement, copy and insertion; require separate legacy clock confirmation and reject invalid clocks before fast journal append.
+- [x] Keep Wayland preparation actions accessible on small windows and enlarged fonts; explain monitor self-capture and hidden-window redraw limitations.
 - [x] Save an independently identified project copy without switching the current editor, and retain a bounded recent-project list.
 - [x] Build and verify an Ubuntu-22-compatible x86_64 portable tarball with exact-file installation, checksums, license notices, and CI artifacts.
 

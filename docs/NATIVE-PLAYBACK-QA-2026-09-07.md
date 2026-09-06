@@ -6,6 +6,8 @@ This is bounded acceptance evidence for capture/playback separation, not a compl
 
 The repository's `scripts/qa/wayland_nested.py` created `/tmp/gfs-wayland-qa.f4lssjb6`: owned Xvfb `:99`, nested GNOME, a private session bus, private PipeWire/media-session, the real desktop/ GNOME Portal, and the repository's animated GTK fixture. The supervisor was 791523 with start ticks 152564143. The lifetime was bounded to 2400 seconds. The normal system chooser was used to authorize the fixture window; no Portal permission responses were fabricated. Host desktop/audio/input services were not replaced.
 
+After acceptance, both extra-app supervisors reported normal application exits. Explicit lab stop returned `LAB_EXIT ... status=0`; the final status is `stopped`, reason `lab stop requested`, with `cleanup_complete: true`. Test projects, GIFs and logs remain for inspection; the isolated desktop services are no longer running.
+
 The initial frozen desktop binary had SHA-256 `8f22151deb954ce6db39b20b92e30f9e5ca418b963157b9783d381368d98b9cd`. It includes the new fixed-playback policy and recording clock identity, but predates the subsequent prepared-page layout repair and stricter invalid-clock append validation. Those later changes must not be inferred from this first run.
 
 ## Manual fixed playback, duplicate snapshots and paused crop movement
@@ -44,7 +46,15 @@ The second binary selected a 2-second periodic sampling interval, fixed 66 ms pl
 
 The same app then created a separate recording with those timing settings, ChangesOnly enabled, and the exact 200×100 red crop at (100,150). Automatic stop saved `output/periodic-changes.gfsproj`, revision 1, with only one 66,000 µs clip and fresh clock `1ca57e81c29848abb3e3ce35f4760139`. Reopen/export produced a 240-byte GIF with 7 ticks (70 ms). Omitted periodic samples and the capture limit did not extend fixed playback. The previous three-frame project was preserved. The app was closed normally before CLI access; an earlier CLI attempt correctly refused its still-held project lock rather than overriding it.
 
-The full-window periodic samples were also pixel-identical: this run does **not** prove ongoing animation rendering for a fully occluded GTK source. Timing/retention evidence is valid for delivered identical samples; hidden-window refresh requires a separate visible-versus-occluded source test and must not be inferred from increasing native sample timestamps. Screenshots `periodic-timed-stop.png` and `changes-timed-stop.png` retain the two editor results.
+The full-window periodic samples were also pixel-identical: that run alone did **not** prove ongoing animation rendering for a fully occluded GTK source. Timing/retention evidence is valid for delivered identical samples; freshness must not be inferred from increasing native sample timestamps. Screenshots `periodic-timed-stop.png` and `changes-timed-stop.png` retain the two editor results.
+
+## Visible-versus-occluded source experiment
+
+A third supervised app (helper 841080, the same second binary) used the normal Portal chooser, Continuous 10 FPS with measured playback and a 10-second capture limit. The maximized controller initially covered the fixture. Five seconds after clicking Start, including the configured 3-second countdown, a normal Alt+Tab brought the fixture in front while the same recording session continued. No source reinitialization or second authorization occurred.
+
+`output/freshness-window.gfsproj` stores 100 clips and 72 distinct pixel assets. The first 22 samples, at 30,000 through 2,132,133 µs, share the covered window's frozen image. At 2,240,658 µs the image changes, and subsequent samples continue producing new assets through 9,943,094 µs. The experiment rules out always replaying the prepared frame in this session and establishes visibility-associated source freshness; it does not locate the precise GTK/GNOME frame-callback mechanism or guarantee hidden-window redraw for other applications.
+
+Automatic stop restored the editor. After normal application close, CLI reopen/export produced revision 200, 72 GIF images, 650,243 bytes and exactly 1000 GIF ticks (10 seconds), matching the 10,000,000 µs project. `freshness-controller.png`, `freshness-visible-source.png` and `fixture-after-close.png` retain the UI observations. The controller now explains that selected windows should remain visible and that sample timestamps alone do not prove refreshed pixels; the source-specific advisory has an egui rendering regression. A compact-controller workflow remains usability work, not a claim to force another application to repaint.
 
 ## Limits
 
@@ -52,4 +62,4 @@ These runs do not validate physical display devices, KDE, mixed-DPI/multi-monito
 
 ## Source regression checks
 
-The integrated source passed 963 workspace tests with six opt-in tests excluded from that default run. The desktop contributes 387 tests, including small-window/enlarged-font hit testing; workflow contributes 51. Strict workspace/all-target/all-feature Clippy, formatting, whitespace checks and Rust 1.88 workspace/all-target/all-feature checking passed. The four new application timing integration tests also passed explicitly on Rust 1.88. No omitted physical-device or multi-gigabyte opt-in test is counted as a pass here.
+The integrated source passed 963 workspace tests with six opt-in tests excluded from that default run on both Rust 1.97.1 and 1.98.0. The desktop contributes 387 tests, including small-window/enlarged-font hit testing; workflow contributes 51. Strict workspace/all-target/all-feature Clippy, formatting, whitespace checks and Rust 1.88 workspace/all-target/all-feature checking passed. The four new application timing integration tests also passed explicitly on Rust 1.88. The subsequent source-visibility advisory passed all ten controller regressions and strict desktop Clippy. No omitted physical-device or multi-gigabyte opt-in test is counted as a pass here.

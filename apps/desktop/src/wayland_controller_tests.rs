@@ -260,7 +260,7 @@ fn prepared_page_overflow_scrolls_without_hiding_top_actions() {
 }
 
 #[test]
-fn monitor_controller_warns_about_self_capture_without_font_dependent_arrows() {
+fn controller_explains_source_specific_visibility_limits_without_font_dependent_arrows() {
     fn labels(shape: &egui::Shape, output: &mut String) {
         match shape {
             egui::Shape::Text(text) => output.push_str(text.galley.text()),
@@ -289,6 +289,10 @@ fn monitor_controller_warns_about_self_capture_without_font_dependent_arrows() {
         assert_eq!(
             text.contains("Monitor capture includes this controller"),
             monitor_source
+        );
+        assert_eq!(
+            text.contains("Keep the selected window visible"),
+            !monitor_source
         );
         assert!(
             !text.contains(['←', '→', '↑', '↓']),

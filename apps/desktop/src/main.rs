@@ -4078,6 +4078,8 @@ fn draw_wayland_crop_controller(
                     ui.visuals().warn_fg_color,
                     "Monitor capture includes this controller if it overlaps the crop. Move it outside the recorded area before Start, or choose a window source. This app cannot exclude itself from monitor capture.",
                 );
+            } else {
+                ui.weak("Keep the selected window visible. Some applications stop redrawing when fully covered or minimized; new capture timestamps do not guarantee updated source pixels.");
             }
             if let Some(notice) = notice { ui.label(notice); }
             draw_source_region_selector(
