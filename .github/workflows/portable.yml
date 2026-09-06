@@ -1,0 +1,61 @@
+name: Linux portable package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: portable-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ubuntu-22-portable:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install build and smoke-test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            clang libclang-dev libpipewire-0.3-dev libwayland-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libegl1-mesa libgl1-mesa-dri \
+            libvulkan1 mesa-vulkan-drivers desktop-file-utils xvfb xdotool
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: 1.88.0
+
+      - name: Build real portable archive
+        run: python3 scripts/build_portable.py --output-dir target/package-first
+
+      - name: Verify deterministic repackaging
+        run: |
+          python3 scripts/build_portable.py --skip-build --output-dir target/package-second
+          cmp target/package-first/*.tar.gz target/package-second/*.tar.gz
+
+      - name: Inspect archives and test safe installation
+        run: python3 scripts/test_portable.py target/package-first/*.tar.gz
+
+      - name: Smoke-test packaged native desktop
+        run: xvfb-run --auto-servernum python3 scripts/smoke_portable_desktop.py target/package-first/*.tar.gz
+
+      - name: Upload tarball and SHA256 checksum
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: gifromscreen-linux-x86_64-ubuntu22-${{ github.sha }}
+          path: |
+            target/package-first/*.tar.gz
+            target/package-first/*.tar.gz.sha256
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 30

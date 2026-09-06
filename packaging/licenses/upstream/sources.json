@@ -1,0 +1,14 @@
+{
+  "CC0-1.0.txt": {
+    "url": "https://creativecommons.org/publicdomain/zero/1.0/legalcode.txt",
+    "sha256": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499"
+  },
+  "cookie-factory-0.3.3-MIT.txt": {
+    "url": "https://raw.githubusercontent.com/rust-bakery/cookie-factory/d36b805dbd7dd65f2df947235c5bcc573afe2c76/LICENSES/MIT.txt",
+    "sha256": "d09216dc1ea5f273997667935a8d6514d80f00b89fb6954ecc3a43e0a6e360de"
+  },
+  "cookie-factory-0.3.3-copyright.txt": {
+    "url": "https://raw.githubusercontent.com/rust-bakery/cookie-factory/d36b805dbd7dd65f2df947235c5bcc573afe2c76/.reuse/dep5",
+    "sha256": "fac95e33eb175ff151cde39e3f7ad52292e6acf83db22bef30d3bfad417a8846"
+  }
+}

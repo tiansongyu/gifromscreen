@@ -1,0 +1,24 @@
+GifFromScreen
+Copyright (c) 2026 GifFromScreen contributors
+https://github.com/tiansongyu/gifromscreen
+
+The workspace is licensed under MIT OR Apache-2.0, as declared by Cargo.toml.
+The application name and icon in this package are project-authored assets.
+This is an independent implementation, not an official ScreenToGif build.
+
+Rust standard library:
+Copyright (c) The Rust Project Developers
+Distributed under MIT OR Apache-2.0; the complete texts accompany this notice.
+Compiler and standard-library version: see BUILD-INFO.json.
+Upstream licensing and additional notices for the pinned build toolchain:
+https://github.com/rust-lang/rust/tree/1.88.0
+
+Third-party Rust dependencies and embedded egui font notices are collected
+from the locally verified Cargo.lock-resolved source packages into
+dependencies/. THIRD-PARTY.json records license expressions, source URLs,
+and the source license paths copied for each included package. The inventory
+conservatively includes normal and build dependencies; it is not a claim
+that every package is statically linked into both binaries.
+
+FFmpeg, ffprobe, system libraries, graphics drivers, portals, and system fonts
+are not bundled. Their licenses are supplied by their system distributors.
