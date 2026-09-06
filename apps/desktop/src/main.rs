@@ -47,7 +47,7 @@ use custom_palette_input::parse_custom_palette;
 use editor_preview::EditorPreviewCache;
 use editor_ui::{
     DrawingDraftPhase, DrawingOverlayDraft, EditorUiAction, EditorUiResult, EditorUiState,
-    show_editor_ui,
+    show_editor_chrome, show_editor_tool_panel,
 };
 use editor_workspace::EditorWorkspace;
 use eframe::egui;
@@ -1391,64 +1391,26 @@ impl GifFromScreenApp {
     }
 
     fn show_editor_contents(&mut self, ui: &mut egui::Ui) {
-        let Some(workspace) = &mut self.editor_workspace else {
-            ui.label("No active editor project.");
+        self.show_editor_work_area(ui);
+        let Some(workspace) = &self.editor_workspace else {
             return;
         };
-        let watermark_running = self.watermark_job.state() == WatermarkDecodeJobState::Running;
-        let results = ui
-            .add_enabled_ui(!watermark_running, |ui| {
-                show_editor_ui(ui, workspace, &mut self.editor_ui_state)
+        ui.separator();
+        let export_action = egui::CollapsingHeader::new("Export GIF")
+            .id_salt("editor-export-options")
+            .show(ui, |ui| {
+                show_export_panel(
+                    ui,
+                    &mut self.settings.output,
+                    &mut self.editor_export_settings,
+                    &self.export_job,
+                    workspace.selection().len(),
+                    workspace.asset_issues().len(),
+                    self.watermark_job.state() == WatermarkDecodeJobState::Running,
+                )
             })
-            .inner;
-        for result in results {
-            if let Some(notice) = editor_result_notice(result) {
-                self.notice = Some(notice);
-            }
-        }
-
-        let watermark_action = if self.editor_ui_state.overlays_selected() {
-            if let Some(notice) = self.text_overlay.show(ui, workspace) {
-                self.notice = Some(notice);
-            }
-            show_watermark_ui(
-                ui,
-                &mut self.watermark_ui,
-                self.watermark_job.state(),
-                !workspace.selection().is_empty(),
-            )
-        } else {
-            WatermarkUiAction::None
-        };
-        if watermark_action == WatermarkUiAction::Start {
-            match PendingWatermark::start(&self.watermark_ui, workspace, &mut self.watermark_job) {
-                Ok(pending) => {
-                    self.pending_watermark = Some(pending);
-                    self.notice = Some("Decoding watermark in the background…".to_owned());
-                }
-                Err(error) => self.notice = Some(format!("Could not decode watermark: {error}")),
-            }
-        }
-
-        ui.separator();
-        show_editor_preview_panel(
-            ui,
-            workspace,
-            &mut self.editor_preview_cache,
-            &mut self.editor_ui_state,
-        );
-        ui.separator();
-        let selected_count = workspace.selection().len();
-        let asset_issue_count = workspace.asset_issues().len();
-        let export_action = show_export_panel(
-            ui,
-            &mut self.settings.output,
-            &mut self.editor_export_settings,
-            &self.export_job,
-            selected_count,
-            asset_issue_count,
-            watermark_running,
-        );
+            .body_returned
+            .unwrap_or(EditorExportAction::None);
         match export_action {
             EditorExportAction::None => {}
             EditorExportAction::Start => {
@@ -1465,6 +1427,70 @@ impl GifFromScreenApp {
         if let Some(notice) = &self.notice {
             ui.add_space(12.0);
             ui.label(notice);
+        }
+    }
+
+    fn show_editor_work_area(&mut self, ui: &mut egui::Ui) {
+        let Some(workspace) = &mut self.editor_workspace else {
+            ui.label("No active editor project.");
+            return;
+        };
+        let watermark_running = self.watermark_job.state() == WatermarkDecodeJobState::Running;
+        let mut results = ui
+            .add_enabled_ui(!watermark_running, |ui| {
+                show_editor_chrome(ui, workspace, &mut self.editor_ui_state)
+            })
+            .inner;
+        let mut watermark_action = WatermarkUiAction::None;
+        let mut inspector =
+            |ui: &mut egui::Ui, workspace: &mut EditorWorkspace, state: &mut EditorUiState| {
+                let (tool_results, notice, action) = show_editor_inspector(
+                    ui,
+                    workspace,
+                    state,
+                    &mut self.text_overlay,
+                    &mut self.watermark_ui,
+                    self.watermark_job.state(),
+                );
+                results.extend(tool_results);
+                if notice.is_some() {
+                    self.notice = notice;
+                }
+                watermark_action = action;
+            };
+        if ui.available_width() >= 900.0 {
+            ui.columns(2, |columns| {
+                inspector(&mut columns[0], workspace, &mut self.editor_ui_state);
+                show_editor_preview_panel(
+                    &mut columns[1],
+                    workspace,
+                    &mut self.editor_preview_cache,
+                    &mut self.editor_ui_state,
+                );
+            });
+        } else {
+            show_editor_preview_panel(
+                ui,
+                workspace,
+                &mut self.editor_preview_cache,
+                &mut self.editor_ui_state,
+            );
+            ui.separator();
+            inspector(ui, workspace, &mut self.editor_ui_state);
+        }
+        for result in results {
+            if let Some(notice) = editor_result_notice(result) {
+                self.notice = Some(notice);
+            }
+        }
+        if watermark_action == WatermarkUiAction::Start {
+            match PendingWatermark::start(&self.watermark_ui, workspace, &mut self.watermark_job) {
+                Ok(pending) => {
+                    self.pending_watermark = Some(pending);
+                    self.notice = Some("Decoding watermark in the background…".to_owned());
+                }
+                Err(error) => self.notice = Some(format!("Could not decode watermark: {error}")),
+            }
         }
     }
 
@@ -2909,6 +2935,40 @@ fn editor_result_notice(result: EditorUiResult) -> Option<String> {
     }
 }
 
+fn show_editor_inspector(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    text: &mut TextOverlayTool,
+    watermark: &mut WatermarkUiState,
+    watermark_job: WatermarkDecodeJobState,
+) -> (Vec<EditorUiResult>, Option<String>, WatermarkUiAction) {
+    let mut results = Vec::new();
+    let mut notice = None;
+    let mut action = WatermarkUiAction::None;
+    egui::ScrollArea::vertical()
+        .id_salt("editor-inspector")
+        .max_height(380.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            results = ui
+                .add_enabled_ui(watermark_job != WatermarkDecodeJobState::Running, |ui| {
+                    show_editor_tool_panel(ui, workspace, state)
+                })
+                .inner;
+            if state.overlays_selected() {
+                notice = text.show(ui, workspace);
+                action = show_watermark_ui(
+                    ui,
+                    watermark,
+                    watermark_job,
+                    !workspace.selection().is_empty(),
+                );
+            }
+        });
+    (results, notice, action)
+}
+
 fn show_editor_scroll_area<R>(
     ui: &mut egui::Ui,
     contents: impl FnOnce(&mut egui::Ui) -> R,
@@ -2960,7 +3020,9 @@ fn show_editor_preview_panel(
                 preview.preview_size[1] as f32,
             );
             let available_width = ui.available_width().max(1.0);
-            let scale = (available_width / natural.x).min(1.0);
+            let scale = (available_width / natural.x)
+                .min(360.0 / natural.y)
+                .min(3.0);
             let image_size = natural * scale;
             let sense = if state.drawing_overlay.phase == DrawingDraftPhase::Capturing {
                 egui::Sense::drag()

@@ -570,11 +570,20 @@ pub(crate) struct EditorUiFailure {
 /// One successful action or recoverable failure produced during an egui frame.
 pub(crate) type EditorUiResult = Result<EditorUiAction, EditorUiFailure>;
 
-/// Draws persistent navigation and the selected editing tool group.
-///
-/// The filmstrip is virtualized: its `ScrollArea` creates widgets only for the range returned by
-/// [`VirtualFilmstripLayout::visible_range`]. The shell owns preview and export surfaces.
+/// Compatibility layout for hosts that place chrome and tools in one column.
 pub(crate) fn show_editor_ui(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+) -> Vec<EditorUiResult> {
+    let mut results = show_editor_chrome(ui, workspace, state);
+    results.extend(show_editor_tool_panel(ui, workspace, state));
+    results
+}
+
+/// Draws persistent navigation, the virtual filmstrip, tool tabs and history.
+/// The shell can place the preview next to the selected tool panel below this chrome.
+pub(crate) fn show_editor_chrome(
     ui: &mut egui::Ui,
     workspace: &mut EditorWorkspace,
     state: &mut EditorUiState,
@@ -595,14 +604,19 @@ pub(crate) fn show_editor_ui(
         show_history_buttons(ui, workspace, state, now, &mut results);
     });
     ui.separator();
-    egui::ScrollArea::vertical()
-        .id_salt(("editor-tool-inspector", state.active_tool.label()))
-        .max_height(220.0)
-        .auto_shrink([false, true])
-        .show(ui, |ui| {
-            show_active_tool(ui, workspace, state, now, &mut results);
-        });
+    schedule_playback_repaint(ui.ctx(), state, now);
+    results
+}
 
+/// Draws only the selected editing tools; the host owns sizing and scrolling.
+pub(crate) fn show_editor_tool_panel(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+) -> Vec<EditorUiResult> {
+    let now = Instant::now();
+    let mut results = Vec::new();
+    show_active_tool(ui, workspace, state, now, &mut results);
     schedule_playback_repaint(ui.ctx(), state, now);
     results
 }
@@ -2163,7 +2177,7 @@ fn show_shape_overlay_toolbar(
     ui.group(|ui| {
         ui.horizontal_wrapped(|ui| {
             ui.strong("Shape overlays");
-            ui.weak("The new track spans the earliest through latest selected frame.");
+            ui.weak("Applies to selected frames only; gaps in the selection stay unchanged.");
         });
         show_shape_overlay_inputs(ui, &mut state.shape_overlay);
         if ui.button("Add shape overlay").clicked() {
@@ -2584,7 +2598,7 @@ fn show_virtual_filmstrip(
 
     let output = egui::ScrollArea::horizontal()
         .id_salt("editor_virtual_filmstrip")
-        .auto_shrink([false, false])
+        .auto_shrink([false, true])
         .max_height(FILMSTRIP_ITEM_HEIGHT + 18.0)
         .horizontal_scroll_offset(requested_offset)
         .show_viewport(ui, |ui, viewport| {
@@ -2636,9 +2650,18 @@ fn show_virtual_filmstrip(
                     egui::pos2(content_origin.x + x, content_origin.y),
                     egui::vec2(item_width, FILMSTRIP_ITEM_HEIGHT),
                 );
+                // Cards share one horizontal row. A scope that advances the
+                // parent cursor would add vertical spacing for every card.
                 let mut response = ui
-                    .push_id(("editor-frame-card", index), |ui| ui.put(rect, button))
-                    .inner;
+                    .new_child(
+                        egui::UiBuilder::new()
+                            .id_salt(("editor-frame-card", index))
+                            .max_rect(rect)
+                            .layout(egui::Layout::centered_and_justified(
+                                egui::Direction::TopDown,
+                            )),
+                    )
+                    .add(button);
                 response.widget_info(|| {
                     egui::WidgetInfo::selected(
                         egui::WidgetType::Button,
@@ -3699,6 +3722,74 @@ mod tests {
 
         let tail = visible_widget_range(50_000, f64::MAX / 2.0, 1.0).unwrap();
         assert_eq!(tail, 49_997..50_000);
+    }
+
+    #[test]
+    fn filmstrip_height_stays_one_card_tall_with_many_visible_frames() {
+        use gif_from_screen_application::{
+            BlankAnimationProjectOptions, create_blank_animation_project,
+        };
+        use gif_from_screen_domain::{EditCommand, ProjectId, UnixTimeMs};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut project = create_blank_animation_project(
+            directory.path().join("layout.gfsproj"),
+            BlankAnimationProjectOptions {
+                project_id: ProjectId::from_u128(1),
+                frame_id: FrameId::from_u128(1),
+                app_version: "layout-test".into(),
+                created_at: UnixTimeMs::new(0),
+                canvas: PhysicalSize::new(1, 1).unwrap(),
+                background: Rgba {
+                    red: 0,
+                    green: 0,
+                    blue: 0,
+                    alpha: 0,
+                },
+                frame_duration: DurationUs::new(50_000).unwrap(),
+                frame_limit_bytes: 4,
+            },
+        )
+        .unwrap();
+        let first = project.manifest().timeline.frames[0].clone();
+        let frames = (2..=36)
+            .map(|id| FrameClip {
+                id: FrameId::from_u128(id),
+                ..first.clone()
+            })
+            .collect();
+        project
+            .commit(EditCommand::InsertFrames { index: 1, frames })
+            .unwrap();
+        let mut workspace =
+            crate::editor_workspace::EditorWorkspace::from_active(project, 10).unwrap();
+        let mut state = EditorUiState::default();
+        let context = eframe::egui::Context::default();
+        let input = eframe::egui::RawInput {
+            screen_rect: Some(eframe::egui::Rect::from_min_size(
+                eframe::egui::Pos2::ZERO,
+                eframe::egui::vec2(1_040.0, 760.0),
+            )),
+            ..Default::default()
+        };
+        let _ = context.run(input, |context| {
+            eframe::egui::CentralPanel::default().show(context, |ui| {
+                ui.spacing_mut().item_spacing = eframe::egui::vec2(8.0, 8.0);
+                let top = ui.cursor().top();
+                super::show_virtual_filmstrip(
+                    ui,
+                    &mut workspace,
+                    &mut state,
+                    Instant::now(),
+                    &mut Vec::new(),
+                );
+                let height = ui.cursor().top() - top;
+                assert!(
+                    height <= 104.0,
+                    "filmstrip occupied {height} points for 78-point cards"
+                );
+            });
+        });
     }
 
     #[test]
