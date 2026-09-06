@@ -47,7 +47,7 @@ use custom_palette_input::parse_custom_palette;
 use editor_preview::EditorPreviewCache;
 use editor_ui::{
     DrawingDraftPhase, DrawingOverlayDraft, EditorUiAction, EditorUiResult, EditorUiState,
-    show_editor_chrome, show_editor_tool_panel,
+    OverlayTool, show_editor_chrome, show_editor_tool_panel,
 };
 use editor_workspace::EditorWorkspace;
 use eframe::egui;
@@ -2956,8 +2956,10 @@ fn show_editor_inspector(
                     show_editor_tool_panel(ui, workspace, state)
                 })
                 .inner;
-            if state.overlays_selected() {
+            if state.overlays_selected() && state.overlay_tool == OverlayTool::Text {
                 notice = text.show(ui, workspace);
+            }
+            if state.overlays_selected() && state.overlay_tool == OverlayTool::Image {
                 action = show_watermark_ui(
                     ui,
                     watermark,

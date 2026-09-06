@@ -11,7 +11,7 @@ use std::{
 use gif_from_screen_domain::{
     AssetDescriptor, AssetId, AssetKind, BlendMode, DurationUs, EditCommand, Effect, FrameId,
     OverlayContent, OverlayId, OverlayItem, OverlayTrack, PhysicalPoint, PhysicalRect,
-    PhysicalSize, ProjectId, ProjectManifest, ProjectRevision, RasterEncoding, TextRaster, TimeUs,
+    PhysicalSize, ProjectId, ProjectManifest, ProjectRevision, RasterEncoding, TimeUs,
     TimelineSpan, TrackId, Transition,
 };
 use gif_from_screen_editor::{
@@ -36,6 +36,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::editor_preview::{EditorPreviewError, render_frame_surface};
+
+#[path = "editor_text.rs"]
+mod text;
+pub(crate) use text::{TextOverlayDraft, TitleFrameRequest};
 
 const MAX_SYNCHRONOUS_DUPLICATE_SCAN_FRAMES: usize = 256;
 const DUPLICATE_RENDER_SURFACE_LIMIT_BYTES: usize = 128 * 1024 * 1024;
@@ -267,12 +271,17 @@ impl EditorWorkspace {
         &self,
     ) -> Result<OverlaySelectionAnchor, EditorWorkspaceError> {
         self.selected_frame_ids()?;
-        Ok(OverlaySelectionAnchor {
+        Ok(self.project_edit_anchor())
+    }
+
+    /// Captures an asynchronous edit target, including an empty timeline or selection.
+    pub(crate) fn project_edit_anchor(&self) -> OverlaySelectionAnchor {
+        OverlaySelectionAnchor {
             project_root: self.project.layout().root.clone(),
             project_id: self.manifest().project_id,
             revision: self.manifest().revision,
             selection: self.selection.clone(),
-        })
+        }
     }
 
     /// Adds one track with an item for each uninterrupted selected frame range.
@@ -326,46 +335,6 @@ impl EditorWorkspace {
         })
     }
 
-    /// Persists shaped text pixels and their original editable attributes as one undoable edit.
-    pub(crate) fn add_text_overlay_for_selection(
-        &mut self,
-        request: &gif_from_screen_text::TextRequest,
-        image: &gif_from_screen_text::TextImage,
-        position: PhysicalPoint,
-    ) -> Result<TrackId, EditorWorkspaceError> {
-        request.validate()?;
-        if request.size != image.size {
-            return Err(EditorWorkspaceError::TextRasterDimensionsMismatch);
-        }
-        self.add_raster_content_for_selection(
-            RasterOverlayEdit {
-                name: "Text".to_owned(),
-                source_size: image.size,
-                position,
-                display_size: image.size,
-                item_opacity: 255,
-                track_opacity: 255,
-                blend_mode: BlendMode::Normal,
-                z_index: 3,
-            },
-            &image.rgba,
-            |asset_id| OverlayContent::Text {
-                text: request.text.clone(),
-                position,
-                max_width: Some(request.size.width),
-                font_family: request.font_family.clone(),
-                font_size_px: request.font_size_px,
-                foreground: request.foreground,
-                background: request.background,
-                alignment: request.alignment,
-                raster: Some(TextRaster {
-                    asset_id,
-                    size: image.size,
-                }),
-            },
-        )
-    }
-
     fn add_raster_content_for_selection(
         &mut self,
         edit: RasterOverlayEdit,
@@ -390,8 +359,32 @@ impl EditorWorkspace {
         if !placement.fits_within(self.project.manifest().canvas.size) {
             return Err(EditorWorkspaceError::RasterOverlayOutsideCanvas);
         }
-        let expected = edit
-            .source_size
+        let asset = self.raster_asset_descriptor(edit.source_size, rgba)?;
+        let track_id = TrackId::from_u128(Uuid::new_v4().as_u128());
+        self.commit_with_raster_assets(
+            &[(asset.clone(), rgba)],
+            vec![EditCommand::UpsertOverlayTrack {
+                track: OverlayTrack {
+                    id: track_id,
+                    name: edit.name,
+                    visible: true,
+                    opacity: edit.track_opacity,
+                    blend_mode: edit.blend_mode,
+                    items: overlay_items(spans, content(asset.id), edit.z_index),
+                },
+            }],
+        )?;
+        Ok(track_id)
+    }
+
+    fn raster_asset_descriptor(
+        &self,
+        size: PhysicalSize,
+        rgba: &[u8],
+    ) -> Result<AssetDescriptor, EditorWorkspaceError> {
+        size.validate()
+            .map_err(|_| EditorWorkspaceError::EmptyRasterOverlaySize)?;
+        let expected = size
             .area()
             .and_then(|pixels| pixels.checked_mul(4))
             .and_then(|bytes| usize::try_from(bytes).ok())
@@ -404,51 +397,55 @@ impl EditorWorkspace {
         }
         let asset_id = AssetStore::id_for_bytes(rgba);
         let existing = self.project.manifest().assets.get(&asset_id);
-        let asset_registered = existing.is_some();
         if let Some(descriptor) = existing {
-            let compatible = matches!(
-                descriptor.kind,
-                AssetKind::Frame { size, encoding }
-                    | AssetKind::OverlayImage { size, encoding }
-                    | AssetKind::Mask { size, encoding }
-                    if size == edit.source_size && encoding == RasterEncoding::Rgba8
-            ) && descriptor.byte_len
-                == u64::try_from(expected).unwrap_or(u64::MAX);
+            let compatible = descriptor.kind.raster_descriptor()
+                == Some((size, RasterEncoding::Rgba8))
+                && descriptor.byte_len == u64::try_from(expected).unwrap_or(u64::MAX);
             if !compatible {
                 return Err(EditorWorkspaceError::RasterOverlayAssetCollision { asset_id });
             }
+            return Ok(descriptor.clone());
         }
-        let stored_id = self.project.assets().put(rgba)?;
-        debug_assert_eq!(stored_id, asset_id);
-        let track_id = TrackId::from_u128(Uuid::new_v4().as_u128());
-        let mut commands = Vec::with_capacity(2);
-        if !asset_registered {
-            commands.push(EditCommand::RegisterAsset {
-                asset: AssetDescriptor {
-                    id: asset_id,
-                    byte_len: u64::try_from(expected)
-                        .map_err(|_| EditorWorkspaceError::RasterOverlayByteLengthOverflow)?,
-                    kind: AssetKind::OverlayImage {
-                        size: edit.source_size,
-                        encoding: RasterEncoding::Rgba8,
-                    },
-                },
-            });
-        }
-        commands.push(EditCommand::UpsertOverlayTrack {
-            track: OverlayTrack {
-                id: track_id,
-                name: edit.name,
-                visible: true,
-                opacity: edit.track_opacity,
-                blend_mode: edit.blend_mode,
-                items: overlay_items(spans, content(asset_id), edit.z_index),
+        Ok(AssetDescriptor {
+            id: asset_id,
+            byte_len: u64::try_from(expected)
+                .map_err(|_| EditorWorkspaceError::RasterOverlayByteLengthOverflow)?,
+            kind: AssetKind::OverlayImage {
+                size,
+                encoding: RasterEncoding::Rgba8,
             },
-        });
-        self.execute(EditCommand::Compound { commands })?;
+        })
+    }
+
+    /// Validate the complete edit before storing bytes, then journal it as one revision.
+    fn commit_with_raster_assets(
+        &mut self,
+        assets: &[(AssetDescriptor, &[u8])],
+        commands: Vec<EditCommand>,
+    ) -> Result<(), EditorWorkspaceError> {
+        let mut registered = BTreeSet::new();
+        let mut compound = Vec::with_capacity(assets.len() + commands.len());
+        for (asset, _) in assets {
+            if registered.insert(asset.id) && !self.manifest().assets.contains_key(&asset.id) {
+                compound.push(EditCommand::RegisterAsset {
+                    asset: asset.clone(),
+                });
+            }
+        }
+        compound.extend(commands);
+        let command = EditCommand::Compound { commands: compound };
+        self.manifest()
+            .clone()
+            .apply_command(&command)
+            .map_err(EditorError::from)?;
+        for (asset, rgba) in assets {
+            let stored_id = self.project.assets().put(rgba)?;
+            debug_assert_eq!(stored_id, asset.id);
+        }
+        self.execute(command)?;
         self.asset_issues
-            .retain(|issue| asset_issue_id(issue) != asset_id);
-        Ok(track_id)
+            .retain(|issue| !registered.contains(&asset_issue_id(issue)));
+        Ok(())
     }
 
     /// Projects current timeline, selection, delay, canvas, and asset statistics.
@@ -1275,6 +1272,15 @@ pub(crate) enum EditorWorkspaceError {
     /// Pixels cannot silently use a different wrapping box than the saved attributes.
     #[error("text raster dimensions do not match the requested text box")]
     TextRasterDimensionsMismatch,
+    /// Editing requires one nonempty, homogeneous track with prepared text pixels.
+    #[error("overlay track {0} is missing or is not a single editable text group")]
+    TextTrackNotEditable(TrackId),
+    /// An asynchronous title operation must not silently use a new insertion point.
+    #[error("title insertion frame {0} is no longer present")]
+    UnknownTitleAnchor(FrameId),
+    /// Added title duration must fit the project time representation.
+    #[error("title frame would overflow the project duration")]
+    TitleDurationOverflow,
     /// Display placement must stay within the project canvas.
     #[error("raster overlay placement must stay inside the project canvas")]
     RasterOverlayOutsideCanvas,
@@ -1308,13 +1314,14 @@ mod tests {
         AssetDescriptor, AssetId, AssetKind, BlendMode, Canvas, CanvasBackground, CaptureMetadata,
         ClipTransform, ColorSpace, FrameClip, OverlayContent, PhysicalPoint, PhysicalPx,
         PhysicalRect, PhysicalSize, ProjectId, ProjectManifest, ProjectRevision, QuarterTurn,
-        RasterEncoding, Rgba, ShapeKind, SlideDirection, Timeline, TransitionKind, UnixTimeMs,
+        RasterEncoding, Rgba, ShapeKind, SlideDirection, TextRaster, Timeline, TransitionKind,
+        UnixTimeMs,
     };
     use tempfile::TempDir;
 
     use super::*;
 
-    fn frame_id(number: u128) -> FrameId {
+    pub(super) fn frame_id(number: u128) -> FrameId {
         FrameId::from_u128(number)
     }
 
@@ -1367,7 +1374,7 @@ mod tests {
         }
     }
 
-    fn create_workspace(
+    pub(super) fn create_workspace(
         directory: &TempDir,
         durations: &[u64],
         history_limit: usize,
@@ -1376,7 +1383,7 @@ mod tests {
         EditorWorkspace::from_active(active, history_limit).unwrap()
     }
 
-    fn create_rendered_duplicate_workspace(directory: &TempDir) -> EditorWorkspace {
+    pub(super) fn create_rendered_duplicate_workspace(directory: &TempDir) -> EditorWorkspace {
         let size = PhysicalSize::new(2, 1).unwrap();
         let manifest = ProjectManifest::new(
             ProjectId::from_u128(900),

@@ -165,6 +165,16 @@ pub(crate) struct DrawingOverlayDraft {
     pub(crate) limit_reached: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum OverlayTool {
+    #[default]
+    Text,
+    Image,
+    Shape,
+    Drawing,
+    Layers,
+}
+
 impl Default for DrawingOverlayDraft {
     fn default() -> Self {
         Self {
@@ -318,6 +328,7 @@ pub(crate) struct EditorUiState {
     /// Pre-rotation resize height input in physical pixels.
     pub(crate) resize_height_input: String,
     shape_overlay: ShapeOverlayUiState,
+    pub(crate) overlay_tool: OverlayTool,
     pub(crate) drawing_overlay: DrawingOverlayDraft,
     /// Monotonic playback clock when playback is active.
     pub(crate) playback: Option<PlaybackClock>,
@@ -380,6 +391,7 @@ impl Default for EditorUiState {
             resize_width_input: "1".into(),
             resize_height_input: "1".into(),
             shape_overlay: ShapeOverlayUiState::default(),
+            overlay_tool: OverlayTool::default(),
             drawing_overlay: DrawingOverlayDraft::default(),
             playback: None,
             loop_preview: true,
@@ -642,7 +654,29 @@ fn show_active_tool(
         }
         EditorToolTab::Transform => show_transform_toolbar(ui, workspace, state, now, results),
         EditorToolTab::Effects => show_effect_toolbar(ui, workspace, state, now, results),
-        EditorToolTab::Overlays => show_shape_overlay_toolbar(ui, workspace, state, now, results),
+        EditorToolTab::Overlays => {
+            ui.horizontal_wrapped(|ui| {
+                for (tool, label) in [
+                    (OverlayTool::Text, "Text & titles"),
+                    (OverlayTool::Image, "Image"),
+                    (OverlayTool::Shape, "Shape"),
+                    (OverlayTool::Drawing, "Draw"),
+                    (OverlayTool::Layers, "Layers"),
+                ] {
+                    ui.selectable_value(&mut state.overlay_tool, tool, label);
+                }
+            });
+            match state.overlay_tool {
+                OverlayTool::Shape => {
+                    show_shape_overlay_toolbar(ui, workspace, state, now, results);
+                }
+                OverlayTool::Drawing => {
+                    show_drawing_overlay_controls(ui, workspace, state, now, results);
+                }
+                OverlayTool::Layers => show_overlay_track_list(ui, workspace, state, now, results),
+                OverlayTool::Text | OverlayTool::Image => {}
+            }
+        }
         EditorToolTab::Project => {
             show_project_storage_toolbar(ui, workspace, results);
             show_editor_statistics(ui, workspace, results);
@@ -2204,8 +2238,6 @@ fn show_shape_overlay_toolbar(
                 result,
             );
         }
-        show_drawing_overlay_controls(ui, workspace, state, now, results);
-        show_overlay_track_list(ui, workspace, state, now, results);
     });
 }
 

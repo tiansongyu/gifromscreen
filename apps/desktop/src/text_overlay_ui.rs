@@ -7,10 +7,26 @@ use std::{
 };
 
 use eframe::egui;
-use gif_from_screen_domain::{HorizontalAlignment, PhysicalPoint, PhysicalPx, PhysicalSize, Rgba};
+use gif_from_screen_domain::{
+    DurationUs, FrameId, HorizontalAlignment, OverlayContent, PhysicalPoint, PhysicalPx,
+    PhysicalSize, Rgba, TrackId,
+};
 use gif_from_screen_text::{MAX_TEXT_BYTES, TextImage, TextRasterizer, TextRequest};
 
-use crate::editor_workspace::{EditorWorkspace, OverlaySelectionAnchor};
+use crate::editor_workspace::{
+    EditorWorkspace, OverlaySelectionAnchor, TextOverlayDraft, TitleFrameRequest,
+};
+
+#[derive(Clone, Copy)]
+enum TextOperation {
+    Add,
+    Replace(TrackId),
+    Title {
+        after: Option<FrameId>,
+        duration: DurationUs,
+        background: Rgba,
+    },
+}
 
 struct PendingText {
     anchor: OverlaySelectionAnchor,
@@ -18,6 +34,7 @@ struct PendingText {
     position: PhysicalPoint,
     receiver: Receiver<Result<TextImage, String>>,
     cancelled: bool,
+    operation: TextOperation,
 }
 
 pub(crate) struct TextOverlayTool {
@@ -31,6 +48,11 @@ pub(crate) struct TextOverlayTool {
     background: [u8; 4],
     with_background: bool,
     pending: Option<PendingText>,
+    editing: Option<(TrackId, OverlaySelectionAnchor)>,
+    title: bool,
+    title_at_start: bool,
+    title_duration_ms: u64,
+    title_background: [u8; 4],
 }
 
 impl Default for TextOverlayTool {
@@ -46,6 +68,11 @@ impl Default for TextOverlayTool {
             background: [0, 0, 0, 160],
             with_background: true,
             pending: None,
+            editing: None,
+            title: false,
+            title_at_start: true,
+            title_duration_ms: 1000,
+            title_background: [24, 28, 36, 255],
         }
     }
 }
@@ -71,8 +98,26 @@ impl TextOverlayTool {
             Err(error) => format!("Could not add text: {error}"),
             Ok(image) => match workspace {
                 Some(workspace) if pending.anchor.matches(workspace) => {
-                    match workspace.add_text_overlay_for_selection(&pending.request, &image, pending.position) {
-                        Ok(_) => "Text added to the selected frames. Its appearance is saved in the project.".to_owned(),
+                    let result = match pending.operation {
+                        TextOperation::Add => workspace.add_text_overlay_for_selection(&pending.request, &image, pending.position).map(|_| ()),
+                        TextOperation::Replace(track_id) => workspace.replace_text_overlay(track_id, &pending.request, &image, pending.position).map(|_| ()),
+                        TextOperation::Title { after, duration, background } => workspace.insert_title_frame(&TitleFrameRequest {
+                            after, duration, background, text: pending.request, position: pending.position,
+                        }, &image).map(|_| ()),
+                    };
+                    match result {
+                        Ok(()) => {
+                            if let Some((_, anchor)) = &mut self.editing
+                                && let Ok(updated) = workspace.overlay_selection_anchor()
+                            {
+                                *anchor = updated;
+                            }
+                            match pending.operation {
+                                TextOperation::Add => "Text added to the selected frames. Its appearance is saved in the project.",
+                                TextOperation::Replace(_) => "Text updated. Timing and layer settings are unchanged.",
+                                TextOperation::Title { .. } => "Title frame inserted and selected. Undo restores the original timeline.",
+                            }.to_owned()
+                        }
                         Err(error) => format!("Could not save text: {error}"),
                     }
                 }
@@ -90,6 +135,7 @@ impl TextOverlayTool {
         ui.group(|ui| {
             ui.strong("Text");
             ui.add_enabled_ui(!self.is_running(), |ui| {
+                self.show_saved_text(ui, workspace, &mut notice);
                 ui.add(
                     egui::TextEdit::multiline(&mut self.text)
                         .hint_text("Add a caption…")
@@ -146,10 +192,18 @@ impl TextOverlayTool {
                             "Zero uses the available canvas width and up to 160 pixels of height.",
                         );
                     });
+                self.show_title_options(ui);
+                let action_label = if self.editing.is_some() {
+                    "Save text changes"
+                } else if self.title {
+                    "Insert title frame"
+                } else {
+                    "Add text to selected frames"
+                };
                 if ui
                     .add_enabled(
-                        !workspace.selection().is_empty(),
-                        egui::Button::new("Add text to selected frames"),
+                        (self.title && self.editing.is_none()) || !workspace.selection().is_empty(),
+                        egui::Button::new(action_label),
                     )
                     .clicked()
                     && let Err(error) = self.start(workspace)
@@ -202,9 +256,39 @@ impl TextOverlayTool {
         if self.is_running() {
             return Err("Text is already being prepared.".to_owned());
         }
-        let anchor = workspace
-            .overlay_selection_anchor()
-            .map_err(|error| error.to_string())?;
+        let anchor = if self.title && self.editing.is_none() {
+            workspace.project_edit_anchor()
+        } else {
+            workspace
+                .overlay_selection_anchor()
+                .map_err(|error| error.to_string())?
+        };
+        let operation = if let Some((track_id, loaded)) = &self.editing {
+            if !loaded.matches(workspace) {
+                return Err("The project or selection changed since loading this text. Choose the saved text again before editing.".to_owned());
+            }
+            TextOperation::Replace(*track_id)
+        } else if self.title {
+            TextOperation::Title {
+                after: if self.title_at_start {
+                    None
+                } else {
+                    Some(workspace.selection().current().ok_or_else(|| {
+                        "Select a frame to insert a title after it, or choose At start.".to_owned()
+                    })?)
+                },
+                duration: self
+                    .title_duration_ms
+                    .checked_mul(1000)
+                    .and_then(DurationUs::new)
+                    .ok_or_else(|| {
+                        "Title duration must be positive and fit the project clock.".to_owned()
+                    })?,
+                background: rgba(self.title_background),
+            }
+        } else {
+            TextOperation::Add
+        };
         let (request, position) = self.request(workspace.manifest().canvas.size)?;
         let work = request.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -223,9 +307,100 @@ impl TextOverlayTool {
             position,
             receiver,
             cancelled: false,
+            operation,
         });
         Ok(())
     }
+
+    fn show_saved_text(
+        &mut self,
+        ui: &mut egui::Ui,
+        workspace: &EditorWorkspace,
+        notice: &mut Option<String>,
+    ) {
+        ui.horizontal_wrapped(|ui| {
+            egui::ComboBox::from_id_salt("saved-caption")
+                .selected_text(if self.editing.is_some() {
+                    "Editing saved text"
+                } else {
+                    "Edit saved text…"
+                })
+                .show_ui(ui, |ui| {
+                    for track in &workspace.manifest().timeline.overlay_tracks {
+                        let Some(item) = track.items.first() else {
+                            continue;
+                        };
+                        let OverlayContent::Text { text, .. } = &item.content else {
+                            continue;
+                        };
+                        let label = text.chars().take(40).collect::<String>();
+                        if ui
+                            .selectable_label(
+                                self.editing.as_ref().is_some_and(|(id, _)| *id == track.id),
+                                label,
+                            )
+                            .clicked()
+                            && let Err(error) = self.load(workspace, track.id)
+                        {
+                            *notice = Some(error);
+                        }
+                    }
+                });
+            if self.editing.is_some() && ui.button("New text").clicked() {
+                self.editing = None;
+            }
+        });
+    }
+
+    fn load(&mut self, workspace: &EditorWorkspace, track_id: TrackId) -> Result<(), String> {
+        let draft: TextOverlayDraft = workspace
+            .text_overlay_draft(track_id)
+            .map_err(|error| error.to_string())?;
+        let anchor = workspace
+            .overlay_selection_anchor()
+            .map_err(|error| error.to_string())?;
+        self.text = draft.request.text;
+        self.font_family = draft.request.font_family;
+        self.font_size = draft.request.font_size_px;
+        self.alignment = draft.request.alignment;
+        self.position = [draft.position.x.get(), draft.position.y.get()];
+        self.size = [
+            draft.request.size.width.get(),
+            draft.request.size.height.get(),
+        ];
+        self.foreground = color_bytes(draft.request.foreground);
+        self.with_background = draft.request.background.is_some();
+        if let Some(background) = draft.request.background {
+            self.background = color_bytes(background);
+        }
+        self.editing = Some((draft.track_id, anchor));
+        self.title = false;
+        Ok(())
+    }
+
+    fn show_title_options(&mut self, ui: &mut egui::Ui) {
+        if self.editing.is_some() {
+            return;
+        }
+        ui.checkbox(&mut self.title, "Insert as a title frame");
+        if self.title {
+            ui.horizontal_wrapped(|ui| {
+                ui.radio_value(&mut self.title_at_start, true, "At start");
+                ui.radio_value(&mut self.title_at_start, false, "After current frame");
+                ui.add(
+                    egui::DragValue::new(&mut self.title_duration_ms)
+                        .range(1..=3_600_000)
+                        .suffix(" ms"),
+                );
+                ui.label("Canvas");
+                ui.color_edit_button_srgba_unmultiplied(&mut self.title_background);
+            });
+        }
+    }
+}
+
+fn color_bytes(color: Rgba) -> [u8; 4] {
+    [color.red, color.green, color.blue, color.alpha]
 }
 
 fn resolve_extent(
@@ -323,6 +498,7 @@ mod tests {
             position,
             receiver,
             cancelled,
+            operation: TextOperation::Add,
         });
         tool
     }
@@ -343,6 +519,70 @@ mod tests {
         assert!(tool.poll(Some(&mut workspace)).is_none());
         workspace.undo().unwrap();
         assert!(workspace.manifest().timeline.overlay_tracks.is_empty());
+    }
+
+    #[test]
+    fn saved_caption_loads_and_applies_to_the_same_track() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = workspace(&directory.path().join("text.gfsproj"));
+        let mut tool = completed_tool(&workspace, false);
+        tool.poll(Some(&mut workspace)).unwrap();
+        let track = workspace.manifest().timeline.overlay_tracks[0].clone();
+        tool.load(&workspace, track.id).unwrap();
+        assert_eq!(tool.text, "Test");
+        tool.text = "Edited".to_owned();
+        let (request, position) = tool.request(workspace.manifest().canvas.size).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(TextRasterizer::bundled_only()
+                .rasterize(&request)
+                .unwrap()))
+            .unwrap();
+        tool.pending = Some(PendingText {
+            anchor: workspace.overlay_selection_anchor().unwrap(),
+            request,
+            position,
+            receiver,
+            cancelled: false,
+            operation: TextOperation::Replace(track.id),
+        });
+        assert!(
+            tool.poll(Some(&mut workspace))
+                .unwrap()
+                .contains("Text updated")
+        );
+        let updated = &workspace.manifest().timeline.overlay_tracks[0];
+        assert_eq!(updated.id, track.id);
+        assert_eq!(updated.items[0].id, track.items[0].id);
+        assert_eq!(updated.items[0].span, track.items[0].span);
+        assert!(
+            matches!(&updated.items[0].content, OverlayContent::Text { text, .. } if text == "Edited")
+        );
+    }
+
+    #[test]
+    fn title_worker_completion_inserts_a_selected_frame_and_can_be_undone() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = workspace(&directory.path().join("title.gfsproj"));
+        let original = workspace.manifest().timeline.clone();
+        let mut tool = completed_tool(&workspace, false);
+        tool.pending.as_mut().unwrap().operation = TextOperation::Title {
+            after: None,
+            duration: DurationUs::new(1_000_000).unwrap(),
+            background: Rgba::TRANSPARENT,
+        };
+        assert!(
+            tool.poll(Some(&mut workspace))
+                .unwrap()
+                .contains("Title frame inserted")
+        );
+        assert_eq!(workspace.manifest().timeline.frames.len(), 2);
+        assert_eq!(
+            workspace.selection().current(),
+            Some(workspace.manifest().timeline.frames[0].id)
+        );
+        workspace.undo().unwrap();
+        assert_eq!(workspace.manifest().timeline, original);
     }
 
     #[test]
