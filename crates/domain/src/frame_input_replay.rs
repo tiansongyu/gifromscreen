@@ -241,6 +241,7 @@ mod tests {
     #[test]
     fn old_frozen_cells_deserialize_without_claiming_missing_replay_history() {
         let cell = FrameOverlayCell {
+            stage: None,
             frame_id: FrameId::from_u128(1),
             scopes: vec![FrameAuthoringSpan {
                 run_id: 1,

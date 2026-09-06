@@ -31,6 +31,7 @@ fn track(project: &ProjectManifest) -> OverlayTrack {
                 .iter()
                 .enumerate()
                 .map(|(index, frame)| FrameOverlayCell {
+                    stage: None,
                     input_replay: None,
                     frame_id: frame.id,
                     scopes: vec![FrameAuthoringSpan {
@@ -85,7 +86,7 @@ fn legacy_tracks_keep_their_wire_shape_and_new_payload_requires_schema_two() {
     assert!(project.validate().is_err());
     project.schema_version = 2;
     project.validate().unwrap();
-    for version in [0, 3, u32::MAX] {
+    for version in [0, crate::CURRENT_SCHEMA_VERSION + 1, u32::MAX] {
         project.schema_version = version;
         assert!(project.validate().is_err());
     }

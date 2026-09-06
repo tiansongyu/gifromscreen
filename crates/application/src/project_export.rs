@@ -1697,6 +1697,7 @@ mod tests {
                 },
             });
             clips.push(FrameClip {
+                render_steps: Vec::new(),
                 capture_clock: None,
                 capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: spec.id,
@@ -1838,6 +1839,7 @@ mod tests {
         track.id = TrackId::from_u128(2);
         let item = track.items.remove(0);
         track.frame_cells = Some(vec![FrameOverlayCell {
+            stage: None,
             input_replay: None,
             frame_id: owner,
             scopes: vec![FrameAuthoringSpan {

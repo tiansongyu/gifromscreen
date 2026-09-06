@@ -184,6 +184,9 @@ pub struct FrameOverlayMark {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FrameOverlayCell {
     pub frame_id: FrameId,
+    /// None paints at the current tail; Some targets the owner's Composite stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<u32>,
     pub scopes: Vec<FrameAuthoringSpan>,
     pub marks: Vec<FrameOverlayMark>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

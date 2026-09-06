@@ -46,10 +46,21 @@ impl CancellationToken for Cancellation<'_> {
     }
 }
 
-pub(super) fn transform_cursor(
+#[cfg(test)]
+fn transform_cursor(
     source: &RgbaSurface,
     frame: &FrameClip,
     frame_size: PhysicalSize,
+    cancellation: &AtomicBool,
+) -> Result<Option<(RgbaSurface, PhysicalPoint)>, String> {
+    transform_cursor_at_stage(source, frame, frame_size, None, cancellation)
+}
+
+pub(super) fn transform_cursor_at_stage(
+    source: &RgbaSurface,
+    frame: &FrameClip,
+    frame_size: PhysicalSize,
+    stage: Option<u32>,
     cancellation: &AtomicBool,
 ) -> Result<Option<(RgbaSurface, PhysicalPoint)>, String> {
     check_cancelled(cancellation)?;
@@ -57,22 +68,57 @@ pub(super) fn transform_cursor(
         return Ok(None);
     };
     let hotspot = frame.capture_metadata.cursor_hotspot.unwrap_or_default();
-    let crop = frame.transform.crop.unwrap_or(PhysicalRect {
+    let initial = (
+        i64::from(position.x.get()) - i64::from(hotspot.x.get()),
+        i64::from(position.y.get()) - i64::from(hotspot.y.get()),
+    );
+    let mut previous: Option<(RgbaSurface, PhysicalPoint)> = None;
+    for geometry in super::geometry::geometry_to_stage(frame, frame_size, stage)? {
+        check_cancelled(cancellation)?;
+        let (source, origin) = previous
+            .as_ref()
+            .map_or((source, initial), |(pixels, position)| {
+                (
+                    pixels,
+                    (i64::from(position.x.get()), i64::from(position.y.get())),
+                )
+            });
+        let Some(patch) = transform_patch(
+            source,
+            origin,
+            geometry.input_size,
+            geometry.transform,
+            cancellation,
+        )?
+        else {
+            return Ok(None);
+        };
+        previous = Some(patch);
+    }
+    Ok(previous)
+}
+
+fn transform_patch(
+    source: &RgbaSurface,
+    origin: (i64, i64),
+    frame_size: PhysicalSize,
+    transform: ClipTransform,
+    cancellation: &AtomicBool,
+) -> Result<Option<(RgbaSurface, PhysicalPoint)>, String> {
+    let crop = transform.crop.unwrap_or(PhysicalRect {
         origin: PhysicalPoint::default(),
         size: frame_size,
     });
     if !crop.fits_within(frame_size) || crop.size.validate().is_err() {
         return Err("Recorded cursor frame crop is invalid.".to_owned());
     }
-    let resized = frame.transform.output_size.unwrap_or(crop.size);
+    let resized = transform.output_size.unwrap_or(crop.size);
     resized.validate().map_err(|error| error.to_string())?;
     if source.pixels().len() > MAX_CURSOR_SURFACE_BYTES {
         return Err("Recorded cursor image exceeds 64 MiB.".to_owned());
     }
-    let origin_x =
-        i64::from(position.x.get()) - i64::from(hotspot.x.get()) - i64::from(crop.origin.x.get());
-    let origin_y =
-        i64::from(position.y.get()) - i64::from(hotspot.y.get()) - i64::from(crop.origin.y.get());
+    let origin_x = origin.0 - i64::from(crop.origin.x.get());
+    let origin_y = origin.1 - i64::from(crop.origin.y.get());
     let (left, right) = visible_axis(
         origin_x,
         source.width(),
@@ -126,19 +172,17 @@ pub(super) fn transform_cursor(
     let transform = ClipTransform {
         crop: None,
         output_size: None,
-        ..frame.transform
+        ..transform
     };
-    let clip = FrameClip {
-        transform,
-        effects: Vec::new(),
-        ..frame.clone()
+    let rendered = if transform == ClipTransform::default() {
+        patch
+    } else {
+        CpuRenderer::with_limits(RenderLimits {
+            max_surface_bytes: MAX_CURSOR_SURFACE_BYTES,
+        })
+        .transform_surface(&patch, transform, &Cancellation(cancellation))
+        .map_err(|error| error.to_string())?
     };
-    let provider = |_| Ok(patch.clone());
-    let rendered = CpuRenderer::with_limits(RenderLimits {
-        max_surface_bytes: MAX_CURSOR_SURFACE_BYTES,
-    })
-    .render_clip(&clip, &provider, &Cancellation(cancellation))
-    .map_err(|error| error.to_string())?;
     let position = transform_patch_origin(left, top, size, resized, transform);
     Ok(Some((rendered, position)))
 }
@@ -188,6 +232,145 @@ mod tests {
     use gif_from_screen_domain::{AssetId, CaptureMetadata, DurationUs, FrameId};
     use gif_from_screen_render::NeverCancel;
 
+    fn staged_frame() -> FrameClip {
+        use gif_from_screen_domain::{Effect, FrameRenderStep};
+        FrameClip {
+            id: FrameId::from_u128(7),
+            asset_id: AssetId::from_digest([7; 32]),
+            duration: DurationUs::new(10).unwrap(),
+            capture_binding: gif_from_screen_domain::CaptureBinding::Original,
+            capture_clock: None,
+            capture_metadata: CaptureMetadata {
+                cursor_position: Some(PhysicalPoint {
+                    x: PhysicalPx::new(4),
+                    y: PhysicalPx::new(3),
+                }),
+                cursor_hotspot: Some(PhysicalPoint {
+                    x: PhysicalPx::new(1),
+                    y: PhysicalPx::new(1),
+                }),
+                ..CaptureMetadata::default()
+            },
+            transform: ClipTransform {
+                crop: Some(PhysicalRect::new(1, 1, 6, 4).unwrap()),
+                output_size: Some(PhysicalSize::new(9, 5).unwrap()),
+                ..ClipTransform::default()
+            },
+            effects: Vec::new(),
+            render_steps: vec![
+                FrameRenderStep::Composite { stage_id: 11 },
+                FrameRenderStep::Crop {
+                    rect: PhysicalRect::new(1, 0, 7, 5).unwrap(),
+                },
+                FrameRenderStep::Resize {
+                    size: PhysicalSize::new(5, 7).unwrap(),
+                },
+                FrameRenderStep::Composite { stage_id: 22 },
+                FrameRenderStep::Rotate {
+                    rotation: QuarterTurn::Clockwise90,
+                },
+                FrameRenderStep::FlipHorizontal,
+                FrameRenderStep::Effect {
+                    effect: Effect::Blur {
+                        region: PhysicalRect::new(0, 0, 7, 5).unwrap(),
+                        radius: 1,
+                    },
+                },
+                FrameRenderStep::Resize {
+                    size: PhysicalSize::new(11, 8).unwrap(),
+                },
+                FrameRenderStep::FlipVertical,
+                FrameRenderStep::Composite { stage_id: 33 },
+                FrameRenderStep::Crop {
+                    rect: PhysicalRect::new(0, 1, 11, 6).unwrap(),
+                },
+                FrameRenderStep::Resize {
+                    size: PhysicalSize::new(4, 9).unwrap(),
+                },
+            ],
+        }
+    }
+
+    fn embed(cursor: &RgbaSurface, size: PhysicalSize, origin: (i64, i64)) -> RgbaSurface {
+        let mut pixels = vec![0; usize::try_from(size.area().unwrap()).unwrap() * 4];
+        for y in 0..cursor.height() {
+            for x in 0..cursor.width() {
+                let (dx, dy) = (origin.0 + i64::from(x), origin.1 + i64::from(y));
+                if dx >= 0
+                    && dy >= 0
+                    && dx < i64::from(size.width.get())
+                    && dy < i64::from(size.height.get())
+                {
+                    let src = usize::try_from(y * cursor.width() + x).unwrap() * 4;
+                    let dst = (usize::try_from(dy).unwrap() * size.width.get() as usize
+                        + usize::try_from(dx).unwrap())
+                        * 4;
+                    pixels[dst..dst + 4].copy_from_slice(&cursor.pixels()[src..src + 4]);
+                }
+            }
+        }
+        RgbaSurface::new(size, pixels).unwrap()
+    }
+
+    #[test]
+    fn staged_nearest_cursor_matches_full_embedding_and_stops_before_its_authoring_stage() {
+        use gif_from_screen_domain::FrameRenderStep;
+        let cursor = RgbaSurface::new(
+            PhysicalSize::new(3, 2).unwrap(),
+            vec![
+                255, 0, 0, 128, 0, 255, 0, 255, 80, 70, 60, 0, 0, 0, 255, 255, 255, 255, 0, 90, 40,
+                30, 20, 0,
+            ],
+        )
+        .unwrap();
+        let size = PhysicalSize::new(8, 6).unwrap();
+        for (x, y) in [(0, 0), (2, 2), (4, 3), (7, 5), (8, 6)] {
+            let mut frame = staged_frame();
+            frame.capture_metadata.cursor_position = Some(PhysicalPoint {
+                x: PhysicalPx::new(x),
+                y: PhysicalPx::new(y),
+            });
+            let embedded = embed(&cursor, size, (i64::from(x) - 1, i64::from(y) - 1));
+            for stage in [Some(11), Some(22), Some(33), None] {
+                let mut reference = frame.clone();
+                let stop = reference
+                    .render_steps
+                    .iter()
+                    .position(|step| {
+                        matches!(step,
+                    FrameRenderStep::Composite { stage_id } if Some(*stage_id) == stage)
+                    })
+                    .unwrap_or(reference.render_steps.len());
+                reference.render_steps.truncate(stop);
+                reference
+                    .render_steps
+                    .retain(|step| !matches!(step, FrameRenderStep::Effect { .. }));
+                let expected = CpuRenderer::default()
+                    .render_clip(&reference, &|_| Ok(embedded.clone()), &NeverCancel)
+                    .unwrap();
+                let patch = transform_cursor_at_stage(
+                    &cursor,
+                    &frame,
+                    size,
+                    stage,
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+                let actual = patch.map_or_else(
+                    || RgbaSurface::new(expected.size(), vec![0; expected.pixels().len()]).unwrap(),
+                    |(patch, position)| {
+                        embed(
+                            &patch,
+                            expected.size(),
+                            (i64::from(position.x.get()), i64::from(position.y.get())),
+                        )
+                    },
+                );
+                assert_eq!(actual, expected, "point=({x},{y}), stage={stage:?}");
+            }
+        }
+    }
+
     #[test]
     fn small_patch_matches_embedding_before_every_frame_transform() {
         let cursor = RgbaSurface::new(
@@ -219,6 +402,7 @@ mod tests {
                         ..CaptureMetadata::default()
                     };
                     let clip = FrameClip {
+                        render_steps: Vec::new(),
                         capture_clock: None,
                         capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                         id: FrameId::from_u128(1),

@@ -97,7 +97,7 @@ fn edited_effect(edit: &FrameEffectEdit) -> Option<&Effect> {
     }
 }
 
-fn validate_effect(effect: &Effect, canvas: PhysicalSize) -> Result<(), EditorError> {
+pub(crate) fn validate_effect(effect: &Effect, canvas: PhysicalSize) -> Result<(), EditorError> {
     match effect {
         Effect::Blur { region, radius } => {
             validate_region("blur", *region, canvas)?;
@@ -246,6 +246,7 @@ mod tests {
         );
         let frames = (1..=2)
             .map(|number| FrameClip {
+                render_steps: Vec::new(),
                 capture_clock: None,
                 capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: FrameId::from_u128(number),

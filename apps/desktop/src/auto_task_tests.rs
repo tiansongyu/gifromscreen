@@ -121,7 +121,10 @@ fn chain_order_is_atomic_reversible_and_persisted_with_completion_record() {
         current.manifest().timeline.frames[0].duration.get(),
         100_000
     );
-    assert_eq!(current.manifest().timeline.frames[0].effects.len(), 1);
+    assert_eq!(
+        gif_from_screen_editor::frame_effect_count(&current.manifest().timeline.frames[0]),
+        1
+    );
     assert_eq!(
         current.manifest().task_runs[0].completed_tasks,
         summary.completed
@@ -255,7 +258,10 @@ fn no_recorded_events_skip_unused_large_boxes_and_allow_later_tasks_to_finish() 
         current.manifest().timeline.frames[0].duration.get(),
         200_000
     );
-    assert_eq!(current.manifest().timeline.frames[0].effects.len(), 1);
+    assert_eq!(
+        gif_from_screen_editor::frame_effect_count(&current.manifest().timeline.frames[0]),
+        1
+    );
     assert_eq!(
         current.manifest().task_runs[0].skipped_tasks,
         result.skipped
@@ -463,7 +469,10 @@ fn all_six_reference_task_classes_share_one_journal_edit_and_frozen_assets() {
     .unwrap();
     assert_eq!(result.completed.len(), 6);
     assert_eq!(current.manifest().timeline.overlay_tracks.len(), 3);
-    assert_eq!(current.manifest().timeline.frames[0].effects.len(), 2);
+    assert_eq!(
+        gif_from_screen_editor::frame_effect_count(&current.manifest().timeline.frames[0]),
+        2
+    );
     assert!(current.manifest().assets.len() > before.assets.len());
     for asset in current.manifest().assets.values() {
         assert_eq!(

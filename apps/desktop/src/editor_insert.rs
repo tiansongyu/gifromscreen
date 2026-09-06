@@ -12,7 +12,7 @@ use std::{
 };
 
 use gif_from_screen_domain::{
-    AssetDescriptor, AssetId, DurationUs, EditCommand, Effect, FrameClip, FrameId, ProjectManifest,
+    AssetDescriptor, AssetId, DurationUs, EditCommand, FrameClip, FrameId, ProjectManifest,
     ProjectRevision, RasterEncoding, TimeUs, Timeline, TrackId, TransitionId,
 };
 use gif_from_screen_editor::{FrameBundle, FrameBundleIdentities};
@@ -147,9 +147,10 @@ pub(crate) fn prepare_project_insertion(
         return Err(ProjectInsertionError::SameProject);
     }
     validate_source(&target, source)?;
+    let output_size = validate_rendered_sizes(source, &target.manifest, cancellation)?;
     let needed = referenced_assets(source);
     let descriptors = checked_descriptors(&target, source, &needed)?;
-    let (command, inserted_frames) = insertion_command(&target, source, &descriptors)?;
+    let (command, inserted_frames) = insertion_command(&target, source, &descriptors, output_size)?;
     let mut candidate = target.manifest.clone();
     candidate
         .apply_command(&command)
@@ -240,7 +241,9 @@ fn validate_source(
         return Err(ProjectInsertionError::OverlayLimit);
     }
     source.validate().map_err(ProjectError::from)?;
-    if source.canvas != target.manifest.canvas {
+    if source.canvas.color_space != target.manifest.canvas.color_space
+        || source.canvas.background != target.manifest.canvas.background
+    {
         return Err(ProjectInsertionError::CanvasMismatch);
     }
     source
@@ -258,12 +261,55 @@ fn validate_source(
     Ok(())
 }
 
+/// Borrow clip metadata directly: large raw input arrays are not cloned just
+/// to inspect the geometry prefix. This pass precedes every pixel/asset read.
+fn validate_rendered_sizes(
+    source: &ProjectManifest,
+    destination: &ProjectManifest,
+    cancellation: &dyn CancellationToken,
+) -> Result<gif_from_screen_domain::PhysicalSize, ProjectInsertionError> {
+    let mut expected = None;
+    for (side, project) in [("source", source), ("destination", destination)] {
+        for frame in &project.timeline.frames {
+            check_cancelled(cancellation)?;
+            let source_size = project
+                .assets
+                .get(&frame.asset_id)
+                .ok_or(ProjectInsertionError::MissingAsset(frame.asset_id))?
+                .kind
+                .raster_size()
+                .ok_or(ProjectInsertionError::UnsupportedAsset(frame.asset_id))?;
+            let actual = gif_from_screen_domain::FrameGeometryPlan::new(frame, source_size)
+                .map_err(|reason| ProjectInsertionError::RenderedGeometry {
+                    side,
+                    frame_id: frame.id,
+                    reason,
+                })?
+                .output_size();
+            if let Some(expected) = expected {
+                if actual != expected {
+                    return Err(ProjectInsertionError::RenderedSizeMismatch {
+                        side,
+                        frame_id: frame.id,
+                        expected,
+                        actual,
+                    });
+                }
+            } else {
+                expected = Some(actual);
+            }
+        }
+    }
+    check_cancelled(cancellation)?;
+    expected.ok_or(ProjectInsertionError::EmptySource)
+}
+
 fn referenced_assets(source: &ProjectManifest) -> BTreeSet<AssetId> {
     let mut needed = BTreeSet::new();
     for frame in &source.timeline.frames {
         needed.insert(frame.asset_id);
         needed.extend(frame.capture_metadata.cursor_asset);
-        needed.extend(frame.effects.iter().filter_map(Effect::referenced_asset));
+        needed.extend(frame.referenced_effect_assets());
     }
     needed.extend(
         source
@@ -361,6 +407,7 @@ fn insertion_command(
     target: &ProjectInsertionTarget,
     source: &ProjectManifest,
     descriptors: &[AssetDescriptor],
+    output_size: gif_from_screen_domain::PhysicalSize,
 ) -> Result<(EditCommand, Vec<FrameId>), ProjectInsertionError> {
     let timeline = &target.manifest.timeline;
     let start = timeline.frames[..target.index]
@@ -437,6 +484,11 @@ fn insertion_command(
         transitions.push(imported);
     }
     commands.push(EditCommand::SetTransitions { transitions });
+    if output_size != target.manifest.canvas.size {
+        let mut canvas = target.manifest.canvas.clone();
+        canvas.size = output_size;
+        commands.push(EditCommand::SetCanvas { canvas });
+    }
     Ok((EditCommand::Compound { commands }, inserted_frames))
 }
 
@@ -661,8 +713,21 @@ pub(crate) enum ProjectInsertionError {
     FrameLimit,
     #[error("insertion supports at most 10,000 source overlay items")]
     OverlayLimit,
-    #[error("source and destination canvas size, color space, and background must match")]
+    #[error("source and destination canvas color space and background must match")]
     CanvasMismatch,
+    #[error("{side} frame {frame_id} cannot be rendered: {reason}")]
+    RenderedGeometry {
+        side: &'static str,
+        frame_id: FrameId,
+        reason: String,
+    },
+    #[error("{side} frame {frame_id} renders at {}x{}, expected {}x{}; normalize both animations to a common output size before insertion", .actual.width.get(), .actual.height.get(), .expected.width.get(), .expected.height.get())]
+    RenderedSizeMismatch {
+        side: &'static str,
+        frame_id: FrameId,
+        expected: gif_from_screen_domain::PhysicalSize,
+        actual: gif_from_screen_domain::PhysicalSize,
+    },
     #[error("the inserted duration would overflow the project timeline")]
     DurationOverflow,
     #[error("inserted assets exceed the 512 MiB input budget or cannot be allocated")]
@@ -692,11 +757,15 @@ mod frame_owned_tests;
 mod input_replay_tests;
 
 #[cfg(test)]
+#[path = "editor_insert_geometry_tests.rs"]
+mod geometry_tests;
+
+#[cfg(test)]
 mod tests {
     use gif_from_screen_domain::{
         AssetKind, BlendMode, Canvas, CanvasBackground, CaptureMetadata, ClipTransform, ColorSpace,
-        FrameClip, PhysicalPoint, PhysicalSize, ProjectId, Rgba, Transition, TransitionKind,
-        UnixTimeMs,
+        Effect, FrameClip, PhysicalPoint, PhysicalSize, ProjectId, Rgba, Transition,
+        TransitionKind, UnixTimeMs,
     };
     use gif_from_screen_gif::{CancellationFlag, NeverCancel};
 
@@ -777,6 +846,7 @@ mod tests {
                         index: 0,
                         frames: (0..frames)
                             .map(|index| FrameClip {
+                                render_steps: Vec::new(),
                                 capture_clock: None,
                                 capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                                 id: frame_id(index as u128 + 1),
@@ -1165,7 +1235,12 @@ mod tests {
             Err(ProjectInsertionError::Cancelled)
         ));
         let mut resized = source.manifest().clone();
-        resized.canvas.size = PhysicalSize::new(3, 1).unwrap();
+        resized.canvas.background = CanvasBackground::Solid(Rgba {
+            red: 1,
+            green: 2,
+            blue: 3,
+            alpha: 255,
+        });
         assert!(matches!(
             prepare_project_insertion(
                 dest.project_insertion_target(None).unwrap(),
@@ -1265,7 +1340,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_and_effect_assets_are_imported_and_unused_assets_are_skipped() {
+    fn cursor_assets_are_imported_unused_assets_skipped_and_effect_references_remain_complete() {
         let dest_root = tempfile::tempdir().unwrap();
         let source_root = tempfile::tempdir().unwrap();
         let mut dest = workspace(dest_root.path(), 1, [255, 0, 0, 255]);
@@ -1300,21 +1375,35 @@ mod tests {
             .collect::<Vec<_>>();
         let mut replacement = source.manifest().timeline.frames[0].clone();
         replacement.capture_metadata.cursor_asset = Some(cursor);
-        replacement
-            .effects
-            .push(gif_from_screen_domain::Effect::Cinemagraph {
-                mask_asset: mask,
-                invert_mask: false,
-            });
         commands.push(EditCommand::ReplaceFrame {
             frame_id: replacement.id,
             replacement: Box::new(replacement),
         });
         source.execute(EditCommand::Compound { commands }).unwrap();
+        // Enumeration must still retain unsupported effect references, without
+        // using an unrenderable effect as the successful insertion fixture.
+        let mut raw = source.manifest().clone();
+        raw.timeline.frames[0].effects.push(Effect::Cinemagraph {
+            mask_asset: mask,
+            invert_mask: false,
+        });
+        raw.validate().unwrap();
+        assert!(referenced_assets(&raw).contains(&mask));
+        raw.timeline.frames[0].effects.clear();
+        raw.timeline.frames[0].render_steps = vec![
+            gif_from_screen_domain::FrameRenderStep::Composite { stage_id: 1 },
+            gif_from_screen_domain::FrameRenderStep::Effect {
+                effect: Effect::Cinemagraph {
+                    mask_asset: mask,
+                    invert_mask: false,
+                },
+            },
+        ];
+        assert!(referenced_assets(&raw).contains(&mask));
         dest.insert_prepared_project(prepare(&dest, &source, None))
             .unwrap();
         assert!(dest.manifest().assets.contains_key(&cursor));
-        assert!(dest.manifest().assets.contains_key(&mask));
+        assert!(!dest.manifest().assets.contains_key(&mask));
         assert!(!dest.manifest().assets.contains_key(&unused));
     }
 

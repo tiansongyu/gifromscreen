@@ -89,7 +89,8 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [x] Implement the schema-2 frame-owned core across validation, journal recovery, preview/GIF rendering, clipboard/Yoyo/project insertion, Save As and baking, with unchanged legacy timed-track behavior.
 - [x] Connect ordinary frame-owned authors, explicit whole-layer legacy conversion and bounded input-aware regeneration, including copied held labels after source deletion and journal recovery.
 - [x] Distinguish same-name annotation/text groups by layer number and coverage without changing their saved names or identities.
-- [ ] Match whole-frame geometric ownership through later crop/resize/rotation/flips/effects; temporal FrameId ownership alone is not full frame-baked parity.
+- [x] Apply crop/resize/rotation/flips/effects to the complete image in editing order with schema-3 stages, stage-aware re-authoring and shared preview/GIF execution; [native geometry and conversion acceptance](ORDERED-GEOMETRY-QA-2026-09-07.md).
+- [ ] Close the remaining geometric fidelity gaps: expanded-canvas shadow and signed inner/outer borders, hidden intermediate-stage baking, and numerical WPF resize/blur comparison. Ordered execution alone is not full upstream pixel parity.
 - [x] Save an independently identified project copy without switching the current editor, and retain a bounded recent-project list.
 - [x] Build and verify an Ubuntu-22-compatible x86_64 portable tarball with exact-file installation, checksums, license notices, and CI artifacts.
 

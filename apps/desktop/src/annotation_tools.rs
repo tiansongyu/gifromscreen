@@ -152,7 +152,9 @@ impl AnnotationTools {
                 ui.weak("New annotations follow their frames when reordered, copied or retimed. Legacy timed groups keep their original time anchors. Updating a group explicitly regenerates its saved marks.");
                 if self.replacing.is_some(){ui.weak("Updating uses the saved authoring scope, including unmarked frames, independently of the current selection. Legacy groups without a saved scope remain limited to their existing marker coverage.");}
                 if ui.button(if self.replacing.is_some(){"Update annotation group"}else{"Add annotations to selection"}).clicked() {
-                    let result = self.request.validate(workspace.manifest().canvas.size).and_then(|()| if self.replacing.is_some(){Ok(workspace.project_edit_anchor())}else{workspace.overlay_selection_anchor().map_err(|e| e.to_string())});
+                    // The worker validates each owner's authoring-stage canvas.
+                    // A saved layer may precede a later crop or resize.
+                    let result = self.request.validate_settings().and_then(|()| if self.replacing.is_some(){Ok(workspace.project_edit_anchor())}else{workspace.overlay_selection_anchor().map_err(|e| e.to_string())});
                     match result {
                         Ok(anchor) => {self.pending=Some(PendingAnnotation::Apply {anchor,request:self.request.clone(),replacing:self.replacing});self.confirming=false;self.converting=false;self.cancel_pending.store(false,Ordering::Release);self.notice=None;}
                         Err(error) => self.notice=Some(error),
@@ -565,6 +567,7 @@ mod tests {
         let bytes = vec![0; 240 * 40 * 4];
         let asset_id = workspace.active_project().assets().put(&bytes).unwrap();
         let frame = FrameClip {
+            render_steps: Vec::new(),
             capture_clock: None,
             id: FrameId::from_u128(1),
             asset_id,

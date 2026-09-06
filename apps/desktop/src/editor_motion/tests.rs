@@ -626,6 +626,7 @@ fn add_owned_overlay(workspace: &mut EditorWorkspace) -> OverlayTrack {
             .iter()
             .enumerate()
             .map(|(index, frame)| FrameOverlayCell {
+                stage: None,
                 input_replay: None,
                 frame_id: frame.id,
                 scopes: vec![FrameAuthoringSpan {
@@ -660,6 +661,83 @@ fn bake_whole_selected(workspace: &mut EditorWorkspace) {
             |_| {},
         )
         .unwrap();
+}
+
+#[test]
+fn staged_cinemagraph_consumes_geometry_once_and_undo_restores_owned_stages() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("staged-cinemagraph.gfsproj");
+    let mut workspace = workspace(&root);
+    add_owned_overlay(&mut workspace);
+    workspace.toggle_selection_horizontal_flip().unwrap();
+    let before = workspace.manifest().timeline.clone();
+    let pixels = render(
+        workspace.active_project(),
+        FrameId::from_u128(1),
+        workspace.manifest().canvas.size,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert!(!before.frames[0].render_steps.is_empty());
+    bake_whole_selected(&mut workspace);
+    assert!(
+        workspace.manifest().timeline.frames[0]
+            .render_steps
+            .is_empty()
+    );
+    assert_eq!(
+        render(
+            workspace.active_project(),
+            FrameId::from_u128(1),
+            workspace.manifest().canvas.size,
+            &AtomicBool::new(false)
+        )
+        .unwrap(),
+        pixels
+    );
+    workspace.undo().unwrap();
+    assert_eq!(workspace.manifest().timeline, before);
+    workspace.redo().unwrap();
+    drop(workspace);
+    let reopened = EditorWorkspace::open(&root, LockPolicy::FailIfPresent, 32).unwrap();
+    assert_eq!(
+        render(
+            reopened.active_project(),
+            FrameId::from_u128(1),
+            reopened.manifest().canvas.size,
+            &AtomicBool::new(false)
+        )
+        .unwrap(),
+        pixels
+    );
+}
+
+#[test]
+fn hidden_intermediate_artwork_blocks_bake_before_any_project_or_asset_change() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut workspace = workspace(&directory.path().join("staged-hidden.gfsproj"));
+    let mut hidden = add_owned_overlay(&mut workspace);
+    hidden.visible = false;
+    workspace
+        .execute(EditCommand::UpsertOverlayTrack { track: hidden })
+        .unwrap();
+    workspace.toggle_selection_horizontal_flip().unwrap();
+    let before = workspace.manifest().clone();
+    let result = workspace.apply_motion_edit(
+        &workspace.project_edit_anchor(),
+        MotionOperation::Cinemagraph {
+            region: PhysicalRect::new(0, 0, 2, 1).unwrap(),
+            invert: false,
+        },
+        &AtomicBool::new(false),
+        |_| {},
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .contains("hidden or zero-opacity artwork")
+    );
+    assert_eq!(workspace.manifest(), &before);
 }
 
 #[test]
@@ -1063,9 +1141,15 @@ fn motion_rejects_stale_selection_invalid_rectangles_canvas_mismatch_and_limits(
         equal_except_revision(workspace.manifest(), &before);
     }
     assert!(validate_budget(PhysicalSize::new(4096, 4096).unwrap(), 5).is_err());
-    workspace
-        .set_selection_output_size(PhysicalSize::new(1, 1).unwrap())
-        .unwrap();
+    // Simulate an older per-frame transform. The current desktop resize fixes
+    // every frame and canvas together, so it no longer creates this mismatch.
+    let command = gif_from_screen_editor::edit_clip_transforms(
+        workspace.manifest(),
+        [FrameId::from_u128(1)],
+        gif_from_screen_editor::ClipTransformEdit::SetOutputSize(PhysicalSize::new(1, 1).unwrap()),
+    )
+    .unwrap();
+    workspace.execute(command).unwrap();
     let mismatch = workspace.manifest().clone();
     let anchor = workspace.project_edit_anchor();
     assert!(

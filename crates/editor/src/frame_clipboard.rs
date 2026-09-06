@@ -569,6 +569,7 @@ mod tests {
         );
         let frames = (0..frame_count)
             .map(|index| FrameClip {
+                render_steps: Vec::new(),
                 capture_clock: None,
                 capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: FrameId::from_u128(u128::try_from(index).unwrap() + 1),

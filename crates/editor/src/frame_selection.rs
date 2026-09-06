@@ -349,6 +349,7 @@ mod tests {
 
     fn frame(number: u128, duration_us: u64) -> FrameClip {
         FrameClip {
+            render_steps: Vec::new(),
             capture_clock: None,
             capture_binding: gif_from_screen_domain::CaptureBinding::Original,
             id: FrameId::from_u128(number),

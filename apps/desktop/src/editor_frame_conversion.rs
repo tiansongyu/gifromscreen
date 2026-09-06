@@ -22,7 +22,9 @@ use serde::{
 use uuid::Uuid;
 
 use super::{EditorWorkspace, OverlaySelectionAnchor};
-use crate::annotation_engine::{AnnotationEditReport, AnnotationProgress, check_cancelled};
+use crate::annotation_engine::{
+    AnnotationEditReport, AnnotationProgress, check_cancelled, legacy_annotation_stage,
+};
 
 impl EditorWorkspace {
     pub(crate) fn convert_overlay_to_frames(
@@ -252,6 +254,7 @@ impl<'a> ConversionPlan<'a> {
             }
             cells.push(FrameOverlayCell {
                 frame_id: self.frames[index].id,
+                stage: legacy_annotation_stage(&self.frames[index]),
                 scopes: planned.scopes.clone(),
                 marks,
                 // Current raw events are not proof of the historical replay pool.
@@ -323,6 +326,8 @@ impl Serialize for CellsView<'_, '_> {
         #[derive(Serialize)]
         struct View<'a, 'p> {
             frame_id: FrameId,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            stage: Option<u32>,
             scopes: &'a [FrameAuthoringSpan],
             marks: MarksView<'a, 'p>,
         }
@@ -330,6 +335,7 @@ impl Serialize for CellsView<'_, '_> {
         for (&index, cell) in &self.0.cells {
             sequence.serialize_element(&View {
                 frame_id: self.0.frames[index].id,
+                stage: legacy_annotation_stage(&self.0.frames[index]),
                 scopes: &cell.scopes,
                 marks: MarksView {
                     plan: self.0,

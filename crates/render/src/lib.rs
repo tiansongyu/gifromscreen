@@ -1,16 +1,19 @@
 //! Deterministic CPU rendering for `GifFromScreen`.
 //!
 //! Source assets and rendered surfaces use straight-alpha sRGB RGBA8 pixels.
-//! A clip is rendered in a fixed order: crop, nearest-neighbor resize, rotation,
-//! horizontal/vertical flips, then effects in their stored order. Blur uses an
+//! A clip retains its legacy prefix: crop, nearest-neighbor resize, rotation,
+//! horizontal/vertical flips, then effects in their stored order. Ordered render
+//! steps follow that prefix, alternating full-surface geometry/effects with
+//! explicit Composite stages. Empty steps preserve legacy pixels. Blur uses an
 //! edge-clamped separable box filter in alpha-weighted integer space and writes
 //! straight-alpha pixels back. Shadow keeps the canvas size fixed, translates
 //! the current surface's alpha mask, box-blurs it with transparent samples
 //! outside the canvas, clips the result to the canvas, and composites the
 //! original pixels over the colored mask. A zero shadow radius is a valid hard
 //! shadow, radii above [`MAX_BLUR_RADIUS`] are rejected, and every `i32` offset
-//! is accepted with overflow-free clipping. Active timed items and matching
-//! frame-owned marks are then composited in stable z/track/item order with hard-edged,
+//! is accepted with overflow-free clipping. Active timed items join the first
+//! Composite stage, stage-anchored marks join their named stage, and unanchored
+//! marks draw at the tail. Each stage uses stable z/track/item order with hard-edged,
 //! allocation-free vector rasterization and straight-alpha blend modes. Keeping
 //! this pipeline CPU-only gives exports a stable reference implementation across
 //! Linux machines and graphics drivers.
@@ -23,6 +26,9 @@ mod overlay;
 mod renderer;
 mod surface;
 mod transition;
+
+#[cfg(test)]
+mod ordered_tests;
 
 pub use control::{CancellationToken, NeverCancel};
 pub use error::{RenderError, SurfaceError, UnsupportedEffect};

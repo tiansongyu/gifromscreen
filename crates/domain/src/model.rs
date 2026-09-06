@@ -269,6 +269,9 @@ pub struct FrameClip {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_clock: Option<crate::CaptureClockContext>,
     pub effects: Vec<Effect>,
+    /// Ordered operations after the unchanged legacy transform/effect prefix.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub render_steps: Vec<crate::FrameRenderStep>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -473,6 +476,21 @@ pub struct OverlayTrack {
 }
 
 impl OverlayTrack {
+    pub fn required_schema_version(&self) -> u32 {
+        if self
+            .frame_cells
+            .iter()
+            .flatten()
+            .any(|cell| cell.stage.is_some())
+        {
+            3
+        } else if self.frame_cells.is_some() {
+            2
+        } else {
+            1
+        }
+    }
+
     /// Includes hidden and zero-opacity content, for persistence and asset ownership checks.
     pub fn all_mark_contents(&self) -> impl Iterator<Item = (OverlayId, &OverlayContent)> {
         self.items
@@ -698,12 +716,43 @@ impl ProjectManifest {
         }
 
         let mut frame_ids = BTreeSet::new();
+        let mut frame_stages = BTreeMap::<FrameId, BTreeSet<u32>>::new();
         for (index, frame) in self.timeline.frames.iter().enumerate() {
             if frame.id.is_nil() {
                 issues.push(ValidationIssue::NilFrameId { index });
             }
             if !frame_ids.insert(frame.id) {
                 issues.push(ValidationIssue::DuplicateFrameId { frame_id: frame.id });
+            }
+            if !frame.render_steps.is_empty() {
+                if self.schema_version < 3 {
+                    issues.push(ValidationIssue::InvalidFrameRenderSteps {
+                        frame_id: frame.id,
+                        reason: "Ordered frame render steps require schema 3.".to_owned(),
+                    });
+                }
+                match crate::validate_frame_render_steps(&frame.render_steps) {
+                    Ok(()) => {
+                        frame_stages.insert(
+                            frame.id,
+                            frame
+                                .render_steps
+                                .iter()
+                                .filter_map(|step| {
+                                    if let crate::FrameRenderStep::Composite { stage_id } = step {
+                                        Some(*stage_id)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect(),
+                        );
+                    }
+                    Err(reason) => issues.push(ValidationIssue::InvalidFrameRenderSteps {
+                        frame_id: frame.id,
+                        reason,
+                    }),
+                }
             }
             if let Some(asset_id) = frame.capture_metadata.cursor_asset {
                 match self.assets.get(&asset_id) {
@@ -738,6 +787,15 @@ impl ProjectManifest {
                     {
                         issues.push(ValidationIssue::CropOutsideAsset { frame_id: frame.id });
                     }
+                    if frame_stages.contains_key(&frame.id)
+                        && let Some(size) = asset.kind.raster_size()
+                        && let Err(reason) = crate::FrameGeometryPlan::new(frame, size)
+                    {
+                        issues.push(ValidationIssue::InvalidFrameRenderSteps {
+                            frame_id: frame.id,
+                            reason,
+                        });
+                    }
                 }
             }
             if frame
@@ -750,9 +808,10 @@ impl ProjectManifest {
                 });
             }
             for effect in &frame.effects {
-                if effect
-                    .region()
-                    .is_some_and(|region| !region.fits_within(self.canvas.size))
+                if frame.render_steps.is_empty()
+                    && effect
+                        .region()
+                        .is_some_and(|region| !region.fits_within(self.canvas.size))
                 {
                     issues.push(ValidationIssue::EffectRegionOutsideCanvas { frame_id: frame.id });
                 }
@@ -763,6 +822,20 @@ impl ProjectManifest {
                         frame_id: frame.id,
                         asset_id,
                     });
+                }
+            }
+            if frame.render_steps.len() <= crate::MAX_FRAME_RENDER_STEPS {
+                for asset_id in frame
+                    .render_steps
+                    .iter()
+                    .filter_map(crate::FrameRenderStep::referenced_asset)
+                {
+                    if !self.assets.contains_key(&asset_id) {
+                        issues.push(ValidationIssue::MissingEffectAsset {
+                            frame_id: frame.id,
+                            asset_id,
+                        });
+                    }
                 }
             }
         }
@@ -795,6 +868,28 @@ impl ProjectManifest {
                 // Do not allocate a global identity set for already rejected,
                 // unbounded frame-owned payloads.
                 continue;
+            }
+            for cell in track.frame_cells.iter().flatten() {
+                if let Some(stage) = cell.stage {
+                    if self.schema_version < 3 {
+                        issues.push(ValidationIssue::InvalidFrameOverlay {
+                            track_id: track.id,
+                            reason: "Anchored frame-overlay stages require schema 3.".to_owned(),
+                        });
+                    }
+                    if !frame_stages
+                        .get(&cell.frame_id)
+                        .is_some_and(|stages| stages.contains(&stage))
+                    {
+                        issues.push(ValidationIssue::InvalidFrameOverlay {
+                            track_id: track.id,
+                            reason: format!(
+                                "Composite stage {stage} does not exist on overlay owner {}.",
+                                cell.frame_id
+                            ),
+                        });
+                    }
+                }
             }
             if track.id.is_nil() {
                 issues.push(ValidationIssue::NilTrackId);
@@ -957,10 +1052,7 @@ impl ProjectManifest {
         self.timeline.frames.iter().any(|frame| {
             frame.asset_id == asset_id
                 || frame.capture_metadata.cursor_asset == Some(asset_id)
-                || frame
-                    .effects
-                    .iter()
-                    .any(|effect| effect.referenced_asset() == Some(asset_id))
+                || frame.referenced_effect_assets().any(|id| id == asset_id)
         }) || self
             .timeline
             .overlay_tracks
@@ -1000,6 +1092,7 @@ pub(crate) mod test_fixtures {
 
     pub fn frame(number: u8, asset_id: AssetId) -> FrameClip {
         FrameClip {
+            render_steps: Vec::new(),
             capture_clock: None,
             capture_binding: crate::CaptureBinding::Original,
             id: FrameId::from_u128(u128::from(number)),

@@ -75,6 +75,7 @@ fn owned_track(id: u128, owner: u128, asset: AssetId, visible: bool) -> OverlayT
     OverlayTrack {
         id: TrackId::from_u128(id),
         frame_cells: Some(vec![FrameOverlayCell {
+            stage: None,
             input_replay: None,
             frame_id: FrameId::from_u128(owner),
             scopes: vec![FrameAuthoringSpan {
@@ -118,6 +119,62 @@ fn export(project: &ActiveProject, path: &Path) -> Vec<u8> {
 }
 
 #[test]
+fn save_as_preserves_ordered_geometry_and_hidden_stage_artwork() {
+    use gif_from_screen_domain::{FrameRenderStep, QuarterTurn};
+    let directory = tempfile::tempdir().unwrap();
+    let mut source = source(&directory.path().join("staged-source.gfsproj"));
+    let mut commands = Vec::new();
+    for frame in &source.manifest().timeline.frames {
+        let mut replacement = frame.clone();
+        replacement.render_steps = vec![
+            FrameRenderStep::Composite { stage_id: 7 },
+            FrameRenderStep::Resize {
+                size: PhysicalSize::new(1, 2).unwrap(),
+            },
+            FrameRenderStep::Rotate {
+                rotation: QuarterTurn::Clockwise90,
+            },
+        ];
+        commands.push(EditCommand::ReplaceFrame {
+            frame_id: frame.id,
+            replacement: Box::new(replacement),
+        });
+    }
+    for track in &source.manifest().timeline.overlay_tracks {
+        let mut track = track.clone();
+        for cell in track.frame_cells.iter_mut().flatten() {
+            cell.stage = Some(7);
+        }
+        commands.push(EditCommand::UpsertOverlayTrack { track });
+    }
+    let mut canvas = source.manifest().canvas.clone();
+    canvas.size = PhysicalSize::new(2, 1).unwrap();
+    commands.push(EditCommand::SetCanvas { canvas });
+    source.commit(EditCommand::Compound { commands }).unwrap();
+    let target = directory.path().join("staged-copy.gfsproj");
+    save_project_copy(
+        &ProjectCopySnapshot::from_active(&source),
+        &SaveProjectCopyOptions {
+            target: target.clone(),
+            project_id: ProjectId::from_u128(23),
+            created_at: UnixTimeMs::new(2),
+        },
+        &AtomicBool::new(false),
+        |_| {},
+    )
+    .unwrap();
+    let copied = ActiveProject::open(&target, LockPolicy::FailIfPresent)
+        .unwrap()
+        .project;
+    assert_eq!(copied.manifest().timeline, source.manifest().timeline);
+    assert_eq!(copied.manifest().canvas, source.manifest().canvas);
+    assert_eq!(
+        export(&copied, &directory.path().join("copy.gif")),
+        export(&source, &directory.path().join("source.gif"))
+    );
+}
+
+#[test]
 fn save_as_preserves_frozen_labels_hidden_assets_and_source_independence() {
     let directory = tempfile::tempdir().unwrap();
     let mut source = source(&directory.path().join("source.gfsproj"));
@@ -144,7 +201,10 @@ fn save_as_preserves_frozen_labels_hidden_assets_and_source_independence() {
     let opened = ActiveProject::open(&target, LockPolicy::FailIfPresent).unwrap();
     assert!(opened.asset_issues.is_empty());
     let copied = opened.project;
-    assert_eq!(copied.manifest().schema_version, 2);
+    assert_eq!(
+        copied.manifest().schema_version,
+        gif_from_screen_domain::CURRENT_SCHEMA_VERSION
+    );
     assert_ne!(copied.manifest().project_id, source.manifest().project_id);
     assert_eq!(copied.manifest().timeline, before.timeline);
     for asset in copied

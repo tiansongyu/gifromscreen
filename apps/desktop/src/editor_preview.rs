@@ -969,6 +969,7 @@ mod tests {
                     EditCommand::InsertFrames {
                         index: 0,
                         frames: vec![FrameClip {
+                            render_steps: Vec::new(),
                             capture_clock: None,
                             capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                             id: frame_id,
@@ -1092,6 +1093,7 @@ mod tests {
                     EditCommand::InsertFrames {
                         index: 1,
                         frames: vec![FrameClip {
+                            render_steps: Vec::new(),
                             capture_clock: None,
                             capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                             id: second,
@@ -1168,6 +1170,7 @@ mod tests {
         track.id = TrackId::from_u128(2);
         track.items.clear();
         track.frame_cells = Some(vec![FrameOverlayCell {
+            stage: None,
             input_replay: None,
             frame_id: FrameId::from_u128(2),
             scopes: vec![FrameAuthoringSpan {

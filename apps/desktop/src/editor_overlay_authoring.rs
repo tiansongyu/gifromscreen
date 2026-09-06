@@ -2,19 +2,36 @@
 
 use std::io::{self, Write};
 
-use gif_from_screen_domain::{FrameOverlayCell, FrameOverlayMark, OverlayContent, OverlayId};
+use gif_from_screen_domain::{
+    FrameOverlayCell, FrameOverlayMark, OverlayContent, OverlayId, PhysicalSize,
+};
 use gif_from_screen_editor::MAX_FRAME_BUNDLE_METADATA_BYTES;
 use uuid::Uuid;
 
 use super::{EditorWorkspace, EditorWorkspaceError};
 
 impl EditorWorkspace {
+    pub(crate) fn selected_authoring_size(&self) -> Result<PhysicalSize, EditorWorkspaceError> {
+        self.selected_frame_ids()?;
+        let mut minimum = None;
+        for frame in &self.manifest().timeline.frames {
+            if self.selection().contains(frame.id) {
+                let size =
+                    crate::annotation_engine::authoring_stage_size(self.manifest(), frame, None)
+                        .map_err(EditorWorkspaceError::FrameOverlayPreparation)?;
+                include_authoring_size(&mut minimum, size);
+            }
+        }
+        minimum.ok_or(EditorWorkspaceError::EmptyOverlaySelection)
+    }
+
     pub(super) fn generic_overlay_cells(
         &self,
         content: OverlayContent,
         z_index: i32,
     ) -> Result<Vec<FrameOverlayCell>, EditorWorkspaceError> {
         let selected = self.selected_frame_ids()?;
+        self.selected_authoring_size()?;
         validate_repeated_content(&content, selected.len())?;
         gif_from_screen_domain::selected_frame_cells(
             &self.manifest().timeline,
@@ -27,6 +44,16 @@ impl EditorWorkspace {
         )
         .map_err(EditorWorkspaceError::FrameOverlayPreparation)
     }
+}
+
+pub(super) fn include_authoring_size(minimum: &mut Option<PhysicalSize>, size: PhysicalSize) {
+    *minimum = Some(minimum.map_or(size, |old| {
+        PhysicalSize::new(
+            old.width.get().min(size.width.get()),
+            old.height.get().min(size.height.get()),
+        )
+        .expect("intersection of positive stage dimensions")
+    }));
 }
 
 pub(super) fn validate_repeated_content(

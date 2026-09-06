@@ -10,6 +10,7 @@ use gif_from_screen_domain::{
 use thiserror::Error;
 
 mod clip_transform;
+mod composed_frame;
 mod duplicates;
 mod frame_bundle;
 mod frame_clipboard;
@@ -22,6 +23,7 @@ mod virtual_filmstrip;
 mod yoyo;
 
 pub use clip_transform::{ClipTransformEdit, edit_clip_transforms};
+pub use composed_frame::{ComposedFrameEdit, edit_composed_frames, frame_effect_count};
 pub use duplicates::{
     DuplicateDelayMode, DuplicateFrameRetention, FrameComparison, FrameSimilarityProvider,
     RemoveDuplicateFramesOptions, remove_duplicate_frames,
@@ -636,6 +638,17 @@ fn ensure_known_selection(
 /// Errors produced while building or applying editor commands.
 #[derive(Debug, Error)]
 pub enum EditorError {
+    /// An ordered edit cannot be represented safely for this frame.
+    #[error("frame {frame_id}: {reason}")]
+    InvalidRenderPipeline {
+        /// Owner of the invalid operation chain.
+        frame_id: FrameId,
+        /// Specific geometry, stage or resource failure.
+        reason: String,
+    },
+    /// One atomic geometry edit would exceed the command metadata budget.
+    #[error("This edit exceeds the 16 MiB metadata budget. Use fewer frames or layers.")]
+    RenderPipelineMetadataLimit,
     /// Frozen frame-owned annotation metadata could not be copied safely.
     #[error(transparent)]
     FrameBundle(#[from] FrameBundleError),
@@ -914,6 +927,7 @@ mod tests {
             .copied()
             .enumerate()
             .map(|(index, duration)| FrameClip {
+                render_steps: Vec::new(),
                 capture_clock: None,
                 capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: FrameId::from_u128(u128::try_from(index).unwrap() + 1),

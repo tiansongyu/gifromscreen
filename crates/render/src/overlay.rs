@@ -1,7 +1,9 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use gif_from_screen_domain::{
-    AssetId, BlendMode, FrameClip, FrameId, OverlayContent, OverlayId, OverlayItem, OverlayTrack,
-    PhysicalPoint, PhysicalRect, PhysicalSize, ProgressDirection, ProgressStyle, Rgba, ShapeKind,
-    StrokePoint, TimeUs, TimelineSpan,
+    AssetId, BlendMode, FrameClip, FrameId, FrameRenderStep, OverlayContent, OverlayId,
+    OverlayItem, OverlayTrack, PhysicalPoint, PhysicalRect, PhysicalSize, ProgressDirection,
+    ProgressStyle, Rgba, ShapeKind, StrokePoint, TimeUs, TimelineSpan, validate_frame_render_steps,
 };
 
 use crate::{
@@ -67,6 +69,7 @@ struct OverlayLayer<'a> {
     id: OverlayId,
     content: &'a OverlayContent,
     span: Option<TimelineSpan>,
+    stage: Option<u32>,
     z_index: i32,
     track_opacity: u8,
     blend_mode: BlendMode,
@@ -88,6 +91,7 @@ struct OwnedOverlayLayer {
     id: OverlayId,
     content: OverlayContent,
     span: Option<TimelineSpan>,
+    stage: Option<u32>,
     track_opacity: u8,
     blend_mode: BlendMode,
 }
@@ -118,6 +122,7 @@ impl OverlayRenderPlan {
                 id: layer.id,
                 content: layer.content.clone(),
                 span: layer.span,
+                stage: layer.stage,
                 track_opacity: layer.track_opacity,
                 blend_mode: layer.blend_mode,
             });
@@ -129,7 +134,9 @@ impl OverlayRenderPlan {
         })
     }
 
-    /// Immutable assets in drawing order, retaining repeated asset identities.
+    /// All active stages' immutable assets, retaining repeated identities.
+    /// Enumeration is stable z/track/item order; chronological stage order is
+    /// resolved only when this plan is rendered with its owner's step vector.
     pub fn raster_assets(&self) -> impl Iterator<Item = RasterOverlayAsset> + '_ {
         self.layers.iter().filter_map(|layer| {
             Some(RasterOverlayAsset {
@@ -147,6 +154,7 @@ impl OverlayRenderPlan {
                 id: layer.id,
                 content: &layer.content,
                 span: layer.span,
+                stage: layer.stage,
                 // The detached plan has already been sorted. These fields are not
                 // consulted again by the compositor.
                 z_index: 0,
@@ -164,7 +172,9 @@ impl CpuRenderer {
     /// Legacy overlay spans use half-open point sampling: an item is active when
     /// `span.start <= sample_time < span.end()`. Visible non-zero-opacity Raster, Shape, and Drawing
     /// items and the matching `clip.id`'s frame-owned marks are ordered globally by
-    /// `(z_index, track order, item order)`. A frame-owned mark is painted once for the whole
+    /// `(z_index, track order, item order)` within each Composite stage. Legacy
+    /// timed items join only the first stage; unanchored marks paint after the
+    /// ordered steps. Empty steps preserve the old global ordering. A frame-owned mark is painted once for the whole
     /// frame, regardless of its authoring scopes or sample time. Raster images are
     /// nearest-neighbor sampled without a resized allocation. Shapes and drawings are hard-edged,
     /// clipped directly to the destination, and allocate no geometry-sized buffers. Track opacity
@@ -194,16 +204,13 @@ impl CpuRenderer {
         P: FrameAssetProvider + ?Sized,
         C: CancellationToken + ?Sized,
     {
-        let mut surface = self.render_clip(clip, provider, cancellation)?;
-        composite_overlay_layers(
-            &mut surface,
+        self.render_staged_overlays(
+            clip,
             active_overlay_layers(tracks, Some(clip.id), sample_time, cancellation)?,
             sample_time,
             provider,
-            self.limits(),
             cancellation,
-        )?;
-        Ok(surface)
+        )
     }
 
     /// Renders a detached plan produced by [`OverlayRenderPlan::for_frame`].
@@ -228,15 +235,56 @@ impl CpuRenderer {
                 actual: clip.id,
             });
         }
-        let mut surface = self.render_clip(clip, provider, cancellation)?;
-        composite_overlay_layers(
-            &mut surface,
+        self.render_staged_overlays(
+            clip,
             plan.layers(),
             plan.sample_time,
             provider,
-            self.limits(),
             cancellation,
-        )?;
+        )
+    }
+
+    fn render_staged_overlays<'a, P: FrameAssetProvider + ?Sized, C: CancellationToken + ?Sized>(
+        &self,
+        clip: &FrameClip,
+        layers: impl IntoIterator<Item = OverlayLayer<'a>>,
+        sample_time: TimeUs,
+        provider: &P,
+        cancellation: &C,
+    ) -> Result<RgbaSurface, RenderError> {
+        let mut groups = stage_overlay_layers(clip, layers, cancellation)?;
+        let mut surface = self.render_clip_prefix(clip, provider, cancellation)?;
+        for step in &clip.render_steps {
+            check_cancelled(cancellation)?;
+            if let FrameRenderStep::Composite { stage_id } = step {
+                if let Some(layers) = groups.remove(&Some(*stage_id)) {
+                    composite_overlay_layers(
+                        &mut surface,
+                        layers,
+                        sample_time,
+                        provider,
+                        self.limits(),
+                        cancellation,
+                    )?;
+                }
+            } else {
+                surface = self.apply_render_step(surface, step, cancellation)?;
+            }
+        }
+        if let Some(layers) = groups.remove(&None) {
+            composite_overlay_layers(
+                &mut surface,
+                layers,
+                sample_time,
+                provider,
+                self.limits(),
+                cancellation,
+            )?;
+        }
+        debug_assert!(
+            groups.is_empty(),
+            "every validated stage is consumed exactly once"
+        );
         Ok(surface)
     }
 
@@ -264,10 +312,63 @@ impl CpuRenderer {
     }
 }
 
+fn stage_overlay_layers<'a, C: CancellationToken + ?Sized>(
+    clip: &FrameClip,
+    layers: impl IntoIterator<Item = OverlayLayer<'a>>,
+    cancellation: &C,
+) -> Result<BTreeMap<Option<u32>, Vec<OverlayLayer<'a>>>, RenderError> {
+    check_cancelled(cancellation)?;
+    validate_frame_render_steps(&clip.render_steps).map_err(|reason| {
+        RenderError::InvalidRenderSteps {
+            frame_id: clip.id,
+            reason,
+        }
+    })?;
+    let stages: BTreeSet<_> = clip
+        .render_steps
+        .iter()
+        .filter_map(|step| match step {
+            FrameRenderStep::Composite { stage_id } => Some(*stage_id),
+            _ => None,
+        })
+        .collect();
+    let first = match clip.render_steps.first() {
+        Some(FrameRenderStep::Composite { stage_id }) => Some(*stage_id),
+        _ => None,
+    };
+    let mut groups: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for layer in layers {
+        check_cancelled(cancellation)?;
+        let stage = if layer.span.is_some() {
+            first
+        } else {
+            layer.stage
+        };
+        if let Some(stage_id) = stage
+            && !stages.contains(&stage_id)
+        {
+            return Err(RenderError::OverlayStageMissing {
+                frame_id: clip.id,
+                overlay_id: layer.id,
+                stage_id,
+            });
+        }
+        let group = groups.entry(stage).or_default();
+        group
+            .try_reserve(1)
+            .map_err(|_| RenderError::OverlayPlanAllocationFailed {
+                requested: group.len().saturating_add(1),
+            })?;
+        group.push(layer);
+    }
+    Ok(groups)
+}
+
 /// Returns raster assets from visible, non-zero-opacity overlays active at `sample_time`.
 ///
-/// Results follow the same deterministic z/track/item ordering used by
-/// [`CpuRenderer::render_clip_with_overlays`]. Repeated asset identities are retained so
+/// Results include all active stages in deterministic z/track/item order.
+/// Stage chronology requires an owner's render steps and is resolved during
+/// rendering. Repeated asset identities are retained so
 /// callers can preserve overlay context or deduplicate explicitly.
 ///
 /// # Errors
@@ -464,6 +565,7 @@ where
                     id: item.id,
                     content: &item.content,
                     span: Some(item.span),
+                    stage: None,
                     z_index: item.z_index,
                     track_opacity: track.opacity,
                     blend_mode: track.blend_mode,
@@ -494,6 +596,7 @@ where
                         id: mark.id,
                         content: &mark.content,
                         span: None,
+                        stage: cell.stage,
                         z_index: mark.z_index,
                         track_opacity: track.opacity,
                         blend_mode: track.blend_mode,
@@ -1225,6 +1328,7 @@ mod tests {
         let mut output = track.clone();
         output.items.clear();
         output.frame_cells = Some(vec![FrameOverlayCell {
+            stage: None,
             frame_id: owner,
             scopes: Vec::new(),
             marks,
@@ -1486,6 +1590,7 @@ mod tests {
 
     fn clip(asset_id: AssetId) -> FrameClip {
         FrameClip {
+            render_steps: Vec::new(),
             capture_clock: None,
             capture_binding: gif_from_screen_domain::CaptureBinding::Original,
             id: gif_from_screen_domain::FrameId::from_u128(1),
@@ -1556,6 +1661,7 @@ mod tests {
     fn owned_track(owner: FrameId, number: u128, items: Vec<OverlayItem>) -> OverlayTrack {
         let mut result = track(number, true, 255, BlendMode::Normal, Vec::new());
         result.frame_cells = Some(vec![FrameOverlayCell {
+            stage: None,
             input_replay: None,
             frame_id: owner,
             // Two disjoint authoring intervals must still paint each mark only

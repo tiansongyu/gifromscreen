@@ -324,9 +324,12 @@ impl ActiveProject {
         if self.frame_positions.contains_key(&frame.id) {
             return Err(DomainError::DuplicateFrameId(frame.id).into());
         }
-        if frame.transform != Default::default() || !frame.effects.is_empty() {
+        if frame.transform != Default::default()
+            || !frame.effects.is_empty()
+            || !frame.render_steps.is_empty()
+        {
             return Err(ProjectError::InvalidRecordingMutation(
-                "fast recording append requires an untransformed frame without effects".to_owned(),
+                "fast recording append requires an untransformed frame without effects or render steps".to_owned(),
             ));
         }
         let descriptor = match new_asset {
@@ -609,6 +612,10 @@ impl ActiveProject {
 #[path = "schema_migration.rs"]
 mod schema_migration;
 
+#[cfg(test)]
+#[path = "schema3_migration.rs"]
+mod schema3_migration;
+
 fn validate_raw_recording_asset(
     manifest: &ProjectManifest,
     descriptor: &AssetDescriptor,
@@ -727,6 +734,7 @@ mod tests {
 
     fn recording_frame(id: u128, asset_id: AssetId, duration_us: u64) -> FrameClip {
         FrameClip {
+            render_steps: Vec::new(),
             capture_clock: None,
             capture_binding: gif_from_screen_domain::CaptureBinding::Original,
             id: FrameId::from_u128(id),

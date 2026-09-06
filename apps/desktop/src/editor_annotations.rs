@@ -301,6 +301,7 @@ mod tests {
                 .into_iter()
                 .zip([1, 3])
                 .map(|(item, owner)| FrameOverlayCell {
+                    stage: None,
                     input_replay: None,
                     frame_id: FrameId::from_u128(owner),
                     scopes: vec![FrameAuthoringSpan {

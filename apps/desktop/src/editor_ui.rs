@@ -1816,7 +1816,7 @@ fn show_transform_toolbar(
     results: &mut Vec<EditorUiResult>,
 ) {
     ui.group(|ui| {
-        ui.strong("Transform selected frames");
+        ui.strong("Image geometry");
         show_crop_resize_controls(ui, workspace, state, now, results);
         show_orientation_controls(ui, workspace, state, now, results);
     });
@@ -1829,6 +1829,8 @@ fn show_crop_resize_controls(
     now: Instant,
     results: &mut Vec<EditorUiResult>,
 ) {
+    ui.label("Crop, resize and rotation affect all frames and their existing artwork.");
+    ui.small("Coordinates refer to the current image. Flip and effects use the selected frames.");
     ui.horizontal_wrapped(|ui| {
         ui.label("Crop");
         ui.label("X");
@@ -1855,7 +1857,7 @@ fn show_crop_resize_controls(
                 Err(message) => push_failure(results, EditorUiOperation::ApplyCrop, message),
             }
         }
-        if ui.button("Clear crop").clicked() {
+        if ui.button("Remove last crop").on_hover_text("Removes the most recent crop on all frames. Later layers keep their stage coordinates; a later crop or effect that no longer fits prevents the edit. Use Undo to restore the exact previous layout.").clicked() {
             let result = workspace.clear_selection_crop();
             record_project_result(
                 workspace,
@@ -1869,7 +1871,7 @@ fn show_crop_resize_controls(
     });
 
     ui.horizontal_wrapped(|ui| {
-        ui.label("Resize before rotation");
+        ui.label("Resize current image");
         ui.label("W");
         compact_input(ui, &mut state.resize_width_input);
         ui.label("H");
@@ -1890,7 +1892,7 @@ fn show_crop_resize_controls(
                 Err(message) => push_failure(results, EditorUiOperation::Resize, message),
             }
         }
-        if ui.button("Clear resize").clicked() {
+        if ui.button("Remove last resize").on_hover_text("Removes the most recent resize on all frames. Later layers retain their own stage coordinates; re-author an input group to recalculate its source-coordinate mapping.").clicked() {
             let result = workspace.clear_selection_output_size();
             record_project_result(
                 workspace,
@@ -2499,6 +2501,7 @@ fn show_overlay_track_list(
         return;
     }
     ui.separator();
+    ui.small("Earlier artwork follows later image operations. Layer order applies within each editing stage; newly added artwork is drawn after existing operations.");
     ui.label(format!(
         "Overlay tracks: {}{}",
         workspace.manifest().timeline.overlay_tracks.len(),
@@ -3780,6 +3783,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, duration)| FrameClip {
+                render_steps: Vec::new(),
                 capture_clock: None,
                 capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: FrameId::from_u128(index as u128 + 1),

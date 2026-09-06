@@ -9,8 +9,8 @@ use gif_from_screen_domain::{
     AnnotationMode, AnnotationRequest, AssetDescriptor, AssetKind, BlendMode, CaptureOrigin,
     EditCommand, FrameClip, FrameId, HorizontalAlignment, MouseButton, OverlayContent, OverlayId,
     OverlayItem, OverlayTrack, PhysicalPoint, PhysicalPx, PhysicalRect, ProgressFraction,
-    ProgressMeasure, ProgressOptions, ProgressStyle, ProjectManifest, QuarterTurn, RasterEncoding,
-    Rgba, TextRaster, TimeUs, TimelineSpan, TrackId,
+    ProgressMeasure, ProgressOptions, ProgressStyle, ProjectManifest, RasterEncoding, Rgba,
+    TextRaster, TimeUs, TimelineSpan, TrackId,
 };
 use gif_from_screen_project::AssetStore;
 use gif_from_screen_render::RgbaSurface;
@@ -29,6 +29,11 @@ mod cursor;
 #[path = "annotation_keys.rs"]
 mod keys;
 use keys::KeyLabelHistory;
+
+#[path = "authoring_geometry.rs"]
+mod geometry;
+use geometry::transform_point_at_stage;
+pub(crate) use geometry::{authoring_stage_size, legacy_annotation_stage};
 
 #[path = "annotation_scope_plan.rs"]
 mod scope;
@@ -94,8 +99,18 @@ struct Labels<'a> {
     cursor_cache: BTreeMap<String, Option<OverlayContent>>,
 }
 
+#[derive(Clone, Copy)]
+enum AnnotationPlacement {
+    Legacy,
+    Tail,
+}
+
 impl Labels<'_> {
-    fn cursor_overlay(&mut self, frame: &FrameClip) -> Result<Option<OverlayContent>, String> {
+    fn cursor_overlay(
+        &mut self,
+        frame: &FrameClip,
+        stage: Option<u32>,
+    ) -> Result<Option<OverlayContent>, String> {
         let meta = &frame.capture_metadata;
         if !meta.cursor_visible || meta.cursor_embedded {
             return Ok(None);
@@ -120,14 +135,16 @@ impl Labels<'_> {
             .get(&frame.asset_id)
             .and_then(|asset| asset.kind.raster_size())
             .ok_or_else(|| "Recorded cursor frame dimensions are unavailable.".to_owned())?;
-        let key = serde_json::to_string(&(
+        let geometry = geometry::geometry_to_stage(frame, frame_size, stage)?;
+        let key = serde_json::to_vec(&(
             asset_id,
-            frame.transform,
+            &geometry,
             frame_size,
             meta.cursor_position,
             meta.cursor_hotspot,
         ))
         .map_err(|error| error.to_string())?;
+        let key = AssetStore::id_for_bytes(&key).to_string();
         if let Some(content) = self.cursor_cache.get(&key) {
             return Ok(content.clone());
         }
@@ -151,7 +168,7 @@ impl Labels<'_> {
             return Ok(None);
         }
         let content = if let Some((surface, position)) =
-            cursor::transform_cursor(&source, frame, frame_size, self.cancellation)?
+            cursor::transform_cursor_at_stage(&source, frame, frame_size, stage, self.cancellation)?
         {
             Some(OverlayContent::Cursor {
                 cursor_asset: Some(self.store_cursor(surface)?),
@@ -326,7 +343,15 @@ pub(crate) fn prepare_legacy_annotations_with_assets(
     manifest.validate().map_err(|error| error.to_string())?;
     validate_selection(manifest, selected)?;
     let plan = ScopePlan::from_selection(manifest, selected)?;
-    prepare_annotation_plan(manifest, &plan, request, cancellation, progress, provider)
+    prepare_annotation_plan(
+        manifest,
+        &plan,
+        request,
+        cancellation,
+        progress,
+        provider,
+        AnnotationPlacement::Legacy,
+    )
 }
 
 pub(crate) fn prepare_annotations_in_scope(
@@ -349,7 +374,15 @@ pub(crate) fn prepare_annotations_in_scope(
     }) {
         return Err("This group's authoring scope includes frames without verified original input coordinates. The whole group is unchanged: confirm eligible legacy coordinates, undo the composite, or use manual annotations.".to_owned());
     }
-    prepare_annotation_plan(manifest, &plan, request, cancellation, progress, provider)
+    prepare_annotation_plan(
+        manifest,
+        &plan,
+        request,
+        cancellation,
+        progress,
+        provider,
+        AnnotationPlacement::Legacy,
+    )
 }
 
 fn prepare_annotation_plan(
@@ -359,6 +392,7 @@ fn prepare_annotation_plan(
     cancellation: &AtomicBool,
     mut progress: impl FnMut(AnnotationProgress),
     provider: &dyn Fn(gif_from_screen_domain::AssetId) -> Result<RgbaSurface, String>,
+    placement: AnnotationPlacement,
 ) -> Result<PreparedAnnotations, String> {
     request.validate_settings()?;
     let (blocked, replay_skips) = replay_filter(manifest, &plan.selected, &request.mode);
@@ -377,7 +411,6 @@ fn prepare_annotation_plan(
             replay_skips,
         });
     }
-    request.validate(manifest.canvas.size)?;
     let mut labels = Labels {
         manifest,
         request,
@@ -389,7 +422,8 @@ fn prepare_annotation_plan(
         cancellation,
         cursor_cache: BTreeMap::new(),
     };
-    let (items, affected) = render_scope_samples(&mut labels, plan, &blocked, &mut progress)?;
+    let (items, affected) =
+        render_scope_samples(&mut labels, plan, &blocked, &mut progress, placement)?;
     check_cancelled(cancellation)?;
     let excluded: Vec<_> = plan
         .samples
@@ -443,6 +477,7 @@ fn render_scope_samples(
     plan: &ScopePlan,
     blocked: &BTreeSet<FrameId>,
     progress: &mut impl FnMut(AnnotationProgress),
+    placement: AnnotationPlacement,
 ) -> Result<(Vec<OverlayItem>, usize), String> {
     let manifest = labels.manifest;
     let request = labels.request;
@@ -491,6 +526,10 @@ fn render_scope_samples(
         }
         let sample = AnnotationFrame {
             frame,
+            stage: match placement {
+                AnnotationPlacement::Legacy => legacy_annotation_stage(frame),
+                AnnotationPlacement::Tail => None,
+            },
             index: planned.index,
             end: planned.frame_end,
             total_us,
@@ -656,6 +695,7 @@ impl std::io::Write for CommandBudget {
 
 struct AnnotationFrame<'a> {
     frame: &'a FrameClip,
+    stage: Option<u32>,
     index: usize,
     end: u64,
     total_us: u64,
@@ -670,6 +710,7 @@ fn prepare_frame(
 ) -> Result<Vec<OverlayContent>, String> {
     let request = labels.request;
     let frame = sample.frame;
+    request.validate(authoring_stage_size(labels.manifest, frame, sample.stage)?)?;
     let mut contents = Vec::new();
     match &request.mode {
         AnnotationMode::Progress(options) => {
@@ -690,7 +731,7 @@ fn prepare_frame(
             prepare_clicks(labels, sample, recent_clicks, &mut contents)?;
         }
         AnnotationMode::RecordedCursor => {
-            if let Some(content) = labels.cursor_overlay(frame)? {
+            if let Some(content) = labels.cursor_overlay(frame, sample.stage)? {
                 contents.push(content);
             }
         }
@@ -816,7 +857,7 @@ fn prepare_clicks(
             *original_origin,
             frame.capture_metadata.capture_origin,
         )
-        .and_then(|point| transform_point(manifest, frame, point))
+        .and_then(|point| transform_point_at_stage(manifest, frame, sample.stage, point))
         {
             contents.push(click(position, *button, request));
         }
@@ -935,62 +976,13 @@ fn format_time(us: u64) -> String {
     )
 }
 
-/// Match crop → nearest resize → rotation → flips; pointer icon size stays native.
+#[cfg(test)]
 fn transform_point(
     manifest: &ProjectManifest,
     frame: &FrameClip,
     point: PhysicalPoint,
 ) -> Option<PhysicalPoint> {
-    let source = manifest.assets.get(&frame.asset_id)?.kind.raster_size()?;
-    let crop = frame.transform.crop.unwrap_or(PhysicalRect {
-        origin: PhysicalPoint::default(),
-        size: source,
-    });
-    let mut x = point.x.get().checked_sub(crop.origin.x.get())?;
-    let mut y = point.y.get().checked_sub(crop.origin.y.get())?;
-    if x >= crop.size.width.get() || y >= crop.size.height.get() {
-        return None;
-    }
-    let size = frame.transform.output_size.unwrap_or(crop.size);
-    x = u32::try_from(
-        u64::from(x) * u64::from(size.width.get()) / u64::from(crop.size.width.get()),
-    )
-    .ok()?;
-    y = u32::try_from(
-        u64::from(y) * u64::from(size.height.get()) / u64::from(crop.size.height.get()),
-    )
-    .ok()?;
-    let (mut x, mut y, w, h) = match frame.transform.rotation {
-        QuarterTurn::Zero => (x, y, size.width.get(), size.height.get()),
-        QuarterTurn::Clockwise90 => (
-            size.height.get() - 1 - y,
-            x,
-            size.height.get(),
-            size.width.get(),
-        ),
-        QuarterTurn::Clockwise180 => (
-            size.width.get() - 1 - x,
-            size.height.get() - 1 - y,
-            size.width.get(),
-            size.height.get(),
-        ),
-        QuarterTurn::Clockwise270 => (
-            y,
-            size.width.get() - 1 - x,
-            size.height.get(),
-            size.width.get(),
-        ),
-    };
-    if frame.transform.flip_horizontal {
-        x = w - 1 - x;
-    }
-    if frame.transform.flip_vertical {
-        y = h - 1 - y;
-    }
-    Some(PhysicalPoint {
-        x: PhysicalPx::new(x),
-        y: PhysicalPx::new(y),
-    })
+    transform_point_at_stage(manifest, frame, None, point)
 }
 
 pub(crate) fn check_cancelled(cancellation: &AtomicBool) -> Result<(), String> {
@@ -1046,7 +1038,7 @@ mod tests {
     use super::prepare_legacy_annotations_with_assets as prepare_annotations_with_assets;
     use gif_from_screen_domain::{
         AssetId, Canvas, CanvasBackground, CaptureMetadata, ClipTransform, ColorSpace, DurationUs,
-        KeyStroke, MouseInputEvent, PhysicalSize, ProjectId, UnixTimeMs,
+        KeyStroke, MouseInputEvent, PhysicalSize, ProjectId, QuarterTurn, UnixTimeMs,
     };
 
     pub(super) fn manifest() -> ProjectManifest {
@@ -1076,6 +1068,7 @@ mod tests {
         );
         for index in 0_u64..3 {
             manifest.timeline.frames.push(FrameClip {
+                render_steps: Vec::new(),
                 capture_clock: Some(gif_from_screen_domain::CaptureClockContext {
                     id: Some(gif_from_screen_domain::CaptureClockId::from_u128(1)),
                     sampled_at: TimeUs::new(index * 100_000),
@@ -1736,6 +1729,10 @@ mod tests {
     fn empty_recorded_tasks_skip_unused_oversized_boxes_without_loading_assets() {
         let mut manifest = manifest();
         manifest.canvas.size = PhysicalSize::new(100, 50).unwrap();
+        // The authoring area is the actual rendered stage, not canvas metadata alone.
+        for frame in &mut manifest.timeline.frames {
+            frame.transform.output_size = Some(manifest.canvas.size);
+        }
         let selected = manifest
             .timeline
             .frames

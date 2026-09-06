@@ -185,6 +185,7 @@ pub(crate) fn persist_rgba_project_with_metadata(
             frame_index,
         )?;
         clips.push(FrameClip {
+            render_steps: Vec::new(),
             capture_clock: capture_metadata.captured_at.map(|sampled_at| {
                 gif_from_screen_domain::CaptureClockContext {
                     id: Some(capture_clock_id),

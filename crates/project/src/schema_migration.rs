@@ -364,11 +364,12 @@ fn stamp_and_reopen_reject_unknown_future_formats_without_mutating_legacy_state(
     let directory = tempfile::tempdir().unwrap();
     let mut project = ActiveProject::create(directory.path(), legacy_manifest()).unwrap();
     let before = fs::read(&project.layout().manifest).unwrap();
-    assert!(project.stamp_schema_upgrade(3).is_err());
+    let unsupported = gif_from_screen_domain::CURRENT_SCHEMA_VERSION + 1;
+    assert!(project.stamp_schema_upgrade(unsupported).is_err());
     assert!(!project.write_requires_recovery);
     assert_eq!(fs::read(&project.layout().manifest).unwrap(), before);
     let mut future = legacy_manifest();
-    future.schema_version = 3;
+    future.schema_version = unsupported;
     write_manifest(&project.layout().manifest, &future).unwrap();
     drop(project);
     assert!(ActiveProject::open(directory.path(), LockPolicy::FailIfPresent).is_err());

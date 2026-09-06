@@ -316,6 +316,7 @@ mod tests {
                 id: item.id,
                 content: &item.content,
                 span: Some(item.span),
+                stage: None,
                 z_index: item.z_index,
                 track_opacity: 255,
                 blend_mode: BlendMode::Normal,

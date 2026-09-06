@@ -136,3 +136,183 @@ fn replay_output_limits_fail_before_retaining_excess_marks_or_combined_text() {
     assert!(output.text(owner, 2, "B".to_owned()).is_err());
     assert_eq!(output.texts[&owner].len(), 1);
 }
+
+fn staged_input_project() -> (ProjectManifest, RgbaSurface) {
+    use gif_from_screen_domain::{
+        ClipTransform, FrameRenderStep, MouseButton, MouseInputEvent, PhysicalPoint, PhysicalPx,
+        PhysicalRect, PhysicalSize, RasterEncoding,
+    };
+    let mut manifest = populated(1);
+    let cursor =
+        RgbaSurface::new(PhysicalSize::new(1, 1).unwrap(), vec![255, 255, 255, 128]).unwrap();
+    let cursor_id = AssetStore::id_for_bytes(cursor.pixels());
+    manifest.assets.insert(
+        cursor_id,
+        AssetDescriptor {
+            id: cursor_id,
+            byte_len: 4,
+            kind: AssetKind::OverlayImage {
+                size: cursor.size(),
+                encoding: RasterEncoding::Rgba8,
+            },
+        },
+    );
+    let frame = &mut manifest.timeline.frames[0];
+    frame.transform = ClipTransform {
+        crop: Some(PhysicalRect::new(10, 0, 20, 20).unwrap()),
+        output_size: Some(PhysicalSize::new(40, 20).unwrap()),
+        ..ClipTransform::default()
+    };
+    frame.render_steps = vec![
+        FrameRenderStep::Composite { stage_id: 11 },
+        FrameRenderStep::Resize {
+            size: PhysicalSize::new(20, 10).unwrap(),
+        },
+    ];
+    let point = PhysicalPoint {
+        x: PhysicalPx::new(20),
+        y: PhysicalPx::new(10),
+    };
+    frame.capture_metadata.cursor_visible = true;
+    frame.capture_metadata.cursor_asset = Some(cursor_id);
+    frame.capture_metadata.cursor_position = Some(point);
+    frame.capture_metadata.mouse_events.push(MouseInputEvent {
+        at: TimeUs::ZERO,
+        button: MouseButton::Left,
+        pressed: true,
+        position: Some(point),
+    });
+    manifest.canvas.size = PhysicalSize::new(20, 10).unwrap();
+    (manifest, cursor)
+}
+
+fn position(prepared: &PreparedAnnotations) -> (u32, u32) {
+    let track = super::super::tests::track(prepared);
+    let content = track.all_mark_contents().next().unwrap().1;
+    let (OverlayContent::MouseClick {
+        position: point, ..
+    }
+    | OverlayContent::Cursor {
+        position: point, ..
+    }) = content
+    else {
+        panic!("expected positional input mark")
+    };
+    (point.x.get(), point.y.get())
+}
+
+fn seal_and_extend_input_program(manifest: &mut ProjectManifest) {
+    use gif_from_screen_domain::{
+        Effect, FrameRenderStep, PhysicalRect, PhysicalSize, QuarterTurn,
+    };
+    manifest.timeline.overlay_tracks[0]
+        .frame_cells
+        .as_mut()
+        .unwrap()[0]
+        .stage = Some(22);
+    manifest.timeline.frames[0].render_steps.extend([
+        FrameRenderStep::Composite { stage_id: 22 },
+        FrameRenderStep::Rotate {
+            rotation: QuarterTurn::Clockwise90,
+        },
+        FrameRenderStep::Crop {
+            rect: PhysicalRect::new(2, 0, 8, 20).unwrap(),
+        },
+        FrameRenderStep::Effect {
+            effect: Effect::Blur {
+                region: PhysicalRect::new(0, 0, 8, 20).unwrap(),
+                radius: 1,
+            },
+        },
+    ]);
+    manifest.canvas.size = PhysicalSize::new(8, 20).unwrap();
+}
+
+#[test]
+fn recorded_click_and_cursor_creation_reedit_and_legacy_replay_use_their_distinct_stages() {
+    for mode in [
+        AnnotationMode::RecordedClicks,
+        AnnotationMode::RecordedCursor,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AssetStore::open(directory.path()).unwrap();
+        let (mut manifest, cursor) = staged_input_project();
+        let raw = manifest.timeline.frames[0].capture_metadata.clone();
+        let clock = manifest.timeline.frames[0].capture_clock;
+        let selected = [manifest.timeline.frames[0].id].into_iter().collect();
+        let request = AnnotationRequest {
+            mode,
+            ..AnnotationRequest::default()
+        };
+        let provider = |_| Ok(cursor.clone());
+        let prepared = super::super::prepare_annotations_with_assets(
+            &manifest,
+            &selected,
+            &request,
+            &AtomicBool::new(false),
+            |_| {},
+            &provider,
+        )
+        .unwrap();
+        assert_eq!(position(&prepared), (10, 5));
+        for (asset, bytes) in &prepared.assets {
+            assert_eq!(store.put(bytes).unwrap(), asset.id);
+        }
+        manifest
+            .apply_command(&EditCommand::Compound {
+                commands: prepared.commands,
+            })
+            .unwrap();
+        seal_and_extend_input_program(&mut manifest);
+        let original = manifest.timeline.overlay_tracks[0].clone();
+        let updated = prepare_replacement(
+            &manifest,
+            &original,
+            &request,
+            &store,
+            &AtomicBool::new(false),
+            |_| {},
+            &provider,
+        )
+        .unwrap();
+        assert_eq!(position(&updated), (10, 5));
+        assert_eq!(
+            super::super::tests::track(&updated)
+                .frame_cells
+                .as_ref()
+                .unwrap()[0]
+                .stage,
+            Some(22)
+        );
+        let tail = super::super::prepare_annotations_with_assets(
+            &manifest,
+            &selected,
+            &request,
+            &AtomicBool::new(false),
+            |_| {},
+            &provider,
+        )
+        .unwrap();
+        assert_eq!(position(&tail), (2, 10));
+        assert_eq!(
+            super::super::tests::track(&tail)
+                .frame_cells
+                .as_ref()
+                .unwrap()[0]
+                .stage,
+            None
+        );
+        let legacy = super::super::prepare_legacy_annotations_with_assets(
+            &manifest,
+            &selected,
+            &request,
+            &AtomicBool::new(false),
+            |_| {},
+            &provider,
+        )
+        .unwrap();
+        assert_eq!(position(&legacy), (20, 10));
+        assert_eq!(manifest.timeline.frames[0].capture_metadata, raw);
+        assert_eq!(manifest.timeline.frames[0].capture_clock, clock);
+    }
+}

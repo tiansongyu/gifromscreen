@@ -9,7 +9,9 @@ use gif_from_screen_domain::{
 use gif_from_screen_text::{TextImage, TextRequest};
 use uuid::Uuid;
 
+use super::overlay_authoring::include_authoring_size;
 use super::{EditorWorkspace, EditorWorkspaceError, RasterOverlayEdit};
+use crate::annotation_engine::{authoring_stage_size, legacy_annotation_stage};
 
 #[derive(Clone, Debug)]
 pub(crate) struct TextOverlayDraft {
@@ -29,6 +31,71 @@ pub(crate) struct TitleFrameRequest {
 }
 
 impl EditorWorkspace {
+    /// Common placement area in the actual owner stages, not the final image canvas.
+    pub(crate) fn text_overlay_authoring_size(
+        &self,
+        track_id: TrackId,
+    ) -> Result<PhysicalSize, EditorWorkspaceError> {
+        let track = self.editable_text_track(track_id)?;
+        let mut minimum = None;
+        if let Some(cells) = &track.frame_cells {
+            let frames: std::collections::BTreeMap<_, _> = self
+                .manifest()
+                .timeline
+                .frames
+                .iter()
+                .map(|frame| (frame.id, frame))
+                .collect();
+            for cell in cells.iter().filter(|cell| !cell.marks.is_empty()) {
+                let frame = frames.get(&cell.frame_id).ok_or_else(|| {
+                    EditorWorkspaceError::FrameOverlayPreparation(
+                        "A text owner frame is missing.".to_owned(),
+                    )
+                })?;
+                let size = authoring_stage_size(self.manifest(), frame, cell.stage)
+                    .map_err(EditorWorkspaceError::FrameOverlayPreparation)?;
+                include_authoring_size(&mut minimum, size);
+            }
+        } else {
+            let mut spans: Vec<_> = track
+                .items
+                .iter()
+                .map(|item| {
+                    item.span
+                        .end()
+                        .map(|end| (item.span.start.get(), end.get()))
+                        .ok_or_else(|| {
+                            EditorWorkspaceError::FrameOverlayPreparation(
+                                "A legacy text span overflows.".to_owned(),
+                            )
+                        })
+                })
+                .collect::<Result<_, _>>()?;
+            spans.sort_unstable();
+            let mut spans = spans.into_iter().peekable();
+            let mut covered_until = 0;
+            let mut start = 0_u64;
+            for frame in &self.manifest().timeline.frames {
+                while spans.peek().is_some_and(|(left, _)| *left <= start) {
+                    covered_until = covered_until.max(spans.next().expect("peeked span").1);
+                }
+                if start < covered_until {
+                    let size = authoring_stage_size(
+                        self.manifest(),
+                        frame,
+                        legacy_annotation_stage(frame),
+                    )
+                    .map_err(EditorWorkspaceError::FrameOverlayPreparation)?;
+                    include_authoring_size(&mut minimum, size);
+                }
+                start = start
+                    .checked_add(frame.duration.get())
+                    .ok_or(EditorWorkspaceError::TitleDurationOverflow)?;
+            }
+        }
+        Ok(minimum.unwrap_or(self.manifest().canvas.size))
+    }
+
     /// Reads one text group without changing its frame coverage or project state.
     pub(crate) fn text_overlay_draft(
         &self,
@@ -77,7 +144,12 @@ impl EditorWorkspace {
         position: PhysicalPoint,
     ) -> Result<TrackId, EditorWorkspaceError> {
         let track = self.editable_text_track(track_id)?;
-        self.validate_text_image(request, image, position)?;
+        Self::validate_text_image(
+            request,
+            image,
+            position,
+            self.text_overlay_authoring_size(track_id)?,
+        )?;
         let asset = self.raster_asset_descriptor(image.size, &image.rgba)?;
         let content = text_content(request, image, position, asset.id);
         super::overlay_authoring::validate_repeated_content(
@@ -107,7 +179,7 @@ impl EditorWorkspace {
         image: &TextImage,
         position: PhysicalPoint,
     ) -> Result<TrackId, EditorWorkspaceError> {
-        self.validate_text_image(request, image, position)?;
+        Self::validate_text_image(request, image, position, self.selected_authoring_size()?)?;
         self.add_raster_content_for_selection(
             RasterOverlayEdit {
                 name: "Text".to_owned(),
@@ -131,7 +203,12 @@ impl EditorWorkspace {
         request: &TitleFrameRequest,
         image: &TextImage,
     ) -> Result<FrameId, EditorWorkspaceError> {
-        self.validate_text_image(&request.text, image, request.position)?;
+        Self::validate_text_image(
+            &request.text,
+            image,
+            request.position,
+            self.manifest().canvas.size,
+        )?;
         let frames = &self.manifest().timeline.frames;
         let index = match request.after {
             None => 0,
@@ -168,6 +245,7 @@ impl EditorWorkspace {
         let text_asset = self.raster_asset_descriptor(image.size, &image.rgba)?;
         let frame_id = FrameId::from_u128(Uuid::new_v4().as_u128());
         let frame = FrameClip {
+            render_steps: Vec::new(),
             capture_clock: None,
             capture_binding: gif_from_screen_domain::CaptureBinding::NotRecorded,
             id: frame_id,
@@ -244,10 +322,10 @@ impl EditorWorkspace {
     }
 
     fn validate_text_image(
-        &self,
         request: &TextRequest,
         image: &TextImage,
         position: PhysicalPoint,
+        canvas: PhysicalSize,
     ) -> Result<(), EditorWorkspaceError> {
         request.validate()?;
         if request.size != image.size {
@@ -257,7 +335,7 @@ impl EditorWorkspace {
             origin: position,
             size: image.size,
         })
-        .fits_within(self.manifest().canvas.size)
+        .fits_within(canvas)
         {
             return Err(EditorWorkspaceError::RasterOverlayOutsideCanvas);
         }
@@ -464,6 +542,90 @@ mod tests {
         workspace
             .execute(EditCommand::UpsertOverlayTrack { track })
             .unwrap();
+    }
+
+    #[test]
+    fn text_edit_after_crop_resize_uses_its_original_stage_not_the_smaller_final_canvas() {
+        for legacy in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut workspace = create_rendered_duplicate_workspace(&directory);
+            workspace.select_only(frame_id(1)).unwrap();
+            let (mut request, mut image) = text("Before crop", BLUE);
+            request.size = PhysicalSize::new(2, 1).unwrap();
+            image.size = request.size;
+            image.rgba = [0, 255, 0, 255, 0, 0, 255, 255].to_vec();
+            let id = workspace
+                .add_text_overlay_for_selection(&request, &image, PhysicalPoint::default())
+                .unwrap();
+            if legacy {
+                legacy_track_fixture(&mut workspace, id);
+            }
+            workspace
+                .set_selection_crop(PhysicalRect::new(1, 0, 1, 1).unwrap())
+                .unwrap();
+            workspace
+                .set_selection_output_size(PhysicalSize::new(1, 2).unwrap())
+                .unwrap();
+            assert_eq!(
+                workspace.manifest().canvas.size,
+                PhysicalSize::new(1, 2).unwrap()
+            );
+            assert_eq!(
+                workspace.text_overlay_authoring_size(id).unwrap(),
+                PhysicalSize::new(2, 1).unwrap()
+            );
+            let stages = workspace.manifest().timeline.overlay_tracks[0]
+                .frame_cells
+                .as_ref()
+                .map(|cells| cells.iter().map(|cell| cell.stage).collect::<Vec<_>>());
+            request.text = "Re-edited before crop".to_owned();
+            image.rgba = [0, 0, 255, 255, 0, 255, 0, 255].to_vec();
+            workspace
+                .replace_text_overlay(id, &request, &image, PhysicalPoint::default())
+                .unwrap();
+            let rendered = crate::editor_preview::render_frame_surface(
+                workspace.active_project(),
+                frame_id(1),
+                1024,
+            )
+            .unwrap();
+            assert_eq!(rendered.pixels(), &[0, 255, 0, 255, 0, 255, 0, 255]);
+            assert_eq!(
+                workspace.manifest().timeline.overlay_tracks[0]
+                    .frame_cells
+                    .as_ref()
+                    .map(|cells| cells.iter().map(|cell| cell.stage).collect::<Vec<_>>()),
+                stages
+            );
+            workspace.undo().unwrap();
+            assert_eq!(
+                crate::editor_preview::render_frame_surface(
+                    workspace.active_project(),
+                    frame_id(1),
+                    1024
+                )
+                .unwrap()
+                .pixels(),
+                &[0, 0, 255, 255, 0, 0, 255, 255]
+            );
+            workspace.redo().unwrap();
+            drop(workspace);
+            let reopened =
+                EditorWorkspace::open(directory.path(), LockPolicy::FailIfPresent, 16).unwrap();
+            assert_eq!(
+                reopened.text_overlay_authoring_size(id).unwrap(),
+                PhysicalSize::new(2, 1).unwrap()
+            );
+            assert_eq!(
+                crate::editor_preview::render_frame_surface(
+                    reopened.active_project(),
+                    frame_id(1),
+                    1024
+                )
+                .unwrap(),
+                rendered
+            );
+        }
     }
 
     fn legacy_whole_track_fixture(workspace: &mut EditorWorkspace, track_id: TrackId) {

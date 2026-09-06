@@ -1,7 +1,8 @@
 use std::error::Error;
 
 use gif_from_screen_domain::{
-    AssetId, EdgeWidths, Effect, FrameClip, PhysicalRect, PhysicalSize, QuarterTurn, Rgba,
+    AssetId, ClipTransform, EdgeWidths, Effect, FrameClip, FrameGeometryPlan, FrameRenderStep,
+    PhysicalRect, PhysicalSize, QuarterTurn, Rgba, validate_frame_render_steps,
 };
 
 use crate::{
@@ -83,9 +84,9 @@ impl CpuRenderer {
 
     /// Loads and renders one frame clip.
     ///
-    /// Operations are applied in canonical order: crop, nearest-neighbor
-    /// `output_size`, clockwise quarter-turn rotation, horizontal flip,
-    /// vertical flip, and finally effects in vector order.
+    /// Applies the unchanged canonical transform/effect prefix, then ordered
+    /// render steps. Composite steps are no-ops here: this entry point never
+    /// draws overlays. Empty steps preserve the legacy pixel pipeline.
     ///
     /// # Errors
     ///
@@ -103,6 +104,29 @@ impl CpuRenderer {
         C: CancellationToken + ?Sized,
     {
         check_cancelled(cancellation)?;
+        validate_frame_render_steps(&clip.render_steps).map_err(|reason| {
+            RenderError::InvalidRenderSteps {
+                frame_id: clip.id,
+                reason,
+            }
+        })?;
+        let mut surface = self.render_clip_prefix(clip, provider, cancellation)?;
+        for step in &clip.render_steps {
+            surface = self.apply_render_step(surface, step, cancellation)?;
+        }
+        Ok(surface)
+    }
+
+    pub(crate) fn render_clip_prefix<
+        P: FrameAssetProvider + ?Sized,
+        C: CancellationToken + ?Sized,
+    >(
+        &self,
+        clip: &FrameClip,
+        provider: &P,
+        cancellation: &C,
+    ) -> Result<RgbaSurface, RenderError> {
+        check_cancelled(cancellation)?;
         let mut surface =
             provider
                 .load_rgba8(clip.asset_id)
@@ -112,28 +136,100 @@ impl CpuRenderer {
                 })?;
         self.ensure_within_limit(surface.size())?;
         check_cancelled(cancellation)?;
+        if !clip.render_steps.is_empty() {
+            FrameGeometryPlan::new(clip, surface.size()).map_err(|reason| {
+                RenderError::InvalidRenderSteps {
+                    frame_id: clip.id,
+                    reason,
+                }
+            })?;
+        }
+        surface = self.apply_transform(surface, clip.transform, cancellation)?;
+        for effect in &clip.effects {
+            check_cancelled(cancellation)?;
+            apply_effect(&mut surface, effect, self.limits, cancellation)?;
+        }
+        Ok(surface)
+    }
 
-        if let Some(crop) = clip.transform.crop {
+    /// Applies canonical geometry to an owned copy of a surface, without asset
+    /// loading, effects, ordered stages, overlays or captured input metadata.
+    ///
+    /// # Errors
+    /// Rejects invalid crop geometry, source/intermediate surface limits,
+    /// allocation failures and cancellation.
+    pub fn transform_surface<C: CancellationToken + ?Sized>(
+        &self,
+        source: &RgbaSurface,
+        transform: ClipTransform,
+        cancellation: &C,
+    ) -> Result<RgbaSurface, RenderError> {
+        check_cancelled(cancellation)?;
+        self.ensure_within_limit(source.size())?;
+        let mut copy = RgbaSurface::try_zeroed(source.size())?;
+        for y in 0..source.height() {
+            check_cancelled(cancellation)?;
+            let start = source.byte_offset(0, y);
+            let end = if y + 1 < source.height() {
+                source.byte_offset(0, y + 1)
+            } else {
+                source.pixels().len()
+            };
+            copy.pixels_mut()[start..end].copy_from_slice(&source.pixels()[start..end]);
+        }
+        self.apply_transform(copy, transform, cancellation)
+    }
+
+    fn apply_transform<C: CancellationToken + ?Sized>(
+        &self,
+        mut surface: RgbaSurface,
+        transform: ClipTransform,
+        cancellation: &C,
+    ) -> Result<RgbaSurface, RenderError> {
+        if let Some(crop) = transform.crop {
             surface = self.crop(&surface, crop, cancellation)?;
         }
-        if let Some(output_size) = clip.transform.output_size
+        if let Some(output_size) = transform.output_size
             && output_size != surface.size()
         {
             surface = self.resize_nearest(&surface, output_size, cancellation)?;
         }
-        if clip.transform.rotation != QuarterTurn::Zero {
-            surface = self.rotate(&surface, clip.transform.rotation, cancellation)?;
+        if transform.rotation != QuarterTurn::Zero {
+            surface = self.rotate(&surface, transform.rotation, cancellation)?;
         }
-        if clip.transform.flip_horizontal {
+        if transform.flip_horizontal {
             flip_horizontal(&mut surface, cancellation)?;
         }
-        if clip.transform.flip_vertical {
+        if transform.flip_vertical {
             flip_vertical(&mut surface, cancellation)?;
         }
 
-        for effect in &clip.effects {
-            check_cancelled(cancellation)?;
-            apply_effect(&mut surface, effect, self.limits, cancellation)?;
+        Ok(surface)
+    }
+
+    pub(crate) fn apply_render_step<C: CancellationToken + ?Sized>(
+        &self,
+        mut surface: RgbaSurface,
+        step: &FrameRenderStep,
+        cancellation: &C,
+    ) -> Result<RgbaSurface, RenderError> {
+        check_cancelled(cancellation)?;
+        match step {
+            FrameRenderStep::Crop { rect } => surface = self.crop(&surface, *rect, cancellation)?,
+            FrameRenderStep::Resize { size } if *size != surface.size() => {
+                surface = self.resize_nearest(&surface, *size, cancellation)?;
+            }
+            FrameRenderStep::Rotate { rotation } if *rotation != QuarterTurn::Zero => {
+                surface = self.rotate(&surface, *rotation, cancellation)?;
+            }
+            FrameRenderStep::FlipHorizontal => flip_horizontal(&mut surface, cancellation)?,
+            FrameRenderStep::FlipVertical => flip_vertical(&mut surface, cancellation)?,
+            FrameRenderStep::Effect { effect } => {
+                apply_effect(&mut surface, effect, self.limits, cancellation)?;
+            }
+            FrameRenderStep::Composite { .. }
+            | FrameRenderStep::Resize { .. }
+            | FrameRenderStep::Rotate { .. } => {}
         }
         Ok(surface)
     }
@@ -989,6 +1085,7 @@ mod tests {
 
     fn clip(transform: ClipTransform, effects: Vec<Effect>) -> FrameClip {
         FrameClip {
+            render_steps: Vec::new(),
             capture_clock: None,
             capture_binding: gif_from_screen_domain::CaptureBinding::Original,
             id: FrameId::from_u128(1),

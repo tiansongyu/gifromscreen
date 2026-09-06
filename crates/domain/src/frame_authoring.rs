@@ -12,6 +12,7 @@ impl FrameOverlayCell {
     pub fn whole(frame_id: FrameId, run_id: u32, marks: Vec<FrameOverlayMark>) -> Self {
         Self {
             frame_id,
+            stage: None,
             scopes: vec![FrameAuthoringSpan {
                 run_id,
                 span: FrameLocalSpan::WHOLE,

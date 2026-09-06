@@ -32,6 +32,7 @@ fn cells(count: u128) -> Vec<FrameOverlayCell> {
     (1..=count)
         .map(|id| FrameOverlayCell {
             frame_id: FrameId::from_u128(id),
+            stage: None,
             scopes: vec![FrameAuthoringSpan {
                 run_id: 1,
                 span: FrameLocalSpan::WHOLE,

@@ -320,6 +320,7 @@ impl IncrementalRecordingProject {
         let (capture_metadata, new_cursor_asset) =
             self.store_cursor_metadata(metadata, asset_id, frame_index)?;
         let clip = FrameClip {
+            render_steps: Vec::new(),
             capture_clock: capture_metadata.captured_at.map(|sampled_at| {
                 gif_from_screen_domain::CaptureClockContext {
                     id: Some(self.capture_clock_id),

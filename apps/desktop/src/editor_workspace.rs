@@ -14,17 +14,17 @@ use gif_from_screen_domain::{
     ProjectManifest, ProjectRevision, RasterEncoding, TimeUs, TimelineSpan, TrackId, Transition,
 };
 use gif_from_screen_editor::{
-    ClipTransformEdit, DuplicateDelayMode, DuplicateFrameRetention, EditorError, EditorStatistics,
+    ComposedFrameEdit, DuplicateDelayMode, DuplicateFrameRetention, EditorError, EditorStatistics,
     EditorStatisticsError, FrameClipboardEntryId, FrameClipboardHistory,
     FrameClipboardHistoryEntry, FrameClipboardHistoryError, FrameComparison, FrameEffectEdit,
     FrameSimilarityProvider, FrameTimeRangeError, FrameTransitionSettings, ReduceDelayMode,
     ReduceOptions, RemoveDuplicateFramesOptions, TimelineSelection, TimelineSelectionError,
     YoyoOptions, YoyoScope, adjust_duration, copy_selected_frames, cut_selected_frames,
-    delete_frames, delete_frames_after, delete_frames_before, edit_clip_transforms,
-    edit_frame_effects, move_selected_left, move_selected_right, override_duration,
-    paste_frame_clipboard, project_statistics, reduce_frames, remove_duplicate_frames,
-    remove_transition_after, reverse_selected, scale_duration, select_frames_by_time_range,
-    set_transition_after, yoyo_frames,
+    delete_frames, delete_frames_after, delete_frames_before, edit_composed_frames,
+    move_selected_left, move_selected_right, override_duration, paste_frame_clipboard,
+    project_statistics, reduce_frames, remove_duplicate_frames, remove_transition_after,
+    reverse_selected, scale_duration, select_frames_by_time_range, set_transition_after,
+    yoyo_frames,
 };
 use gif_from_screen_project::{
     ActiveProject, AssetIssue, AssetStore, CommitReceipt, JournalRecoveryReport, LockPolicy,
@@ -42,6 +42,10 @@ pub(crate) use text::{TextOverlayDraft, TitleFrameRequest};
 
 #[path = "editor_overlay_authoring.rs"]
 mod overlay_authoring;
+
+#[cfg(test)]
+#[path = "editor_pipeline_tests.rs"]
+mod pipeline_tests;
 
 #[path = "editor_insert.rs"]
 mod insert;
@@ -386,7 +390,7 @@ impl EditorWorkspace {
             origin: edit.position,
             size: edit.display_size,
         };
-        if !placement.fits_within(self.project.manifest().canvas.size) {
+        if !placement.fits_within(self.selected_authoring_size()?) {
             return Err(EditorWorkspaceError::RasterOverlayOutsideCanvas);
         }
         let asset = self.raster_asset_descriptor(edit.source_size, rgba)?;
@@ -900,50 +904,54 @@ impl EditorWorkspace {
         self.execute_selection_effect(&FrameEffectEdit::Clear)
     }
 
-    /// Sets one source-coordinate crop on every selected frame.
+    /// Crops the current composed image on every animation frame.
     pub(crate) fn set_selection_crop(
         &mut self,
         crop: PhysicalRect,
     ) -> Result<(), EditorWorkspaceError> {
-        self.execute_selection_transform(ClipTransformEdit::SetCrop(crop))
+        self.execute_selection_transform(&ComposedFrameEdit::Crop(crop))
     }
 
-    /// Clears cropping from every selected frame.
+    /// Removes the latest crop on every animation frame.
     pub(crate) fn clear_selection_crop(&mut self) -> Result<(), EditorWorkspaceError> {
-        self.execute_selection_transform(ClipTransformEdit::ClearCrop)
+        self.execute_selection_transform(&ComposedFrameEdit::ClearCrop)
     }
 
-    /// Sets the pre-rotation output dimensions on every selected frame.
+    /// Resizes every animation frame, including its existing artwork.
     pub(crate) fn set_selection_output_size(
         &mut self,
         size: PhysicalSize,
     ) -> Result<(), EditorWorkspaceError> {
-        self.execute_selection_transform(ClipTransformEdit::SetOutputSize(size))
+        self.execute_selection_transform(&ComposedFrameEdit::Resize(size))
     }
 
-    /// Clears explicit output dimensions from every selected frame.
+    /// Removes the latest resize on every animation frame.
     pub(crate) fn clear_selection_output_size(&mut self) -> Result<(), EditorWorkspaceError> {
-        self.execute_selection_transform(ClipTransformEdit::ClearOutputSize)
+        self.execute_selection_transform(&ComposedFrameEdit::ClearResize)
     }
 
-    /// Rotates every selected frame 90 degrees clockwise relative to its current transform.
+    /// Rotates every animation frame's current composed image clockwise.
     pub(crate) fn rotate_selection_clockwise(&mut self) -> Result<(), EditorWorkspaceError> {
-        self.execute_selection_transform(ClipTransformEdit::RotateClockwise)
+        self.execute_selection_transform(&ComposedFrameEdit::Rotate(
+            gif_from_screen_domain::QuarterTurn::Clockwise90,
+        ))
     }
 
-    /// Rotates every selected frame 90 degrees counterclockwise relative to its current transform.
+    /// Rotates every animation frame's current composed image counterclockwise.
     pub(crate) fn rotate_selection_counterclockwise(&mut self) -> Result<(), EditorWorkspaceError> {
-        self.execute_selection_transform(ClipTransformEdit::RotateCounterclockwise)
+        self.execute_selection_transform(&ComposedFrameEdit::Rotate(
+            gif_from_screen_domain::QuarterTurn::Clockwise270,
+        ))
     }
 
     /// Toggles horizontal flipping on every selected frame.
     pub(crate) fn toggle_selection_horizontal_flip(&mut self) -> Result<(), EditorWorkspaceError> {
-        self.execute_selection_transform(ClipTransformEdit::ToggleHorizontalFlip)
+        self.execute_selection_transform(&ComposedFrameEdit::FlipHorizontal)
     }
 
     /// Toggles vertical flipping on every selected frame.
     pub(crate) fn toggle_selection_vertical_flip(&mut self) -> Result<(), EditorWorkspaceError> {
-        self.execute_selection_transform(ClipTransformEdit::ToggleVerticalFlip)
+        self.execute_selection_transform(&ComposedFrameEdit::FlipVertical)
     }
 
     /// Commits the newest inverse command through the project journal.
@@ -1019,10 +1027,10 @@ impl EditorWorkspace {
 
     fn execute_selection_transform(
         &mut self,
-        edit: ClipTransformEdit,
+        edit: &ComposedFrameEdit,
     ) -> Result<(), EditorWorkspaceError> {
         let selected = self.selected_frame_ids()?;
-        let command = edit_clip_transforms(self.project.manifest(), selected, edit)?;
+        let command = edit_composed_frames(self.project.manifest(), selected, edit)?;
         self.execute(command)
     }
 
@@ -1079,7 +1087,11 @@ impl EditorWorkspace {
         edit: &FrameEffectEdit,
     ) -> Result<(), EditorWorkspaceError> {
         let selected = self.selected_frame_ids()?;
-        let command = edit_frame_effects(self.project.manifest(), selected, edit)?;
+        let command = edit_composed_frames(
+            self.project.manifest(),
+            selected,
+            &ComposedFrameEdit::Effect(edit.clone()),
+        )?;
         self.execute(command)
     }
 
@@ -1363,6 +1375,7 @@ mod tests {
             .copied()
             .enumerate()
             .map(|(index, duration)| FrameClip {
+                render_steps: Vec::new(),
                 capture_clock: None,
                 capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: frame_id(u128::try_from(index).unwrap() + 1),
@@ -1437,6 +1450,7 @@ mod tests {
                 },
             });
             frames.push(FrameClip {
+                render_steps: Vec::new(),
                 capture_clock: None,
                 capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                 id: frame_id(u128::try_from(index).unwrap() + 1),
@@ -1761,6 +1775,7 @@ mod tests {
 
     #[test]
     fn transform_helpers_persist_and_undo_as_workspace_edits() {
+        use gif_from_screen_domain::FrameRenderStep;
         let directory = tempfile::tempdir().unwrap();
         let crop = PhysicalRect::new(1, 1, 2, 2).unwrap();
         let output_size = PhysicalSize::new(8, 6).unwrap();
@@ -1775,25 +1790,45 @@ mod tests {
         workspace.clear_selection_crop().unwrap();
         workspace.clear_selection_output_size().unwrap();
         workspace.rotate_selection_counterclockwise().unwrap();
-        let transform = workspace.manifest().timeline.frames[0].transform;
-        assert_eq!(transform.crop, None);
-        assert_eq!(transform.output_size, None);
-        assert_eq!(transform.rotation, QuarterTurn::Zero);
-        assert!(transform.flip_horizontal);
-        assert!(transform.flip_vertical);
+        let frame = &workspace.manifest().timeline.frames[0];
+        assert_eq!(frame.transform, ClipTransform::default());
+        assert!(
+            frame
+                .render_steps
+                .contains(&FrameRenderStep::FlipHorizontal)
+        );
+        assert!(frame.render_steps.contains(&FrameRenderStep::FlipVertical));
+        assert!(!frame.render_steps.iter().any(|step| matches!(
+            step,
+            FrameRenderStep::Crop { .. } | FrameRenderStep::Resize { .. }
+        )));
 
         assert!(workspace.undo().unwrap());
         assert!(workspace.undo().unwrap());
         assert!(workspace.undo().unwrap());
-        let restored = workspace.manifest().timeline.frames[0].transform;
-        assert_eq!(restored.crop, Some(crop));
-        assert_eq!(restored.output_size, Some(output_size));
-        assert_eq!(restored.rotation, QuarterTurn::Clockwise90);
+        let restored = workspace.manifest().timeline.frames[0].render_steps.clone();
+        assert!(restored.contains(&FrameRenderStep::Crop { rect: crop }));
+        assert!(restored.contains(&FrameRenderStep::Resize { size: output_size }));
+        assert!(restored.contains(&FrameRenderStep::Rotate {
+            rotation: QuarterTurn::Clockwise90
+        }));
+        assert_eq!(
+            workspace.manifest().canvas.size,
+            PhysicalSize::new(6, 8).unwrap()
+        );
+        assert!(
+            !workspace.manifest().timeline.frames[1]
+                .render_steps
+                .contains(&FrameRenderStep::FlipHorizontal)
+        );
         drop(workspace);
 
         let reopened =
             EditorWorkspace::open(directory.path(), LockPolicy::FailIfPresent, 16).unwrap();
-        assert_eq!(reopened.manifest().timeline.frames[0].transform, restored);
+        assert_eq!(
+            reopened.manifest().timeline.frames[0].render_steps,
+            restored
+        );
         assert!(reopened.is_dirty());
     }
 
@@ -2103,14 +2138,23 @@ mod tests {
         assert_eq!(&lightened.pixels()[..4], &[255, 255, 255, 255]);
 
         workspace.clear_selection_effects().unwrap();
-        assert!(workspace.manifest().timeline.frames[0].effects.is_empty());
+        assert_eq!(
+            gif_from_screen_editor::frame_effect_count(&workspace.manifest().timeline.frames[0]),
+            0
+        );
         assert!(workspace.undo().unwrap());
-        assert_eq!(workspace.manifest().timeline.frames[0].effects.len(), 1);
+        assert_eq!(
+            gif_from_screen_editor::frame_effect_count(&workspace.manifest().timeline.frames[0]),
+            1
+        );
         drop(workspace);
 
         let reopened =
             EditorWorkspace::open(directory.path(), LockPolicy::FailIfPresent, 16).unwrap();
-        assert_eq!(reopened.manifest().timeline.frames[0].effects.len(), 1);
+        assert_eq!(
+            gif_from_screen_editor::frame_effect_count(&reopened.manifest().timeline.frames[0]),
+            1
+        );
         let reopened_render = render_frame_surface(
             reopened.active_project(),
             frame_id,

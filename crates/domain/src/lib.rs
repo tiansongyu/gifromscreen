@@ -15,6 +15,7 @@ mod editing_task;
 mod error;
 mod export_preset;
 mod frame_authoring;
+mod frame_geometry;
 #[cfg(test)]
 mod frame_input_assets_tests;
 mod frame_input_replay;
@@ -39,6 +40,7 @@ pub use editing_task::*;
 pub use error::{DomainError, IdParseError, UnitError, ValidationIssue};
 pub use export_preset::*;
 pub use frame_authoring::*;
+pub use frame_geometry::*;
 pub use frame_input_replay::*;
 pub use frame_overlay::*;
 pub use id::{AssetId, CaptureClockId, FrameId, OverlayId, ProjectId, TrackId, TransitionId};
@@ -48,4 +50,4 @@ pub use task_run::*;
 pub use units::*;
 
 /// Current on-disk manifest schema understood by this version of the domain.
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;

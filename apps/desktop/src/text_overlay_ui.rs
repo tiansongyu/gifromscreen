@@ -290,7 +290,16 @@ impl TextOverlayTool {
         } else {
             TextOperation::Add
         };
-        let (request, position) = self.request(workspace.manifest().canvas.size)?;
+        let canvas = match &operation {
+            TextOperation::Replace(track_id) => workspace
+                .text_overlay_authoring_size(*track_id)
+                .map_err(|error| error.to_string())?,
+            TextOperation::Add => workspace
+                .selected_authoring_size()
+                .map_err(|error| error.to_string())?,
+            TextOperation::Title { .. } => workspace.manifest().canvas.size,
+        };
+        let (request, position) = self.request(canvas)?;
         let work = request.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         thread::Builder::new()

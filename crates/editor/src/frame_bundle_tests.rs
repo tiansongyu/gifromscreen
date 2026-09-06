@@ -16,6 +16,7 @@ fn frame_id(value: u128) -> FrameId {
 
 fn cell(owner: u128, text: Option<&str>) -> FrameOverlayCell {
     FrameOverlayCell {
+        stage: None,
         input_replay: None,
         frame_id: frame_id(owner),
         scopes: vec![
@@ -75,6 +76,7 @@ fn project() -> ProjectManifest {
         .map(|id| {
             let sampled_at = TimeUs::new(u64::try_from((id - 1) * 100_000).unwrap());
             FrameClip {
+                render_steps: Vec::new(),
                 id: frame_id(id),
                 asset_id: AssetId::from_digest([7; 32]),
                 duration: DurationUs::new(100_000).unwrap(),
@@ -120,6 +122,7 @@ fn project() -> ProjectManifest {
         blend_mode: BlendMode::Multiply,
         items: Vec::new(),
         frame_cells: Some(vec![FrameOverlayCell {
+            stage: None,
             input_replay: None,
             frame_id: frame_id(2),
             scopes: Vec::new(),

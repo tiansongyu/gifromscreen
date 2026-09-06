@@ -191,6 +191,7 @@ pub fn create_blank_animation_project(
         },
     };
     let frame = FrameClip {
+        render_steps: Vec::new(),
         capture_clock: None,
         capture_binding: gif_from_screen_domain::CaptureBinding::NotRecorded,
         id: options.frame_id,

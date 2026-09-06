@@ -1,7 +1,7 @@
 //! Bounded baked motion edits. The caller lends the workspace to a background worker.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -218,7 +218,6 @@ impl EditorWorkspace {
                     .to_owned(),
             );
         }
-        let baseline = render(self.active_project(), current, canvas, cancellation)?;
         let spans = self
             .selected_timeline_spans()
             .map_err(|error| error.to_string())?;
@@ -229,6 +228,8 @@ impl EditorWorkspace {
             &owners,
             cancellation,
         )?;
+        validate_baked_stage_survivors(self.manifest(), &owners, &commands, cancellation)?;
+        let baseline = render(self.active_project(), current, canvas, cancellation)?;
         let mut registered = BTreeSet::new();
         for (index, original) in selected.iter().enumerate() {
             check_cancelled(cancellation)?;
@@ -244,6 +245,7 @@ impl EditorWorkspace {
                 asset_id,
                 transform: ClipTransform::default(),
                 effects: Vec::new(),
+                render_steps: Vec::new(),
                 capture_binding: gif_from_screen_domain::CaptureBinding::ArchivedAfterComposite,
                 ..original.clone()
             };
@@ -327,6 +329,7 @@ impl EditorWorkspace {
             let start = u64::from(index) * duration_us / u64::from(count);
             let end = (u64::from(index) + 1) * duration_us / u64::from(count);
             frames.push(FrameClip {
+                render_steps: Vec::new(),
                 capture_clock: None,
                 capture_binding: gif_from_screen_domain::CaptureBinding::ArchivedAfterComposite,
                 id: FrameId::from_u128(Uuid::new_v4().as_u128()),
@@ -359,6 +362,65 @@ impl EditorWorkspace {
         );
         Ok((EditCommand::Compound { commands }, usize::from(count)))
     }
+}
+
+/// A baked source is already in final coordinates. Keeping a hidden layer's
+/// old intermediate anchor would either orphan it or transform the baked source
+/// twice. Refuse that ambiguous bake before pixel/asset I/O; ordinary staged
+/// frames and hidden tail layers are safe and retain their existing behavior.
+fn validate_baked_stage_survivors(
+    project: &gif_from_screen_domain::ProjectManifest,
+    owners: &BTreeSet<FrameId>,
+    changes: &[EditCommand],
+    cancellation: &AtomicBool,
+) -> Result<(), String> {
+    let mut staged = BTreeSet::new();
+    let mut sample_times = BTreeSet::new();
+    let mut time = TimeUs::ZERO;
+    for frame in &project.timeline.frames {
+        check_cancelled(cancellation)?;
+        if owners.contains(&frame.id) && !frame.render_steps.is_empty() {
+            staged.insert(frame.id);
+            sample_times.insert(time);
+        }
+        time = time
+            .checked_add_duration(frame.duration)
+            .ok_or("Motion frame clock overflow.")?;
+    }
+    if staged.is_empty() {
+        return Ok(());
+    }
+    let replacements: BTreeMap<_, _> = changes
+        .iter()
+        .filter_map(|command| match command {
+            EditCommand::UpsertOverlayTrack { track } => Some((track.id, Some(track))),
+            EditCommand::RemoveOverlayTrack { track_id } => Some((*track_id, None)),
+            _ => None,
+        })
+        .collect();
+    for original in &project.timeline.overlay_tracks {
+        check_cancelled(cancellation)?;
+        let retained = replacements
+            .get(&original.id)
+            .copied()
+            .unwrap_or(Some(original));
+        let Some(track) = retained else { continue };
+        let intermediate_owned = track.frame_cells.as_ref().is_some_and(|cells| {
+            cells
+                .iter()
+                .any(|cell| staged.contains(&cell.frame_id) && cell.stage.is_some())
+        });
+        let intermediate_timed = track.frame_cells.is_none()
+            && track.items.iter().any(|item| {
+                item.span
+                    .end()
+                    .is_some_and(|end| sample_times.range(item.span.start..end).next().is_some())
+            });
+        if intermediate_owned || intermediate_timed {
+            return Err("Cinemagraph cannot discard the intermediate coordinates of hidden or zero-opacity artwork. Show or remove those layers on the selected frames first, or use Undo to return before the geometry edit. Nothing was changed.".to_owned());
+        }
+    }
+    Ok(())
 }
 
 /// `ScreenToGif` loop search counts equal ARGB pixels, not average color distance.

@@ -17,10 +17,10 @@ use gif_from_screen_project::AssetStore;
 use gif_from_screen_render::RgbaSurface;
 
 use super::{
-    AnnotationFrame, AnnotationProgress, AnnotationReplaySkips, CommandBudget, Labels,
-    PreparedAnnotations, ScopePlan, check_cancelled, click, keys::KeyLabelHistory,
-    prepare_annotation_plan, prepare_frame, rebase_position, replay_filter, transform_point,
-    update_click_history,
+    AnnotationFrame, AnnotationPlacement, AnnotationProgress, AnnotationReplaySkips, CommandBudget,
+    Labels, PreparedAnnotations, ScopePlan, check_cancelled, click, keys::KeyLabelHistory,
+    prepare_annotation_plan, prepare_frame, rebase_position, replay_filter,
+    transform_point_at_stage, update_click_history,
 };
 use uuid::Uuid;
 
@@ -45,8 +45,15 @@ pub(super) fn prepare_new(
     progress: impl FnMut(AnnotationProgress),
     provider: &dyn Fn(AssetId) -> Result<RgbaSurface, String>,
 ) -> Result<PreparedAnnotations, String> {
-    let mut prepared =
-        prepare_annotation_plan(manifest, plan, request, cancellation, progress, provider)?;
+    let mut prepared = prepare_annotation_plan(
+        manifest,
+        plan,
+        request,
+        cancellation,
+        progress,
+        provider,
+        AnnotationPlacement::Tail,
+    )?;
     let Some(EditCommand::UpsertOverlayTrack { track }) = prepared.commands.last_mut() else {
         return Ok(prepared);
     };
@@ -71,6 +78,7 @@ pub(super) fn prepare_new(
             .entry(frame.id)
             .or_insert_with(|| FrameOverlayCell {
                 frame_id: frame.id,
+                stage: None,
                 scopes: Vec::new(),
                 marks: Vec::new(),
                 input_replay: None,
@@ -331,7 +339,7 @@ pub(crate) fn prepare_replacement(
 ) -> Result<PreparedAnnotations, String> {
     check_cancelled(cancellation)?;
     manifest.validate().map_err(|error| error.to_string())?;
-    request.validate(manifest.canvas.size)?;
+    request.validate_settings()?;
     let cells = original
         .frame_cells
         .as_ref()
@@ -353,6 +361,11 @@ pub(crate) fn prepare_replacement(
         cursor_cache: BTreeMap::new(),
     };
     let intervals = frame_intervals(manifest)?;
+    for cell in cells {
+        check_cancelled(cancellation)?;
+        let frame = &manifest.timeline.frames[intervals[&cell.frame_id].0];
+        request.validate(super::authoring_stage_size(manifest, frame, cell.stage)?)?;
+    }
     let total_us = manifest
         .timeline
         .total_duration()
@@ -372,6 +385,7 @@ pub(crate) fn prepare_replacement(
             ensure_original_binding(frame, request)?;
             let sample = AnnotationFrame {
                 frame,
+                stage: cell.stage,
                 index,
                 end,
                 total_us,
@@ -546,6 +560,10 @@ fn replay_cells(
     store: &AssetStore,
     output: &mut BTreeMap<FrameId, Vec<OverlayContent>>,
 ) -> Result<(), String> {
+    let stages: BTreeMap<_, _> = cells
+        .iter()
+        .map(|cell| (cell.frame_id, cell.stage))
+        .collect();
     let mut groups: BTreeMap<(AssetId, u32), Vec<(FrameId, FrameInputReplayRef)>> = BTreeMap::new();
     for cell in cells {
         check_cancelled(labels.cancellation)?;
@@ -591,7 +609,15 @@ fn replay_cells(
         }
         let pool = &loaded.as_ref().expect("current pool").1;
         owners.sort_unstable_by_key(|(frame, reference)| (reference.sample_at, *frame));
-        replay_pool(labels, pool, run_id, &owners, intervals, &mut result)?;
+        replay_pool(
+            labels,
+            pool,
+            run_id,
+            &owners,
+            intervals,
+            &stages,
+            &mut result,
+        )?;
     }
     for (frame_id, runs) in std::mem::take(&mut result.texts) {
         let text = runs
@@ -623,6 +649,7 @@ fn replay_pool(
     run_id: u32,
     owners: &[(FrameId, FrameInputReplayRef)],
     intervals: &BTreeMap<FrameId, (usize, u64)>,
+    stages: &BTreeMap<FrameId, Option<u32>>,
     output: &mut ReplayOutput,
 ) -> Result<(), String> {
     let mut keys = KeyLabelHistory::default();
@@ -667,7 +694,9 @@ fn replay_pool(
             for (_, button, position, origin) in &clicks {
                 if let Some(position) =
                     rebase_position(*position, *origin, frame.capture_metadata.capture_origin)
-                        .and_then(|point| transform_point(labels.manifest, frame, point))
+                        .and_then(|point| {
+                            transform_point_at_stage(labels.manifest, frame, stages[id], point)
+                        })
                 {
                     output.push(*id, click(position, *button, labels.request))?;
                 }

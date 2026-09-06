@@ -129,6 +129,7 @@ fn write_demo_project(
             },
         };
         let clip = FrameClip {
+            render_steps: Vec::new(),
             capture_clock: None,
             capture_binding: gif_from_screen_domain::CaptureBinding::NotRecorded,
             id: FrameId::from_u128(unique_u128()),
@@ -459,6 +460,7 @@ mod tests {
         Timeline {
             frames: (1..=count)
                 .map(|number| FrameClip {
+                    render_steps: Vec::new(),
                     capture_clock: None,
                     capture_binding: gif_from_screen_domain::CaptureBinding::Original,
                     id: FrameId::from_u128(u128::from(number)),

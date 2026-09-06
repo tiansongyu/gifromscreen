@@ -84,6 +84,75 @@ fn convert(workspace: &mut EditorWorkspace, track: TrackId) -> AnnotationEditRep
 }
 
 #[test]
+fn conversion_in_an_ordered_pipeline_stays_at_the_first_legacy_composite() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut workspace = create_rendered_duplicate_workspace(&directory);
+    let id = TrackId::from_u128(10);
+    workspace
+        .execute(EditCommand::UpsertOverlayTrack {
+            track: track(10, vec![item(100, 0, 100), shape(101)]),
+        })
+        .unwrap();
+    workspace.select_all();
+    workspace
+        .set_selection_output_size(gif_from_screen_domain::PhysicalSize::new(4, 2).unwrap())
+        .unwrap();
+    workspace.rotate_selection_clockwise().unwrap();
+    workspace
+        .add_selection_effect(gif_from_screen_domain::Effect::Blur {
+            region: PhysicalRect::new(0, 0, 2, 4).unwrap(),
+            radius: 1,
+        })
+        .unwrap();
+    let before = workspace.manifest().clone();
+    let pixels: Vec<_> = before
+        .timeline
+        .frames
+        .iter()
+        .map(|frame| paint(&workspace, frame.id))
+        .collect();
+    assert_eq!(convert(&mut workspace, id).frames, 4);
+    let converted = &workspace.manifest().timeline.overlay_tracks[0];
+    for cell in converted.frame_cells.as_ref().unwrap() {
+        let frame = before
+            .timeline
+            .frames
+            .iter()
+            .find(|frame| frame.id == cell.frame_id)
+            .unwrap();
+        assert!(cell.stage.is_some());
+        assert_eq!(cell.stage, legacy_annotation_stage(frame));
+    }
+    assert_eq!(workspace.manifest().timeline.frames, before.timeline.frames);
+    assert_eq!(
+        before
+            .timeline
+            .frames
+            .iter()
+            .map(|frame| paint(&workspace, frame.id))
+            .collect::<Vec<_>>(),
+        pixels
+    );
+    workspace.undo().unwrap();
+    assert_eq!(
+        workspace.manifest().timeline.overlay_tracks,
+        before.timeline.overlay_tracks
+    );
+    workspace.redo().unwrap();
+    drop(workspace);
+    let reopened = EditorWorkspace::open(directory.path(), LockPolicy::FailIfPresent, 16).unwrap();
+    assert_eq!(
+        before
+            .timeline
+            .frames
+            .iter()
+            .map(|frame| paint(&reopened, frame.id))
+            .collect::<Vec<_>>(),
+        pixels
+    );
+}
+
+#[test]
 fn entire_track_conversion_preserves_pixels_order_frames_assets_undo_and_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let mut workspace = create_rendered_duplicate_workspace(&directory);

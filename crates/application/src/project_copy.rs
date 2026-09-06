@@ -403,6 +403,7 @@ mod tests {
                     EditCommand::InsertFrames {
                         index: 0,
                         frames: vec![FrameClip {
+                            render_steps: Vec::new(),
                             capture_clock: Some(gif_from_screen_domain::CaptureClockContext {
                                 id: Some(gif_from_screen_domain::CaptureClockId::from_u128(200)),
                                 sampled_at: gif_from_screen_domain::TimeUs::ZERO,

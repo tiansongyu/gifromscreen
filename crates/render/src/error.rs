@@ -56,6 +56,26 @@ impl std::fmt::Display for UnsupportedEffect {
 /// Errors produced by the deterministic CPU renderer.
 #[derive(Debug, Error)]
 pub enum RenderError {
+    /// The ordered geometry/compositing pipeline is malformed or invalid.
+    #[error("frame {frame_id} has invalid render steps: {reason}")]
+    InvalidRenderSteps {
+        /// Owner whose ordered pipeline failed validation.
+        frame_id: FrameId,
+        /// Structural or geometry validation failure.
+        reason: String,
+    },
+    /// Active owned artwork references a stage absent from its owner's pipeline.
+    #[error(
+        "overlay {overlay_id} references missing Composite stage {stage_id} on frame {frame_id}"
+    )]
+    OverlayStageMissing {
+        /// Active mark that must not disappear silently.
+        overlay_id: OverlayId,
+        /// Owner whose stage is missing.
+        frame_id: FrameId,
+        /// Requested frame-local stage identity.
+        stage_id: u32,
+    },
     /// Legacy time-only planning cannot decide which frame-owned marks to draw.
     #[error("frame-owned overlays require frame identity; use frame-aware overlay planning")]
     OverlayFrameIdentityRequired,

@@ -145,20 +145,28 @@ impl EditCommand {
     pub fn required_schema_version(&self) -> u32 {
         match self {
             Self::UpsertOverlayTrack { track } | Self::RestoreOverlayTrack { track, .. } => {
-                if track.frame_cells.is_some() { 2 } else { 1 }
+                track.required_schema_version()
             }
+            Self::InsertFrames { frames, .. } => frames
+                .iter()
+                .map(FrameClip::required_schema_version)
+                .max()
+                .unwrap_or(1),
+            Self::RestoreFrames { frames } => frames
+                .iter()
+                .map(|indexed| indexed.frame.required_schema_version())
+                .max()
+                .unwrap_or(1),
+            Self::ReplaceFrame { replacement, .. } => replacement.required_schema_version(),
             Self::RestoreFrameEdit {
                 edit,
                 overlay_tracks,
             } => edit.required_schema_version().max(
-                if overlay_tracks
+                overlay_tracks
                     .iter()
-                    .any(|track| track.frame_cells.is_some())
-                {
-                    2
-                } else {
-                    1
-                },
+                    .map(OverlayTrack::required_schema_version)
+                    .max()
+                    .unwrap_or(1),
             ),
             Self::Compound { commands } => commands
                 .iter()

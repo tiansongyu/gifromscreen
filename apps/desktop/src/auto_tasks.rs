@@ -15,7 +15,8 @@ use gif_from_screen_domain::{
     MAX_EDIT_TASK_RUNS, ProjectManifest, RasterEncoding, TaskDelay,
 };
 use gif_from_screen_editor::{
-    FrameEffectEdit, adjust_duration, edit_frame_effects, override_duration, scale_duration,
+    ComposedFrameEdit, FrameEffectEdit, adjust_duration, edit_composed_frames, override_duration,
+    scale_duration,
 };
 use gif_from_screen_project::ActiveProject;
 use gif_from_screen_render::RgbaSurface;
@@ -462,13 +463,13 @@ fn prepare_task(
             TaskDelay::Scale { percent } => scale_duration(project, selected, *percent),
         }
         .map_err(|error| error.to_string())?,
-        EditingTaskAction::Border { widths, color } => edit_frame_effects(
+        EditingTaskAction::Border { widths, color } => edit_composed_frames(
             project,
             selected,
-            &FrameEffectEdit::Add(Effect::Border {
+            &ComposedFrameEdit::Effect(FrameEffectEdit::Add(Effect::Border {
                 widths: *widths,
                 color: *color,
-            }),
+            })),
         )
         .map_err(|error| error.to_string())?,
         EditingTaskAction::Shadow {
@@ -476,15 +477,15 @@ fn prepare_task(
             offset_y,
             blur_radius,
             color,
-        } => edit_frame_effects(
+        } => edit_composed_frames(
             project,
             selected,
-            &FrameEffectEdit::Add(Effect::Shadow {
+            &ComposedFrameEdit::Effect(FrameEffectEdit::Add(Effect::Shadow {
                 offset_x: *offset_x,
                 offset_y: *offset_y,
                 blur_radius: *blur_radius,
                 color: *color,
-            }),
+            })),
         )
         .map_err(|error| error.to_string())?,
         EditingTaskAction::Annotation { request } => {

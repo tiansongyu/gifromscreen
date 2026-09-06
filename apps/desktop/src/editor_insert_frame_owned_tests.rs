@@ -32,6 +32,7 @@ fn add_owned(
         id: track_id,
         frame_cells: Some(vec![
             FrameOverlayCell {
+                stage: None,
                 input_replay: None,
                 frame_id: FrameId::from_u128(2),
                 scopes: scopes.clone(),
@@ -46,6 +47,7 @@ fn add_owned(
                 }],
             },
             FrameOverlayCell {
+                stage: None,
                 input_replay: None,
                 frame_id: FrameId::from_u128(3),
                 scopes,

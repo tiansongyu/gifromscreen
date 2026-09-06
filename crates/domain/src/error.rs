@@ -56,6 +56,10 @@ impl Error for UnitError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ValidationIssue {
+    InvalidFrameRenderSteps {
+        frame_id: FrameId,
+        reason: String,
+    },
     InvalidFrameOverlay {
         track_id: TrackId,
         reason: String,
