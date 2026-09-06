@@ -68,6 +68,8 @@ Each package includes:
 
 GitHub Actions dependencies in the packaging workflow are pinned to immutable commit hashes; the Rust toolchain version is fixed. The package builder itself needs no network beyond Cargo's locked dependency/toolchain retrieval.
 
+The portable workflow restores a separate dependency cache for `target/portable-build`, after selecting Rust 1.88.0. Cache saves are limited to main-branch runs. A cache hit never bypasses the locked release build, source/binary receipt checks, deterministic repackaging, installation tests or native-window smoke test. This follows the cache action's [custom workspace/target configuration](https://github.com/Swatinem/rust-cache/tree/6323deb102c322ba6fcbdcafc7e3dddab59af2b6); it is a build-time optimization, not additional evidence of reproducible compilation or runtime correctness.
+
 ## Verification scope and remaining formats
 
 The automated suite validates the real archive, CLI GIF export, installation under prefixes with spaces/reserved characters, idempotent reinstall, refusal to replace foreign files/symlinks, checksum corruption, modified-installed-file protection, traversal protection, and preservation of unlisted projects during uninstall. Xvfb verifies that the packaged desktop displays a native X11 window. These checks do not substitute for GNOME/KDE Wayland sharing permission and compositor testing.
