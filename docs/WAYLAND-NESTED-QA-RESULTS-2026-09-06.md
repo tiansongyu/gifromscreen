@@ -146,6 +146,8 @@ A second normally authorized monitor recording wrote `discard-confirm.gfsproj` w
 
 A third normally authorized monitor session tested the actual title-bar Close button while recording. Clicking the root window's top-right close control stopped and saved instead of discarding or quitting: the same app returned to its editor with `controller-close.gfsproj`, **14 frames, 200×150 and 1.400513 seconds** (`logs/close-save-recording.png`, `logs/close-save-returned.png`). This provides native evidence for the close-preserves-project regression as distinct from the explicit Discard path.
 
+Final explicit-stop verification found every registered child exited and no process remaining in the owned launcher group 704697. PipeWire's socket was removed. GNOME left a stale owner-only Wayland socket pathname in the retained evidence directory, but `ss -xlpn` found no listening endpoint for this lab; this pathname is not a running compositor. The harness rejects all further `exec` requests using these stale connection details. Evidence/output directories were retained deliberately, not recursively deleted.
+
 ## Remaining acceptance gates
 
 - Window preview normalization, controller opening, continuous recording, fixed-size movement while recording and paused, active timing, Stop and independently decoded GUI GIF export passed.
