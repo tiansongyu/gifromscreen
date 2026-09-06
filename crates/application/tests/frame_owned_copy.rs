@@ -75,6 +75,7 @@ fn owned_track(id: u128, owner: u128, asset: AssetId, visible: bool) -> OverlayT
     OverlayTrack {
         id: TrackId::from_u128(id),
         frame_cells: Some(vec![FrameOverlayCell {
+            input_replay: None,
             frame_id: FrameId::from_u128(owner),
             scopes: vec![FrameAuthoringSpan {
                 run_id: 1,
@@ -180,4 +181,78 @@ fn save_as_preserves_frozen_labels_hidden_assets_and_source_independence() {
     drop(copied);
     let reopened = ActiveProject::open(target, LockPolicy::FailIfPresent).unwrap();
     assert_eq!(reopened.project.manifest().timeline, before.timeline);
+}
+
+#[test]
+fn save_as_keeps_non_raster_input_pools_without_putting_them_into_the_gif() {
+    use gif_from_screen_domain::{
+        FrameInputReplay, FrameInputReplayPool, FrameInputReplayRef, INPUT_REPLAY_MEDIA_TYPE,
+        TimeUs,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let mut source = source(&directory.path().join("source.gfsproj"));
+    let before_gif = export(&source, &directory.path().join("before.gif"));
+    let bytes = serde_json::to_vec(&FrameInputReplayPool {
+        version: 1,
+        clock_id: None,
+        started_at: TimeUs::ZERO,
+        steps: Vec::new(),
+    })
+    .unwrap();
+    let id = source.assets().put(&bytes).unwrap();
+    let mut track = source.manifest().timeline.overlay_tracks[1].clone();
+    track.frame_cells.as_mut().unwrap()[0].input_replay = Some(FrameInputReplay {
+        runs: vec![FrameInputReplayRef {
+            run_id: 1,
+            asset_id: id,
+            sample_at: TimeUs::ZERO,
+            step_end: 0,
+        }],
+    });
+    source
+        .commit(EditCommand::Compound {
+            commands: vec![
+                EditCommand::RegisterAsset {
+                    asset: AssetDescriptor {
+                        id,
+                        byte_len: bytes.len() as u64,
+                        kind: AssetKind::ImportedSource {
+                            media_type: INPUT_REPLAY_MEDIA_TYPE.to_owned(),
+                        },
+                    },
+                },
+                EditCommand::UpsertOverlayTrack { track },
+            ],
+        })
+        .unwrap();
+    let before = source.manifest().clone();
+    let target = directory.path().join("with-history.gfsproj");
+    save_project_copy(
+        &ProjectCopySnapshot::from_active(&source),
+        &SaveProjectCopyOptions {
+            target: target.clone(),
+            project_id: ProjectId::from_u128(23),
+            created_at: UnixTimeMs::new(3),
+        },
+        &AtomicBool::new(false),
+        |_| {},
+    )
+    .unwrap();
+    let copied = ActiveProject::open(target, LockPolicy::FailIfPresent)
+        .unwrap()
+        .project;
+    assert_eq!(
+        std::fs::read(copied.assets().asset_path(id)).unwrap(),
+        bytes
+    );
+    assert_eq!(copied.manifest().timeline, before.timeline);
+    assert_eq!(source.manifest(), &before);
+    assert_eq!(
+        export(&source, &directory.path().join("source-with-pool.gif")),
+        before_gif
+    );
+    assert_eq!(
+        export(&copied, &directory.path().join("copied-with-pool.gif")),
+        before_gif
+    );
 }

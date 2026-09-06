@@ -1838,6 +1838,7 @@ mod tests {
         track.id = TrackId::from_u128(2);
         let item = track.items.remove(0);
         track.frame_cells = Some(vec![FrameOverlayCell {
+            input_replay: None,
             frame_id: owner,
             scopes: vec![FrameAuthoringSpan {
                 run_id: 1,

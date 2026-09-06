@@ -31,6 +31,7 @@ fn track(project: &ProjectManifest) -> OverlayTrack {
                 .iter()
                 .enumerate()
                 .map(|(index, frame)| FrameOverlayCell {
+                    input_replay: None,
                     frame_id: frame.id,
                     scopes: vec![FrameAuthoringSpan {
                         run_id: u32::try_from(index + 1).unwrap(),

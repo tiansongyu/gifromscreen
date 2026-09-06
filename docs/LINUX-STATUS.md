@@ -87,7 +87,9 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [x] Keep Wayland preparation actions accessible on small windows and enlarged fonts; explain monitor self-capture and hidden-window redraw limitations.
 - [x] Use a compact, zoom-aware Wayland controller with bounded geometry acknowledgements and responsive primary controls; restore the prior local window extent on stop or recorder close.
 - [x] Implement the schema-2 frame-owned core across validation, journal recovery, preview/GIF rendering, clipboard/Yoyo/project insertion, Save As and baking, with unchanged legacy timed-track behavior.
-- [ ] Connect normal frame-owned authoring, explicit legacy conversion and bounded input-aware regeneration; current frame-owned regeneration fails safely without changing existing marks.
+- [x] Connect ordinary frame-owned authors, explicit whole-layer legacy conversion and bounded input-aware regeneration, including copied held labels after source deletion and journal recovery.
+- [x] Distinguish same-name annotation/text groups by layer number and coverage without changing their saved names or identities.
+- [ ] Match whole-frame geometric ownership through later crop/resize/rotation/flips/effects; temporal FrameId ownership alone is not full frame-baked parity.
 - [x] Save an independently identified project copy without switching the current editor, and retain a bounded recent-project list.
 - [x] Build and verify an Ubuntu-22-compatible x86_64 portable tarball with exact-file installation, checksums, license notices, and CI artifacts.
 

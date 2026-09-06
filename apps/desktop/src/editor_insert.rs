@@ -166,9 +166,24 @@ pub(crate) fn prepare_project_insertion(
 
     // Read and verify the entire bounded input before storing the first blob.
     // A corrupt late asset cannot leave a partially imported project behind.
+    let mut replay_refs: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for reference in source
+        .timeline
+        .overlay_tracks
+        .iter()
+        .flat_map(|track| track.frame_cells.iter().flatten())
+        .flat_map(|cell| cell.input_replay.iter())
+        .flat_map(|replay| &replay.runs)
+    {
+        replay_refs
+            .entry(reference.asset_id)
+            .or_default()
+            .push(reference);
+    }
     let mut bytes = Vec::with_capacity(descriptors.len());
     for descriptor in &descriptors {
         let pixels = read_asset(source_assets, descriptor, cancellation)?;
+        validate_input_replay_asset(descriptor, &pixels, replay_refs.get(&descriptor.id))?;
         if target.assets.contains(descriptor.id) {
             // Reuse must never silently accept damaged destination content.
             verify_existing_asset(&target.assets, descriptor, &pixels, cancellation)?;
@@ -273,22 +288,13 @@ fn checked_descriptors(
                 .assets
                 .get(id)
                 .ok_or(ProjectInsertionError::MissingAsset(*id))?;
-            let Some((size, RasterEncoding::Rgba8)) = descriptor.kind.raster_descriptor() else {
-                return Err(ProjectInsertionError::UnsupportedAsset(*id));
-            };
-            let expected = u64::from(size.width.get())
-                .checked_mul(u64::from(size.height.get()))
-                .and_then(|pixels| pixels.checked_mul(4))
-                .ok_or(ProjectInsertionError::AssetBudget)?;
-            if expected != descriptor.byte_len {
-                return Err(ProjectInsertionError::InvalidAssetLength(*id));
-            }
+            validate_inserted_asset_descriptor(descriptor)?;
             total = total
                 .checked_add(descriptor.byte_len)
                 .filter(|total| *total <= MAX_INSERTED_ASSET_BYTES)
                 .ok_or(ProjectInsertionError::AssetBudget)?;
             if let Some(existing) = target.manifest.assets.get(id)
-                && (existing.kind.raster_descriptor() != descriptor.kind.raster_descriptor()
+                && (!same_asset_storage(existing, descriptor)
                     || existing.byte_len != descriptor.byte_len)
             {
                 return Err(ProjectInsertionError::AssetCollision(*id));
@@ -296,6 +302,59 @@ fn checked_descriptors(
             Ok(descriptor.clone())
         })
         .collect()
+}
+
+fn same_asset_storage(left: &AssetDescriptor, right: &AssetDescriptor) -> bool {
+    match (
+        left.kind.raster_descriptor(),
+        right.kind.raster_descriptor(),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        (None, None) => left.kind == right.kind,
+        _ => false,
+    }
+}
+
+fn validate_inserted_asset_descriptor(
+    descriptor: &AssetDescriptor,
+) -> Result<(), ProjectInsertionError> {
+    if let Some((size, RasterEncoding::Rgba8)) = descriptor.kind.raster_descriptor() {
+        let expected = u64::from(size.width.get())
+            .checked_mul(u64::from(size.height.get()))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or(ProjectInsertionError::AssetBudget)?;
+        if expected != descriptor.byte_len {
+            return Err(ProjectInsertionError::InvalidAssetLength(descriptor.id));
+        }
+        return Ok(());
+    }
+    if matches!(&descriptor.kind, gif_from_screen_domain::AssetKind::ImportedSource { media_type } if media_type == gif_from_screen_domain::INPUT_REPLAY_MEDIA_TYPE)
+        && (1..=gif_from_screen_domain::MAX_INPUT_REPLAY_POOL_BYTES).contains(&descriptor.byte_len)
+    {
+        return Ok(());
+    }
+    Err(ProjectInsertionError::UnsupportedAsset(descriptor.id))
+}
+
+fn validate_input_replay_asset(
+    descriptor: &AssetDescriptor,
+    bytes: &[u8],
+    references: Option<&Vec<&gif_from_screen_domain::FrameInputReplayRef>>,
+) -> Result<(), ProjectInsertionError> {
+    let Some(references) = references else {
+        return Ok(());
+    };
+    let failure = |message: String| ProjectInsertionError::InvalidInputReplay {
+        asset_id: descriptor.id,
+        message,
+    };
+    let pool: gif_from_screen_domain::FrameInputReplayPool =
+        serde_json::from_slice(bytes).map_err(|error| failure(error.to_string()))?;
+    pool.validate().map_err(failure)?;
+    for reference in references {
+        pool.validate_reference(reference).map_err(failure)?;
+    }
+    Ok(())
 }
 
 fn insertion_command(
@@ -576,6 +635,8 @@ fn check_cancelled(cancellation: &dyn CancellationToken) -> Result<(), ProjectIn
 
 #[derive(Debug, Error)]
 pub(crate) enum ProjectInsertionError {
+    #[error("input replay asset {asset_id} is invalid: {message}")]
+    InvalidInputReplay { asset_id: AssetId, message: String },
     #[error(transparent)]
     FrameBundle(#[from] gif_from_screen_editor::FrameBundleError),
     #[error(transparent)]
@@ -625,6 +686,10 @@ pub(crate) enum ProjectInsertionError {
 #[cfg(test)]
 #[path = "editor_insert_frame_owned_tests.rs"]
 mod frame_owned_tests;
+
+#[cfg(test)]
+#[path = "editor_insert_input_replay_tests.rs"]
+mod input_replay_tests;
 
 #[cfg(test)]
 mod tests {
@@ -766,6 +831,33 @@ mod tests {
                 },
                 &[color.red, color.green, color.blue, color.alpha],
             )
+            .unwrap();
+        // These existing insertion tests exercise legacy time-anchor shifting,
+        // not the representation chosen by the current new-artwork UI.
+        let mut legacy = workspace
+            .manifest()
+            .timeline
+            .overlay_tracks
+            .last()
+            .unwrap()
+            .clone();
+        let cells = legacy.frame_cells.take().unwrap();
+        let mark = cells[0].marks[0].clone();
+        legacy.items = vec![gif_from_screen_domain::OverlayItem {
+            id: mark.id,
+            span: gif_from_screen_domain::TimelineSpan {
+                start: TimeUs::ZERO,
+                duration: DurationUs::new(
+                    workspace.manifest().timeline.frames[0].duration.get()
+                        + workspace.manifest().timeline.frames[1].duration.get(),
+                )
+                .unwrap(),
+            },
+            z_index: mark.z_index,
+            content: mark.content,
+        }];
+        workspace
+            .execute(EditCommand::UpsertOverlayTrack { track: legacy })
             .unwrap();
         workspace
             .execute(EditCommand::SetTransitions {
@@ -923,6 +1015,41 @@ mod tests {
         assert_eq!(&decoded.frames()[1].rgba()[..4], &[0, 0, 255, 255]);
     }
 
+    fn legacy_progress_fixture(current: &EditorWorkspace) -> gif_from_screen_domain::OverlayTrack {
+        let mut track = current.manifest().timeline.overlay_tracks[0].clone();
+        // Keep the legacy absolute-scope insertion fixture independent of the
+        // representation chosen by current annotation authoring.
+        track.items = track
+            .frame_cells
+            .take()
+            .unwrap()
+            .into_iter()
+            .flat_map(|cell| {
+                assert!(cell.input_replay.is_none());
+                let owner = current
+                    .manifest()
+                    .timeline
+                    .frames
+                    .iter()
+                    .find(|frame| frame.id == cell.frame_id)
+                    .unwrap();
+                let span = gif_from_screen_domain::TimelineSpan {
+                    start: current.manifest().timeline.frame_start(owner.id).unwrap(),
+                    duration: owner.duration,
+                };
+                cell.marks
+                    .into_iter()
+                    .map(move |mark| gif_from_screen_domain::OverlayItem {
+                        id: mark.id,
+                        span,
+                        z_index: mark.z_index,
+                        content: mark.content,
+                    })
+            })
+            .collect();
+        track
+    }
+
     #[test]
     fn whole_project_insertion_offsets_source_scope_and_excludes_it_from_destination_scope() {
         use gif_from_screen_domain::{
@@ -950,7 +1077,7 @@ mod tests {
                     |_| {},
                 )
                 .unwrap();
-            let mut track = current.manifest().timeline.overlay_tracks[0].clone();
+            let mut track = legacy_progress_fixture(current);
             track.annotation_scope = Some(vec![TimelineSpan {
                 start: TimeUs::ZERO,
                 duration: DurationUs::new(

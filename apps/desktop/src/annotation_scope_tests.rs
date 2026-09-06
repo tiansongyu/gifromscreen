@@ -1,5 +1,7 @@
 use super::tests::{manifest, track};
 use super::*;
+// Persisted timed scopes keep their original ripple and gap semantics.
+use super::prepare_legacy_annotations_with_assets as prepare_annotations_with_assets;
 use gif_from_screen_domain::{CaptureBinding, DurationUs, FrameDurationChange, KeyStroke};
 
 fn span(start: u64, end: u64) -> TimelineSpan {

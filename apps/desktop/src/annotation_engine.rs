@@ -1,4 +1,4 @@
-//! Prepare time-anchored annotations without mutating the project or touching its files.
+//! Prepare frame-owned annotations and preserve the separate legacy timed replay path.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -33,6 +33,10 @@ use keys::KeyLabelHistory;
 #[path = "annotation_scope_plan.rs"]
 mod scope;
 use scope::ScopePlan;
+
+#[path = "owned_annotation_engine.rs"]
+mod owned;
+pub(crate) use owned::prepare_replacement as prepare_owned_annotation_replacement;
 
 #[cfg(test)]
 #[path = "annotation_scope_tests.rs"]
@@ -277,19 +281,40 @@ impl Labels<'_> {
 }
 
 #[cfg(test)]
-pub(crate) fn prepare_annotations(
+pub(crate) fn prepare_legacy_annotations(
     manifest: &ProjectManifest,
     selected: &BTreeSet<FrameId>,
     request: &AnnotationRequest,
     cancellation: &AtomicBool,
     progress: impl FnMut(AnnotationProgress),
 ) -> Result<PreparedAnnotations, String> {
-    prepare_annotations_with_assets(manifest, selected, request, cancellation, progress, &|_| {
-        Err("A recorded cursor asset needs a project asset provider.".to_owned())
-    })
+    prepare_legacy_annotations_with_assets(
+        manifest,
+        selected,
+        request,
+        cancellation,
+        progress,
+        &|_| Err("A recorded cursor asset needs a project asset provider.".to_owned()),
+    )
 }
 
 pub(crate) fn prepare_annotations_with_assets(
+    manifest: &ProjectManifest,
+    selected: &BTreeSet<FrameId>,
+    request: &AnnotationRequest,
+    cancellation: &AtomicBool,
+    progress: impl FnMut(AnnotationProgress),
+    provider: &dyn Fn(gif_from_screen_domain::AssetId) -> Result<RgbaSurface, String>,
+) -> Result<PreparedAnnotations, String> {
+    check_cancelled(cancellation)?;
+    manifest.validate().map_err(|error| error.to_string())?;
+    validate_selection(manifest, selected)?;
+    let plan = ScopePlan::from_selection(manifest, selected)?;
+    owned::prepare_new(manifest, &plan, request, cancellation, progress, provider)
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_legacy_annotations_with_assets(
     manifest: &ProjectManifest,
     selected: &BTreeSet<FrameId>,
     request: &AnnotationRequest,
@@ -778,27 +803,13 @@ fn prepare_clicks(
     let clock = sample.clock;
     let request = labels.request;
     let manifest = labels.manifest;
-    if frame.capture_metadata.mouse_events.len() > MAX_EVENTS_PER_FRAME {
-        return Err("A frame has more than 512 mouse events.".to_owned());
-    }
-    let oldest = clock.saturating_sub(u64::from(request.hold_ms) * 1000);
-    recent_clicks.retain(|(at, _, _, _)| *at >= oldest && *at <= clock);
-    for event in &frame.capture_metadata.mouse_events {
-        if event.pressed
-            && event.at.get() <= clock
-            && let Some(position) = event.position
-        {
-            recent_clicks.push((
-                clock,
-                event.button,
-                position,
-                frame.capture_metadata.capture_origin,
-            ));
-        }
-    }
-    if recent_clicks.len() > MAX_ACTIVE_EVENTS {
-        return Err("Too many simultaneous click markers; shorten the hold time.".to_owned());
-    }
+    update_click_history(
+        &frame.capture_metadata.mouse_events,
+        frame.capture_metadata.capture_origin,
+        clock,
+        request.hold_ms,
+        recent_clicks,
+    )?;
     for (_, button, position, original_origin) in recent_clicks.iter() {
         if let Some(position) = rebase_position(
             *position,
@@ -809,6 +820,32 @@ fn prepare_clicks(
         {
             contents.push(click(position, *button, request));
         }
+    }
+    Ok(())
+}
+
+fn update_click_history(
+    events: &[gif_from_screen_domain::MouseInputEvent],
+    origin: Option<CaptureOrigin>,
+    clock: u64,
+    hold_ms: u32,
+    recent_clicks: &mut Vec<(u64, MouseButton, PhysicalPoint, Option<CaptureOrigin>)>,
+) -> Result<(), String> {
+    if events.len() > MAX_EVENTS_PER_FRAME {
+        return Err("A frame has more than 512 mouse events.".to_owned());
+    }
+    let oldest = clock.saturating_sub(u64::from(hold_ms) * 1000);
+    recent_clicks.retain(|(at, _, _, _)| *at >= oldest && *at <= clock);
+    for event in events {
+        if event.pressed
+            && event.at.get() <= clock
+            && let Some(position) = event.position
+        {
+            recent_clicks.push((clock, event.button, position, origin));
+        }
+    }
+    if recent_clicks.len() > MAX_ACTIVE_EVENTS {
+        return Err("Too many simultaneous click markers; shorten the hold time.".to_owned());
     }
     Ok(())
 }
@@ -1005,6 +1042,8 @@ pub(crate) fn load_annotation_asset(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // These fixtures deliberately exercise the schema-1 timed authoring path.
+    use super::prepare_legacy_annotations_with_assets as prepare_annotations_with_assets;
     use gif_from_screen_domain::{
         AssetId, Canvas, CanvasBackground, CaptureMetadata, ClipTransform, ColorSpace, DurationUs,
         KeyStroke, MouseInputEvent, PhysicalSize, ProjectId, UnixTimeMs,
@@ -1065,7 +1104,7 @@ mod tests {
         selected: &[u128],
         request: AnnotationRequest,
     ) -> PreparedAnnotations {
-        prepare_annotations(
+        prepare_legacy_annotations(
             manifest,
             &selected.iter().copied().map(FrameId::from_u128).collect(),
             &request,
@@ -1880,7 +1919,7 @@ mod tests {
         let manifest = manifest();
         let selected = [FrameId::from_u128(1)].into();
         assert!(
-            prepare_annotations(
+            prepare_legacy_annotations(
                 &manifest,
                 &selected,
                 &AnnotationRequest::default(),
@@ -1891,7 +1930,7 @@ mod tests {
             .contains("cancelled")
         );
         assert!(
-            prepare_annotations(
+            prepare_legacy_annotations(
                 &manifest,
                 &selected,
                 &AnnotationRequest {

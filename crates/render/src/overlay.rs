@@ -1,6 +1,7 @@
 use gif_from_screen_domain::{
-    AssetId, BlendMode, FrameClip, FrameId, OverlayContent, OverlayId, OverlayTrack, PhysicalPoint,
-    PhysicalRect, PhysicalSize, Rgba, ShapeKind, StrokePoint, TimeUs, TimelineSpan,
+    AssetId, BlendMode, FrameClip, FrameId, OverlayContent, OverlayId, OverlayItem, OverlayTrack,
+    PhysicalPoint, PhysicalRect, PhysicalSize, ProgressDirection, ProgressStyle, Rgba, ShapeKind,
+    StrokePoint, TimeUs, TimelineSpan,
 };
 
 use crate::{
@@ -12,6 +13,45 @@ const CANCELLATION_PIXEL_INTERVAL: u32 = 1_024;
 
 #[path = "event_overlay.rs"]
 mod events;
+
+/// Freezes one legacy timed item's content at a half-open sampling point.
+///
+/// Visibility, track opacity and raster opacity deliberately do not filter this
+/// operation: hidden artwork must survive an explicit representation change.
+/// Existing fixed styles and static content are copied unchanged. Legacy time
+/// progress retains its millionths-then-ceiling pixel rule, not exact-ratio rounding.
+/// This performs no asset, font or pixel I/O and does not create mark identities.
+///
+/// # Errors
+/// Returns an overflowing-span or unsupported-content error. In particular,
+/// legacy frame-number progress without a frozen label remains unsupported.
+/// `Ok(None)` means only that the item is inactive at this sampling point.
+pub fn freeze_timed_overlay_content(
+    item: &OverlayItem,
+    sample_time: TimeUs,
+) -> Result<Option<OverlayContent>, RenderError> {
+    let end = item.span.end().ok_or(RenderError::OverlaySpanOverflow {
+        overlay_id: item.id,
+    })?;
+    if sample_time < item.span.start || sample_time >= end {
+        return Ok(None);
+    }
+    validate_overlay_content(item.id, &item.content, true)?;
+    let mut content = item.content.clone();
+    if let OverlayContent::Progress { style, .. } = &mut content
+        && style.is_none()
+    {
+        *style = Some(ProgressStyle {
+            amount_millionths: events::legacy_progress_amount(item.span, sample_time),
+            fraction: None,
+            direction: ProgressDirection::LeftToRight,
+            label: None,
+            label_position: PhysicalPoint::default(),
+            label_text: String::new(),
+        });
+    }
+    Ok(Some(content))
+}
 
 /// Stable identity pair for one active raster overlay and its immutable asset.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -479,15 +519,31 @@ fn push_layer<'a>(
     if matches!(layer.content, OverlayContent::Raster { opacity: 0, .. }) {
         return Ok(());
     }
-    if layer.span.is_none() && matches!(layer.content, OverlayContent::Progress { style: None, .. })
-    {
+    validate_overlay_content(layer.id, layer.content, layer.span.is_some())?;
+    let requested = layers
+        .len()
+        .checked_add(1)
+        .ok_or(RenderError::OverlayPlanSizeOverflow)?;
+    layers
+        .try_reserve(1)
+        .map_err(|_| RenderError::OverlayPlanAllocationFailed { requested })?;
+    layers.push(layer);
+    Ok(())
+}
+
+fn validate_overlay_content(
+    id: OverlayId,
+    content: &OverlayContent,
+    timed: bool,
+) -> Result<(), RenderError> {
+    if !timed && matches!(content, OverlayContent::Progress { style: None, .. }) {
         return Err(RenderError::InvalidOverlayGeometry {
-            overlay_id: layer.id,
+            overlay_id: id,
             reason: "frame-owned progress requires a frozen style",
         });
     }
     if !matches!(
-        layer.content,
+        content,
         OverlayContent::Raster { .. }
             | OverlayContent::Text {
                 raster: Some(_),
@@ -507,16 +563,8 @@ fn push_layer<'a>(
             | OverlayContent::Shape { .. }
             | OverlayContent::Drawing { .. }
     ) {
-        return Err(unsupported_overlay(layer.id, layer.content));
+        return Err(unsupported_overlay(id, content));
     }
-    let requested = layers
-        .len()
-        .checked_add(1)
-        .ok_or(RenderError::OverlayPlanSizeOverflow)?;
-    layers
-        .try_reserve(1)
-        .map_err(|_| RenderError::OverlayPlanAllocationFailed { requested })?;
-    layers.push(layer);
     Ok(())
 }
 
@@ -1155,6 +1203,272 @@ mod tests {
     use super::*;
     use crate::{AssetProviderError, NeverCancel};
 
+    fn freeze_track(track: &OverlayTrack, owner: FrameId, time: TimeUs) -> OverlayTrack {
+        let marks = track
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                freeze_timed_overlay_content(item, time)
+                    .unwrap()
+                    .map(|content| FrameOverlayMark {
+                        id: OverlayId::from_u128(
+                            10_000
+                                + u128::from_be_bytes(*track.id.as_bytes()) * 100
+                                + u128::try_from(index).unwrap(),
+                        ),
+                        z_index: item.z_index,
+                        content,
+                    })
+            })
+            .collect();
+        let mut output = track.clone();
+        output.items.clear();
+        output.frame_cells = Some(vec![FrameOverlayCell {
+            frame_id: owner,
+            scopes: Vec::new(),
+            marks,
+            input_replay: None,
+        }]);
+        output
+    }
+
+    #[test]
+    fn frozen_legacy_progress_preserves_pixels_after_clipping_and_all_track_blends() {
+        let owner = clip(asset(1));
+        let provider = |_id| -> Result<RgbaSurface, AssetProviderError> {
+            Ok(surface(10, 2, &[20, 50, 90, 255].repeat(20)))
+        };
+        for (width, duration, elapsed) in [
+            (1, 2, 1),
+            (10, 3, 1),
+            (17, 7, 6),
+            (u32::MAX, u64::MAX, 1),
+            (10, 1, 0),
+        ] {
+            for x in [0, 8, u32::MAX - width] {
+                if x.checked_add(width).is_none() {
+                    continue;
+                }
+                for opacity in [0, 87, 255] {
+                    for blend in [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen] {
+                        let item = OverlayItem {
+                            id: OverlayId::from_u128(1),
+                            span: TimelineSpan {
+                                start: TimeUs::ZERO,
+                                duration: DurationUs::new(duration).unwrap(),
+                            },
+                            z_index: -2,
+                            content: OverlayContent::Progress {
+                                bounds: PhysicalRect::new(x, 0, width, 2).unwrap(),
+                                foreground: rgba(200, 30, 40, 133),
+                                background: rgba(1, 100, 200, 127),
+                                show_frame_number: false,
+                                style: None,
+                            },
+                        };
+                        let legacy = track(1, true, opacity, blend, vec![item]);
+                        let frozen = freeze_track(&legacy, owner.id, TimeUs::new(elapsed));
+                        let expected = CpuRenderer::default()
+                            .render_clip_with_overlays(
+                                &owner,
+                                &[legacy],
+                                TimeUs::new(elapsed),
+                                &provider,
+                                &NeverCancel,
+                            )
+                            .unwrap();
+                        for time in [0, elapsed, u64::MAX] {
+                            let actual = CpuRenderer::default()
+                                .render_clip_with_overlays(
+                                    &owner,
+                                    std::slice::from_ref(&frozen),
+                                    TimeUs::new(time),
+                                    &provider,
+                                    &NeverCancel,
+                                )
+                                .unwrap();
+                            assert_eq!(
+                                actual, expected,
+                                "width={width}, x={x}, opacity={opacity}, blend={blend:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn timed_content_freeze_uses_half_open_points_and_keeps_unsupported_legacy_errors() {
+        let mut item = OverlayItem {
+            id: OverlayId::from_u128(2),
+            z_index: 0,
+            span: TimelineSpan {
+                start: TimeUs::new(5),
+                duration: DurationUs::new(3).unwrap(),
+            },
+            content: OverlayContent::Progress {
+                bounds: PhysicalRect::new(0, 0, 10, 1).unwrap(),
+                foreground: rgba(255, 0, 0, 255),
+                background: Rgba::TRANSPARENT,
+                show_frame_number: false,
+                style: None,
+            },
+        };
+        for time in [0, 4, 8, u64::MAX] {
+            assert!(
+                freeze_timed_overlay_content(&item, TimeUs::new(time))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let Some(OverlayContent::Progress {
+            style: Some(style), ..
+        }) = freeze_timed_overlay_content(&item, TimeUs::new(6)).unwrap()
+        else {
+            panic!("frozen progress");
+        };
+        assert_eq!(style.amount_millionths, 333_333);
+        assert!(style.fraction.is_none() && style.label.is_none());
+        if let OverlayContent::Progress {
+            show_frame_number, ..
+        } = &mut item.content
+        {
+            *show_frame_number = true;
+        }
+        assert!(matches!(
+            freeze_timed_overlay_content(&item, TimeUs::new(6)),
+            Err(RenderError::UnsupportedOverlay {
+                kind: "progress",
+                ..
+            })
+        ));
+        item.span.start = TimeUs::new(u64::MAX);
+        assert!(matches!(
+            freeze_timed_overlay_content(&item, TimeUs::new(u64::MAX)),
+            Err(RenderError::OverlaySpanOverflow { .. })
+        ));
+    }
+
+    fn exact_styled_progress() -> OverlayItem {
+        use gif_from_screen_domain::{ProgressFraction, TextRaster};
+        OverlayItem {
+            id: OverlayId::from_u128(1),
+            z_index: 5,
+            span: TimelineSpan {
+                start: TimeUs::ZERO,
+                duration: DurationUs::new(10).unwrap(),
+            },
+            content: OverlayContent::Progress {
+                bounds: PhysicalRect::new(0, 0, 4, 2).unwrap(),
+                foreground: rgba(255, 10, 10, 120),
+                background: rgba(0, 0, 0, 80),
+                show_frame_number: true,
+                style: Some(ProgressStyle {
+                    amount_millionths: u32::MAX,
+                    fraction: ProgressFraction::new(1, 6),
+                    direction: ProgressDirection::RightToLeft,
+                    label: Some(TextRaster {
+                        asset_id: asset(2),
+                        size: PhysicalSize::new(1, 1).unwrap(),
+                    }),
+                    label_position: point(2, 0),
+                    label_text: "keep exactly".to_owned(),
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn frozen_existing_progress_keeps_fraction_direction_label_and_stacking_order() {
+        let owner = clip(asset(1));
+        let progress = exact_styled_progress();
+        assert_eq!(
+            freeze_timed_overlay_content(&progress, TimeUs::new(1)).unwrap(),
+            Some(progress.content.clone())
+        );
+        let first = track(
+            1,
+            true,
+            100,
+            BlendMode::Screen,
+            vec![
+                progress,
+                raster_item(
+                    2,
+                    asset(2),
+                    5,
+                    0,
+                    10,
+                    point(0, 0),
+                    PhysicalSize::new(2, 2).unwrap(),
+                    127,
+                ),
+            ],
+        );
+        let second = track(
+            2,
+            true,
+            230,
+            BlendMode::Multiply,
+            vec![raster_item(
+                3,
+                asset(2),
+                5,
+                0,
+                10,
+                point(1, 0),
+                PhysicalSize::new(2, 2).unwrap(),
+                150,
+            )],
+        );
+        let provider = |id| -> Result<RgbaSurface, AssetProviderError> {
+            Ok(if id == asset(2) {
+                surface(1, 1, &[30, 190, 70, 128])
+            } else {
+                surface(4, 2, &[10, 20, 90, 255].repeat(8))
+            })
+        };
+        let tracks = [first, second];
+        let frozen = tracks
+            .iter()
+            .map(|track| freeze_track(track, owner.id, TimeUs::new(1)))
+            .collect::<Vec<_>>();
+        let expected = CpuRenderer::default()
+            .render_clip_with_overlays(&owner, &tracks, TimeUs::new(1), &provider, &NeverCancel)
+            .unwrap();
+        let actual = CpuRenderer::default()
+            .render_clip_with_overlays(&owner, &frozen, TimeUs::new(100), &provider, &NeverCancel)
+            .unwrap();
+        assert_eq!(actual, expected);
+        let mut hidden = tracks[0].clone();
+        hidden.visible = false;
+        hidden.opacity = 0;
+        assert_eq!(
+            freeze_track(&hidden, owner.id, TimeUs::new(1))
+                .frame_cells
+                .unwrap()[0]
+                .marks
+                .len(),
+            2
+        );
+        let transparent = raster_item(
+            9,
+            asset(2),
+            0,
+            0,
+            10,
+            point(0, 0),
+            PhysicalSize::new(1, 1).unwrap(),
+            0,
+        );
+        assert_eq!(
+            freeze_timed_overlay_content(&transparent, TimeUs::ZERO).unwrap(),
+            Some(transparent.content)
+        );
+    }
+
     fn asset(number: u8) -> AssetId {
         AssetId::from_digest([number; 32])
     }
@@ -1242,6 +1556,7 @@ mod tests {
     fn owned_track(owner: FrameId, number: u128, items: Vec<OverlayItem>) -> OverlayTrack {
         let mut result = track(number, true, 255, BlendMode::Normal, Vec::new());
         result.frame_cells = Some(vec![FrameOverlayCell {
+            input_replay: None,
             frame_id: owner,
             // Two disjoint authoring intervals must still paint each mark only
             // once, including at times outside both intervals.

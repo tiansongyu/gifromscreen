@@ -16,6 +16,7 @@ fn frame_id(value: u128) -> FrameId {
 
 fn cell(owner: u128, text: Option<&str>) -> FrameOverlayCell {
     FrameOverlayCell {
+        input_replay: None,
         frame_id: frame_id(owner),
         scopes: vec![
             FrameAuthoringSpan {
@@ -119,6 +120,7 @@ fn project() -> ProjectManifest {
         blend_mode: BlendMode::Multiply,
         items: Vec::new(),
         frame_cells: Some(vec![FrameOverlayCell {
+            input_replay: None,
             frame_id: frame_id(2),
             scopes: Vec::new(),
             marks: vec![FrameOverlayMark {

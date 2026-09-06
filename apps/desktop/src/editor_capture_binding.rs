@@ -462,9 +462,10 @@ mod tests {
         let Some(EditCommand::UpsertOverlayTrack { track }) = prepared.commands.last() else {
             panic!("expected prepared key track")
         };
-        assert_eq!(track.items.len(), 2);
-        assert!(track.items.iter().all(
-            |item| matches!(&item.content,OverlayContent::KeyStroke{text,..}if text=="Ctrl+C")
+        assert_eq!(track.frame_cells.as_ref().unwrap().len(), 2);
+        assert_eq!(track.all_mark_contents().count(), 2);
+        assert!(track.all_mark_contents().all(
+            |(_, content)| matches!(content,OverlayContent::KeyStroke{text,..}if text=="Ctrl+C")
         ));
         workspace.undo().unwrap();
         assert!(

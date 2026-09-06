@@ -9,8 +9,8 @@ use crate::{
 };
 use eframe::egui;
 use gif_from_screen_domain::{
-    AnnotationMode, AnnotationRequest, MouseButton, PhysicalPoint, PhysicalPx, PhysicalSize,
-    ProgressDirection, ProgressMeasure, ProgressOptions, ProjectId, Rgba, TrackId,
+    AnnotationMode, AnnotationRequest, MouseButton, OverlayTrack, PhysicalPoint, PhysicalPx,
+    PhysicalSize, ProgressDirection, ProgressMeasure, ProgressOptions, ProjectId, Rgba, TrackId,
 };
 use std::{
     sync::{
@@ -22,6 +22,24 @@ use std::{
 
 type WorkspaceLoan = Arc<Mutex<Option<EditorWorkspace>>>;
 
+#[cfg(test)]
+#[path = "annotation_group_tests.rs"]
+mod group_tests;
+
+/// Presentation-only label; layer numbering follows the complete track list.
+pub(crate) fn overlay_group_label(layer_index: usize, track: &OverlayTrack) -> String {
+    let (count, noun) = track.frame_cells.as_ref().map_or_else(
+        || (track.items.len(), "timed item"),
+        |cells| (cells.len(), "frame"),
+    );
+    format!(
+        "Layer {} · {} · {count} {noun}{}",
+        layer_index + 1,
+        track.name,
+        if count == 1 { "" } else { "s" },
+    )
+}
+
 enum PendingAnnotation {
     Apply {
         anchor: OverlaySelectionAnchor,
@@ -32,6 +50,10 @@ enum PendingAnnotation {
         anchor: OverlaySelectionAnchor,
         declare_common_clock: bool,
     },
+    ConvertTrack {
+        anchor: OverlaySelectionAnchor,
+        track_id: TrackId,
+    },
 }
 
 impl PendingAnnotation {
@@ -41,7 +63,8 @@ impl PendingAnnotation {
                 anchor,
                 replacing: Some(_),
                 ..
-            } => anchor.matches_project(workspace),
+            }
+            | Self::ConvertTrack { anchor, .. } => anchor.matches_project(workspace),
             Self::Apply { anchor, .. } | Self::ConfirmBinding { anchor, .. } => {
                 anchor.matches(workspace)
             }
@@ -59,11 +82,30 @@ pub(crate) struct AnnotationTools {
     completed: Option<Result<AnnotationEditReport, String>>,
     task: BackgroundTask<AnnotationEditReport, AnnotationProgress>,
     confirming: bool,
+    converting: bool,
     cancel_pending: AtomicBool,
     notice: Option<String>,
 }
 
 impl AnnotationTools {
+    pub(crate) fn queue_track_conversion(
+        &mut self,
+        workspace: &EditorWorkspace,
+        track_id: TrackId,
+    ) -> Result<(), String> {
+        if self.is_running() {
+            return Err("Another annotation operation is already running.".to_owned());
+        }
+        self.pending = Some(PendingAnnotation::ConvertTrack {
+            anchor: workspace.project_edit_anchor(),
+            track_id,
+        });
+        self.confirming = false;
+        self.converting = true;
+        self.cancel_pending.store(false, Ordering::Release);
+        self.notice = None;
+        Ok(())
+    }
     pub(crate) fn queue_binding_confirmation(
         &mut self,
         workspace: &EditorWorkspace,
@@ -80,6 +122,7 @@ impl AnnotationTools {
             declare_common_clock,
         });
         self.confirming = true;
+        self.converting = false;
         self.cancel_pending.store(false, Ordering::Release);
         self.notice = None;
         Ok(())
@@ -102,22 +145,16 @@ impl AnnotationTools {
                 self.request.position = PhysicalPoint {x:PhysicalPx::ZERO,y:PhysicalPx::new(canvas.height.get()-self.request.size.height.get())};
             }
             ui.add_enabled_ui(!self.is_running(),|ui| {
-                let editing_name=self.replacing.and_then(|id|workspace.manifest().timeline.overlay_tracks.iter().find(|track|track.id==id)).map_or("New annotation group",|track|track.name.as_str());
-                egui::ComboBox::from_id_salt("annotation-existing-group").selected_text(editing_name).show_ui(ui,|ui|{
-                    if ui.selectable_label(self.replacing.is_none(),"New annotation group").clicked(){self.replacing=None;}
-                    for track in &workspace.manifest().timeline.overlay_tracks {
-                        if let Some(request)=&track.annotation && ui.selectable_label(self.replacing==Some(track.id),&track.name).clicked(){self.replacing=Some(track.id);self.request=request.clone();}
-                    }
-                });
+                self.show_group_selector(ui, &workspace.manifest().timeline.overlay_tracks);
                 show_annotation_options(ui,&mut self.request);
                 ui.weak("Applies to selected frames only. Gaps stay untouched. Labels use original timeline frame numbers and frame-end times; transition in-betweens are not numbered separately.");
                 ui.weak("Recorded events are sampled per frame. Captured cursor pixels follow crop, resize, rotation and flips exactly. Events cannot cross selection gaps.");
-                ui.weak("Annotations are frozen at authoring time. Duration edits ripple their spans; reordering keeps their timeline times. Update the group to regenerate numbers or event positions.");
+                ui.weak("New annotations follow their frames when reordered, copied or retimed. Legacy timed groups keep their original time anchors. Updating a group explicitly regenerates its saved marks.");
                 if self.replacing.is_some(){ui.weak("Updating uses the saved authoring scope, including unmarked frames, independently of the current selection. Legacy groups without a saved scope remain limited to their existing marker coverage.");}
                 if ui.button(if self.replacing.is_some(){"Update annotation group"}else{"Add annotations to selection"}).clicked() {
                     let result = self.request.validate(workspace.manifest().canvas.size).and_then(|()| if self.replacing.is_some(){Ok(workspace.project_edit_anchor())}else{workspace.overlay_selection_anchor().map_err(|e| e.to_string())});
                     match result {
-                        Ok(anchor) => {self.pending=Some(PendingAnnotation::Apply {anchor,request:self.request.clone(),replacing:self.replacing});self.confirming=false;self.cancel_pending.store(false,Ordering::Release);self.notice=None;}
+                        Ok(anchor) => {self.pending=Some(PendingAnnotation::Apply {anchor,request:self.request.clone(),replacing:self.replacing});self.confirming=false;self.converting=false;self.cancel_pending.store(false,Ordering::Release);self.notice=None;}
                         Err(error) => self.notice=Some(error),
                     }
                 }
@@ -127,18 +164,61 @@ impl AnnotationTools {
         });
     }
 
+    fn show_group_selector(&mut self, ui: &mut egui::Ui, tracks: &[OverlayTrack]) {
+        let selected = self.replacing.and_then(|id| {
+            tracks
+                .iter()
+                .enumerate()
+                .find(|(_, track)| track.id == id && track.annotation.is_some())
+        });
+        let label = selected.map_or_else(
+            || "New annotation group".to_owned(),
+            |(index, track)| overlay_group_label(index, track),
+        );
+        egui::ComboBox::from_id_salt("annotation-existing-group")
+            .selected_text(label)
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(self.replacing.is_none(), "New annotation group")
+                    .clicked()
+                {
+                    self.replacing = None;
+                }
+                for (index, track) in tracks.iter().enumerate() {
+                    let Some(request) = &track.annotation else {
+                        continue;
+                    };
+                    ui.push_id(track.id, |ui| {
+                        if ui
+                            .selectable_label(
+                                self.replacing == Some(track.id),
+                                overlay_group_label(index, track),
+                            )
+                            .clicked()
+                        {
+                            self.replacing = Some(track.id);
+                            self.request = request.clone();
+                        }
+                    });
+                }
+            });
+    }
+
     pub(crate) fn show_running(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.spinner();
             ui.label(if self.confirming {
                 "Confirming original input coordinates…"
+            } else if self.converting {
+                "Converting layer to frame ownership…"
             } else {
                 "Preparing and saving annotations…"
             });
         });
         if let Some(progress) = self.task.progress() {
             ui.label(format!(
-                "{} / {} selected frames",
+                "{} / {} frames",
                 progress.completed, progress.total
             ));
         }
@@ -161,6 +241,10 @@ impl AnnotationTools {
             let notice = match self.completed.take()? {
                 Ok(report) if self.confirming => format!(
                     "Updated input associations on {} frames; raw pixels/events are unchanged and no annotations were added. One undo restores the previous bindings and clocks.",
+                    report.frames
+                ),
+                Ok(report) if self.converting => format!(
+                    "Layer frozen onto {} owner frames. Existing pixels are preserved; one undo restores the timed layer. Recorded key/click replay history cannot be inferred by conversion.",
                     report.frames
                 ),
                 Ok(report) => format!(
@@ -194,12 +278,20 @@ impl AnnotationTools {
         let loan = Arc::new(Mutex::new(workspace.take()));
         let worker = Arc::clone(&loan);
         self.confirming = matches!(pending, PendingAnnotation::ConfirmBinding { .. });
+        self.converting = matches!(pending, PendingAnnotation::ConvertTrack { .. });
         if let Err(error) = self.task.start("gfs-annotations", move |context| {
             let mut slot = worker.lock().unwrap_or_else(PoisonError::into_inner);
             let workspace = slot
                 .as_mut()
                 .ok_or_else(|| "Annotation workspace is unavailable.".to_owned())?;
             match pending {
+                PendingAnnotation::ConvertTrack { anchor, track_id } => workspace
+                    .convert_overlay_to_frames(
+                        &anchor,
+                        track_id,
+                        context.cancellation(),
+                        |progress| context.report(progress),
+                    ),
                 PendingAnnotation::Apply {
                     anchor,
                     request,
@@ -316,7 +408,8 @@ pub(crate) fn show_annotation_options(ui: &mut egui::Ui, request: &mut Annotatio
             ui.weak("Uses recorded cursor pixels when available. Frames that already contain the cursor are skipped to avoid duplicate pointers.");
         }
         AnnotationMode::RecordedKeys | AnnotationMode::RecordedClicks => {
-            ui.weak("Requires input events in the recorded frames. Backends without global input access can use the manual annotation modes.");
+            ui.weak("Uses recorded source input or the group's saved replay history. When neither is available, use a manual mode.");
+            ui.weak("Editable projects retain captured input history (including shared pools); share an exported GIF to exclude this metadata.");
         }
         AnnotationMode::BuiltinCursor => {}
     }
@@ -462,7 +555,7 @@ mod tests {
         EditorWorkspace::from_active(ActiveProject::create(root, manifest).unwrap(), 16).unwrap()
     }
 
-    fn legacy_workspace(root: &std::path::Path) -> EditorWorkspace {
+    pub(super) fn legacy_workspace(root: &std::path::Path) -> EditorWorkspace {
         use gif_from_screen_domain::{
             AssetDescriptor, AssetKind, CaptureBinding, CaptureMetadata, ClipTransform, DurationUs,
             EditCommand, FrameClip, FrameId, KeyStroke, RasterEncoding, TimeUs,
@@ -618,6 +711,104 @@ mod tests {
         });
         tool.cancel();
         assert!(tool.poll(&mut workspace).unwrap().contains("cancelled"));
+        assert_eq!(workspace.as_ref().unwrap().manifest(), &before);
+    }
+
+    fn timed_conversion_workspace(root: &std::path::Path) -> EditorWorkspace {
+        use gif_from_screen_domain::{
+            BlendMode, DurationUs, EditCommand, OverlayContent, OverlayId, OverlayItem,
+            OverlayTrack, PhysicalRect, ShapeKind, TimeUs, TimelineSpan,
+        };
+        let mut workspace = legacy_workspace(root);
+        workspace
+            .execute(EditCommand::UpsertOverlayTrack {
+                track: OverlayTrack {
+                    id: TrackId::from_u128(41),
+                    frame_cells: None,
+                    annotation: None,
+                    annotation_scope: None,
+                    name: "Timed test layer".to_owned(),
+                    visible: true,
+                    opacity: 128,
+                    blend_mode: BlendMode::Normal,
+                    items: vec![OverlayItem {
+                        id: OverlayId::from_u128(51),
+                        z_index: 1,
+                        span: TimelineSpan {
+                            start: TimeUs::ZERO,
+                            duration: DurationUs::new(100_000).unwrap(),
+                        },
+                        content: OverlayContent::Shape {
+                            kind: ShapeKind::Rectangle,
+                            bounds: PhysicalRect::new(0, 0, 1, 1).unwrap(),
+                            stroke_width: 0,
+                            stroke: Rgba::TRANSPARENT,
+                            fill: Some(Rgba {
+                                red: 255,
+                                green: 0,
+                                blue: 0,
+                                alpha: 128,
+                            }),
+                        },
+                    }],
+                },
+            })
+            .unwrap();
+        workspace
+    }
+
+    #[test]
+    fn queued_track_conversion_uses_project_anchor_and_returns_the_exclusive_loan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut workspace = Some(timed_conversion_workspace(
+            &dir.path().join("convert.gfsproj"),
+        ));
+        let before = workspace
+            .as_ref()
+            .unwrap()
+            .manifest()
+            .timeline
+            .overlay_tracks[0]
+            .clone();
+        let mut tools = AnnotationTools::default();
+        tools
+            .queue_track_conversion(workspace.as_ref().unwrap(), before.id)
+            .unwrap();
+        workspace.as_mut().unwrap().clear_selection();
+        assert!(tools.poll(&mut workspace).is_none());
+        assert!(workspace.is_none());
+        assert!(finish(&mut tools, &mut workspace).contains("Layer frozen"));
+        assert!(!tools.is_running());
+        let workspace = workspace.as_mut().unwrap();
+        assert!(
+            workspace.manifest().timeline.overlay_tracks[0]
+                .frame_cells
+                .is_some()
+        );
+        workspace.undo().unwrap();
+        assert_eq!(workspace.manifest().timeline.overlay_tracks[0], before);
+    }
+
+    #[test]
+    fn cancelled_and_missing_track_conversions_leave_the_original_workspace_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut workspace = Some(timed_conversion_workspace(
+            &dir.path().join("cancel-convert.gfsproj"),
+        ));
+        let before = workspace.as_ref().unwrap().manifest().clone();
+        let mut tools = AnnotationTools::default();
+        tools
+            .queue_track_conversion(workspace.as_ref().unwrap(), TrackId::from_u128(41))
+            .unwrap();
+        tools.cancel();
+        assert!(tools.poll(&mut workspace).unwrap().contains("cancelled"));
+        assert_eq!(workspace.as_ref().unwrap().manifest(), &before);
+        tools
+            .queue_track_conversion(workspace.as_ref().unwrap(), TrackId::from_u128(999))
+            .unwrap();
+        assert!(tools.poll(&mut workspace).is_none());
+        assert!(workspace.is_none());
+        assert!(finish(&mut tools, &mut workspace).contains("operation reported"));
         assert_eq!(workspace.as_ref().unwrap().manifest(), &before);
     }
 

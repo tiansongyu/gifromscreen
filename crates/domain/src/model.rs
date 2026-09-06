@@ -490,6 +490,13 @@ impl OverlayTrack {
     pub fn referenced_assets(&self) -> impl Iterator<Item = AssetId> + '_ {
         self.all_mark_contents()
             .filter_map(|(_, content)| content.referenced_asset())
+            .chain(
+                self.frame_cells
+                    .iter()
+                    .flatten()
+                    .flat_map(|cell| cell.input_replay.iter())
+                    .flat_map(crate::FrameInputReplay::referenced_assets),
+            )
     }
 
     /// Counts authored marks without walking or cloning each mark's content.
@@ -831,6 +838,24 @@ impl ProjectManifest {
                     issues.push(ValidationIssue::MissingOverlayAsset {
                         overlay_id,
                         asset_id,
+                    });
+                }
+            }
+            for asset_id in track
+                .frame_cells
+                .iter()
+                .flatten()
+                .flat_map(|cell| cell.input_replay.iter())
+                .flat_map(crate::FrameInputReplay::referenced_assets)
+            {
+                let valid = self.assets.get(&asset_id).is_some_and(|asset| {
+                    matches!(&asset.kind, AssetKind::ImportedSource { media_type } if media_type == crate::INPUT_REPLAY_MEDIA_TYPE)
+                        && (1..=crate::MAX_INPUT_REPLAY_POOL_BYTES).contains(&asset.byte_len)
+                });
+                if !valid {
+                    issues.push(ValidationIssue::InvalidFrameOverlay {
+                        track_id: track.id,
+                        reason: format!("Input replay asset {asset_id} requires a bounded input-replay JSON descriptor."),
                     });
                 }
             }

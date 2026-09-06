@@ -186,6 +186,8 @@ pub struct FrameOverlayCell {
     pub frame_id: FrameId,
     pub scopes: Vec<FrameAuthoringSpan>,
     pub marks: Vec<FrameOverlayMark>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_replay: Option<crate::FrameInputReplay>,
 }
 
 pub(crate) fn validate_cells(
@@ -205,6 +207,9 @@ pub(crate) fn validate_cells(
     let mut scopes = 0_usize;
     let mut marks = 0_usize;
     for cell in cells {
+        if let Some(replay) = &cell.input_replay {
+            replay.validate(&cell.scopes)?;
+        }
         if !frame_ids.contains(&cell.frame_id) || !owners.insert(cell.frame_id) {
             return Err("Frame-owned cells require distinct existing owner frame IDs.".to_owned());
         }

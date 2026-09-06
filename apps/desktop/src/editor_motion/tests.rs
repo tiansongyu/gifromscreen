@@ -562,25 +562,50 @@ fn loop_search_noop_invalid_and_cancelled_runs_do_not_write_a_revision() {
 
 fn add_overlay(workspace: &mut EditorWorkspace) {
     workspace.select_all();
+    // This fixture intentionally models the original time-anchored authoring
+    // path. Frame-owned baking tests below convert it explicitly; ordinary new
+    // authoring is covered independently by the generic-authoring regressions.
     workspace
-        .add_overlay_for_selection(
-            "Before baking".to_owned(),
-            OverlayContent::Shape {
-                kind: ShapeKind::Rectangle,
-                bounds: rect(),
-                stroke_width: 0,
-                stroke: Rgba::TRANSPARENT,
-                fill: Some(Rgba {
-                    red: 0,
-                    green: 0,
-                    blue: 0,
-                    alpha: 128,
-                }),
+        .execute(EditCommand::UpsertOverlayTrack {
+            track: OverlayTrack {
+                id: TrackId::from_u128(uuid::Uuid::new_v4().as_u128()),
+                frame_cells: None,
+                annotation: None,
+                annotation_scope: None,
+                name: "Before baking".to_owned(),
+                visible: true,
+                opacity: 255,
+                blend_mode: BlendMode::Normal,
+                items: vec![OverlayItem {
+                    id: OverlayId::from_u128(uuid::Uuid::new_v4().as_u128()),
+                    span: TimelineSpan {
+                        start: TimeUs::ZERO,
+                        duration: DurationUs::new(
+                            workspace
+                                .manifest()
+                                .timeline
+                                .total_duration()
+                                .unwrap()
+                                .get(),
+                        )
+                        .unwrap(),
+                    },
+                    z_index: 4,
+                    content: OverlayContent::Shape {
+                        kind: ShapeKind::Rectangle,
+                        bounds: rect(),
+                        stroke_width: 0,
+                        stroke: Rgba::TRANSPARENT,
+                        fill: Some(Rgba {
+                            red: 0,
+                            green: 0,
+                            blue: 0,
+                            alpha: 128,
+                        }),
+                    },
+                }],
             },
-            4,
-            255,
-            BlendMode::Normal,
-        )
+        })
         .unwrap();
 }
 
@@ -601,6 +626,7 @@ fn add_owned_overlay(workspace: &mut EditorWorkspace) -> OverlayTrack {
             .iter()
             .enumerate()
             .map(|(index, frame)| FrameOverlayCell {
+                input_replay: None,
                 frame_id: frame.id,
                 scopes: vec![FrameAuthoringSpan {
                     run_id: 1,

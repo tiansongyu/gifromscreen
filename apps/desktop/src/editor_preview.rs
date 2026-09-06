@@ -1168,6 +1168,7 @@ mod tests {
         track.id = TrackId::from_u128(2);
         track.items.clear();
         track.frame_cells = Some(vec![FrameOverlayCell {
+            input_replay: None,
             frame_id: FrameId::from_u128(2),
             scopes: vec![FrameAuthoringSpan {
                 run_id: 1,

@@ -2021,6 +2021,19 @@ impl GifFromScreenApp {
             inspector(ui, workspace, &mut self.editor_ui_state);
         }
         for result in results {
+            if let Ok(EditorUiAction::ConvertOverlayTrack(track_id)) = &result {
+                match self
+                    .annotation_tools
+                    .queue_track_conversion(workspace, *track_id)
+                {
+                    Ok(()) => {
+                        self.notice =
+                            Some("Converting the complete layer to frame ownership…".to_owned());
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
+                continue;
+            }
             if let Some(notice) = editor_result_notice(result) {
                 self.notice = Some(notice);
             }

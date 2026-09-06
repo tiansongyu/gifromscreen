@@ -567,6 +567,7 @@ pub(crate) enum EditorUiOperation {
     AddShapeOverlay,
     AddDrawingOverlay,
     RemoveOverlayTrack,
+    ConvertOverlayTrack,
     SetTransition,
     DeleteTransition,
     SaveCheckpoint,
@@ -587,6 +588,8 @@ pub(crate) enum EditorUiOperation {
 /// Successful state change emitted by [`show_editor_ui`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum EditorUiAction {
+    /// The host queues this full-layer conversion in its exclusive background worker.
+    ConvertOverlayTrack(gif_from_screen_domain::TrackId),
     Selection(EditorUiOperation),
     Project(EditorUiOperation),
     Playback {
@@ -2476,8 +2479,10 @@ fn show_overlay_track_list(
         .overlay_tracks
         .iter()
         .take(MAX_VISIBLE_OVERLAY_TRACKS)
-        .map(|track| {
+        .enumerate()
+        .map(|(index, track)| {
             (
+                index + 1,
                 track.id,
                 track.name.clone(),
                 track
@@ -2485,6 +2490,8 @@ fn show_overlay_track_list(
                     .next()
                     .map(|(_, content)| overlay_content_label(content)),
                 track.mark_count(),
+                track.frame_cells.is_some(),
+                track.annotation.is_none() || track.annotation_scope.is_some(),
             )
         })
         .collect::<Vec<_>>();
@@ -2502,12 +2509,23 @@ fn show_overlay_track_list(
         }
     ));
     let mut remove = None;
-    for (track_id, name, kind, item_count) in tracks {
-        ui.horizontal(|ui| {
+    for (layer_number, track_id, name, kind, item_count, frame_owned, known_coverage) in tracks {
+        ui.horizontal_wrapped(|ui| {
             ui.label(format!(
-                "{name} · {} · {item_count} item(s)",
-                kind.unwrap_or("Empty")
+                "Layer {layer_number} · {name} · {} · {item_count} item(s) · {}",
+                kind.unwrap_or("Empty"),
+                if frame_owned { "Frame-owned" } else { "Time-anchored" },
             ));
+            if !frame_owned && ui.add_enabled(known_coverage, egui::Button::new("Attach to frames").small())
+                .on_hover_text(if known_coverage {
+                    "Preserve this entire layer's current frame appearances, including hidden content. Future frame moves and copies carry its marks. Original input history is not inferred; some older input groups cannot be regenerated. Undo restores the timed layer, but the project format stays upgraded."
+                } else {
+                    "This older annotation group did not save its original authoring coverage. Keep its timed behavior or recreate it from an explicit frame selection; visible marks alone cannot prove that coverage."
+                }).clicked()
+            {
+                state.pause_preview();
+                results.push(Ok(EditorUiAction::ConvertOverlayTrack(track_id)));
+            }
             if ui.small_button("Remove track").clicked() {
                 remove = Some(track_id);
             }
@@ -3205,6 +3223,10 @@ fn schedule_playback_repaint(context: &egui::Context, state: &EditorUiState, now
 }
 
 #[cfg(test)]
+#[path = "editor_layer_conversion_ui_tests.rs"]
+mod layer_conversion_tests;
+
+#[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
@@ -3870,7 +3892,8 @@ mod tests {
         assert!(clock.advance(&plan, now, false).unwrap().1.is_none());
     }
 
-    fn transition_workspace() -> (tempfile::TempDir, crate::editor_workspace::EditorWorkspace) {
+    pub(super) fn transition_workspace()
+    -> (tempfile::TempDir, crate::editor_workspace::EditorWorkspace) {
         use gif_from_screen_application::{
             BlankAnimationProjectOptions, create_blank_animation_project,
         };

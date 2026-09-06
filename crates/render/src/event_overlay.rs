@@ -4,9 +4,16 @@ use gif_from_screen_domain::ProgressDirection;
 
 use super::{
     CANCELLATION_PIXEL_INTERVAL, CancellationToken, FrameAssetProvider, OverlayContent,
-    OverlayLayer, RenderError, RenderLimits, Rgba, RgbaSurface, TimeUs, blend_pixel,
+    OverlayLayer, RenderError, RenderLimits, Rgba, RgbaSurface, TimeUs, TimelineSpan, blend_pixel,
     check_cancelled, checked_byte_len, composite_raster_overlay, unsupported_overlay,
 };
+
+pub(super) fn legacy_progress_amount(span: TimelineSpan, sample_time: TimeUs) -> u32 {
+    let elapsed = sample_time.get().saturating_sub(span.start.get());
+    u32::try_from(u128::from(elapsed) * 1_000_000 / u128::from(span.duration.get()))
+        .unwrap_or(1_000_000)
+        .min(1_000_000)
+}
 
 pub(super) fn composite_event<P: FrameAssetProvider + ?Sized, C: CancellationToken + ?Sized>(
     destination: &mut RgbaSurface,
@@ -169,9 +176,7 @@ fn composite_progress<P: FrameAssetProvider + ?Sized, C: CancellationToken + ?Si
                     overlay_id: layer.id,
                     reason: "frame-owned progress requires a frozen style",
                 })?;
-                let elapsed = sample_time.get().saturating_sub(span.start.get());
-                u32::try_from(u128::from(elapsed) * 1_000_000 / u128::from(span.duration.get()))
-                    .unwrap_or(1_000_000)
+                legacy_progress_amount(span, sample_time)
             }
             .min(1_000_000);
             let direction = style

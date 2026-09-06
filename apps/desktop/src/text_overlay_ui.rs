@@ -13,6 +13,7 @@ use gif_from_screen_domain::{
 };
 use gif_from_screen_text::{MAX_TEXT_BYTES, TextImage, TextRasterizer, TextRequest};
 
+use crate::annotation_tools::overlay_group_label;
 use crate::editor_workspace::{
     EditorWorkspace, OverlaySelectionAnchor, TextOverlayDraft, TitleFrameRequest,
 };
@@ -318,27 +319,46 @@ impl TextOverlayTool {
         workspace: &EditorWorkspace,
         notice: &mut Option<String>,
     ) {
+        let selected_label = self
+            .editing
+            .as_ref()
+            .and_then(|(id, _)| {
+                workspace
+                    .manifest()
+                    .timeline
+                    .overlay_tracks
+                    .iter()
+                    .enumerate()
+                    .find(|(_, track)| track.id == *id)
+            })
+            .map_or_else(
+                || "Edit saved text…".to_owned(),
+                |(index, track)| overlay_group_label(index, track),
+            );
         ui.horizontal_wrapped(|ui| {
             egui::ComboBox::from_id_salt("saved-caption")
-                .selected_text(if self.editing.is_some() {
-                    "Editing saved text"
-                } else {
-                    "Edit saved text…"
-                })
+                .selected_text(selected_label)
                 .show_ui(ui, |ui| {
-                    for track in &workspace.manifest().timeline.overlay_tracks {
-                        let Some(item) = track.items.first() else {
+                    for (index, track) in workspace
+                        .manifest()
+                        .timeline
+                        .overlay_tracks
+                        .iter()
+                        .enumerate()
+                    {
+                        let Some((_, OverlayContent::Text { .. })) =
+                            track.all_mark_contents().next()
+                        else {
                             continue;
                         };
-                        let OverlayContent::Text { text, .. } = &item.content else {
-                            continue;
-                        };
-                        let label = text.chars().take(40).collect::<String>();
                         if ui
-                            .selectable_label(
-                                self.editing.as_ref().is_some_and(|(id, _)| *id == track.id),
-                                label,
-                            )
+                            .push_id(track.id, |ui| {
+                                ui.selectable_label(
+                                    self.editing.as_ref().is_some_and(|(id, _)| *id == track.id),
+                                    overlay_group_label(index, track),
+                                )
+                            })
+                            .inner
                             .clicked()
                             && let Err(error) = self.load(workspace, track.id)
                         {
@@ -503,6 +523,189 @@ mod tests {
         tool
     }
 
+    fn copied_caption_groups(root: &std::path::Path) -> (EditorWorkspace, [TrackId; 2]) {
+        let mut workspace = workspace(root);
+        workspace
+            .add_overlay_for_selection(
+                "Backdrop".to_owned(),
+                OverlayContent::Shape {
+                    kind: gif_from_screen_domain::ShapeKind::Rectangle,
+                    bounds: gif_from_screen_domain::PhysicalRect::new(0, 0, 1, 1).unwrap(),
+                    stroke_width: 0,
+                    stroke: Rgba::TRANSPARENT,
+                    fill: None,
+                },
+                0,
+                255,
+                gif_from_screen_domain::BlendMode::Normal,
+            )
+            .unwrap();
+        let mut initial = completed_tool(&workspace, false);
+        initial.poll(Some(&mut workspace)).unwrap();
+        workspace.copy_selection().unwrap();
+        workspace.paste_after_current().unwrap();
+        let ids: Vec<_> = workspace
+            .manifest()
+            .timeline
+            .overlay_tracks
+            .iter()
+            .filter(|track| {
+                track
+                    .all_mark_contents()
+                    .next()
+                    .is_some_and(|(_, content)| matches!(content, OverlayContent::Text { .. }))
+            })
+            .map(|track| track.id)
+            .collect();
+        let ids: [TrackId; 2] = ids.try_into().unwrap();
+        assert_ne!(ids[0], ids[1]);
+        let mut draft = workspace.text_overlay_draft(ids[1]).unwrap();
+        // Equal names and owner counts, but distinguishable saved requests.
+        // This changes only the fixture before read-only chooser interaction.
+        draft.request.text = "Copy".to_owned();
+        draft.request.font_size_px = 17;
+        let image = TextRasterizer::bundled_only()
+            .rasterize(&draft.request)
+            .unwrap();
+        workspace
+            .replace_text_overlay(ids[1], &draft.request, &image, draft.position)
+            .unwrap();
+        (workspace, ids)
+    }
+
+    fn draw_saved_chooser(
+        context: &egui::Context,
+        tool: &mut TextOverlayTool,
+        workspace: &EditorWorkspace,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mut notice = None;
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 360.0),
+                )),
+                events,
+                ..egui::RawInput::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    tool.show_saved_text(ui, workspace, &mut notice);
+                });
+            },
+        );
+        assert!(notice.is_none(), "{notice:?}");
+        output
+    }
+
+    fn saved_label_rect(output: &egui::FullOutput, label: &str) -> egui::Rect {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape
+                    && text.galley.text() == label
+                {
+                    Some(
+                        egui::Rect::from_min_size(text.pos, text.galley.size())
+                            .intersect(shape.clip_rect),
+                    )
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("missing saved-text label: {label}"))
+    }
+
+    fn click_saved_chooser(
+        context: &egui::Context,
+        tool: &mut TextOverlayTool,
+        workspace: &EditorWorkspace,
+        point: egui::Pos2,
+    ) {
+        for pressed in [true, false] {
+            let _ = draw_saved_chooser(
+                context,
+                tool,
+                workspace,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+    }
+
+    fn assert_loaded_request(tool: &TextOverlayTool, workspace: &EditorWorkspace, id: TrackId) {
+        let draft = workspace.text_overlay_draft(id).unwrap();
+        let (request, position) = tool.request(workspace.manifest().canvas.size).unwrap();
+        assert_eq!(position, draft.position);
+        assert_eq!(request.text, draft.request.text);
+        assert_eq!(request.font_family, draft.request.font_family);
+        assert_eq!(request.font_size_px, draft.request.font_size_px);
+        assert_eq!(request.size, draft.request.size);
+        assert_eq!(request.foreground, draft.request.foreground);
+        assert_eq!(request.background, draft.request.background);
+        assert_eq!(request.alignment, draft.request.alignment);
+    }
+
+    #[test]
+    fn copied_same_name_caption_choices_use_full_layer_numbers_and_load_exact_track_without_editing()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let (workspace, ids) =
+            copied_caption_groups(&directory.path().join("copied-captions.gfsproj"));
+        let tracks = &workspace.manifest().timeline.overlay_tracks;
+        assert_eq!(
+            [tracks[1].name.as_str(), tracks[3].name.as_str()],
+            ["Text", "Text"]
+        );
+        assert_eq!(
+            [
+                tracks[1].frame_cells.as_ref().unwrap().len(),
+                tracks[3].frame_cells.as_ref().unwrap().len()
+            ],
+            [1, 1]
+        );
+        let labels = [
+            overlay_group_label(1, &tracks[1]),
+            overlay_group_label(3, &tracks[3]),
+        ];
+        assert_eq!(
+            labels,
+            ["Layer 2 · Text · 1 frame", "Layer 4 · Text · 1 frame"]
+        );
+        let before = workspace.manifest().clone();
+        let context = egui::Context::default();
+        let mut tool = TextOverlayTool::default();
+        let mut button_label = "Edit saved text…".to_owned();
+        // Select the copied group first, then the original: identical names
+        // and counts never substitute text matching for the stable TrackId.
+        for selected in [1, 0] {
+            let output = draw_saved_chooser(&context, &mut tool, &workspace, Vec::new());
+            let button = saved_label_rect(&output, &button_label);
+            click_saved_chooser(&context, &mut tool, &workspace, button.center());
+            let opened = draw_saved_chooser(&context, &mut tool, &workspace, Vec::new());
+            assert!(saved_label_rect(&opened, &labels[0]).is_positive());
+            let choice = saved_label_rect(&opened, &labels[selected]);
+            assert!(choice.is_positive());
+            click_saved_chooser(&context, &mut tool, &workspace, choice.center());
+            let closed = draw_saved_chooser(&context, &mut tool, &workspace, Vec::new());
+            assert_eq!(tool.editing.as_ref().unwrap().0, ids[selected]);
+            assert_loaded_request(&tool, &workspace, ids[selected]);
+            assert!(saved_label_rect(&closed, &labels[selected]).is_positive());
+            assert_eq!(workspace.manifest(), &before);
+            assert!(!tool.is_running());
+            button_label.clone_from(&labels[selected]);
+        }
+    }
+
     #[test]
     fn completed_text_is_committed_once_and_undoable() {
         let directory = tempfile::tempdir().unwrap();
@@ -553,10 +756,13 @@ mod tests {
         );
         let updated = &workspace.manifest().timeline.overlay_tracks[0];
         assert_eq!(updated.id, track.id);
-        assert_eq!(updated.items[0].id, track.items[0].id);
-        assert_eq!(updated.items[0].span, track.items[0].span);
+        let cells = updated.frame_cells.as_ref().unwrap();
+        let original_cells = track.frame_cells.as_ref().unwrap();
+        assert_eq!(cells[0].marks[0].id, original_cells[0].marks[0].id);
+        assert_eq!(cells[0].scopes, original_cells[0].scopes);
+        assert_eq!(cells[0].frame_id, original_cells[0].frame_id);
         assert!(
-            matches!(&updated.items[0].content, OverlayContent::Text { text, .. } if text == "Edited")
+            matches!(&cells[0].marks[0].content, OverlayContent::Text { text, .. } if text == "Edited")
         );
     }
 

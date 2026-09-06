@@ -2,8 +2,9 @@
 
 use gif_from_screen_domain::{
     AssetId, AssetKind, BlendMode, CaptureMetadata, ClipTransform, DurationUs, EditCommand,
-    FrameClip, FrameId, OverlayContent, OverlayId, OverlayItem, OverlayTrack, PhysicalPoint,
-    PhysicalRect, PhysicalSize, RasterEncoding, Rgba, TextRaster, TimeUs, TimelineSpan, TrackId,
+    FrameClip, FrameId, FrameOverlayCell, FrameOverlayMark, OverlayContent, OverlayId, OverlayItem,
+    OverlayTrack, PhysicalPoint, PhysicalRect, PhysicalSize, RasterEncoding, Rgba, TextRaster,
+    TimeUs, TrackId,
 };
 use gif_from_screen_text::{TextImage, TextRequest};
 use uuid::Uuid;
@@ -34,17 +35,20 @@ impl EditorWorkspace {
         track_id: TrackId,
     ) -> Result<TextOverlayDraft, EditorWorkspaceError> {
         let track = self.editable_text_track(track_id)?;
-        let OverlayContent::Text {
-            text,
-            position,
-            font_family,
-            font_size_px,
-            foreground,
-            background,
-            alignment,
-            raster: Some(raster),
-            ..
-        } = &track.items[0].content
+        let Some((
+            _,
+            OverlayContent::Text {
+                text,
+                position,
+                font_family,
+                font_size_px,
+                foreground,
+                background,
+                alignment,
+                raster: Some(raster),
+                ..
+            },
+        )) = track.all_mark_contents().next()
         else {
             return Err(EditorWorkspaceError::TextTrackNotEditable(track_id));
         };
@@ -72,12 +76,22 @@ impl EditorWorkspace {
         image: &TextImage,
         position: PhysicalPoint,
     ) -> Result<TrackId, EditorWorkspaceError> {
-        let mut track = self.editable_text_track(track_id)?.clone();
+        let track = self.editable_text_track(track_id)?;
         self.validate_text_image(request, image, position)?;
         let asset = self.raster_asset_descriptor(image.size, &image.rgba)?;
         let content = text_content(request, image, position, asset.id);
+        super::overlay_authoring::validate_repeated_content(
+            &content,
+            track.all_mark_contents().count(),
+        )?;
+        let mut track = track.clone();
         for item in &mut track.items {
             item.content.clone_from(&content);
+        }
+        for cell in track.frame_cells.iter_mut().flatten() {
+            for mark in &mut cell.marks {
+                mark.content.clone_from(&content);
+            }
         }
         self.commit_with_raster_assets(
             &[(asset, &image.rgba)],
@@ -169,7 +183,20 @@ impl EditorWorkspace {
         let mut commands = self.title_insertion_commands(index, start, request.duration, frame)?;
         commands.push(EditCommand::UpsertOverlayTrack {
             track: OverlayTrack {
-                frame_cells: None,
+                frame_cells: Some(vec![FrameOverlayCell::whole(
+                    frame_id,
+                    1,
+                    vec![FrameOverlayMark {
+                        id: OverlayId::from_u128(Uuid::new_v4().as_u128()),
+                        z_index: 3,
+                        content: text_content(
+                            &request.text,
+                            image,
+                            request.position,
+                            text_asset.id,
+                        ),
+                    }],
+                )]),
                 annotation: None,
                 annotation_scope: None,
                 id: TrackId::from_u128(Uuid::new_v4().as_u128()),
@@ -177,15 +204,7 @@ impl EditorWorkspace {
                 visible: true,
                 opacity: 255,
                 blend_mode: BlendMode::Normal,
-                items: vec![OverlayItem {
-                    id: OverlayId::from_u128(Uuid::new_v4().as_u128()),
-                    span: TimelineSpan {
-                        start: TimeUs::new(start),
-                        duration: request.duration,
-                    },
-                    z_index: 3,
-                    content: text_content(&request.text, image, request.position, text_asset.id),
-                }],
+                items: Vec::new(),
             },
         });
         self.commit_with_raster_assets(
@@ -207,16 +226,17 @@ impl EditorWorkspace {
             .iter()
             .find(|track| track.id == track_id)
             .ok_or(EditorWorkspaceError::TextTrackNotEditable(track_id))?;
-        let Some(first) = track.items.first() else {
+        let mut contents = track.all_mark_contents();
+        let Some((_, first)) = contents.next() else {
             return Err(EditorWorkspaceError::TextTrackNotEditable(track_id));
         };
         if !matches!(
-            first.content,
+            first,
             OverlayContent::Text {
                 raster: Some(_),
                 ..
             }
-        ) || track.items.iter().any(|item| item.content != first.content)
+        ) || contents.any(|(_, content)| content != first)
         {
             return Err(EditorWorkspaceError::TextTrackNotEditable(track_id));
         }
@@ -270,7 +290,11 @@ impl EditorWorkspace {
             index,
             frames: vec![frame],
         });
-        for track in &timeline.overlay_tracks {
+        for track in timeline
+            .overlay_tracks
+            .iter()
+            .filter(|track| track.frame_cells.is_none())
+        {
             let mut shifted = track.clone();
             shifted.items = exclude_inserted_title(&track.items, start, duration)?;
             if let Some(scope) = &track.annotation_scope {
@@ -351,7 +375,8 @@ pub(super) fn exclude_inserted_title(
 #[cfg(test)]
 mod tests {
     use gif_from_screen_domain::{
-        HorizontalAlignment, ProjectManifest, ShapeKind, Transition, TransitionId, TransitionKind,
+        HorizontalAlignment, ProjectManifest, ShapeKind, TimelineSpan, Transition, TransitionId,
+        TransitionKind,
     };
     use gif_from_screen_project::LockPolicy;
 
@@ -402,6 +427,73 @@ mod tests {
         assert_eq!(&actual, expected);
     }
 
+    // Test-only representation of projects authored before frame-owned marks.
+    // Production code never converts old/new anchors implicitly.
+    fn legacy_track_fixture(workspace: &mut EditorWorkspace, track_id: TrackId) {
+        let mut track = workspace
+            .manifest()
+            .timeline
+            .overlay_tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .unwrap()
+            .clone();
+        let cells = track.frame_cells.take().unwrap();
+        track.items = cells
+            .into_iter()
+            .flat_map(|cell| {
+                let frame = workspace
+                    .manifest()
+                    .timeline
+                    .frames
+                    .iter()
+                    .find(|frame| frame.id == cell.frame_id)
+                    .unwrap();
+                let span = TimelineSpan {
+                    start: workspace.manifest().timeline.frame_start(frame.id).unwrap(),
+                    duration: frame.duration,
+                };
+                cell.marks.into_iter().map(move |mark| OverlayItem {
+                    id: mark.id,
+                    span,
+                    z_index: mark.z_index,
+                    content: mark.content,
+                })
+            })
+            .collect();
+        workspace
+            .execute(EditCommand::UpsertOverlayTrack { track })
+            .unwrap();
+    }
+
+    fn legacy_whole_track_fixture(workspace: &mut EditorWorkspace, track_id: TrackId) {
+        legacy_track_fixture(workspace, track_id);
+        let mut legacy = workspace
+            .manifest()
+            .timeline
+            .overlay_tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .unwrap()
+            .clone();
+        legacy.items.truncate(1);
+        legacy.items[0].span = TimelineSpan {
+            start: TimeUs::ZERO,
+            duration: DurationUs::new(
+                workspace
+                    .manifest()
+                    .timeline
+                    .total_duration()
+                    .unwrap()
+                    .get(),
+            )
+            .unwrap(),
+        };
+        workspace
+            .execute(EditCommand::UpsertOverlayTrack { track: legacy })
+            .unwrap();
+    }
+
     fn export_frames(
         workspace: &EditorWorkspace,
         name: &str,
@@ -424,6 +516,13 @@ mod tests {
         .unwrap()
     }
 
+    fn assert_title_pixels(workspace: &EditorWorkspace, frame_id: FrameId) {
+        let rendered =
+            crate::editor_preview::render_frame_surface(workspace.active_project(), frame_id, 1024)
+                .unwrap();
+        assert_eq!(rendered.pixels(), &[0, 0, 255, 255, 0, 0, 0, 255]);
+    }
+
     #[test]
     fn replacing_text_preserves_group_identity_spans_settings_and_exact_undo() {
         let directory = tempfile::tempdir().unwrap();
@@ -438,6 +537,7 @@ mod tests {
                 PhysicalPoint::default(),
             )
             .unwrap();
+        legacy_track_fixture(&mut workspace, track_id);
         let mut original_track = workspace.manifest().timeline.overlay_tracks[0].clone();
         original_track.name = "Selected captions".to_owned();
         original_track.items[0].z_index = -7;
@@ -487,6 +587,73 @@ mod tests {
     }
 
     #[test]
+    fn frame_owned_text_reedit_preserves_ids_partial_scopes_and_layer_settings_after_reorder() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = create_rendered_duplicate_workspace(&directory);
+        workspace.select_only(frame_id(1)).unwrap();
+        workspace.toggle_selection(frame_id(3)).unwrap();
+        let (request, image) = text("Before", GREEN);
+        let id = workspace
+            .add_text_overlay_for_selection(&request, &image, PhysicalPoint::default())
+            .unwrap();
+        let mut track = workspace.manifest().timeline.overlay_tracks[0].clone();
+        track.name = "Hidden editable caption".to_owned();
+        track.visible = false;
+        track.opacity = 177;
+        track.blend_mode = BlendMode::Screen;
+        let cells = track.frame_cells.as_mut().unwrap();
+        cells[0].scopes[0].span =
+            gif_from_screen_domain::FrameLocalSpan::new(1, 2, DurationUs::new(3).unwrap()).unwrap();
+        cells[0].scopes[0].run_id = 9;
+        cells[0].marks[0].z_index = -7;
+        cells[1].marks[0].z_index = 9;
+        cells.push(FrameOverlayCell::whole(frame_id(2), 10, Vec::new()));
+        workspace
+            .execute(EditCommand::UpsertOverlayTrack {
+                track: track.clone(),
+            })
+            .unwrap();
+        workspace
+            .execute(EditCommand::ReorderFrames {
+                order: vec![frame_id(3), frame_id(2), frame_id(1), frame_id(4)],
+            })
+            .unwrap();
+        workspace.clear_selection();
+        let before = workspace.manifest().clone();
+        let draft = workspace.text_overlay_draft(id).unwrap();
+        assert_eq!(draft.request.text, "Before");
+        let (request, image) = text("After", BLUE);
+        workspace
+            .replace_text_overlay(id, &request, &image, draft.position)
+            .unwrap();
+        let after = workspace.manifest().clone();
+        let updated = &after.timeline.overlay_tracks[0];
+        let content = updated.all_mark_contents().next().unwrap().1.clone();
+        for mark in track
+            .frame_cells
+            .iter_mut()
+            .flatten()
+            .flat_map(|cell| &mut cell.marks)
+        {
+            mark.content.clone_from(&content);
+        }
+        assert_eq!(updated, &track);
+        assert!(updated.frame_cells.as_ref().unwrap()[2].marks.is_empty());
+        workspace.undo().unwrap();
+        assert_project_content(workspace.manifest(), &before);
+        workspace.redo().unwrap();
+        assert_project_content(workspace.manifest(), &after);
+        drop(workspace);
+        let reopened =
+            EditorWorkspace::open(directory.path(), LockPolicy::FailIfPresent, 16).unwrap();
+        assert_project_content(reopened.manifest(), &after);
+        assert_eq!(
+            reopened.text_overlay_draft(id).unwrap().request.text,
+            "After"
+        );
+    }
+
+    #[test]
     fn title_insertion_at_beginning_middle_and_end_excludes_existing_overlays_and_roundtrips() {
         for after in [None, Some(frame_id(1)), Some(frame_id(4))] {
             let directory = tempfile::tempdir().unwrap();
@@ -507,6 +674,8 @@ mod tests {
                     BlendMode::Normal,
                 )
                 .unwrap();
+            let track_id = workspace.manifest().timeline.overlay_tracks[0].id;
+            legacy_whole_track_fixture(&mut workspace, track_id);
             workspace
                 .execute(EditCommand::SetTransitions {
                     transitions: [(1, 2), (3, 4)]
@@ -564,10 +733,7 @@ mod tests {
                 workspace.manifest().timeline.transitions.len(),
                 if index == 1 { 1 } else { 2 }
             );
-            let rendered =
-                crate::editor_preview::render_frame_surface(workspace.active_project(), id, 1024)
-                    .unwrap();
-            assert_eq!(rendered.pixels(), &[0, 0, 255, 255, 0, 0, 0, 255]);
+            assert_title_pixels(&workspace, id);
             let edited = workspace.manifest().clone();
             for _ in 0..10 {
                 assert!(workspace.undo().unwrap());
@@ -587,6 +753,89 @@ mod tests {
                 .filter(|frame| frame.rgba() == [0, 0, 255, 255, 0, 0, 0, 255])
                 .count();
             assert_eq!(title_frames, 1);
+        }
+    }
+
+    #[test]
+    fn title_does_not_inherit_frame_owned_artwork_and_its_own_caption_follows_reorder() {
+        for after in [None, Some(frame_id(1)), Some(frame_id(4))] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut workspace = create_rendered_duplicate_workspace(&directory);
+            workspace.select_all();
+            workspace
+                .add_overlay_for_selection(
+                    "Original frames only".to_owned(),
+                    OverlayContent::Shape {
+                        kind: ShapeKind::Rectangle,
+                        bounds: PhysicalRect::new(0, 0, 2, 1).unwrap(),
+                        stroke_width: 0,
+                        stroke: GREEN,
+                        fill: Some(GREEN),
+                    },
+                    100,
+                    255,
+                    BlendMode::Normal,
+                )
+                .unwrap();
+            let original_track = workspace.manifest().timeline.overlay_tracks[0].clone();
+            let (request, image) = text("Title", BLUE);
+            let id = workspace
+                .insert_title_frame(
+                    &TitleFrameRequest {
+                        after,
+                        duration: DurationUs::new(50_000).unwrap(),
+                        background: BLACK,
+                        text: request,
+                        position: PhysicalPoint::default(),
+                    },
+                    &image,
+                )
+                .unwrap();
+            assert_eq!(
+                workspace.manifest().timeline.overlay_tracks[0],
+                original_track
+            );
+            let title_track = workspace.manifest().timeline.overlay_tracks[1].clone();
+            assert!(title_track.items.is_empty());
+            assert_eq!(title_track.frame_cells.as_ref().unwrap()[0].frame_id, id);
+            let expected = [0, 0, 255, 255, 0, 0, 0, 255];
+            let rendered =
+                crate::editor_preview::render_frame_surface(workspace.active_project(), id, 1024)
+                    .unwrap();
+            assert_eq!(rendered.pixels(), expected);
+            let order = workspace
+                .manifest()
+                .timeline
+                .frames
+                .iter()
+                .rev()
+                .map(|frame| frame.id)
+                .collect();
+            workspace
+                .execute(EditCommand::ReorderFrames { order })
+                .unwrap();
+            assert_eq!(
+                workspace.manifest().timeline.overlay_tracks,
+                [original_track, title_track]
+            );
+            let rendered =
+                crate::editor_preview::render_frame_surface(workspace.active_project(), id, 1024)
+                    .unwrap();
+            assert_eq!(rendered.pixels(), expected);
+            let after = workspace.manifest().clone();
+            drop(workspace);
+            let reopened =
+                EditorWorkspace::open(directory.path(), LockPolicy::FailIfPresent, 16).unwrap();
+            assert_project_content(reopened.manifest(), &after);
+            let exported = export_frames(&reopened, "frame-owned-title.gif");
+            assert_eq!(
+                exported
+                    .frames()
+                    .iter()
+                    .filter(|frame| frame.rgba() == expected)
+                    .count(),
+                1
+            );
         }
     }
 
@@ -612,6 +861,8 @@ mod tests {
                 |_| {},
             )
             .unwrap();
+        let track_id = workspace.manifest().timeline.overlay_tracks[0].id;
+        legacy_track_fixture(&mut workspace, track_id);
         let total = workspace
             .manifest()
             .timeline
@@ -675,15 +926,22 @@ mod tests {
             let mut track = workspace.manifest().timeline.overlay_tracks[0].clone();
             let target = if invalid == 0 { TrackId::NIL } else { id };
             if invalid == 1 {
-                if let OverlayContent::Text { text, .. } = &mut track.items[1].content {
+                if let OverlayContent::Text { text, .. } =
+                    &mut track.frame_cells.as_mut().unwrap()[1].marks[0].content
+                {
                     *text = "Different source".to_owned();
                 }
                 workspace
                     .execute(EditCommand::UpsertOverlayTrack { track })
                     .unwrap();
             } else if invalid == 2 {
-                for item in &mut track.items {
-                    if let OverlayContent::Text { raster, .. } = &mut item.content {
+                for mark in track
+                    .frame_cells
+                    .iter_mut()
+                    .flatten()
+                    .flat_map(|cell| &mut cell.marks)
+                {
+                    if let OverlayContent::Text { raster, .. } = &mut mark.content {
                         *raster = None;
                     }
                 }

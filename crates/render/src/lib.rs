@@ -28,7 +28,7 @@ pub use control::{CancellationToken, NeverCancel};
 pub use error::{RenderError, SurfaceError, UnsupportedEffect};
 pub use overlay::{
     OverlayRenderPlan, RasterOverlayAsset, active_raster_overlay_assets,
-    active_raster_overlay_assets_for_frame,
+    active_raster_overlay_assets_for_frame, freeze_timed_overlay_content,
 };
 pub use renderer::{
     AssetProviderError, CpuRenderer, FrameAssetProvider, MAX_BLUR_RADIUS, RenderLimits,

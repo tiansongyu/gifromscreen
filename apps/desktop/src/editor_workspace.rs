@@ -10,9 +10,8 @@ use std::{
 
 use gif_from_screen_domain::{
     AssetDescriptor, AssetId, AssetKind, BlendMode, DurationUs, EditCommand, Effect, FrameId,
-    OverlayContent, OverlayId, OverlayItem, OverlayTrack, PhysicalPoint, PhysicalRect,
-    PhysicalSize, ProjectId, ProjectManifest, ProjectRevision, RasterEncoding, TimeUs,
-    TimelineSpan, TrackId, Transition,
+    OverlayContent, OverlayTrack, PhysicalPoint, PhysicalRect, PhysicalSize, ProjectId,
+    ProjectManifest, ProjectRevision, RasterEncoding, TimeUs, TimelineSpan, TrackId, Transition,
 };
 use gif_from_screen_editor::{
     ClipTransformEdit, DuplicateDelayMode, DuplicateFrameRetention, EditorError, EditorStatistics,
@@ -41,6 +40,9 @@ use crate::editor_preview::{EditorPreviewError, render_frame_surface};
 mod text;
 pub(crate) use text::{TextOverlayDraft, TitleFrameRequest};
 
+#[path = "editor_overlay_authoring.rs"]
+mod overlay_authoring;
+
 #[path = "editor_insert.rs"]
 mod insert;
 pub(crate) use insert::{
@@ -59,6 +61,9 @@ mod annotations;
 
 #[path = "editor_capture_binding.rs"]
 mod capture_binding;
+
+#[path = "editor_frame_conversion.rs"]
+mod frame_conversion;
 
 const MAX_SYNCHRONOUS_DUPLICATE_SCAN_FRAMES: usize = 256;
 const DUPLICATE_RENDER_SURFACE_LIMIT_BYTES: usize = 128 * 1024 * 1024;
@@ -306,7 +311,7 @@ impl EditorWorkspace {
         }
     }
 
-    /// Adds one track with an item for each uninterrupted selected frame range.
+    /// Adds frozen marks owned by the selected frames, preserving selection gaps.
     pub(crate) fn add_overlay_for_selection(
         &mut self,
         name: String,
@@ -318,11 +323,11 @@ impl EditorWorkspace {
         if name.trim().is_empty() {
             return Err(EditorWorkspaceError::EmptyOverlayName);
         }
-        let spans = self.selected_timeline_spans()?;
+        let cells = self.generic_overlay_cells(content, z_index)?;
         let track_id = TrackId::from_u128(Uuid::new_v4().as_u128());
         self.execute(EditCommand::UpsertOverlayTrack {
             track: OverlayTrack {
-                frame_cells: None,
+                frame_cells: Some(cells),
                 annotation: None,
                 annotation_scope: None,
                 id: track_id,
@@ -330,7 +335,7 @@ impl EditorWorkspace {
                 visible: true,
                 opacity: track_opacity,
                 blend_mode,
-                items: overlay_items(spans, content, z_index),
+                items: Vec::new(),
             },
         })?;
         Ok(track_id)
@@ -376,7 +381,7 @@ impl EditorWorkspace {
             .validate()
             .and_then(|()| edit.display_size.validate())
             .map_err(|_| EditorWorkspaceError::EmptyRasterOverlaySize)?;
-        let spans = self.selected_timeline_spans()?;
+        self.selected_frame_ids()?;
         let placement = PhysicalRect {
             origin: edit.position,
             size: edit.display_size,
@@ -385,12 +390,13 @@ impl EditorWorkspace {
             return Err(EditorWorkspaceError::RasterOverlayOutsideCanvas);
         }
         let asset = self.raster_asset_descriptor(edit.source_size, rgba)?;
+        let cells = self.generic_overlay_cells(content(asset.id), edit.z_index)?;
         let track_id = TrackId::from_u128(Uuid::new_v4().as_u128());
         self.commit_with_raster_assets(
             &[(asset.clone(), rgba)],
             vec![EditCommand::UpsertOverlayTrack {
                 track: OverlayTrack {
-                    frame_cells: None,
+                    frame_cells: Some(cells),
                     annotation: None,
                     annotation_scope: None,
                     id: track_id,
@@ -398,7 +404,7 @@ impl EditorWorkspace {
                     visible: true,
                     opacity: edit.track_opacity,
                     blend_mode: edit.blend_mode,
-                    items: overlay_items(spans, content(asset.id), edit.z_index),
+                    items: Vec::new(),
                 },
             }],
         )?;
@@ -1130,24 +1136,6 @@ struct ExactDuplicateRenderError {
     source: EditorPreviewError,
 }
 
-fn overlay_items(
-    spans: Vec<TimelineSpan>,
-    content: OverlayContent,
-    z_index: i32,
-) -> Vec<OverlayItem> {
-    let count = spans.len();
-    spans
-        .into_iter()
-        .zip(std::iter::repeat_n(content, count))
-        .map(|(span, content)| OverlayItem {
-            id: OverlayId::from_u128(Uuid::new_v4().as_u128()),
-            span,
-            z_index,
-            content,
-        })
-        .collect()
-}
-
 fn rendered_similarity(first: &RgbaSurface, second: &RgbaSurface) -> FrameComparison {
     if first.size() != second.size() {
         return FrameComparison::DifferentDimensions;
@@ -1282,6 +1270,8 @@ pub(crate) enum EditorWorkspaceError {
     /// Overlay authoring requires visible track text.
     #[error("overlay track name must not be empty")]
     EmptyOverlayName,
+    #[error("could not prepare frame-owned overlay: {0}")]
+    FrameOverlayPreparation(String),
     /// Overlay authoring requires at least one selected frame.
     #[error("select at least one frame before adding an overlay")]
     EmptyOverlaySelection,
@@ -2463,14 +2453,25 @@ mod tests {
         assert_eq!(track.name, "Callout");
         assert_eq!(track.opacity, 200);
         assert_eq!(track.blend_mode, BlendMode::Screen);
-        assert_eq!(track.items[0].span.start, TimeUs::ZERO);
-        assert_eq!(track.items.len(), 2);
-        assert_eq!(track.items[0].span.duration, DurationUs::new(10).unwrap());
-        assert_eq!(track.items[1].span.start, TimeUs::new(30));
-        assert_eq!(track.items[1].span.duration, DurationUs::new(30).unwrap());
-        assert_ne!(track.items[0].id, track.items[1].id);
-        assert_eq!(track.items[0].content, track.items[1].content);
-        assert_eq!(track.items[0].z_index, 7);
+        assert!(track.items.is_empty());
+        let cells = track.frame_cells.as_ref().unwrap();
+        assert_eq!(cells.len(), 2);
+        assert_eq!(
+            [cells[0].frame_id, cells[1].frame_id],
+            [frame_id(1), frame_id(3)]
+        );
+        assert_eq!(
+            [cells[0].scopes[0].run_id, cells[1].scopes[0].run_id],
+            [1, 2]
+        );
+        assert!(
+            cells
+                .iter()
+                .all(|cell| cell.scopes[0].span == gif_from_screen_domain::FrameLocalSpan::WHOLE)
+        );
+        assert_ne!(cells[0].marks[0].id, cells[1].marks[0].id);
+        assert_eq!(cells[0].marks[0].content, cells[1].marks[0].content);
+        assert_eq!(cells[0].marks[0].z_index, 7);
 
         assert!(workspace.undo().unwrap());
         assert!(workspace.manifest().timeline.overlay_tracks.is_empty());
@@ -2703,9 +2704,11 @@ mod tests {
             .unwrap();
         let track = workspace.manifest().timeline.overlay_tracks[0].clone();
         assert_eq!(track.id, track_id);
-        assert_eq!(track.items.len(), 2);
+        assert!(track.items.is_empty());
+        let cells = track.frame_cells.as_ref().unwrap();
+        assert_eq!(cells.len(), 2);
         assert_eq!(
-            track.items[0].content,
+            cells[0].marks[0].content,
             OverlayContent::Text {
                 text: request.text.clone(),
                 position,

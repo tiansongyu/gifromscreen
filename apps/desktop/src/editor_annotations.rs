@@ -4,9 +4,14 @@ use super::{EditorWorkspace, OverlaySelectionAnchor};
 use crate::annotation_engine::{
     AnnotationEditReport, AnnotationProgress, check_cancelled, load_annotation_asset,
     prepare_annotations_in_scope, prepare_annotations_with_assets,
+    prepare_owned_annotation_replacement,
 };
 use gif_from_screen_domain::{AnnotationRequest, EditCommand, TrackId};
 use std::sync::atomic::AtomicBool;
+
+#[cfg(test)]
+#[path = "editor_owned_annotation_tests.rs"]
+mod owned_tests;
 
 impl EditorWorkspace {
     pub(crate) fn apply_annotation_edit(
@@ -49,11 +54,22 @@ impl EditorWorkspace {
                     })
             })
             .transpose()?;
-        if original
+        if let Some(original) = original
             .as_ref()
-            .is_some_and(|track| track.frame_cells.is_some())
+            .filter(|track| track.frame_cells.is_some())
         {
-            return Err("Frame-owned group re-authoring is not supported by this editor yet. Its saved marks, scope and settings are unchanged; create a new group instead.".to_owned());
+            let provider =
+                |id| load_annotation_asset(self.manifest(), self.active_project().assets(), id);
+            let prepared = prepare_owned_annotation_replacement(
+                self.manifest(),
+                original,
+                request,
+                self.active_project().assets(),
+                cancellation,
+                progress,
+                &provider,
+            )?;
+            return self.commit_annotations(prepared, cancellation);
         }
         let coverage = original
             .as_ref()
@@ -162,7 +178,39 @@ mod tests {
     use gif_from_screen_gif::RgbaFrame;
     use gif_from_screen_project::LockPolicy;
 
-    fn workspace(root: &std::path::Path) -> EditorWorkspace {
+    impl EditorWorkspace {
+        // Explicit schema-1 fixture authoring; production creation is frame-owned.
+        fn apply_legacy_annotation_edit(
+            &mut self,
+            anchor: &OverlaySelectionAnchor,
+            request: &AnnotationRequest,
+            cancellation: &AtomicBool,
+            progress: impl FnMut(AnnotationProgress),
+        ) -> Result<usize, String> {
+            if !anchor.matches(self) {
+                return Err(
+                    "Project or selection changed before annotation preparation.".to_owned(),
+                );
+            }
+            let provider =
+                |id| load_annotation_asset(self.manifest(), self.active_project().assets(), id);
+            let prepared = crate::annotation_engine::prepare_legacy_annotations_with_assets(
+                self.manifest(),
+                self.selection().selected(),
+                request,
+                cancellation,
+                progress,
+                &provider,
+            )?;
+            if prepared.commands.is_empty() {
+                return Err("No matching recorded events were found.".to_owned());
+            }
+            self.commit_annotations(prepared, cancellation)
+                .map(|report| report.frames)
+        }
+    }
+
+    pub(super) fn workspace(root: &std::path::Path) -> EditorWorkspace {
         let mut writer = IncrementalRecordingProject::create(
             root,
             PhysicalSize::new(240, 40).unwrap(),
@@ -188,7 +236,7 @@ mod tests {
         workspace
     }
 
-    fn record_first_key(workspace: &mut EditorWorkspace) {
+    pub(super) fn record_first_key(workspace: &mut EditorWorkspace) {
         let commands = workspace
             .manifest()
             .timeline
@@ -226,10 +274,13 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_frame_owned_reauthor_never_clears_marks_or_changes_saved_recipe() {
+    fn unseeded_frame_owned_recorded_reauthor_never_clears_marks_or_changes_saved_recipe() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("owned-reauthor.gfsproj");
         let mut workspace = workspace(&path);
+        record_first_key(&mut workspace);
+        workspace.select_only(FrameId::from_u128(1)).unwrap();
+        workspace.toggle_selection(FrameId::from_u128(3)).unwrap();
         let mut request = AnnotationRequest {
             mode: AnnotationMode::ManualKeys {
                 text: "Frozen".to_owned(),
@@ -237,7 +288,7 @@ mod tests {
             ..AnnotationRequest::default()
         };
         workspace
-            .apply_annotation_edit(
+            .apply_legacy_annotation_edit(
                 &workspace.project_edit_anchor(),
                 &request,
                 &AtomicBool::new(false),
@@ -250,6 +301,7 @@ mod tests {
                 .into_iter()
                 .zip([1, 3])
                 .map(|(item, owner)| FrameOverlayCell {
+                    input_replay: None,
                     frame_id: FrameId::from_u128(owner),
                     scopes: vec![FrameAuthoringSpan {
                         run_id: u32::try_from(owner).unwrap(),
@@ -271,9 +323,7 @@ mod tests {
         let before = workspace.manifest().clone();
         let journal = std::fs::read(path.join("journal.ndjson")).unwrap();
         request.opacity = 31;
-        request.mode = AnnotationMode::ManualKeys {
-            text: "Do not replace saved pixels".to_owned(),
-        };
+        request.mode = AnnotationMode::RecordedKeys;
         let error = workspace
             .apply_annotation_group(
                 &workspace.project_edit_anchor(),
@@ -283,7 +333,7 @@ mod tests {
                 |_| panic!("unsupported reauthor must not start generation"),
             )
             .unwrap_err();
-        assert!(error.contains("re-authoring is not supported"));
+        assert!(error.contains("no complete recorded-input replay context"));
         assert_eq!(workspace.manifest(), &before);
         assert_eq!(std::fs::read(path.join("journal.ndjson")).unwrap(), journal);
         drop(workspace);
@@ -304,7 +354,7 @@ mod tests {
         };
         assert_eq!(
             workspace
-                .apply_annotation_edit(
+                .apply_legacy_annotation_edit(
                     &workspace.project_edit_anchor(),
                     &request,
                     &AtomicBool::new(false),
@@ -361,7 +411,7 @@ mod tests {
                 ..AnnotationRequest::default()
             };
             workspace
-                .apply_annotation_edit(
+                .apply_legacy_annotation_edit(
                     &workspace.project_edit_anchor(),
                     &request,
                     &AtomicBool::new(false),
@@ -422,7 +472,7 @@ mod tests {
             ..AnnotationRequest::default()
         };
         workspace
-            .apply_annotation_edit(
+            .apply_legacy_annotation_edit(
                 &workspace.project_edit_anchor(),
                 &request,
                 &AtomicBool::new(false),
@@ -464,7 +514,7 @@ mod tests {
             ..AnnotationRequest::default()
         };
         workspace
-            .apply_annotation_edit(
+            .apply_legacy_annotation_edit(
                 &workspace.project_edit_anchor(),
                 &request,
                 &AtomicBool::new(false),
@@ -524,7 +574,7 @@ mod tests {
             ..AnnotationRequest::default()
         };
         workspace
-            .apply_annotation_edit(
+            .apply_legacy_annotation_edit(
                 &workspace.project_edit_anchor(),
                 &request,
                 &AtomicBool::new(false),
@@ -619,7 +669,7 @@ mod tests {
             ..AnnotationRequest::default()
         };
         workspace
-            .apply_annotation_edit(
+            .apply_legacy_annotation_edit(
                 &workspace.project_edit_anchor(),
                 &request,
                 &AtomicBool::new(false),
@@ -680,7 +730,7 @@ mod tests {
         let anchor = workspace.project_edit_anchor();
         assert!(
             workspace
-                .apply_annotation_edit(
+                .apply_legacy_annotation_edit(
                     &anchor,
                     &AnnotationRequest::default(),
                     &AtomicBool::new(true),
@@ -696,7 +746,7 @@ mod tests {
         };
         assert!(
             workspace
-                .apply_annotation_edit(&anchor, &no_events, &AtomicBool::new(false), |_| {})
+                .apply_legacy_annotation_edit(&anchor, &no_events, &AtomicBool::new(false), |_| {})
                 .unwrap_err()
                 .contains("No matching recorded events")
         );
@@ -705,7 +755,7 @@ mod tests {
         workspace.select_only(FrameId::from_u128(2)).unwrap();
         assert!(
             workspace
-                .apply_annotation_edit(
+                .apply_legacy_annotation_edit(
                     &anchor,
                     &AnnotationRequest::default(),
                     &AtomicBool::new(false),
