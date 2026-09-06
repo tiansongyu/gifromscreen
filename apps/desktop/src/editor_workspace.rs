@@ -14,17 +14,17 @@ use gif_from_screen_domain::{
     ProjectManifest, ProjectRevision, RasterEncoding, TimeUs, TimelineSpan, TrackId, Transition,
 };
 use gif_from_screen_editor::{
-    ComposedFrameEdit, DuplicateDelayMode, DuplicateFrameRetention, EditorError, EditorStatistics,
-    EditorStatisticsError, FrameClipboardEntryId, FrameClipboardHistory,
-    FrameClipboardHistoryEntry, FrameClipboardHistoryError, FrameComparison, FrameEffectEdit,
-    FrameSimilarityProvider, FrameTimeRangeError, FrameTransitionSettings, ReduceDelayMode,
-    ReduceOptions, RemoveDuplicateFramesOptions, TimelineSelection, TimelineSelectionError,
-    YoyoOptions, YoyoScope, adjust_duration, copy_selected_frames, cut_selected_frames,
-    delete_frames, delete_frames_after, delete_frames_before, edit_composed_frames,
-    move_selected_left, move_selected_right, override_duration, paste_frame_clipboard,
-    project_statistics, reduce_frames, remove_duplicate_frames, remove_transition_after,
-    reverse_selected, scale_duration, select_frames_by_time_range, set_transition_after,
-    yoyo_frames,
+    ComposedEffectEdit, ComposedFrameEdit, ComposedImageEffect, DuplicateDelayMode,
+    DuplicateFrameRetention, EditorError, EditorStatistics, EditorStatisticsError,
+    FrameClipboardEntryId, FrameClipboardHistory, FrameClipboardHistoryEntry,
+    FrameClipboardHistoryError, FrameComparison, FrameEffectEdit, FrameSimilarityProvider,
+    FrameTimeRangeError, FrameTransitionSettings, ReduceDelayMode, ReduceOptions,
+    RemoveDuplicateFramesOptions, TimelineSelection, TimelineSelectionError, YoyoOptions,
+    YoyoScope, adjust_duration, copy_selected_frames, cut_selected_frames, delete_frames,
+    delete_frames_after, delete_frames_before, edit_composed_frames, move_selected_left,
+    move_selected_right, override_duration, paste_frame_clipboard, project_statistics,
+    reduce_frames, remove_duplicate_frames, remove_transition_after, reverse_selected,
+    scale_duration, select_frames_by_time_range, set_transition_after, yoyo_frames,
 };
 use gif_from_screen_project::{
     ActiveProject, AssetIssue, AssetStore, CommitReceipt, JournalRecoveryReport, LockPolicy,
@@ -46,6 +46,10 @@ mod overlay_authoring;
 #[cfg(test)]
 #[path = "editor_pipeline_tests.rs"]
 mod pipeline_tests;
+
+#[cfg(test)]
+#[path = "editor_image_effect_tests.rs"]
+mod image_effect_tests;
 
 #[path = "editor_insert.rs"]
 mod insert;
@@ -888,6 +892,35 @@ impl EditorWorkspace {
         effect: Effect,
     ) -> Result<(), EditorWorkspaceError> {
         self.execute_selection_effect(&FrameEffectEdit::Add(effect))
+    }
+
+    /// Canvas effects determine whole-animation scope in the shared command builder.
+    pub(crate) fn add_image_effect(
+        &mut self,
+        effect: ComposedImageEffect,
+    ) -> Result<(), EditorWorkspaceError> {
+        self.execute_image_effect(&ComposedEffectEdit::Add(effect))
+    }
+
+    pub(crate) fn replace_image_effect(
+        &mut self,
+        index: usize,
+        effect: ComposedImageEffect,
+    ) -> Result<(), EditorWorkspaceError> {
+        self.execute_image_effect(&ComposedEffectEdit::Replace { index, effect })
+    }
+
+    fn execute_image_effect(
+        &mut self,
+        edit: &ComposedEffectEdit,
+    ) -> Result<(), EditorWorkspaceError> {
+        let selected = self.selected_frame_ids()?;
+        let command = edit_composed_frames(
+            self.manifest(),
+            selected,
+            &ComposedFrameEdit::ImageEffect(edit.clone()),
+        )?;
+        self.execute(command)
     }
 
     /// Replaces one zero-based effect position on every selected frame.

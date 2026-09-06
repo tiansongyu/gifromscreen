@@ -20,7 +20,7 @@ use gif_from_screen_domain::{
     StrokePoint, TimeUs, Transition, TransitionKind,
 };
 use gif_from_screen_editor::{
-    DuplicateDelayMode, DuplicateFrameRetention, FrameTransitionSettings,
+    ComposedImageEffect, DuplicateDelayMode, DuplicateFrameRetention, FrameTransitionSettings,
     MAX_FRAME_EFFECT_BLUR_RADIUS, ReduceDelayMode, VirtualFilmstripError, VirtualFilmstripLayout,
     YoyoScope, parse_frame_expression,
 };
@@ -77,6 +77,8 @@ pub(crate) enum EffectChoice {
     Lighten,
     Border,
     Shadow,
+    ImageBorder,
+    ImageShadow,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -306,6 +308,8 @@ pub(crate) struct EditorUiState {
     pub(crate) effect_color_green_input: String,
     pub(crate) effect_color_blue_input: String,
     pub(crate) effect_color_alpha_input: String,
+    pub(crate) image_border: gif_from_screen_domain::ImageBorderStyle,
+    pub(crate) image_shadow: gif_from_screen_domain::ImageShadowStyle,
     /// Comma/range expression used to replace the current frame selection.
     pub(crate) frame_expression: String,
     /// Outgoing transition family for the current frame.
@@ -382,6 +386,8 @@ impl Default for EditorUiState {
             effect_color_green_input: "0".into(),
             effect_color_blue_input: "0".into(),
             effect_color_alpha_input: "255".into(),
+            image_border: gif_from_screen_domain::ImageBorderStyle::default(),
+            image_shadow: gif_from_screen_domain::ImageShadowStyle::default(),
             frame_expression: "1".into(),
             transition_choice: TransitionChoice::FadeToNext,
             transition_duration_us_input: "100000".into(),
@@ -1994,6 +2000,8 @@ fn show_effect_toolbar(
                         EffectChoice::Pixelate,
                         EffectChoice::Darken,
                         EffectChoice::Lighten,
+                        EffectChoice::ImageBorder,
+                        EffectChoice::ImageShadow,
                         EffectChoice::Border,
                         EffectChoice::Shadow,
                     ] {
@@ -2010,9 +2018,9 @@ fn show_effect_toolbar(
         show_effect_inputs(ui, state);
         ui.horizontal_wrapped(|ui| {
             if ui.button("Add effect").clicked() {
-                match build_effect(state) {
+                match build_image_effect(state) {
                     Ok(effect) => {
-                        let result = workspace.add_selection_effect(effect);
+                        let result = workspace.add_image_effect(effect);
                         record_project_result(
                             workspace,
                             state,
@@ -2027,10 +2035,10 @@ fn show_effect_toolbar(
             }
             if ui.button("Replace effect").clicked() {
                 match parse_effect_index(state)
-                    .and_then(|index| build_effect(state).map(|effect| (index, effect)))
+                    .and_then(|index| build_image_effect(state).map(|effect| (index, effect)))
                 {
                     Ok((index, effect)) => {
-                        let result = workspace.replace_selection_effect(index, effect);
+                        let result = workspace.replace_image_effect(index, effect);
                         record_project_result(
                             workspace,
                             state,
@@ -2045,7 +2053,7 @@ fn show_effect_toolbar(
                     }
                 }
             }
-            if ui.button("Clear selected effects").clicked() {
+            if ui.button("Clear effects").on_hover_text("Selected frames, unless a canvas-changing border or shadow is involved: then all frames are cleared to keep a consistent animation size. Undo restores the whole edit.").clicked() {
                 let result = workspace.clear_selection_effects();
                 record_project_result(
                     workspace,
@@ -2057,6 +2065,7 @@ fn show_effect_toolbar(
                 );
             }
         });
+        ui.weak("Adding shadow or an outer border affects all frames. Replacing or clearing canvas effects also uses all frames; later artwork keeps its authored stage coordinates.");
     });
 }
 
@@ -2085,7 +2094,10 @@ fn show_effect_inputs(ui: &mut egui::Ui, state: &mut EditorUiState) {
                         ui.label("Percent");
                         compact_input(ui, &mut state.effect_tone_percent_input);
                     }
-                    EffectChoice::Border | EffectChoice::Shadow => {}
+                    EffectChoice::Border
+                    | EffectChoice::Shadow
+                    | EffectChoice::ImageBorder
+                    | EffectChoice::ImageShadow => {}
                 }
             });
         }
@@ -2109,6 +2121,12 @@ fn show_effect_inputs(ui: &mut egui::Ui, state: &mut EditorUiState) {
                 show_effect_color_inputs(ui, state);
             });
         }
+        EffectChoice::ImageBorder => {
+            crate::image_effect_ui::show_border(ui, &mut state.image_border);
+        }
+        EffectChoice::ImageShadow => {
+            crate::image_effect_ui::show_shadow(ui, &mut state.image_shadow);
+        }
     }
 }
 
@@ -2126,13 +2144,32 @@ const fn effect_choice_label(choice: EffectChoice) -> &'static str {
         EffectChoice::Pixelate => "Pixelate",
         EffectChoice::Darken => "Darken",
         EffectChoice::Lighten => "Lighten",
-        EffectChoice::Border => "Border",
-        EffectChoice::Shadow => "Shadow",
+        EffectChoice::Border => "Legacy inset border",
+        EffectChoice::Shadow => "Legacy clipped shadow",
+        EffectChoice::ImageBorder => "Border · inner / outer",
+        EffectChoice::ImageShadow => "Shadow · expanded canvas",
+    }
+}
+
+fn build_image_effect(state: &EditorUiState) -> Result<ComposedImageEffect, String> {
+    match state.effect_choice {
+        EffectChoice::ImageBorder => {
+            state.image_border.validate()?;
+            Ok(ComposedImageEffect::Border(state.image_border))
+        }
+        EffectChoice::ImageShadow => {
+            state.image_shadow.validate()?;
+            Ok(ComposedImageEffect::Shadow(state.image_shadow))
+        }
+        _ => build_effect(state).map(ComposedImageEffect::Legacy),
     }
 }
 
 fn build_effect(state: &EditorUiState) -> Result<Effect, String> {
     match state.effect_choice {
+        EffectChoice::ImageBorder | EffectChoice::ImageShadow => {
+            Err("Use the current-image effect builder for canvas effects.".to_owned())
+        }
         EffectChoice::Blur => {
             let radius = parse_input::<u16>(&state.effect_blur_radius_input, "blur radius")?;
             if !(1..=MAX_FRAME_EFFECT_BLUR_RADIUS).contains(&radius) {

@@ -21,9 +21,18 @@ pub enum FrameRenderStep {
     FlipHorizontal,
     FlipVertical,
     Effect { effect: Effect },
+    ImageBorder { style: crate::ImageBorderStyle },
+    ImageShadow { style: crate::ImageShadowStyle },
 }
 
 impl FrameRenderStep {
+    pub const fn required_schema_version(&self) -> u32 {
+        match self {
+            Self::ImageBorder { .. } | Self::ImageShadow { .. } => 4,
+            _ => 3,
+        }
+    }
+
     pub const fn effect(&self) -> Option<&Effect> {
         match self {
             Self::Effect { effect } => Some(effect),
@@ -78,14 +87,18 @@ impl FrameClip {
     }
 
     pub fn required_schema_version(&self) -> u32 {
-        if self.render_steps.is_empty() { 1 } else { 3 }
+        self.render_steps
+            .iter()
+            .map(FrameRenderStep::required_schema_version)
+            .max()
+            .unwrap_or(1)
     }
 }
 
 /// Dimensions at every ordered operation and explicitly identified paint stage.
 ///
-/// No pixels are loaded or allocated. Effects keep the surface dimensions;
-/// their regions and renderer-supported parameters are checked at their input.
+/// No pixels are loaded or allocated. Legacy effects keep the surface size;
+/// image border/shadow steps expand it. Parameters are checked at their input.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrameGeometryPlan {
     base_size: PhysicalSize,
@@ -198,6 +211,8 @@ fn apply_geometry_step(
         FrameRenderStep::Rotate { rotation } => return Ok(rotated_size(size, *rotation)),
         FrameRenderStep::FlipHorizontal | FrameRenderStep::FlipVertical => {}
         FrameRenderStep::Effect { effect } => validate_render_effect(effect, size)?,
+        FrameRenderStep::ImageBorder { style } => return Ok(style.placement(size)?.output_size),
+        FrameRenderStep::ImageShadow { style } => return Ok(style.placement(size)?.output_size),
     }
     Ok(size)
 }

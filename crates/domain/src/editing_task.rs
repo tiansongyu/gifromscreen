@@ -5,10 +5,11 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AnnotationRequest, EdgeWidths, EditTaskTrigger, MAX_EDIT_TASKS, Rgba, validate_task_name,
+    AnnotationRequest, EdgeWidths, EditTaskTrigger, ImageBorderStyle, ImageShadowStyle,
+    MAX_EDIT_TASKS, Rgba, validate_task_name,
 };
 
-pub const EDITING_TASKS_VERSION: u16 = 1;
+pub const EDITING_TASKS_VERSION: u16 = 2;
 pub const MAX_EDITING_PRESETS: usize = 32;
 pub const MAX_EDITING_SETTINGS_BYTES: usize = 256 * 1024;
 
@@ -96,6 +97,12 @@ pub enum EditingTaskAction {
         blur_radius: u16,
         color: Rgba,
     },
+    ImageBorder {
+        style: ImageBorderStyle,
+    },
+    ImageShadow {
+        style: ImageShadowStyle,
+    },
     Annotation {
         request: AnnotationRequest,
     },
@@ -110,8 +117,22 @@ pub enum TaskDelay {
 }
 
 impl EditingTaskSettings {
+    /// Minimum settings format required by every stored task, including
+    /// disabled tasks and presets that are not currently active.
+    pub fn required_version(&self) -> u16 {
+        self.presets
+            .iter()
+            .flat_map(|preset| &preset.tasks)
+            .map(|task| match task.action {
+                EditingTaskAction::ImageBorder { .. } | EditingTaskAction::ImageShadow { .. } => 2,
+                _ => 1,
+            })
+            .max()
+            .unwrap_or(1)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != EDITING_TASKS_VERSION {
+        if !(1..=EDITING_TASKS_VERSION).contains(&self.version) {
             return Err(
                 "Unsupported editing-task settings version; the file was left unchanged."
                     .to_owned(),
@@ -127,6 +148,9 @@ impl EditingTaskSettings {
                 return Err("Editing preset names must be unique.".to_owned());
             }
             preset.validate()?;
+        }
+        if self.version < self.required_version() {
+            return Err("Expanded-image tasks require editing-task settings version 2.".to_owned());
         }
         if self
             .active_preset
@@ -202,6 +226,8 @@ impl EditingTaskAction {
                 }
             }
             Self::Annotation { request } => request.validate_settings()?,
+            Self::ImageBorder { style } => style.validate()?,
+            Self::ImageShadow { style } => style.validate()?,
         }
         Ok(())
     }
@@ -210,6 +236,7 @@ impl EditingTaskAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SignedEdgeWidths;
 
     fn settings() -> EditingTaskSettings {
         EditingTaskSettings {
@@ -299,5 +326,85 @@ mod tests {
             assert!(!sources.includes(trigger));
         }
         assert!(sources.includes(EditTaskTrigger::Manual));
+    }
+
+    #[test]
+    fn legacy_settings_keep_their_version_and_actions_without_implicit_conversion() {
+        let mut original = settings();
+        original.version = 1;
+        original.presets[0].tasks[0].action = EditingTaskAction::Border {
+            widths: EdgeWidths {
+                top: 1,
+                right: 0,
+                bottom: 0,
+                left: 0,
+            },
+            color: ImageBorderStyle::default().color,
+        };
+        original.validate().unwrap();
+        assert_eq!(original.required_version(), 1);
+        let bytes = serde_json::to_vec(&original).unwrap();
+        let restored: EditingTaskSettings = serde_json::from_slice(&bytes).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored, original);
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), bytes);
+        assert_eq!(EditingTaskSettings::default().version, 2);
+        assert_eq!(EditingTaskSettings::default().required_version(), 1);
+    }
+
+    #[test]
+    fn image_actions_require_v2_even_when_disabled_and_outside_the_active_preset() {
+        for action in [
+            EditingTaskAction::ImageBorder {
+                style: ImageBorderStyle::default(),
+            },
+            EditingTaskAction::ImageShadow {
+                style: ImageShadowStyle::default(),
+            },
+        ] {
+            let mut original = settings();
+            original.presets.push(EditingTaskPreset {
+                name: "Inactive".to_owned(),
+                sources: EditingTaskSources::default(),
+                tasks: vec![EditingTask {
+                    name: "Disabled".to_owned(),
+                    enabled: false,
+                    action,
+                }],
+            });
+            assert_eq!(original.required_version(), 2);
+            original.version = 1;
+            assert!(original.validate().unwrap_err().contains("version 2"));
+            original.version = original.version.max(original.required_version());
+            original.validate().unwrap();
+            let bytes = serde_json::to_vec(&original).unwrap();
+            let restored: EditingTaskSettings = serde_json::from_slice(&bytes).unwrap();
+            restored.validate().unwrap();
+            assert_eq!(restored, original);
+            assert!(bytes.len() < MAX_EDITING_SETTINGS_BYTES);
+        }
+    }
+
+    #[test]
+    fn image_task_validation_preserves_supported_transparency_and_rejects_invalid_shadow() {
+        EditingTaskAction::ImageBorder {
+            style: ImageBorderStyle {
+                widths: SignedEdgeWidths::default(),
+                color: Rgba::TRANSPARENT,
+                background: Rgba::TRANSPARENT,
+            },
+        }
+        .validate()
+        .unwrap();
+        let mut original = settings();
+        original.presets[0].tasks[0].action = EditingTaskAction::ImageShadow {
+            style: ImageShadowStyle {
+                direction_hundredths: 36_001,
+                ..ImageShadowStyle::default()
+            },
+        };
+        assert!(original.validate().unwrap_err().contains("direction"));
+        original.version = 0;
+        assert!(original.validate().unwrap_err().contains("Unsupported"));
     }
 }

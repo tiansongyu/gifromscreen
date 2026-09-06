@@ -20,7 +20,8 @@ region masks and already drawn cursor images also need the later operation.
 
 ## Representation and compatibility
 
-Schema 3 adds `FrameClip.render_steps` and optional `FrameOverlayCell.stage`.
+Schema 3 introduced `FrameClip.render_steps` and optional `FrameOverlayCell.stage`.
+Schema 4 extends that program with [expanded image effects](EXPANDED-IMAGE-EFFECTS.md).
 Absent/empty steps and absent anchors are omitted from serialization, preserving
 old journal checksums and the old canonical prefix exactly. Schema 1 and 2 stay
 readable; merely opening an old project does not move or convert artwork.
@@ -104,8 +105,9 @@ completed hidden-layer bake-fidelity claim.
 
 The upstream editor itself does not retain independent editable text after
 applying it. Our stage-aware re-authoring is a deliberate additional capability.
-Numeric resize/blur fidelity is not yet certified against Windows/WPF. The
-current shadow effect retains its canvas; upstream shadow can expand it.
+Numeric resize/blur fidelity is not yet certified against Windows/WPF. Schema
+4 now supplies expanding shadows and mixed inner/outer borders; old effect
+variants retain their original fixed-canvas pixels for compatibility.
 Physical compositor/device, global-shortcut, packaging and other open release
 gates remain in [Linux status](LINUX-STATUS.md). Ordered stages do not establish
 complete ScreenToGif parity or absence of every bug.

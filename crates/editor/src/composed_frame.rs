@@ -14,6 +14,10 @@ use crate::{
     EditorError, FrameEffectEdit, MAX_FRAME_BUNDLE_METADATA_BYTES, ensure_known_selection,
 };
 
+#[path = "composed_effect.rs"]
+mod effects;
+pub use effects::{ComposedEffectEdit, ComposedImageEffect, MAX_COMPOSED_IMAGE_BYTES};
+
 /// Current-image operations. Unlike the legacy clip-transform property API, an
 /// appended operation affects artwork already present, but not later artwork.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,6 +38,8 @@ pub enum ComposedFrameEdit {
     ClearResize,
     /// Add, replace or remove effects on selected frames.
     Effect(FrameEffectEdit),
+    /// Add, replace or clear current-image effects, including canvas expansion.
+    ImageEffect(ComposedEffectEdit),
 }
 
 impl ComposedFrameEdit {
@@ -56,6 +62,7 @@ impl ComposedFrameEdit {
             Self::Effect(FrameEffectEdit::Add(effect)) => FrameRenderStep::Effect {
                 effect: effect.clone(),
             },
+            Self::ImageEffect(ComposedEffectEdit::Add(effect)) => effect.step(),
             _ => return None,
         })
     }
@@ -67,7 +74,7 @@ pub fn frame_effect_count(frame: &FrameClip) -> usize {
         + frame
             .render_steps
             .iter()
-            .filter(|step| matches!(step, FrameRenderStep::Effect { .. }))
+            .filter(|step| effects::is_effect(step))
             .count()
 }
 
@@ -94,7 +101,16 @@ pub fn edit_composed_frames(
 ) -> Result<EditCommand, EditorError> {
     let requested: BTreeSet<_> = frame_ids.into_iter().collect();
     ensure_known_selection(project, &requested)?;
-    let selected: BTreeSet<_> = if edit.changes_canvas() {
+    let effect_edit = match edit {
+        ComposedFrameEdit::Effect(edit) => Some(ComposedEffectEdit::from(edit)),
+        ComposedFrameEdit::ImageEffect(edit) => Some(edit.clone()),
+        _ => None,
+    };
+    let changes_canvas = edit.changes_canvas()
+        || effect_edit
+            .as_ref()
+            .is_some_and(|edit| edit.requires_all_frames(project, &requested));
+    let selected: BTreeSet<_> = if changes_canvas {
         project
             .timeline
             .frames
@@ -130,8 +146,8 @@ pub fn edit_composed_frames(
         let mut replacement = frame.clone();
         if let Some(step) = &appending {
             let before = geometry(frame, source_size)?;
-            if let FrameRenderStep::Effect { effect } = step {
-                crate::frame_effect::validate_effect(effect, before.output_size())?;
+            if let Some(effect) = effect_edit.as_ref().and_then(ComposedEffectEdit::appended) {
+                effect.validate(frame.id, before.output_size())?;
             }
             if replacement.render_steps.is_empty() || tail_owners.contains(&frame.id) {
                 let stage_id = next_stage_id(frame)?;
@@ -141,11 +157,14 @@ pub fn edit_composed_frames(
                 sealed.insert(frame.id, stage_id);
             }
             replacement.render_steps.push(step.clone());
+        } else if let Some(effect_edit) = &effect_edit {
+            effect_edit.apply(&mut replacement, source_size)?;
         } else {
-            modify_previous(&mut replacement, edit, source_size)?;
+            modify_previous(&mut replacement, edit);
         }
         let after = geometry(&replacement, source_size)?;
-        if edit.changes_canvas() {
+        effects::validate_program(&replacement, source_size, &after)?;
+        if changes_canvas {
             if output_size.is_some_and(|size| size != after.output_size()) {
                 return Err(pipeline_error(
                     frame.id,
@@ -280,11 +299,7 @@ fn next_stage_id(frame: &FrameClip) -> Result<u32, EditorError> {
         .ok_or_else(|| pipeline_error(frame.id, "Compositing stage identities are exhausted."))
 }
 
-fn modify_previous(
-    frame: &mut FrameClip,
-    edit: &ComposedFrameEdit,
-    source_size: PhysicalSize,
-) -> Result<(), EditorError> {
+fn modify_previous(frame: &mut FrameClip, edit: &ComposedFrameEdit) {
     match edit {
         ComposedFrameEdit::ClearCrop => {
             if let Some(index) = frame
@@ -308,43 +323,8 @@ fn modify_previous(
                 frame.transform.output_size = None;
             }
         }
-        ComposedFrameEdit::Effect(FrameEffectEdit::Clear) => {
-            frame.effects.clear();
-            frame
-                .render_steps
-                .retain(|step| !matches!(step, FrameRenderStep::Effect { .. }));
-        }
-        ComposedFrameEdit::Effect(FrameEffectEdit::Replace { index, effect }) => {
-            let count = frame_effect_count(frame);
-            if *index < frame.effects.len() {
-                frame.effects[*index] = effect.clone();
-                let plan = geometry(frame, source_size)?;
-                crate::frame_effect::validate_effect(effect, plan.base_size())?;
-            } else {
-                let (position, step) = frame
-                    .render_steps
-                    .iter_mut()
-                    .enumerate()
-                    .filter(|(_, step)| matches!(step, FrameRenderStep::Effect { .. }))
-                    .nth(index - frame.effects.len())
-                    .ok_or(EditorError::EffectIndexOutOfBounds {
-                        frame_id: frame.id,
-                        index: *index,
-                        effect_count: count,
-                    })?;
-                *step = FrameRenderStep::Effect {
-                    effect: effect.clone(),
-                };
-                let plan = geometry(frame, source_size)?;
-                let size = plan
-                    .step_input_size(position)
-                    .map_err(|reason| pipeline_error(frame.id, reason))?;
-                crate::frame_effect::validate_effect(effect, size)?;
-            }
-        }
         _ => unreachable!("append-only edits handled by caller"),
     }
-    Ok(())
 }
 
 fn pipeline_error(frame_id: FrameId, reason: impl Into<String>) -> EditorError {

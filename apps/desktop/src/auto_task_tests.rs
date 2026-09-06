@@ -144,6 +144,120 @@ fn chain_order_is_atomic_reversible_and_persisted_with_completion_record() {
 }
 
 #[test]
+fn new_canvas_effect_tasks_share_interactive_order_and_one_durable_undo() {
+    use gif_from_screen_domain::{ImageBorderStyle, ImageShadowStyle, SignedEdgeWidths};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("image-effects");
+    let mut current = workspace(&path);
+    let before = current.manifest().clone();
+    let chain = preset(vec![
+        EditingTaskAction::ImageShadow {
+            style: ImageShadowStyle {
+                blur_radius_hundredths: 400,
+                depth_hundredths: 200,
+                direction_hundredths: 0,
+                ..ImageShadowStyle::default()
+            },
+        },
+        EditingTaskAction::ImageBorder {
+            style: ImageBorderStyle {
+                widths: SignedEdgeWidths {
+                    left_milli: -2000,
+                    bottom_milli: -1000,
+                    ..SignedEdgeWidths::default()
+                },
+                ..ImageBorderStyle::default()
+            },
+        },
+    ]);
+    let summary = apply_task_chain(
+        &mut current,
+        &chain,
+        EditTaskTrigger::ScreenRecording,
+        &AtomicBool::new(false),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(summary.completed.len(), 2);
+    assert_eq!(
+        current.manifest().canvas.size,
+        PhysicalSize::new(16, 13).unwrap()
+    );
+    let frame = &current.manifest().timeline.frames[0];
+    assert_eq!(gif_from_screen_editor::frame_effect_count(frame), 2);
+    assert_eq!(frame.asset_id, before.timeline.frames[0].asset_id);
+    assert_eq!(
+        frame.capture_metadata,
+        before.timeline.frames[0].capture_metadata
+    );
+    let pixels = crate::editor_preview::render_frame_surface(
+        current.active_project(),
+        frame.id,
+        1024 * 1024,
+    )
+    .unwrap();
+    assert_eq!(pixels.size(), current.manifest().canvas.size);
+    let after = current.manifest().clone();
+    assert!(current.undo().unwrap());
+    assert_eq!(current.manifest().timeline, before.timeline);
+    assert_eq!(current.manifest().canvas, before.canvas);
+    assert!(current.redo().unwrap());
+    assert_eq!(current.manifest().timeline, after.timeline);
+    drop(current);
+    let reopened = EditorWorkspace::open(&path, LockPolicy::FailIfPresent, 32).unwrap();
+    assert_eq!(
+        crate::editor_preview::render_frame_surface(
+            reopened.active_project(),
+            after.timeline.frames[0].id,
+            1024 * 1024
+        )
+        .unwrap(),
+        pixels
+    );
+}
+
+#[test]
+fn saving_new_canvas_tasks_upgrades_old_settings_only_on_explicit_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("editing.json");
+    let store = AutoTaskStore::new(path.clone());
+    let mut legacy = EditingTaskSettings {
+        version: 1,
+        enabled: false,
+        active_preset: Some("Demo".into()),
+        presets: vec![preset(vec![border()])],
+    };
+    let initial = store.load().unwrap();
+    store.save(&initial, legacy.clone()).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let mut tool = AutoTasks::new(path.clone());
+    let mut slot = None;
+    wait_loaded(&mut tool, &mut slot);
+    assert_eq!(tool.draft.version, 1);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    legacy.presets[0].tasks.push(EditingTask {
+        name: "New shadow".into(),
+        enabled: true,
+        action: EditingTaskAction::ImageShadow {
+            style: gif_from_screen_domain::ImageShadowStyle::default(),
+        },
+    });
+    tool.draft = legacy;
+    tool.save();
+    wait_loaded(&mut tool, &mut slot);
+    let saved = store.load().unwrap().config;
+    assert_eq!(saved.version, 2);
+    assert!(matches!(
+        saved.presets[0].tasks[0].action,
+        EditingTaskAction::Border { .. }
+    ));
+    assert!(matches!(
+        saved.presets[0].tasks[1].action,
+        EditingTaskAction::ImageShadow { .. }
+    ));
+}
+
+#[test]
 fn late_failure_and_cancellation_leave_project_and_undo_history_unchanged() {
     let dir = tempfile::tempdir().unwrap();
     let mut current = workspace(&dir.path().join("project"));

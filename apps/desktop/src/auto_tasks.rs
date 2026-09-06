@@ -15,8 +15,8 @@ use gif_from_screen_domain::{
     MAX_EDIT_TASK_RUNS, ProjectManifest, RasterEncoding, TaskDelay,
 };
 use gif_from_screen_editor::{
-    ComposedFrameEdit, FrameEffectEdit, adjust_duration, edit_composed_frames, override_duration,
-    scale_duration,
+    ComposedEffectEdit, ComposedFrameEdit, ComposedImageEffect, FrameEffectEdit, adjust_duration,
+    edit_composed_frames, override_duration, scale_duration,
 };
 use gif_from_screen_project::ActiveProject;
 use gif_from_screen_render::RgbaSurface;
@@ -210,6 +210,7 @@ impl AutoTasks {
         let Some(previous) = self.snapshot.clone() else {
             return;
         };
+        self.draft.version = self.draft.version.max(self.draft.required_version());
         if let Err(error) = self.draft.validate() {
             self.notice = Some(error);
             return;
@@ -451,6 +452,22 @@ fn prepare_task(
         .map(|frame| frame.id)
         .collect();
     let command = match action {
+        EditingTaskAction::ImageBorder { style } => edit_composed_frames(
+            project,
+            selected,
+            &ComposedFrameEdit::ImageEffect(ComposedEffectEdit::Add(ComposedImageEffect::Border(
+                *style,
+            ))),
+        )
+        .map_err(|error| error.to_string())?,
+        EditingTaskAction::ImageShadow { style } => edit_composed_frames(
+            project,
+            selected,
+            &ComposedFrameEdit::ImageEffect(ComposedEffectEdit::Add(ComposedImageEffect::Shadow(
+                *style,
+            ))),
+        )
+        .map_err(|error| error.to_string())?,
         EditingTaskAction::Delay { mode } => match mode {
             TaskDelay::Override { milliseconds } => override_duration(
                 project,

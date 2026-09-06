@@ -21,6 +21,7 @@ mod editor_ui;
 mod editor_workspace;
 mod export_job;
 mod fixed_crop_session;
+mod image_effect_ui;
 mod import_gif_job;
 mod import_static_image_job;
 mod import_static_sequence_job;

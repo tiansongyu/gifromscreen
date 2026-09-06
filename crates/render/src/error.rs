@@ -56,6 +56,14 @@ impl std::fmt::Display for UnsupportedEffect {
 /// Errors produced by the deterministic CPU renderer.
 #[derive(Debug, Error)]
 pub enum RenderError {
+    /// An expanding image effect has invalid parameters or canvas geometry.
+    #[error("invalid {effect}: {reason}")]
+    InvalidImageEffect {
+        /// Stable image-effect name.
+        effect: &'static str,
+        /// Geometry or parameter validation failure.
+        reason: String,
+    },
     /// The ordered geometry/compositing pipeline is malformed or invalid.
     #[error("frame {frame_id} has invalid render steps: {reason}")]
     InvalidRenderSteps {

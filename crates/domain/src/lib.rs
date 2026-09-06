@@ -21,6 +21,7 @@ mod frame_input_assets_tests;
 mod frame_input_replay;
 mod frame_overlay;
 mod id;
+mod image_effect;
 mod model;
 mod overlay_timing;
 mod progress_fraction;
@@ -44,10 +45,11 @@ pub use frame_geometry::*;
 pub use frame_input_replay::*;
 pub use frame_overlay::*;
 pub use id::{AssetId, CaptureClockId, FrameId, OverlayId, ProjectId, TrackId, TransitionId};
+pub use image_effect::*;
 pub use model::*;
 pub use progress_fraction::ProgressFraction;
 pub use task_run::*;
 pub use units::*;
 
 /// Current on-disk manifest schema understood by this version of the domain.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;

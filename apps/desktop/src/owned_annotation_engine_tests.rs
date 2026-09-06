@@ -316,3 +316,221 @@ fn recorded_click_and_cursor_creation_reedit_and_legacy_replay_use_their_distinc
         assert_eq!(manifest.timeline.frames[0].capture_clock, clock);
     }
 }
+
+fn expanded_styles() -> (
+    gif_from_screen_domain::ImageBorderStyle,
+    gif_from_screen_domain::ImageShadowStyle,
+) {
+    use gif_from_screen_domain::{ImageBorderStyle, ImageShadowStyle, Rgba, SignedEdgeWidths};
+    (
+        ImageBorderStyle {
+            widths: SignedEdgeWidths {
+                left_milli: -1750,
+                right_milli: -250,
+                top_milli: -2250,
+                bottom_milli: 500,
+            },
+            color: Rgba {
+                red: 80,
+                green: 255,
+                blue: 20,
+                alpha: 255,
+            },
+            background: Rgba {
+                red: 255,
+                green: 40,
+                blue: 90,
+                alpha: 255,
+            },
+        },
+        ImageShadowStyle {
+            blur_radius_hundredths: 150,
+            depth_hundredths: 75,
+            direction_hundredths: 22_500,
+            opacity_basis_points: 7500,
+            color: Rgba {
+                red: 250,
+                green: 190,
+                blue: 10,
+                alpha: 255,
+            },
+            background: Rgba {
+                red: 30,
+                green: 40,
+                blue: 200,
+                alpha: 255,
+            },
+        },
+    )
+}
+
+#[test]
+fn expanding_effects_shift_new_input_marks_but_reedit_preserves_the_original_stage() {
+    use gif_from_screen_domain::{FrameRenderStep, PhysicalSize};
+    for mode in [
+        AnnotationMode::RecordedClicks,
+        AnnotationMode::RecordedCursor,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AssetStore::open(directory.path()).unwrap();
+        let (mut manifest, cursor) = staged_input_project();
+        let raw = manifest.timeline.frames[0].capture_metadata.clone();
+        let clock = manifest.timeline.frames[0].capture_clock;
+        let selected = [manifest.timeline.frames[0].id].into_iter().collect();
+        let request = AnnotationRequest {
+            mode,
+            ..AnnotationRequest::default()
+        };
+        let provider = |_| Ok(cursor.clone());
+        let prepared = super::super::prepare_annotations_with_assets(
+            &manifest,
+            &selected,
+            &request,
+            &AtomicBool::new(false),
+            |_| {},
+            &provider,
+        )
+        .unwrap();
+        assert_eq!(position(&prepared), (10, 5));
+        for (asset, bytes) in &prepared.assets {
+            assert_eq!(store.put(bytes).unwrap(), asset.id);
+        }
+        manifest
+            .apply_command(&EditCommand::Compound {
+                commands: prepared.commands,
+            })
+            .unwrap();
+        let (border, shadow) = expanded_styles();
+        let border_placement = border
+            .placement(PhysicalSize::new(20, 10).unwrap())
+            .unwrap();
+        let shadow_placement = shadow.placement(border_placement.output_size).unwrap();
+        let x =
+            10 + border_placement.source_origin.x.get() + shadow_placement.source_origin.x.get();
+        let y = 5 + border_placement.source_origin.y.get() + shadow_placement.source_origin.y.get();
+        let expected = (shadow_placement.output_size.width.get() - 1 - x, y);
+        manifest.timeline.overlay_tracks[0]
+            .frame_cells
+            .as_mut()
+            .unwrap()[0]
+            .stage = Some(22);
+        manifest.timeline.frames[0].render_steps.extend([
+            FrameRenderStep::Composite { stage_id: 22 },
+            FrameRenderStep::ImageBorder { style: border },
+            FrameRenderStep::ImageShadow { style: shadow },
+            FrameRenderStep::FlipHorizontal,
+        ]);
+        manifest.canvas.size = shadow_placement.output_size;
+        let original = manifest.timeline.overlay_tracks[0].clone();
+        let updated = prepare_replacement(
+            &manifest,
+            &original,
+            &request,
+            &store,
+            &AtomicBool::new(false),
+            |_| {},
+            &provider,
+        )
+        .unwrap();
+        assert_eq!(position(&updated), (10, 5));
+        assert_eq!(
+            super::super::tests::track(&updated)
+                .frame_cells
+                .as_ref()
+                .unwrap()[0]
+                .stage,
+            Some(22)
+        );
+        let tail = super::super::prepare_annotations_with_assets(
+            &manifest,
+            &selected,
+            &request,
+            &AtomicBool::new(false),
+            |_| {},
+            &provider,
+        )
+        .unwrap();
+        assert_eq!(position(&tail), expected);
+        assert_ne!(expected, (10, 5));
+        let legacy = super::super::prepare_legacy_annotations_with_assets(
+            &manifest,
+            &selected,
+            &request,
+            &AtomicBool::new(false),
+            |_| {},
+            &provider,
+        )
+        .unwrap();
+        assert_eq!(position(&legacy), (20, 10));
+        assert_eq!(manifest.timeline.frames[0].capture_metadata, raw);
+        assert_eq!(manifest.timeline.frames[0].capture_clock, clock);
+    }
+}
+
+#[test]
+fn cursor_cache_distinguishes_equal_sized_expansions_with_different_source_origins() {
+    use gif_from_screen_domain::{FrameRenderStep, SignedEdgeWidths};
+    let (mut manifest, cursor) = staged_input_project();
+    let (mut left, _) = expanded_styles();
+    left.widths = SignedEdgeWidths {
+        left_milli: -2000,
+        ..SignedEdgeWidths::default()
+    };
+    let mut right = left;
+    right.widths = SignedEdgeWidths {
+        right_milli: -2000,
+        ..SignedEdgeWidths::default()
+    };
+    let mut second = manifest.timeline.frames[0].clone();
+    second.id = FrameId::from_u128(2);
+    manifest.timeline.frames[0]
+        .render_steps
+        .push(FrameRenderStep::ImageBorder { style: left });
+    second
+        .render_steps
+        .push(FrameRenderStep::ImageBorder { style: right });
+    manifest.timeline.frames.push(second);
+    manifest.canvas.size = left
+        .placement(gif_from_screen_domain::PhysicalSize::new(20, 10).unwrap())
+        .unwrap()
+        .output_size;
+    let before = manifest.timeline.frames.clone();
+    let selected = manifest
+        .timeline
+        .frames
+        .iter()
+        .map(|frame| frame.id)
+        .collect();
+    let reads = std::cell::Cell::new(0);
+    let prepared = super::super::prepare_annotations_with_assets(
+        &manifest,
+        &selected,
+        &AnnotationRequest {
+            mode: AnnotationMode::RecordedCursor,
+            ..AnnotationRequest::default()
+        },
+        &AtomicBool::new(false),
+        |_| {},
+        &|_| {
+            reads.set(reads.get() + 1);
+            Ok(cursor.clone())
+        },
+    )
+    .unwrap();
+    let points: Vec<_> = super::super::tests::track(&prepared)
+        .all_mark_contents()
+        .map(|(_, content)| {
+            let OverlayContent::Cursor { position, .. } = content else {
+                panic!("cursor mark")
+            };
+            (position.x.get(), position.y.get())
+        })
+        .collect();
+    assert_eq!(points, [(12, 5), (10, 5)]);
+    assert_eq!(
+        reads.get(),
+        2,
+        "the second frame cannot reuse the first frame's placement"
+    );
+    assert_eq!(manifest.timeline.frames, before);
+}

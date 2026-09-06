@@ -215,6 +215,272 @@ fn imported_maximum_stage_identity_does_not_exhaust_available_ids() {
     );
 }
 
+fn image_edit(effect: ComposedImageEffect) -> ComposedFrameEdit {
+    ComposedFrameEdit::ImageEffect(ComposedEffectEdit::Add(effect))
+}
+
+fn shadow() -> gif_from_screen_domain::ImageShadowStyle {
+    gif_from_screen_domain::ImageShadowStyle {
+        blur_radius_hundredths: 400,
+        depth_hundredths: 200,
+        direction_hundredths: 0,
+        ..gif_from_screen_domain::ImageShadowStyle::default()
+    }
+}
+
+#[test]
+fn inner_border_is_selected_but_outer_border_and_shadow_change_the_entire_canvas() {
+    use gif_from_screen_domain::{ImageBorderStyle, SignedEdgeWidths};
+    let inner = ImageBorderStyle {
+        widths: SignedEdgeWidths {
+            top_milli: 1000,
+            ..SignedEdgeWidths::default()
+        },
+        ..ImageBorderStyle::default()
+    };
+    let outer = ImageBorderStyle {
+        widths: SignedEdgeWidths {
+            left_milli: -2000,
+            bottom_milli: -1000,
+            top_milli: 1000,
+            right_milli: 0,
+        },
+        ..ImageBorderStyle::default()
+    };
+    for (effect, expected, all) in [
+        (
+            ComposedImageEffect::Border(inner),
+            PhysicalSize::new(8, 4).unwrap(),
+            false,
+        ),
+        (
+            ComposedImageEffect::Border(outer),
+            PhysicalSize::new(10, 5).unwrap(),
+            true,
+        ),
+        (
+            ComposedImageEffect::Shadow(shadow()),
+            PhysicalSize::new(14, 8).unwrap(),
+            true,
+        ),
+    ] {
+        let mut project = fixture();
+        owned(&mut project, 20, false, 0);
+        let before = project.clone();
+        let inverse = apply(&mut project, image_edit(effect));
+        assert_eq!(project.schema_version, 4);
+        assert_eq!(project.canvas.size, expected);
+        assert_eq!(!project.timeline.frames[1].render_steps.is_empty(), all);
+        let cells = project.timeline.overlay_tracks[0]
+            .frame_cells
+            .as_ref()
+            .unwrap();
+        assert_eq!(cells[0].stage, Some(1));
+        assert_eq!(cells[1].stage, all.then_some(1));
+        for (frame, original) in project.timeline.frames.iter().zip(&before.timeline.frames) {
+            assert_eq!(frame.capture_metadata, original.capture_metadata);
+            assert_eq!(frame.capture_binding, original.capture_binding);
+        }
+        project.apply_command(&inverse).unwrap();
+        assert_eq!(project.timeline, before.timeline);
+        assert_eq!(project.canvas, before.canvas);
+        assert_eq!(project.schema_version, 4);
+    }
+}
+
+#[test]
+fn replacing_and_clearing_canvas_effects_keep_every_frame_size_consistent() {
+    let mut project = fixture();
+    owned(&mut project, 20, true, 255);
+    apply(
+        &mut project,
+        image_edit(ComposedImageEffect::Shadow(shadow())),
+    );
+    apply(
+        &mut project,
+        ComposedFrameEdit::Rotate(QuarterTurn::Clockwise90),
+    );
+    let before = project.clone();
+    apply(
+        &mut project,
+        ComposedFrameEdit::ImageEffect(ComposedEffectEdit::Replace {
+            index: 0,
+            effect: ComposedImageEffect::Shadow(gif_from_screen_domain::ImageShadowStyle {
+                depth_hundredths: 0,
+                ..shadow()
+            }),
+        }),
+    );
+    assert_eq!(project.canvas.size, PhysicalSize::new(8, 12).unwrap());
+    assert!(
+        project
+            .timeline
+            .frames
+            .iter()
+            .all(|frame| frame_effect_count(frame) == 1)
+    );
+    assert_eq!(
+        project.timeline.overlay_tracks,
+        before.timeline.overlay_tracks
+    );
+    let inverse = apply(
+        &mut project,
+        ComposedFrameEdit::Effect(FrameEffectEdit::Clear),
+    );
+    assert_eq!(project.canvas.size, PhysicalSize::new(4, 8).unwrap());
+    assert!(
+        project
+            .timeline
+            .frames
+            .iter()
+            .all(|frame| frame_effect_count(frame) == 0)
+    );
+    project.apply_command(&inverse).unwrap();
+    assert_eq!(project.canvas.size, PhysicalSize::new(8, 12).unwrap());
+    project.validate().unwrap();
+}
+
+#[test]
+fn replacing_earlier_canvas_effect_cannot_strand_later_crop_or_effect_regions() {
+    let mut project = fixture();
+    apply(
+        &mut project,
+        image_edit(ComposedImageEffect::Shadow(shadow())),
+    );
+    apply(
+        &mut project,
+        ComposedFrameEdit::Crop(PhysicalRect::new(10, 0, 3, 2).unwrap()),
+    );
+    let before = project.clone();
+    let edit = ComposedFrameEdit::ImageEffect(ComposedEffectEdit::Replace {
+        index: 0,
+        effect: ComposedImageEffect::Border(gif_from_screen_domain::ImageBorderStyle::default()),
+    });
+    assert!(edit_composed_frames(&project, [FrameId::from_u128(1)], &edit).is_err());
+    assert_eq!(project, before);
+}
+
+#[test]
+fn expanded_effect_limits_reject_before_command_and_prefix_replacement_is_explicit() {
+    use gif_from_screen_domain::{ImageBorderStyle, SignedEdgeWidths};
+    let mut project = fixture();
+    for widths in [
+        SignedEdgeWidths {
+            left_milli: i32::MIN,
+            ..SignedEdgeWidths::default()
+        },
+        SignedEdgeWidths {
+            left_milli: -32_000_000,
+            top_milli: -1_000_000,
+            ..SignedEdgeWidths::default()
+        },
+    ] {
+        let edit = image_edit(ComposedImageEffect::Border(ImageBorderStyle {
+            widths,
+            ..ImageBorderStyle::default()
+        }));
+        let error = edit_composed_frames(&project, [FrameId::from_u128(1)], &edit).unwrap_err();
+        assert!(error.to_string().contains("64 MiB"));
+        assert_eq!(project.schema_version, 2);
+    }
+    project.timeline.frames[0].effects.push(Effect::Darken {
+        region: PhysicalRect::new(0, 0, 8, 4).unwrap(),
+        amount_percent: 20,
+    });
+    let edit = ComposedFrameEdit::ImageEffect(ComposedEffectEdit::Replace {
+        index: 0,
+        effect: ComposedImageEffect::Shadow(shadow()),
+    });
+    assert!(
+        edit_composed_frames(&project, [FrameId::from_u128(1)], &edit)
+            .unwrap_err()
+            .to_string()
+            .contains("legacy prefix")
+    );
+    assert_eq!(project.schema_version, 2);
+}
+
+fn two_shadows(width: u32, height: u32) -> ProjectManifest {
+    let mut project = fixture();
+    project.canvas.size = PhysicalSize::new(width, height).unwrap();
+    for frame in &mut project.timeline.frames {
+        frame.transform.output_size = Some(project.canvas.size);
+    }
+    for _ in 0..2 {
+        apply(
+            &mut project,
+            image_edit(ComposedImageEffect::Shadow(
+                gif_from_screen_domain::ImageShadowStyle {
+                    blur_radius_hundredths: 1000,
+                    depth_hundredths: 0,
+                    ..shadow()
+                },
+            )),
+        );
+    }
+    project
+}
+
+fn replace_first_shadow(blur: u16) -> ComposedFrameEdit {
+    ComposedFrameEdit::ImageEffect(ComposedEffectEdit::Replace {
+        index: 0,
+        effect: ComposedImageEffect::Shadow(gif_from_screen_domain::ImageShadowStyle {
+            blur_radius_hundredths: blur,
+            depth_hundredths: 0,
+            ..shadow()
+        }),
+    })
+}
+
+#[test]
+fn replacing_an_early_effect_checks_later_memory_even_when_a_final_crop_is_small() {
+    let mut project = two_shadows(4000, 4000);
+    for cropped in [false, true] {
+        if cropped {
+            apply(
+                &mut project,
+                ComposedFrameEdit::Crop(PhysicalRect::new(0, 0, 10, 10).unwrap()),
+            );
+        }
+        let before = project.clone();
+        let error = edit_composed_frames(
+            &project,
+            [FrameId::from_u128(1)],
+            &replace_first_shadow(9000),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("64 MiB"));
+        assert_eq!(project, before);
+    }
+}
+
+#[test]
+fn gif_dimensions_are_checked_at_the_final_output_without_rejecting_valid_intermediates() {
+    let mut project = two_shadows(65_500, 1);
+    assert!(
+        edit_composed_frames(
+            &project,
+            [FrameId::from_u128(1)],
+            &replace_first_shadow(3000)
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("GIF")
+    );
+    apply(
+        &mut project,
+        ComposedFrameEdit::Crop(PhysicalRect::new(0, 0, 10, 10).unwrap()),
+    );
+    apply(&mut project, replace_first_shadow(3000));
+    assert_eq!(project.canvas.size, PhysicalSize::new(10, 10).unwrap());
+    let plan = geometry(
+        &project.timeline.frames[0],
+        PhysicalSize::new(8, 4).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(plan.step_input_size(3).unwrap().width.get(), 65_540);
+}
+
 #[test]
 fn effect_validation_uses_its_stage_and_clear_keeps_composite_identities() {
     let mut project = fixture();

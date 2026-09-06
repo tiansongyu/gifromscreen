@@ -227,6 +227,12 @@ impl CpuRenderer {
             FrameRenderStep::Effect { effect } => {
                 apply_effect(&mut surface, effect, self.limits, cancellation)?;
             }
+            FrameRenderStep::ImageBorder { style } => {
+                surface = crate::image_effects::border(&surface, style, self.limits, cancellation)?;
+            }
+            FrameRenderStep::ImageShadow { style } => {
+                surface = crate::image_effects::shadow(&surface, style, self.limits, cancellation)?;
+            }
             FrameRenderStep::Composite { .. }
             | FrameRenderStep::Resize { .. }
             | FrameRenderStep::Rotate { .. } => {}

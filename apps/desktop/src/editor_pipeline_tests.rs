@@ -106,7 +106,10 @@ fn complete_pixels_follow_operation_order_and_recover_for_gif_export() {
     let tracks = &workspace.manifest().timeline.overlay_tracks;
     assert_eq!(tracks[0].frame_cells.as_ref().unwrap()[0].stage, Some(2));
     assert_eq!(tracks[1].frame_cells.as_ref().unwrap()[0].stage, None);
-    assert_eq!(workspace.manifest().schema_version, 3);
+    assert_eq!(
+        workspace.manifest().schema_version,
+        gif_from_screen_domain::CURRENT_SCHEMA_VERSION
+    );
     workspace.clear_selection_effects().unwrap();
     assert_eq!(
         &image(&workspace).pixels()[(2 * 4 + 1) * 4..(2 * 4 + 2) * 4],

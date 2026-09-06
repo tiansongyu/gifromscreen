@@ -12,7 +12,7 @@ use gif_from_screen_domain::{
 use super::{ActiveProject, LockPolicy, ProjectError, read_manifest, write_manifest};
 use crate::{JournalRecord, JournalStopReason, journal};
 
-fn project(root: &Path, schema: u32) -> ActiveProject {
+pub(super) fn project(root: &Path, schema: u32) -> ActiveProject {
     let size = PhysicalSize::new(2, 2).unwrap();
     let mut manifest = ProjectManifest::new(
         ProjectId::from_u128(33),
@@ -99,13 +99,23 @@ fn staged_edit(project: &ActiveProject) -> EditCommand {
 #[test]
 fn schema_two_upgrade_stamps_old_committed_frames_before_new_stages_and_undo_is_sticky() {
     let directory = tempfile::tempdir().unwrap();
-    let mut project = project(directory.path(), 2);
+    let project = project(directory.path(), 2);
+    let edit = staged_edit(&project);
+    assert_upgrade_roundtrip(directory.path(), project, edit, 3);
+}
+
+pub(super) fn assert_upgrade_roundtrip(
+    root: &Path,
+    mut project: ActiveProject,
+    edit: EditCommand,
+    required_schema: u32,
+) {
     let before = project.manifest().clone();
     let prefix = fs::read(&project.layout().journal).unwrap();
-    let receipt = project.commit(staged_edit(&project)).unwrap();
-    assert_eq!(project.manifest().schema_version, 3);
+    let receipt = project.commit(edit).unwrap();
+    assert_eq!(project.manifest().schema_version, required_schema);
     let mut stamped = before.clone();
-    stamped.schema_version = 3;
+    stamped.schema_version = required_schema;
     assert_eq!(read_manifest(&project.layout().manifest).unwrap(), stamped);
     assert!(
         fs::read(&project.layout().journal)
@@ -114,21 +124,21 @@ fn schema_two_upgrade_stamps_old_committed_frames_before_new_stages_and_undo_is_
     );
     let after = project.manifest().clone();
     drop(project);
-    let opened = ActiveProject::open(directory.path(), LockPolicy::FailIfPresent).unwrap();
+    let opened = ActiveProject::open(root, LockPolicy::FailIfPresent).unwrap();
     assert!(opened.journal_recovery.is_clean());
     assert_eq!(opened.journal_recovery.already_snapshotted_records, 1);
     assert_eq!(opened.journal_recovery.replayed_records, 1);
     assert_eq!(opened.project.manifest(), &after);
     let mut project = opened.project;
     let redo = project.commit(receipt.inverse).unwrap().inverse;
-    assert_eq!(project.manifest().schema_version, 3);
+    assert_eq!(project.manifest().schema_version, required_schema);
     assert_eq!(project.manifest().timeline, before.timeline);
     project.checkpoint_and_compact().unwrap();
     drop(project);
-    let mut opened = ActiveProject::open(directory.path(), LockPolicy::FailIfPresent)
+    let mut opened = ActiveProject::open(root, LockPolicy::FailIfPresent)
         .unwrap()
         .project;
-    assert_eq!(opened.manifest().schema_version, 3);
+    assert_eq!(opened.manifest().schema_version, required_schema);
     opened.commit(redo).unwrap();
     assert_eq!(opened.manifest().timeline, after.timeline);
     assert_eq!(
@@ -166,7 +176,7 @@ fn invalid_stage_payload_never_upgrades_a_legacy_snapshot() {
 
 #[test]
 fn raw_recording_fast_path_rejects_render_steps_in_every_supported_schema() {
-    for schema in [1, 2, 3] {
+    for schema in [1, 2, 3, 4] {
         let directory = tempfile::tempdir().unwrap();
         let mut project = project(directory.path(), schema);
         let before = project.manifest().clone();

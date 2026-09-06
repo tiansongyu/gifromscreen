@@ -1,6 +1,6 @@
 use eframe::egui;
 use gif_from_screen_domain::{
-    AnnotationMode, AnnotationRequest, EdgeWidths, EditTaskTrigger, EditingTask, EditingTaskAction,
+    AnnotationMode, AnnotationRequest, EditTaskTrigger, EditingTask, EditingTaskAction,
     EditingTaskPreset, EditingTaskSources, MAX_EDIT_TASKS, MAX_EDITING_PRESETS, Rgba, TaskDelay,
 };
 
@@ -103,6 +103,8 @@ impl AutoTasks {
 
 fn show_task(ui: &mut egui::Ui, action: &mut EditingTaskAction) {
     match action {
+        EditingTaskAction::ImageBorder { style } => crate::image_effect_ui::show_border(ui, style),
+        EditingTaskAction::ImageShadow { style } => crate::image_effect_ui::show_shadow(ui, style),
         EditingTaskAction::Delay { mode } => {
             let mut selected = match mode {
                 TaskDelay::Override { .. } => 0,
@@ -147,6 +149,7 @@ fn show_task(ui: &mut egui::Ui, action: &mut EditingTaskAction) {
             }
         }
         EditingTaskAction::Border { widths, color } => {
+            ui.weak("Legacy inset border: preserves this preset's original fixed-canvas behavior.");
             ui.horizontal_wrapped(|ui| {
                 for (label, edge) in [
                     ("Top ", &mut widths.top),
@@ -170,6 +173,7 @@ fn show_task(ui: &mut egui::Ui, action: &mut EditingTaskAction) {
             blur_radius,
             color,
         } => {
+            ui.weak("Legacy clipped shadow: preserves this preset's original box-blur behavior.");
             ui.horizontal_wrapped(|ui| {
                 ui.add(
                     egui::DragValue::new(offset_x)
@@ -227,30 +231,15 @@ fn task_label(kind: usize) -> &'static str {
 }
 
 fn new_task(kind: usize, canvas: Option<gif_from_screen_domain::PhysicalSize>) -> EditingTask {
-    let color = Rgba {
-        red: 0,
-        green: 0,
-        blue: 0,
-        alpha: 220,
-    };
     let action = match kind {
         0 => EditingTaskAction::Delay {
             mode: TaskDelay::Override { milliseconds: 100 },
         },
-        4 => EditingTaskAction::Border {
-            widths: EdgeWidths {
-                top: 1,
-                right: 1,
-                bottom: 1,
-                left: 1,
-            },
-            color,
+        4 => EditingTaskAction::ImageBorder {
+            style: gif_from_screen_domain::ImageBorderStyle::default(),
         },
-        5 => EditingTaskAction::Shadow {
-            offset_x: 4,
-            offset_y: 4,
-            blur_radius: 8,
-            color,
+        5 => EditingTaskAction::ImageShadow {
+            style: gif_from_screen_domain::ImageShadowStyle::default(),
         },
         _ => {
             let mut request = AnnotationRequest::default();
@@ -284,6 +273,20 @@ fn new_task(kind: usize, canvas: Option<gif_from_screen_domain::PhysicalSize>) -
 mod tests {
     use super::*;
     use gif_from_screen_domain::PhysicalSize;
+
+    #[test]
+    fn new_border_and_shadow_presets_use_expanded_effects_with_unambiguous_units() {
+        let EditingTaskAction::ImageBorder { style } = new_task(4, None).action else {
+            panic!("new border")
+        };
+        assert_eq!(style.widths.left_milli, 1000);
+        assert_eq!(style.background.alpha, 255);
+        let EditingTaskAction::ImageShadow { style } = new_task(5, None).action else {
+            panic!("new shadow")
+        };
+        assert_eq!(style.opacity_basis_points, 6000);
+        style.validate().unwrap();
+    }
 
     #[test]
     fn initial_annotation_options_fit_the_open_canvas_without_mutating_saved_parameters() {

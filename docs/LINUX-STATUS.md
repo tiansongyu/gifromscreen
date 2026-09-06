@@ -90,7 +90,8 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [x] Connect ordinary frame-owned authors, explicit whole-layer legacy conversion and bounded input-aware regeneration, including copied held labels after source deletion and journal recovery.
 - [x] Distinguish same-name annotation/text groups by layer number and coverage without changing their saved names or identities.
 - [x] Apply crop/resize/rotation/flips/effects to the complete image in editing order with schema-3 stages, stage-aware re-authoring and shared preview/GIF execution; [native geometry and conversion acceptance](ORDERED-GEOMETRY-QA-2026-09-07.md).
-- [ ] Close the remaining geometric fidelity gaps: expanded-canvas shadow and signed inner/outer borders, hidden intermediate-stage baking, and numerical WPF resize/blur comparison. Ordered execution alone is not full upstream pixel parity.
+- [x] Add schema-4 expanded-canvas software-reference shadows and signed inner/outer borders, with shared placement, stage-aware authors, settings v2, whole-program resource preflight and [native effect/reopen/GIF acceptance](IMAGE-EFFECTS-QA-2026-09-07.md).
+- [ ] Close hidden intermediate-stage baking and numerical Windows/WPF/WIC pixel-comparison gates. Reference algorithms alone are not full upstream pixel certification.
 - [x] Save an independently identified project copy without switching the current editor, and retain a bounded recent-project list.
 - [x] Build and verify an Ubuntu-22-compatible x86_64 portable tarball with exact-file installation, checksums, license notices, and CI artifacts.
 

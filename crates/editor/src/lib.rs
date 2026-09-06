@@ -23,7 +23,10 @@ mod virtual_filmstrip;
 mod yoyo;
 
 pub use clip_transform::{ClipTransformEdit, edit_clip_transforms};
-pub use composed_frame::{ComposedFrameEdit, edit_composed_frames, frame_effect_count};
+pub use composed_frame::{
+    ComposedEffectEdit, ComposedFrameEdit, ComposedImageEffect, MAX_COMPOSED_IMAGE_BYTES,
+    edit_composed_frames, frame_effect_count,
+};
 pub use duplicates::{
     DuplicateDelayMode, DuplicateFrameRetention, FrameComparison, FrameSimilarityProvider,
     RemoveDuplicateFramesOptions, remove_duplicate_frames,

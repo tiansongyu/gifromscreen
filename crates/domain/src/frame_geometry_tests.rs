@@ -327,7 +327,7 @@ fn legacy_manifest_acceptance_is_preserved_but_planning_uses_real_effect_input_s
         region: PhysicalRect::new(80, 80, 10, 10).unwrap(),
         radius: 1,
     }];
-    for version in [1, 2, 3] {
+    for version in [1, 2, 3, 4] {
         project.schema_version = version;
         project.validate().unwrap();
     }
@@ -413,6 +413,158 @@ fn empty_new_fields_preserve_legacy_wire_shape_and_stage_payloads_require_v3() {
         1
     );
     assert_eq!(anchored_track(staged.id, None).required_schema_version(), 2);
+}
+
+#[test]
+fn image_steps_expand_each_input_before_the_next_paint_stage_and_effect() {
+    let mut frame = clip();
+    frame.render_steps = vec![
+        composite(1),
+        FrameRenderStep::ImageBorder {
+            style: crate::ImageBorderStyle {
+                widths: crate::SignedEdgeWidths {
+                    left_milli: -1_500,
+                    top_milli: -2_000,
+                    ..crate::SignedEdgeWidths::default()
+                },
+                ..crate::ImageBorderStyle::default()
+            },
+        },
+        composite(2),
+        FrameRenderStep::ImageShadow {
+            style: crate::ImageShadowStyle::default(),
+        },
+        composite(3),
+        FrameRenderStep::Effect {
+            effect: Effect::Blur {
+                region: PhysicalRect::new(41, 21, 1, 1).unwrap(),
+                radius: 1,
+            },
+        },
+        FrameRenderStep::Rotate {
+            rotation: QuarterTurn::Clockwise90,
+        },
+    ];
+    let plan = FrameGeometryPlan::new(&frame, size(20, 10)).unwrap();
+    assert_eq!(plan.base_size(), size(20, 10));
+    assert_eq!(plan.stage_size(Some(1)).unwrap(), size(20, 10));
+    assert_eq!(plan.stage_size(Some(2)).unwrap(), size(22, 12));
+    assert_eq!(plan.step_input_size(3).unwrap(), size(22, 12));
+    assert_eq!(plan.stage_size(Some(3)).unwrap(), size(42, 22));
+    assert_eq!(plan.output_size(), size(22, 42));
+    assert_eq!(plan.stage_size(None).unwrap(), size(22, 42));
+    frame.render_steps[3] = FrameRenderStep::ImageShadow {
+        style: crate::ImageShadowStyle {
+            direction_hundredths: 36_001,
+            ..crate::ImageShadowStyle::default()
+        },
+    };
+    let error = FrameGeometryPlan::new(&frame, size(20, 10)).unwrap_err();
+    assert!(error.contains("Render step 4") && error.contains("direction"));
+}
+
+#[test]
+fn expanded_effects_require_schema_four_but_do_not_reinterpret_legacy_effects() {
+    let steps = [
+        FrameRenderStep::ImageBorder {
+            style: crate::ImageBorderStyle::default(),
+        },
+        FrameRenderStep::ImageShadow {
+            style: crate::ImageShadowStyle::default(),
+        },
+    ];
+    for step in steps {
+        let mut project = staged_project();
+        project.timeline.frames[0].render_steps.push(step);
+        assert_eq!(project.timeline.frames[0].required_schema_version(), 4);
+        for schema in [1, 2, 3] {
+            project.schema_version = schema;
+            assert!(project.validate().is_err());
+        }
+        project.schema_version = 4;
+        project.validate().unwrap();
+        let json = serde_json::to_vec(&project).unwrap();
+        let restored: ProjectManifest = serde_json::from_slice(&json).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored, project);
+    }
+
+    let mut frame = clip();
+    frame.effects = vec![
+        Effect::Border {
+            widths: EdgeWidths {
+                top: 100,
+                right: 100,
+                bottom: 100,
+                left: 100,
+            },
+            color: Rgba::TRANSPARENT,
+        },
+        Effect::Shadow {
+            offset_x: -10,
+            offset_y: 10,
+            blur_radius: 0,
+            color: Rgba::TRANSPARENT,
+        },
+    ];
+    assert_eq!(frame.required_schema_version(), 1);
+    assert_eq!(
+        FrameGeometryPlan::new(&frame, size(20, 10))
+            .unwrap()
+            .output_size(),
+        size(20, 10)
+    );
+    frame.render_steps = vec![
+        composite(1),
+        FrameRenderStep::Effect {
+            effect: frame.effects[0].clone(),
+        },
+    ];
+    assert_eq!(frame.required_schema_version(), 3);
+    assert_eq!(
+        FrameGeometryPlan::new(&frame, size(20, 10))
+            .unwrap()
+            .output_size(),
+        size(20, 10)
+    );
+}
+
+#[test]
+fn invalid_image_edit_rolls_back_schema_while_successful_undo_keeps_v4() {
+    let mut project = staged_project();
+    project.schema_version = 3;
+    let before = project.clone();
+    let mut replacement = project.timeline.frames[0].clone();
+    replacement.render_steps.push(FrameRenderStep::ImageShadow {
+        style: crate::ImageShadowStyle {
+            depth_hundredths: 10_001,
+            ..crate::ImageShadowStyle::default()
+        },
+    });
+    assert!(
+        project
+            .apply_command(&EditCommand::ReplaceFrame {
+                frame_id: replacement.id,
+                replacement: Box::new(replacement.clone())
+            })
+            .is_err()
+    );
+    assert_eq!(project, before);
+    *replacement.render_steps.last_mut().unwrap() = FrameRenderStep::ImageShadow {
+        style: crate::ImageShadowStyle::default(),
+    };
+    let inverse = project
+        .apply_command(&EditCommand::ReplaceFrame {
+            frame_id: replacement.id,
+            replacement: Box::new(replacement),
+        })
+        .unwrap();
+    assert_eq!(project.schema_version, 4);
+    project.apply_command(&inverse.inverse).unwrap();
+    let mut expected = before;
+    expected.schema_version = 4;
+    expected.revision = expected.revision.next().unwrap().next().unwrap();
+    assert_eq!(project, expected);
 }
 
 #[test]

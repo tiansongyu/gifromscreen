@@ -725,10 +725,11 @@ impl ProjectManifest {
                 issues.push(ValidationIssue::DuplicateFrameId { frame_id: frame.id });
             }
             if !frame.render_steps.is_empty() {
-                if self.schema_version < 3 {
+                let required_schema = frame.required_schema_version();
+                if self.schema_version < required_schema {
                     issues.push(ValidationIssue::InvalidFrameRenderSteps {
                         frame_id: frame.id,
-                        reason: "Ordered frame render steps require schema 3.".to_owned(),
+                        reason: format!("Frame render steps require schema {required_schema}."),
                     });
                 }
                 match crate::validate_frame_render_steps(&frame.render_steps) {

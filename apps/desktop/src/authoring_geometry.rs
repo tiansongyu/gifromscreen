@@ -7,9 +7,17 @@ use gif_from_screen_domain::{
 use serde::Serialize;
 
 #[derive(Clone, Copy, Serialize)]
-pub(super) struct GeometryTransform {
-    pub input_size: PhysicalSize,
-    pub transform: ClipTransform,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(super) enum GeometryOperation {
+    Transform {
+        input_size: PhysicalSize,
+        transform: ClipTransform,
+    },
+    PlaceCanvas {
+        input_size: PhysicalSize,
+        output_size: PhysicalSize,
+        source_origin: PhysicalPoint,
+    },
 }
 
 pub(crate) fn legacy_annotation_stage(frame: &FrameClip) -> Option<u32> {
@@ -36,10 +44,10 @@ pub(super) fn geometry_to_stage(
     frame: &FrameClip,
     source: PhysicalSize,
     stage: Option<u32>,
-) -> Result<Vec<GeometryTransform>, String> {
+) -> Result<Vec<GeometryOperation>, String> {
     let plan = FrameGeometryPlan::new(frame, source)?;
     let target_size = plan.stage_size(stage)?;
-    let mut geometry = vec![GeometryTransform {
+    let mut geometry = vec![GeometryOperation::Transform {
         input_size: source,
         transform: frame.transform,
     }];
@@ -51,13 +59,33 @@ pub(super) fn geometry_to_stage(
         let mut transform = ClipTransform::default();
         match step {
             FrameRenderStep::Composite { .. } | FrameRenderStep::Effect { .. } => continue,
+            FrameRenderStep::ImageBorder { style } => {
+                let placement = style.placement(size)?;
+                geometry.push(GeometryOperation::PlaceCanvas {
+                    input_size: size,
+                    output_size: placement.output_size,
+                    source_origin: placement.source_origin,
+                });
+                size = placement.output_size;
+                continue;
+            }
+            FrameRenderStep::ImageShadow { style } => {
+                let placement = style.placement(size)?;
+                geometry.push(GeometryOperation::PlaceCanvas {
+                    input_size: size,
+                    output_size: placement.output_size,
+                    source_origin: placement.source_origin,
+                });
+                size = placement.output_size;
+                continue;
+            }
             FrameRenderStep::Crop { rect } => transform.crop = Some(*rect),
             FrameRenderStep::Resize { size } => transform.output_size = Some(*size),
             FrameRenderStep::Rotate { rotation } => transform.rotation = *rotation,
             FrameRenderStep::FlipHorizontal => transform.flip_horizontal = true,
             FrameRenderStep::FlipVertical => transform.flip_vertical = true,
         }
-        geometry.push(GeometryTransform {
+        geometry.push(GeometryOperation::Transform {
             input_size: size,
             transform,
         });
@@ -96,13 +124,35 @@ pub(super) fn transform_point_at_stage(
     Some(point)
 }
 
-fn transform_point(point: PhysicalPoint, geometry: GeometryTransform) -> Option<PhysicalPoint> {
-    let transform = geometry.transform;
+fn transform_point(point: PhysicalPoint, geometry: GeometryOperation) -> Option<PhysicalPoint> {
+    let (input_size, transform) = match geometry {
+        GeometryOperation::Transform {
+            input_size,
+            transform,
+        } => (input_size, transform),
+        GeometryOperation::PlaceCanvas {
+            input_size,
+            output_size,
+            source_origin,
+        } => {
+            if point.x.get() >= input_size.width.get() || point.y.get() >= input_size.height.get() {
+                return None;
+            }
+            let x = point.x.get().checked_add(source_origin.x.get())?;
+            let y = point.y.get().checked_add(source_origin.y.get())?;
+            return (x < output_size.width.get() && y < output_size.height.get()).then_some(
+                PhysicalPoint {
+                    x: PhysicalPx::new(x),
+                    y: PhysicalPx::new(y),
+                },
+            );
+        }
+    };
     let crop = transform
         .crop
         .unwrap_or(gif_from_screen_domain::PhysicalRect {
             origin: PhysicalPoint::default(),
-            size: geometry.input_size,
+            size: input_size,
         });
     let mut x = point.x.get().checked_sub(crop.origin.x.get())?;
     let mut y = point.y.get().checked_sub(crop.origin.y.get())?;
