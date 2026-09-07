@@ -57,7 +57,7 @@ internal static class Provenance
             peak_working_set_bytes = process.PeakWorkingSet64,
             source_contract = "ScreenToGif a4d0a67c2131cd048ceec86cd40afc2f1a06f2fd, Editor BorderAsync/ShadowAsync, physical-pixel 96-DPI measurement space",
             runtime_contract = "Actual installed .NET 9 WPF RenderTargetBitmap + PNG/WIC; not simulated Rust pixels",
-            dpi_policy = "Raw PNG/WIC decoded DPI and pixels are retained as artifacts. Before the next operation, only working DPI metadata is reset to 96; pixel dimensions, format, palette and native-format bytes are asserted unchanged. Decode accepts only 96 or the adjacent integer PNG densities 3779/3780 pixels per metre, within 1e-6 DPI. This isolates physical-pixel 96-DPI arithmetic; it does not validate ScreenToGif's unnormalized fractional-DPI/mixed-DIP behavior.",
+            dpi_policy = "Raw PNG/WIC decoded DPI and pixels are retained as artifacts. Before the next operation, only working DPI metadata is reset to 96; pixel dimensions, format, palette and native-format bytes are asserted unchanged. Decode accepts only 96, adjacent integer PNG densities 3779/3780 pixels per metre, or their native single-precision readbacks, within 1e-9 DPI. This isolates physical-pixel 96-DPI arithmetic; it does not validate ScreenToGif's unnormalized fractional-DPI/mixed-DIP behavior.",
         };
     }
 

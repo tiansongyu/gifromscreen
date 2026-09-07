@@ -4,8 +4,9 @@ This is a bounded, headless **verification tool for the Linux renderer**, not a
 Windows edition of GifFromScreen. It invokes real .NET 9 WPF public APIs and
 PNG/WIC decoding. It never reads the screen, opens a window, or uses fonts.
 
-The `WPF pixel reference` workflow starts as manual `workflow_dispatch` while
-calibrating numerical behavior. A reference or comparison failure is a failed
+The `WPF pixel reference` workflow runs for relevant renderer/domain/input
+changes and still supports manual `workflow_dispatch`. The first complete
+hosted producer/comparator passed on `35c246b` (run `34073441806`). A reference or comparison failure is a failed
 run, with artifacts retained for diagnosis; it never updates expected pixels
 from Rust output or weakens a tolerance automatically.
 

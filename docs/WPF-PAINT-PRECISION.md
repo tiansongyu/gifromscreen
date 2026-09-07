@@ -68,8 +68,14 @@ differences**, including RGB under transparent alpha. Report SHA-256:
 `582f19ef42c6bf335e775a243ae119b99d45f4431d36129e66d22ad44ee4efa1`.
 Definition SHA-256:
 `700e371bd6536d815e5412e3e5e994a7e7262193a4b6dc28765a2e93a6d7c732`.
-The workflow's original failed comparison is not relabeled as a passing run;
-a fresh hosted run remains the committed-revision verification step.
+The workflow's original failed comparison is not relabeled as a passing run.
+A fresh complete [hosted run 34073441806](https://github.com/tiansongyu/gifromscreen/actions/runs/34073441806)
+at committed revision `35c246bab300dbe7bb55f89608be9b6afac26c25` passed both
+the actual Windows producer and strict Linux/MSRV comparator. Relevant
+renderer/domain/reference changes now trigger this independent check on push
+or pull request. A follow-up corrects the provenance description's DPI epsilon
+and single-precision whitelist to match its existing implementation; that source
+hash change requires newly generated references, not an edited old index.
 
 Local workspace checks on Rust 1.98.0 and the 1.88.0 minimum toolchain each
 passed 1,198 automated tests (7 explicit opt-in tests remain ignored in the
