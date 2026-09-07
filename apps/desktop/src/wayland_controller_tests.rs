@@ -322,6 +322,7 @@ fn x11_shell_restoration_keeps_its_existing_position_and_decoration_commands() {
         [
             egui::ViewportCommand::Title(APP_NAME.to_owned()),
             egui::ViewportCommand::Decorations(true),
+            egui::ViewportCommand::MousePassthrough(false),
             egui::ViewportCommand::MinInnerSize(egui::vec2(680.0, 440.0)),
             egui::ViewportCommand::InnerSize(original),
             egui::ViewportCommand::Maximized(true),

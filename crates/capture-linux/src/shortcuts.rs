@@ -15,7 +15,7 @@ use crate::LinuxDisplayServer;
 #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
 mod portal;
 #[cfg(all(target_os = "linux", feature = "native-x11"))]
-mod x11;
+pub(crate) mod x11;
 
 const QUEUE_LIMIT: usize = 64;
 

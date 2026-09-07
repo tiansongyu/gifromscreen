@@ -164,6 +164,7 @@ impl GifFromScreenApp {
                 || self.recording_countdown.is_active());
         let actions = self.shortcut_tool.poll(context, self.display_server, scope);
         if !scope {
+            self.pending_recorder_action = None;
             return;
         }
         for action in actions {
@@ -207,6 +208,11 @@ impl GifFromScreenApp {
                     break;
                 }
                 Dispatch::Recorder(action) => {
+                    if action == RecorderOverlayAction::Start {
+                        // Resolve this tick's geometry/input before starting capture.
+                        self.pending_recorder_action = Some(action);
+                        continue;
+                    }
                     if self.wayland_crop_controller.is_some() {
                         self.handle_wayland_controller_action(context, action);
                     } else {
@@ -219,7 +225,7 @@ impl GifFromScreenApp {
 
     fn shortcut_preparation(&self) -> Preparation {
         if let Some(overlay) = &self.recorder_overlay {
-            if overlay.initialized {
+            if overlay.initialized && overlay.input.ready() && overlay.last_region_valid {
                 Preparation::Controller
             } else {
                 Preparation::InitializingController
@@ -232,6 +238,18 @@ impl GifFromScreenApp {
             Preparation::Choosing
         } else {
             Preparation::Idle
+        }
+    }
+
+    pub(crate) fn recorder_frame_action(
+        &mut self,
+        clicked: RecorderOverlayAction,
+    ) -> RecorderOverlayAction {
+        let pending = self.pending_recorder_action.take();
+        if clicked == RecorderOverlayAction::None {
+            pending.unwrap_or(RecorderOverlayAction::None)
+        } else {
+            clicked
         }
     }
 }
@@ -429,5 +447,99 @@ mod tests {
             assert!(clip.contains_rect(rect));
             assert!(screen.contains_rect(rect));
         }
+    }
+
+    #[test]
+    fn x11_transparent_ui_prefers_gl_and_preserves_explicit_backend_choices() {
+        fn backends(options: &eframe::NativeOptions) -> wgpu::Backends {
+            match &options.wgpu_options.wgpu_setup {
+                eframe::egui_wgpu::WgpuSetup::CreateNew(setup) => {
+                    setup.instance_descriptor.backends
+                }
+                eframe::egui_wgpu::WgpuSetup::Existing(_) => panic!("test expects a new renderer"),
+            }
+        }
+        let mut options = crate::native_options();
+        assert_eq!(options.viewport.transparent, Some(true));
+        assert_eq!(
+            options.viewport.app_id.as_deref(),
+            Some(gif_from_screen_capture_linux::APPLICATION_ID)
+        );
+        crate::configure_ui_backend(
+            &mut options,
+            Some(gif_from_screen_capture_linux::LinuxDisplayServer::X11),
+            None,
+        );
+        assert_eq!(backends(&options), wgpu::Backends::GL);
+        crate::configure_ui_backend(
+            &mut options,
+            Some(gif_from_screen_capture_linux::LinuxDisplayServer::X11),
+            Some(wgpu::Backends::VULKAN),
+        );
+        assert_eq!(backends(&options), wgpu::Backends::VULKAN);
+        crate::configure_ui_backend(
+            &mut options,
+            Some(gif_from_screen_capture_linux::LinuxDisplayServer::Wayland),
+            None,
+        );
+        assert_eq!(backends(&options), wgpu::Backends::VULKAN);
+        let app = GifFromScreenApp::default();
+        assert_eq!(
+            eframe::App::clear_color(&app, &egui::Visuals::dark()).map(f32::to_bits),
+            [0; 4]
+        );
+    }
+
+    #[test]
+    fn deferred_start_is_consumed_once_and_never_overrides_a_clicked_close() {
+        let mut app = GifFromScreenApp::default();
+        app.pending_recorder_action = Some(RecorderOverlayAction::Start);
+        assert_eq!(
+            app.recorder_frame_action(RecorderOverlayAction::None),
+            RecorderOverlayAction::Start
+        );
+        assert_eq!(
+            app.recorder_frame_action(RecorderOverlayAction::None),
+            RecorderOverlayAction::None
+        );
+        app.pending_recorder_action = Some(RecorderOverlayAction::Start);
+        assert_eq!(
+            app.recorder_frame_action(RecorderOverlayAction::Close),
+            RecorderOverlayAction::Close
+        );
+        assert!(app.pending_recorder_action.is_none());
+    }
+
+    #[test]
+    fn closing_the_transparent_parent_stops_and_saves_instead_of_discarding() {
+        let context = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let mut app = GifFromScreenApp::default();
+        let (controller, _control) = RecordingController::channel();
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let cancellation = gif_from_screen_gif::CancellationFlag::default();
+        app.job = Some(crate::RecordingJob {
+            shortcut_state: LiveShortcutState::default(),
+            receiver,
+            controller,
+            cancellation: cancellation.clone(),
+            paused: false,
+            pause_requested: None,
+            terminal_requested: false,
+            retarget: None,
+            snapshot_requests: std::collections::VecDeque::default(),
+        });
+        let _ = context.run(input, |context| app.handle_worker_shutdown(context));
+        assert_eq!(app.shutdown, ShutdownState::WaitingForWorkers);
+        assert!(app.job.as_ref().unwrap().terminal_requested);
+        assert!(!gif_from_screen_gif::CancellationToken::is_cancelled(
+            &cancellation
+        ));
     }
 }

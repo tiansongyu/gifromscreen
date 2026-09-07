@@ -17,9 +17,9 @@ use x11rb::{
 #[path = "x11/keymap.rs"]
 mod keymap;
 #[path = "x11/stream.rs"]
-mod stream;
+pub(crate) mod stream;
 
-type Client<'a> = x11rb::rust_connection::RustConnection<stream::BoundedStream<'a>>;
+pub(crate) type Client<'a> = x11rb::rust_connection::RustConnection<stream::BoundedStream<'a>>;
 const DEVICE: u16 = 256; // XkbUseCoreKbd, not a wildcard key/modifier grab.
 
 pub(super) fn run(bindings: &[ShortcutBinding], context: &ShortcutContext) -> Result<(), String> {

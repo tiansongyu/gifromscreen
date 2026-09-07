@@ -13,6 +13,12 @@ use gif_from_screen_capture::{
 };
 use std::env;
 
+/// Desktop-file and portal identity of the `GifFromScreen` application.
+pub const APPLICATION_ID: &str = "io.github.tiansongyu.gifromscreen";
+
+mod recorder_input;
+pub use recorder_input::set_recorder_input_shape;
+
 mod shortcuts;
 pub use shortcuts::{
     GlobalShortcutService, RegisteredShortcut, ShortcutAction, ShortcutActionHandler,

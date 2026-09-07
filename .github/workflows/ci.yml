@@ -29,7 +29,9 @@ jobs:
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
             libxcb-shape0-dev \
-            libxcb-xfixes0-dev
+            libxcb-xfixes0-dev \
+            xvfb \
+            xauth
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

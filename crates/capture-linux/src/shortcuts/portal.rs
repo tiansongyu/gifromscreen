@@ -20,6 +20,7 @@ use futures_util::StreamExt;
 
 use super::{RegisteredShortcut, ShortcutAction, ShortcutBinding, ShortcutContext};
 
+mod identity;
 mod objects;
 #[cfg(test)]
 mod tests;
@@ -93,6 +94,16 @@ async fn run_session(
     timeouts: Timeouts,
     objects: &mut Option<RequestObjects>,
 ) -> Result<(), String> {
+    // Register this bus peer before constructing any application portal proxy.
+    // A window's Wayland app_id does not identify an independent D-Bus connection.
+    phase(
+        context,
+        "register the application identity for global shortcuts",
+        timeouts.probe,
+        identity::register(connection, crate::APPLICATION_ID),
+        None,
+    )
+    .await?;
     let portal = phase(
         context,
         "open GlobalShortcuts portal",
@@ -180,21 +191,22 @@ fn registered(
         return Err("GlobalShortcuts returned more bindings than requested.".into());
     }
     let mut actual = Vec::with_capacity(shortcuts.len());
+    let mut seen = Vec::with_capacity(shortcuts.len());
     for shortcut in shortcuts {
         let action = action_for(bindings, shortcut.id())
             .ok_or_else(|| "GlobalShortcuts returned an unrequested action.".to_owned())?;
-        if actual
-            .iter()
-            .any(|item: &RegisteredShortcut| item.action == action)
-        {
+        if seen.contains(&action) {
             return Err("GlobalShortcuts returned a duplicate action.".into());
         }
+        seen.push(action);
         let description = shortcut.trigger_description();
-        if description.is_empty()
-            || description.len() > 256
-            || description.chars().any(char::is_control)
-        {
+        if description.len() > 256 || description.chars().any(char::is_control) {
             return Err("GlobalShortcuts returned an invalid trigger description.".into());
+        }
+        // KDE can return persisted actions with no assigned combination. They
+        // are not active bindings, and must never fall back to our preference.
+        if description.trim().is_empty() {
+            continue;
         }
         actual.push(RegisteredShortcut {
             action,

@@ -46,6 +46,7 @@ mod wayland_controller_layout;
 #[path = "wayland_controller_tests.rs"]
 mod wayland_controller_tests;
 mod wayland_prepare_job;
+mod x11_recorder_input;
 
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -691,6 +692,9 @@ struct WaylandCropController {
 }
 
 struct RecorderOverlay {
+    window_title: String,
+    input: x11_recorder_input::RecorderInput,
+    last_region_valid: bool,
     initial_position: egui::Pos2,
     initial_size: egui::Vec2,
     initialized: bool,
@@ -760,9 +764,11 @@ impl RecorderStage {
 struct RecorderOverlayFrame {
     action: RecorderOverlayAction,
     region: Option<PhysicalRect>,
+    input_geometry: Option<x11_recorder_input::Geometry>,
 }
 
 struct GifFromScreenApp {
+    pending_recorder_action: Option<RecorderOverlayAction>,
     shortcut_tool: shortcut_ui::ShortcutTool,
     view: AppView,
     notice: Option<String>,
@@ -821,6 +827,7 @@ struct GifFromScreenApp {
 impl Default for GifFromScreenApp {
     fn default() -> Self {
         Self {
+            pending_recorder_action: None,
             shortcut_tool: shortcut_ui::ShortcutTool::default(),
             view: AppView::Landing,
             notice: None,
@@ -914,6 +921,10 @@ impl eframe::App for GifFromScreenApp {
         self.restore_main_window_if_requested(context);
         if self.recorder_overlay.is_some() {
             self.show_recorder_overlay(context);
+            if self.recorder_overlay.is_some() {
+                context.request_repaint_after(Duration::from_millis(33));
+                return;
+            }
         }
         if self.wayland_crop_controller.is_some() {
             self.show_wayland_crop_controller(context);
@@ -980,6 +991,8 @@ impl eframe::App for GifFromScreenApp {
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // Ordinary pages paint opaque panels. The mapped recorder parent and
+        // the capture hole stay transparent when the main page is not painted.
         [0.0, 0.0, 0.0, 0.0]
     }
 }
@@ -1047,6 +1060,7 @@ impl GifFromScreenApp {
             .filter(|snapshot| matches!(snapshot.restore, MainWindowRestore::X11Geometry))
         {
             context.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+            context.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
             context.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
                 680.0, 440.0,
             )));
@@ -1058,7 +1072,7 @@ impl GifFromScreenApp {
                 context.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
             }
         }
-        // Neither the off-screen X11 shell nor the dedicated Wayland shell is hidden.
+        // The transparent X11 parent and dedicated Wayland shell remain mapped.
         context.send_viewport_cmd(egui::ViewportCommand::Focus);
         self.restore_main_window = false;
     }
@@ -1184,7 +1198,8 @@ impl GifFromScreenApp {
             && (self.source_workers_active()
                 || self.project_library.is_active()
                 || self.auto_tasks.is_loading()
-                || self.shortcut_tool.is_active())
+                || self.shortcut_tool.is_active()
+                || self.job.is_some())
         {
             self.video_import.cancel();
             self.project_insert.cancel();
@@ -1194,12 +1209,17 @@ impl GifFromScreenApp {
             self.annotation_tools.cancel();
             self.auto_tasks.cancel();
             self.shortcut_tool.shutdown();
+            if let Some(job) = &mut self.job {
+                job.stop_retargeting();
+                let _ = job.controller.stop();
+            }
             self.shutdown = ShutdownState::WaitingForWorkers;
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
         if self.shutdown == ShutdownState::WaitingForWorkers
             && !self.source_workers_active()
             && !self.auto_tasks.is_loading()
+            && self.job.is_none()
         {
             self.project_library.shutdown();
             if self.project_library.is_active() || self.shortcut_tool.is_active() {
@@ -2359,12 +2379,7 @@ impl GifFromScreenApp {
             return Err("The capture rectangle must stay inside the selected source.".into());
         }
 
-        let pixels_per_point = context.input(|input| {
-            input
-                .viewport()
-                .native_pixels_per_point
-                .unwrap_or_else(|| context.pixels_per_point())
-        });
+        let pixels_per_point = context.pixels_per_point();
         let absolute_x = source_geometry
             .origin()
             .x
@@ -2386,6 +2401,9 @@ impl GifFromScreenApp {
                 + RECORDER_TOOLBAR_POINTS,
         );
         self.recorder_overlay = Some(RecorderOverlay {
+            window_title: format!("GifFromScreen recorder [{}]", uuid::Uuid::new_v4().simple()),
+            input: x11_recorder_input::RecorderInput::default(),
+            last_region_valid: false,
             initial_position: position,
             initial_size: size,
             initialized: false,
@@ -2394,12 +2412,8 @@ impl GifFromScreenApp {
         self.main_window_snapshot = Some(main_window);
         self.notice = Some("Recorder frame opened. Move or resize it, then press Start.".into());
         context.request_repaint();
-        context.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(1.0, 1.0)));
         context.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
-        context.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1.0, 1.0)));
-        context.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-            -10_000.0, -10_000.0,
-        )));
+        context.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
         Ok(())
     }
 
@@ -2424,7 +2438,7 @@ impl GifFromScreenApp {
             self.notice = Some(snapshot_notice);
         }
         let mut builder = egui::ViewportBuilder::default()
-            .with_title("GifFromScreen recorder")
+            .with_title(&overlay.window_title)
             .with_transparent(true)
             .with_decorations(false)
             .with_resizable(stage.allows_resizing())
@@ -2441,8 +2455,22 @@ impl GifFromScreenApp {
         }
         let progress = self.progress;
         let source_geometry = overlay.source_geometry;
+        let input_ready = overlay.input.ready() && overlay.last_region_valid;
         let manual_snapshots = self.settings.cadence == RecordingCadenceChoice::Manual;
         let shortcut_summary = self.shortcut_tool.status_summary();
+        let input_notice = overlay.input.notice().or_else(|| {
+            (!overlay.last_region_valid).then_some(
+                "Keep the capture rectangle inside the selected source; Start remains disabled.",
+            )
+        });
+        let toolbar_notice = input_notice
+            .map(|notice| {
+                format!(
+                    "{notice} {}",
+                    shortcut_summary.as_deref().unwrap_or_default()
+                )
+            })
+            .or(shortcut_summary);
         let frame = context.show_viewport_immediate(
             recorder_viewport_id(),
             builder,
@@ -2453,12 +2481,28 @@ impl GifFromScreenApp {
                     progress,
                     source_geometry,
                     manual_snapshots,
-                    shortcut_summary.as_deref(),
+                    toolbar_notice.as_deref(),
+                    input_ready,
                 )
             },
         );
         if let Some(overlay) = &mut self.recorder_overlay {
             overlay.initialized = true;
+            overlay.last_region_valid = frame.region.is_some();
+            overlay
+                .input
+                .update(context, &overlay.window_title, frame.input_geometry);
+            if overlay.input.failed()
+                && let Some(job) = &mut self.job
+                && !job.terminal_requested
+            {
+                job.stop_retargeting();
+                let _ = job.controller.stop();
+                self.notice = Some(
+                    "Recorder input preparation failed; stopping and saving the captured project."
+                        .into(),
+                );
+            }
         }
         if let Some(region) = frame.region {
             apply_overlay_region(&mut self.settings, stage, region);
@@ -2468,7 +2512,8 @@ impl GifFromScreenApp {
                 job.observe_target(region);
             }
         }
-        self.handle_recorder_overlay_action(context, frame.action);
+        let action = self.recorder_frame_action(frame.action);
+        self.handle_recorder_overlay_action(context, action);
     }
 
     fn recorder_stage(&self) -> RecorderStage {
@@ -2569,6 +2614,7 @@ impl GifFromScreenApp {
     }
 
     fn close_recorder_overlay(&mut self) {
+        self.pending_recorder_action = None;
         self.shortcut_tool.reset_recording_scope();
         self.recording_countdown.cancel();
         self.recorder_overlay = None;
@@ -2577,6 +2623,13 @@ impl GifFromScreenApp {
 
     fn begin_recording(&mut self, context: &egui::Context) -> Result<(), String> {
         validate_settings(&self.settings)?;
+        if self
+            .recorder_overlay
+            .as_ref()
+            .is_some_and(|overlay| !overlay.last_region_valid || !overlay.input.ready())
+        {
+            return Err("Wait for the current input hole and keep the recorder inside its source before starting.".into());
+        }
         if self.job.is_some() {
             return Ok(());
         }
@@ -3097,7 +3150,8 @@ impl GifFromScreenApp {
         {
             job.observe_target(region);
         }
-        self.handle_wayland_controller_action(context, frame.action);
+        let action = self.recorder_frame_action(frame.action);
+        self.handle_wayland_controller_action(context, action);
     }
 
     fn handle_wayland_controller_action(
@@ -3171,6 +3225,7 @@ impl GifFromScreenApp {
     }
 
     fn close_wayland_crop_controller(&mut self) {
+        self.pending_recorder_action = None;
         self.shortcut_tool.reset_recording_scope();
         self.recording_countdown.cancel();
         self.wayland_crop_controller = None;
@@ -3623,6 +3678,7 @@ impl GifFromScreenApp {
     }
 
     fn finish_recording_job(&mut self) {
+        self.pending_recorder_action = None;
         self.shortcut_tool.reset_recording_scope();
         self.job = None;
         self.progress = None;
@@ -4275,7 +4331,11 @@ fn draw_wayland_crop_controller(
         context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         action = RecorderOverlayAction::Close;
     }
-    RecorderOverlayFrame { action, region }
+    RecorderOverlayFrame {
+        action,
+        region,
+        input_geometry: None,
+    }
 }
 
 fn trace_wayland_controller(marker: &'static str) {
@@ -4639,8 +4699,16 @@ fn draw_recorder_overlay(
     source_geometry: PhysicalRect,
     manual_snapshots: bool,
     shortcuts: Option<&str>,
+    input_ready: bool,
 ) -> RecorderOverlayFrame {
-    let mut action = draw_recorder_toolbar(context, stage, progress, manual_snapshots, shortcuts);
+    let mut action = draw_recorder_toolbar(
+        context,
+        stage,
+        progress,
+        manual_snapshots,
+        shortcuts,
+        input_ready,
+    );
     let central = egui::CentralPanel::default()
         .frame(
             egui::Frame::new()
@@ -4683,6 +4751,11 @@ fn draw_recorder_overlay(
     RecorderOverlayFrame {
         action,
         region: overlay_region_from_viewport(context, central, source_geometry),
+        input_geometry: context
+            .input(|input| input.viewport().inner_rect.map(|rect| rect.size()))
+            .and_then(|size| {
+                x11_recorder_input::Geometry::new(size, central, context.pixels_per_point())
+            }),
     }
 }
 
@@ -4692,6 +4765,7 @@ fn draw_recorder_toolbar(
     progress: Option<WorkflowProgress>,
     manual_snapshots: bool,
     shortcuts: Option<&str>,
+    input_ready: bool,
 ) -> RecorderOverlayAction {
     let mut action = RecorderOverlayAction::None;
     egui::TopBottomPanel::bottom("recorder_controls")
@@ -4705,7 +4779,7 @@ fn draw_recorder_toolbar(
             match stage {
                 RecorderStage::Ready => {
                     ui.horizontal_centered(|ui| {
-                        action = show_ready_recorder_controls(ui, context);
+                        action = show_ready_recorder_controls(ui, context, input_ready);
                     });
                 }
                 RecorderStage::Countdown(remaining) => {
@@ -4771,6 +4845,7 @@ fn draw_recorder_toolbar(
 fn show_ready_recorder_controls(
     ui: &mut egui::Ui,
     context: &egui::Context,
+    input_ready: bool,
 ) -> RecorderOverlayAction {
     let mut action = RecorderOverlayAction::None;
     egui::Grid::new("ready_recorder_controls")
@@ -4792,7 +4867,10 @@ fn show_ready_recorder_controls(
             if ui.small_button("H+").clicked() {
                 nudge_recorder_size(context, 0.0, 10.0);
             }
-            if ui.button("Start").clicked() {
+            if ui
+                .add_enabled(input_ready, egui::Button::new("Start"))
+                .clicked()
+            {
                 action = RecorderOverlayAction::Start;
             }
             if ui.button("Cancel").clicked() {
@@ -4930,12 +5008,7 @@ fn move_recorder_window(context: &egui::Context, response: &egui::Response) {
 }
 
 fn nudge_recorder_window(context: &egui::Context, horizontal: f32, vertical: f32) {
-    let pixels_per_point = context.input(|input| {
-        input
-            .viewport()
-            .native_pixels_per_point
-            .unwrap_or_else(|| context.pixels_per_point())
-    });
+    let pixels_per_point = context.pixels_per_point();
     let delta = egui::vec2(horizontal, vertical) / pixels_per_point;
     if let Some(position) = context.input(|input| input.viewport().outer_rect.map(|rect| rect.min))
     {
@@ -4944,12 +5017,7 @@ fn nudge_recorder_window(context: &egui::Context, horizontal: f32, vertical: f32
 }
 
 fn nudge_recorder_size(context: &egui::Context, horizontal: f32, vertical: f32) {
-    let pixels_per_point = context.input(|input| {
-        input
-            .viewport()
-            .native_pixels_per_point
-            .unwrap_or_else(|| context.pixels_per_point())
-    });
+    let pixels_per_point = context.pixels_per_point();
     let delta = egui::vec2(horizontal, vertical) / pixels_per_point;
     if let Some(size) = context.input(|input| input.viewport().inner_rect.map(|rect| rect.size())) {
         context.send_viewport_cmd(egui::ViewportCommand::InnerSize(
@@ -5025,10 +5093,8 @@ fn overlay_region_from_viewport(
     capture_rect: egui::Rect,
     source_geometry: PhysicalRect,
 ) -> Option<PhysicalRect> {
-    let (outer, pixels_per_point) = context.input(|input| {
-        let viewport = input.viewport();
-        Some((viewport.outer_rect?, viewport.native_pixels_per_point?))
-    })?;
+    let outer = context.input(|input| input.viewport().outer_rect)?;
+    let pixels_per_point = context.pixels_per_point();
     let absolute_left = ((outer.min.x + capture_rect.min.x) * pixels_per_point).round() as i64;
     let absolute_top = ((outer.min.y + capture_rect.min.y) * pixels_per_point).round() as i64;
     let width = (capture_rect.width() * pixels_per_point).round().max(1.0) as u32;
@@ -6587,18 +6653,9 @@ fn has_static_image_extension(path: &Path) -> bool {
 
 fn main() -> eframe::Result {
     let startup_intent = parse_startup_intent(std::env::args_os().skip(1));
-    let options = eframe::NativeOptions {
-        renderer: eframe::Renderer::Wgpu,
-        viewport: egui::ViewportBuilder::default()
-            .with_title(APP_NAME)
-            .with_inner_size([1040.0, 760.0])
-            .with_min_inner_size([680.0, 440.0]),
-        ..Default::default()
-    };
-
     eframe::run_native(
         APP_NAME,
-        options,
+        native_options(),
         Box::new(move |creation_context| {
             appearance::configure(&creation_context.egui_ctx);
             let mut app = GifFromScreenApp::default();
@@ -6606,6 +6663,43 @@ fn main() -> eframe::Result {
             Ok(Box::new(app))
         }),
     )
+}
+
+fn native_options() -> eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Wgpu,
+        viewport: egui::ViewportBuilder::default()
+            .with_title(APP_NAME)
+            .with_app_id(gif_from_screen_capture_linux::APPLICATION_ID)
+            // eframe creates one shared painter; child transparency alone is
+            // insufficient to enable alpha-capable Wgpu swapchains.
+            .with_transparent(true)
+            .with_inner_size([1040.0, 760.0])
+            .with_min_inner_size([680.0, 440.0]),
+        ..Default::default()
+    };
+    let display = gif_from_screen_capture_linux::LinuxEnvironment::from_process()
+        .detect()
+        .display_server();
+    configure_ui_backend(&mut options, display, wgpu::Backends::from_env());
+    options
+}
+
+fn configure_ui_backend(
+    options: &mut eframe::NativeOptions,
+    display: Option<LinuxDisplayServer>,
+    requested: Option<wgpu::Backends>,
+) {
+    // The X11 ARGB/multiple-viewport path was verified with GL; the software
+    // Vulkan driver failed transparent presentation. Capture/GIF rendering is
+    // independent of this UI backend. Keep explicit diagnostic overrides.
+    let backends = requested
+        .or_else(|| (display == Some(LinuxDisplayServer::X11)).then_some(wgpu::Backends::GL));
+    if let Some(backends) = backends
+        && let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup
+    {
+        setup.instance_descriptor.backends = backends;
+    }
 }
 
 #[cfg(test)]

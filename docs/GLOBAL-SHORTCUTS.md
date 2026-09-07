@@ -76,6 +76,17 @@ Wayland uses a dedicated GlobalShortcuts Portal connection/session. It verifies
 the actual interface, binds once, and reports the returned subset and desktop
 trigger descriptions; preferred triggers are not assumed to be accepted. Signals
 are ordered and checked against the service owner, session and known actions.
+Before its first portal operation, each host connection registers
+`io.github.tiansongyu.gifromscreen` through the identity Registry. Modern frontends
+require a nonempty application identity; the matching installed `.desktop` file
+is required for host registration. Failures explain installation instead of
+creating host files automatically. Only precise missing-Registry compatibility
+errors fall back; permission denial and invalid identity are not swallowed.
+The root window uses the same app ID, but that does not replace bus registration.
+Empty desktop trigger strings are treated as unbound actions; valid remaining
+bindings still work. Unknown/repeated IDs, control characters and oversized
+descriptions are still rejected.
+[Registry contract](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.host.portal.Registry.html).
 Cancellation closes the actual pending Request and Session and disconnects the
 owned bus connection, without waiting for a dialog response. Interface probing is
 bounded to five seconds, each permission step to 120 seconds, object Close to two

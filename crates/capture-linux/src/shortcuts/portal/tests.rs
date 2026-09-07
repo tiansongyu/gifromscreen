@@ -21,6 +21,9 @@ use crate::shortcuts::{Inbox, ShortcutStatus, default_shortcut_bindings};
 type Dictionary = HashMap<String, OwnedValue>;
 type WireShortcuts = Vec<(String, Dictionary)>;
 
+#[path = "registry_tests.rs"]
+mod registry_tests;
+
 struct PrivateBus {
     child: Child,
     address: String,
@@ -73,6 +76,12 @@ enum Behavior {
     InvalidDescription,
     PendingBindReply,
     SlowClose,
+    UnboundEntries,
+    DuplicateUnbound,
+    UnknownUnbound,
+    AllUnbound,
+    OversizedUnbound,
+    ControlUnbound,
 }
 
 #[derive(Default)]
@@ -85,6 +94,7 @@ struct State {
     session_closes: AtomicUsize,
     session: Mutex<Option<OwnedObjectPath>>,
     requested: Mutex<Vec<(String, String)>>,
+    calls: Mutex<Vec<&'static str>>,
 }
 
 struct RequestClose(Arc<State>);
@@ -119,6 +129,7 @@ struct MockPortal(Arc<State>);
 impl MockPortal {
     #[zbus(property, name = "version")]
     fn version(&self) -> u32 {
+        self.0.calls.lock().unwrap().push("global");
         self.0.version
     }
 
@@ -128,6 +139,7 @@ impl MockPortal {
         #[zbus(connection)] connection: &Connection,
         #[zbus(header)] header: Header<'_>,
     ) -> OwnedObjectPath {
+        self.0.calls.lock().unwrap().push("create");
         let request = object_path(&header, &options, "request", "handle_token");
         let session = object_path(&header, &options, "session", "session_handle_token");
         connection
@@ -179,6 +191,7 @@ impl MockPortal {
         #[zbus(connection)] connection: &Connection,
         #[zbus(header)] header: Header<'_>,
     ) -> OwnedObjectPath {
+        self.0.calls.lock().unwrap().push("bind");
         assert_eq!(Some(&session), self.0.session.lock().unwrap().as_ref());
         assert!(parent_window.is_empty());
         let request = object_path(&header, &options, "request", "handle_token");
@@ -217,6 +230,33 @@ impl MockPortal {
                         .1
                         .insert("trigger_description".into(), value("bad\ntrigger"));
                 }
+                match self.0.behavior {
+                    Behavior::UnboundEntries => {
+                        shortcuts.extend(
+                            [
+                                (ShortcutAction::Stop.id(), ""),
+                                (ShortcutAction::Snapshot.id(), "   "),
+                            ]
+                            .map(|(id, trigger)| wire_binding(id, trigger)),
+                        );
+                    }
+                    Behavior::AllUnbound => {
+                        shortcuts = vec![wire_binding("start-pause", "")];
+                    }
+                    Behavior::DuplicateUnbound => {
+                        shortcuts.insert(0, wire_binding("start-pause", ""));
+                    }
+                    Behavior::UnknownUnbound => {
+                        shortcuts.push(wire_binding("unknown", ""));
+                    }
+                    Behavior::OversizedUnbound => {
+                        shortcuts.push(wire_binding("stop", &" ".repeat(257)));
+                    }
+                    Behavior::ControlUnbound => {
+                        shortcuts.push(wire_binding("stop", "\t"));
+                    }
+                    _ => {}
+                }
                 response(
                     connection,
                     &request,
@@ -238,13 +278,20 @@ fn value(text: &str) -> OwnedValue {
 }
 
 fn subset() -> WireShortcuts {
-    vec![(
-        ShortcutAction::StartPause.id().into(),
+    vec![wire_binding(
+        ShortcutAction::StartPause.id(),
+        "Desktop chose Super+R",
+    )]
+}
+
+fn wire_binding(id: &str, trigger: &str) -> (String, Dictionary) {
+    (
+        id.into(),
         HashMap::from([
             ("description".into(), value("Recorder")),
-            ("trigger_description".into(), value("Desktop chose Super+R")),
+            ("trigger_description".into(), value(trigger)),
         ]),
-    )]
+    )
 }
 
 fn object_path(
@@ -286,7 +333,7 @@ async fn response(
 }
 
 struct Fixture {
-    _bus: PrivateBus,
+    bus: PrivateBus,
     service: Connection,
     client: Connection,
     state: Arc<State>,
@@ -331,7 +378,7 @@ impl Fixture {
             })),
         };
         Self {
-            _bus: bus,
+            bus,
             service,
             client,
             state,
@@ -645,6 +692,7 @@ fn empty_authorized_subset_does_not_invent_bindings_or_actions() {
 fn unsupported_interface_reports_error_without_creating_or_binding() {
     runtime().block_on(async {
         let fixture = Fixture::new(Behavior::Grant).await;
+        registry_tests::install_supported_registry(&fixture).await;
         fixture
             .service
             .object_server()
@@ -791,5 +839,61 @@ fn unresponsive_close_is_bounded_and_queued_actions_are_cleared_before_cleanup()
                 .await
                 .is_err()
         );
+    });
+}
+
+#[test]
+fn kde_empty_and_blank_triggers_are_unbound_not_preferred_bindings() {
+    runtime().block_on(async {
+        for behavior in [Behavior::UnboundEntries, Behavior::AllUnbound] {
+            let fixture = Fixture::new(behavior).await;
+            let (result, ()) = tokio::join!(fixture.run(timeouts()), async {
+                fixture.active().await;
+                let ShortcutStatus::Active(actual) =
+                    fixture.context.inbox.lock().unwrap().status.clone()
+                else {
+                    panic!("must publish actual bindings");
+                };
+                if matches!(behavior, Behavior::AllUnbound) {
+                    assert!(actual.is_empty());
+                } else {
+                    assert_eq!(
+                        actual,
+                        vec![RegisteredShortcut {
+                            action: ShortcutAction::StartPause,
+                            trigger_description: "Desktop chose Super+R".into()
+                        }]
+                    );
+                }
+                let own = fixture.session();
+                fixture.event(&own, "stop", "Activated").await;
+                fixture.event(&own, "snapshot", "Activated").await;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                let inbox = fixture.context.inbox.lock().unwrap();
+                assert!(inbox.queue.is_empty());
+                assert!(!inbox.stop_pending);
+                drop(inbox);
+                fixture.cancel();
+            });
+            result.unwrap();
+            fixture.assert_closed();
+        }
+    });
+}
+
+#[test]
+fn unbound_entries_still_reject_unknown_or_duplicate_ids_controls_and_oversize() {
+    runtime().block_on(async {
+        for (behavior, expected) in [
+            (Behavior::DuplicateUnbound, "duplicate action"),
+            (Behavior::UnknownUnbound, "unrequested action"),
+            (Behavior::OversizedUnbound, "invalid trigger"),
+            (Behavior::ControlUnbound, "invalid trigger"),
+        ] {
+            let fixture = Fixture::new(behavior).await;
+            let error = fixture.run(timeouts()).await.unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            fixture.assert_closed();
+        }
     });
 }

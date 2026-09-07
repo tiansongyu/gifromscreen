@@ -31,7 +31,7 @@ const POLL_TIME: Timespec = Timespec {
     tv_nsec: 20_000_000,
 };
 
-pub(super) struct BoundedStream<'a> {
+pub(crate) struct BoundedStream<'a> {
     inner: DefaultStream,
     cancellation: &'a AtomicBool,
     deadline: Mutex<Option<Instant>>,
@@ -41,7 +41,7 @@ impl BoundedStream<'_> {
     pub(super) fn registration_complete(&self) {
         *self.deadline.lock().unwrap_or_else(PoisonError::into_inner) = None;
     }
-    pub(super) fn begin_cleanup(&self) {
+    pub(crate) fn begin_cleanup(&self) {
         *self.deadline.lock().unwrap_or_else(PoisonError::into_inner) =
             Some(Instant::now() + Duration::from_millis(100));
         self.cleanup.store(true, Ordering::Release);
@@ -104,7 +104,7 @@ impl Stream for BoundedStream<'_> {
     }
 }
 
-pub(super) fn connect<'a>(
+pub(crate) fn connect<'a>(
     display: Option<&str>,
     cancellation: &'a AtomicBool,
 ) -> Result<super::Client<'a>, String> {
