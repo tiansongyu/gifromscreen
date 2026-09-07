@@ -67,6 +67,15 @@ The manual Windows-producer/Linux-comparator workflow also runs this sample
 gate separately from snapshot composition. It does not turn the known line
 outline mismatches below into passing producer tests.
 
+The fresh complete [hosted run 34087127760](https://github.com/tiansongyu/gifromscreen/actions/runs/34087127760)
+passed at `8a3b639f2ab1b94103dc9fd5a599ddb2d621137a`: actual Windows generation,
+Linux Rust-1.88 snapshot comparison and the new strict sample comparison all
+succeeded. This is a new committed-revision run, not a relabeled local replay.
+The separate WPF paint reference passed at that same commit. Linux CI and the
+full portable archive/install/native-smoke workflow had already passed for the
+unchanged production-code cohort at `9861225` ([portable run](https://github.com/tiansongyu/gifromscreen/actions/runs/34085772807));
+later changes are reference tests and documentation, not a new release claim.
+
 ## Actual production outline → clipped PM result
 
 A second bounded program passed original fixture samples and dimensions to
