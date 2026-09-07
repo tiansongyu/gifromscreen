@@ -5,3 +5,4 @@ scripts/qa/run_wpf_reference.ps1 text eol=lf
 .github/workflows/wpf-reference.yml text eol=lf
 scripts/qa/cinemagraph_probe/** text eol=lf
 .github/workflows/cinemagraph-probe.yml text eol=lf
+packaging/licenses/upstream/dotnet-wpf-MIT.txt text eol=lf

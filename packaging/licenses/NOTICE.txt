@@ -22,3 +22,9 @@ that every package is statically linked into both binaries.
 
 FFmpeg, ffprobe, system libraries, graphics drivers, portals, and system fonts
 are not bundled. Their licenses are supplied by their system distributors.
+
+Ink geometry and antialiased rasterization include algorithms adapted from
+dotnet/wpf, commit a04736acb8edb533756131d3d5fc55f15cd03d6a.
+Copyright (c) .NET Foundation and Contributors.
+Licensed under MIT; see upstream/dotnet-wpf-MIT.txt. This does not bundle
+the Windows WPF runtime or imply affiliation with its authors.

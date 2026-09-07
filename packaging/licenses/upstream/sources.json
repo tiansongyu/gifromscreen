@@ -1,4 +1,10 @@
 {
+  "dotnet-wpf-MIT.txt": {
+    "url": "https://raw.githubusercontent.com/dotnet/wpf/a04736acb8edb533756131d3d5fc55f15cd03d6a/LICENSE.TXT",
+    "sha256": "e1a7f024fdb8b7f09f5f75ed7f9723c9379dd6aa02f8ef0a24098ef7efb48c35",
+    "upstream_sha256": "ae48df11a335dc1a615f4f938b69cba73bcf4485c4f97af49b38efb0f216353b",
+    "normalization": "One final LF added; upstream has no final newline."
+  },
   "CC0-1.0.txt": {
     "url": "https://creativecommons.org/publicdomain/zero/1.0/legalcode.txt",
     "sha256": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499"

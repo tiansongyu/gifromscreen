@@ -33,6 +33,9 @@
 mod control;
 mod error;
 mod image_effects;
+mod ink;
+mod ink_outline;
+mod ink_raster;
 mod overlay;
 mod premultiplied;
 mod renderer;
@@ -45,6 +48,12 @@ mod ordered_tests;
 
 pub use control::{CancellationToken, NeverCancel};
 pub use error::{RenderError, SurfaceError, UnsupportedEffect};
+pub use ink::{
+    InkAttributes, InkError, InkFigure, InkFillRule, InkLimits, InkPath, InkPoint, InkSample,
+    InkSegment, InkStroke, InkTip,
+};
+pub use ink_outline::{fitted_ink_samples, outline_ink_stroke, outline_ink_strokes};
+pub use ink_raster::{clip_ink_reference, rasterize_ink_paths};
 pub use overlay::{
     OverlayRenderPlan, RasterOverlayAsset, active_raster_overlay_assets,
     active_raster_overlay_assets_for_frame, freeze_timed_overlay_content,

@@ -5,6 +5,16 @@ composition. The remaining producer must generate those clipped pixels from
 Linux ink input. This plan records the source/measurement distinctions so that
 implementation does not silently replace the reference with ordinary A8 painting.
 
+Implementation update: Rust now has bounded subpixel ink types, pressure-aware
+tip/sweep outlines, the default WPF fitting algorithm, and an HFD32/64 adaptive
+scan converter with per-path winding and geometric union. The renderer suite
+passes 137 tests; its 14 outline and 15 raster tests also pass on Rust 1.88.
+Five independent compilations of the original WPF C++ curve algorithm matched
+the Rust flattened-vertex digests, including large-coordinate fallback. These
+are component/source-rule checks, not proof of complete Stroke.GetGeometry,
+point-erasure or degenerate VisualBrush equivalence. Native fitting/erasing
+diagnostics and the interactive authoring integration remain in progress.
+
 ## Verified source rules, not yet a complete Rust ink implementation
 
 The upstream application is pinned to `a4d0a67`; WPF algorithm sources below
