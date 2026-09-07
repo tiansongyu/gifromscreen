@@ -7,6 +7,9 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::{Duration, Instant};
+
+const START_WAIT_LIMIT: Duration = Duration::from_secs(5);
 
 use crate::{
     AppView, CaptureSourceJobState, GifFromScreenApp, RecorderOverlayAction, RecorderStage,
@@ -22,7 +25,7 @@ enum Dispatch {
     Recorder(RecorderOverlayAction),
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Preparation {
     Idle,
     Choosing,
@@ -164,7 +167,7 @@ impl GifFromScreenApp {
                 || self.recording_countdown.is_active());
         let actions = self.shortcut_tool.poll(context, self.display_server, scope);
         if !scope {
-            self.pending_recorder_action = None;
+            self.pending_recorder_start = None;
             return;
         }
         for action in actions {
@@ -177,8 +180,21 @@ impl GifFromScreenApp {
                     .as_ref()
                     .is_some_and(|job| job.pause_requested.is_some()),
             };
+            trace(format_args!(
+                "action={action:?} stage={:?} preparation={:?} dispatch={:?}",
+                state.stage,
+                state.preparation,
+                dispatch(action, &state)
+            ));
             match dispatch(action, &state) {
-                Dispatch::None => {}
+                Dispatch::None => {
+                    if action == ShortcutAction::StartPause
+                        && state.stage == RecorderStage::Ready
+                        && state.preparation == Preparation::InitializingController
+                    {
+                        self.notice = Some("The recorder is still preparing its capture area. Wait for Start to become available, then press the shortcut again.".into());
+                    }
+                }
                 Dispatch::PrepareSource => {
                     if self.source_catalog_job.state() == CaptureSourceJobState::Loading
                         || self.source_workers_active()
@@ -210,7 +226,7 @@ impl GifFromScreenApp {
                 Dispatch::Recorder(action) => {
                     if action == RecorderOverlayAction::Start {
                         // Resolve this tick's geometry/input before starting capture.
-                        self.pending_recorder_action = Some(action);
+                        self.pending_recorder_start = Some(Instant::now());
                         continue;
                     }
                     if self.wayland_crop_controller.is_some() {
@@ -245,13 +261,72 @@ impl GifFromScreenApp {
         &mut self,
         clicked: RecorderOverlayAction,
     ) -> RecorderOverlayAction {
-        let pending = self.pending_recorder_action.take();
-        if clicked == RecorderOverlayAction::None {
-            pending.unwrap_or(RecorderOverlayAction::None)
+        self.recorder_frame_action_at(clicked, Instant::now())
+    }
+
+    fn recorder_frame_action_at(
+        &mut self,
+        clicked: RecorderOverlayAction,
+        now: Instant,
+    ) -> RecorderOverlayAction {
+        if clicked == RecorderOverlayAction::Start {
+            self.pending_recorder_start = Some(now);
+        } else if clicked != RecorderOverlayAction::None {
+            self.pending_recorder_start = None;
+            return clicked;
+        }
+        let Some(requested_at) = self.pending_recorder_start else {
+            return RecorderOverlayAction::None;
+        };
+        if self.recorder_stage() != RecorderStage::Ready
+            || (self.recorder_overlay.is_none() && self.wayland_crop_controller.is_none())
+        {
+            self.pending_recorder_start = None;
+            return RecorderOverlayAction::None;
+        }
+        let error = if now.saturating_duration_since(requested_at) >= START_WAIT_LIMIT {
+            Some("Start request expired while the capture area was changing. Press Start again.")
+        } else if let Some(overlay) = &self.recorder_overlay {
+            if overlay.input.failed() {
+                Some(
+                    "Start cancelled because mouse-transparent input preparation failed. Close the recorder and retry.",
+                )
+            } else if !overlay.last_region_valid {
+                Some(
+                    "Start cancelled: keep the capture rectangle inside its selected source, then press Start again.",
+                )
+            } else if !overlay.input.ready() {
+                // The just-drawn native geometry can revoke a previously ready shape.
+                // Preserve the intent only within this controller and a short deadline.
+                self.notice = Some("Start pending: waiting for the current capture area to become mouse-transparent…".into());
+                return RecorderOverlayAction::None;
+            } else {
+                None
+            }
         } else {
-            clicked
+            None
+        };
+        self.pending_recorder_start = None;
+        if let Some(error) = error {
+            self.notice = Some(error.into());
+            return RecorderOverlayAction::None;
+        }
+        RecorderOverlayAction::Start
+    }
+}
+
+/// Opt-in, bounded debug diagnostics contain recorder state only, not input text.
+pub(crate) fn trace(message: std::fmt::Arguments<'_>) {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("GFS_RECORDER_TRACE").is_some() {
+        use std::sync::atomic::AtomicUsize;
+        static LINES: AtomicUsize = AtomicUsize::new(0);
+        if LINES.fetch_add(1, Ordering::Relaxed) < 128 {
+            eprintln!("recorder: {message}");
         }
     }
+    #[cfg(not(debug_assertions))]
+    let _ = message;
 }
 
 #[cfg(test)]
@@ -493,7 +568,20 @@ mod tests {
     #[test]
     fn deferred_start_is_consumed_once_and_never_overrides_a_clicked_close() {
         let mut app = GifFromScreenApp::default();
-        app.pending_recorder_action = Some(RecorderOverlayAction::Start);
+        let context = egui::Context::default();
+        app.wayland_crop_controller = Some(crate::WaylandCropController {
+            texture: context.load_texture(
+                "start-test",
+                egui::ColorImage::filled([1, 1], egui::Color32::BLACK),
+                egui::TextureOptions::NEAREST,
+            ),
+            source_size: gif_from_screen_capture::PhysicalSize::new(640, 480).unwrap(),
+            region: gif_from_screen_capture::PhysicalRect::new(0, 0, 640, 480).unwrap(),
+            drag_start: None,
+            drag_current: None,
+            drag_initial_region: None,
+        });
+        app.pending_recorder_start = Some(Instant::now());
         assert_eq!(
             app.recorder_frame_action(RecorderOverlayAction::None),
             RecorderOverlayAction::Start
@@ -502,12 +590,92 @@ mod tests {
             app.recorder_frame_action(RecorderOverlayAction::None),
             RecorderOverlayAction::None
         );
-        app.pending_recorder_action = Some(RecorderOverlayAction::Start);
+        app.pending_recorder_start = Some(Instant::now());
         assert_eq!(
             app.recorder_frame_action(RecorderOverlayAction::Close),
             RecorderOverlayAction::Close
         );
-        assert!(app.pending_recorder_action.is_none());
+        assert!(app.pending_recorder_start.is_none());
+    }
+
+    fn preparing_overlay() -> crate::RecorderOverlay {
+        crate::RecorderOverlay {
+            window_title: "synthetic-controller".into(),
+            input: crate::x11_recorder_input::RecorderInput::default(),
+            last_region_valid: true,
+            initial_position: egui::Pos2::ZERO,
+            initial_size: egui::vec2(648.0, 584.0),
+            initialized: true,
+            source_geometry: gif_from_screen_capture::PhysicalRect::new(0, 0, 1440, 1000).unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_start_survives_this_frames_input_shape_change_but_expires_without_an_ack() {
+        let mut app = GifFromScreenApp::default();
+        app.recorder_overlay = Some(preparing_overlay());
+        let now = Instant::now();
+        app.pending_recorder_start = Some(now);
+        assert_eq!(
+            app.recorder_frame_action_at(RecorderOverlayAction::None, now),
+            RecorderOverlayAction::None
+        );
+        assert_eq!(app.pending_recorder_start, Some(now));
+        assert!(app.notice.as_deref().unwrap().contains("Start pending"));
+        assert_eq!(
+            app.recorder_frame_action_at(RecorderOverlayAction::None, now + START_WAIT_LIMIT),
+            RecorderOverlayAction::None
+        );
+        assert!(app.pending_recorder_start.is_none());
+        assert!(app.notice.as_deref().unwrap().contains("expired"));
+    }
+
+    #[test]
+    fn clicked_start_waits_too_but_cancel_and_invalid_geometry_revoke_the_intent() {
+        let mut app = GifFromScreenApp::default();
+        app.recorder_overlay = Some(preparing_overlay());
+        let now = Instant::now();
+        assert_eq!(
+            app.recorder_frame_action_at(RecorderOverlayAction::Start, now),
+            RecorderOverlayAction::None
+        );
+        assert_eq!(app.pending_recorder_start, Some(now));
+        app.recorder_overlay.as_mut().unwrap().last_region_valid = false;
+        assert_eq!(
+            app.recorder_frame_action_at(RecorderOverlayAction::None, now),
+            RecorderOverlayAction::None
+        );
+        assert!(app.pending_recorder_start.is_none());
+        assert!(app.notice.as_deref().unwrap().contains("inside"));
+        app.pending_recorder_start = Some(now);
+        assert_eq!(
+            app.recorder_frame_action_at(RecorderOverlayAction::Close, now),
+            RecorderOverlayAction::Close
+        );
+        assert!(app.pending_recorder_start.is_none());
+        app.pending_recorder_start = Some(now);
+        app.close_recorder_overlay();
+        assert!(app.pending_recorder_start.is_none());
+    }
+
+    #[test]
+    fn a_pending_start_cannot_escape_its_controller_or_replay_during_countdown() {
+        let mut app = GifFromScreenApp::default();
+        let now = Instant::now();
+        app.pending_recorder_start = Some(now);
+        assert_eq!(
+            app.recorder_frame_action_at(RecorderOverlayAction::None, now),
+            RecorderOverlayAction::None
+        );
+        assert!(app.pending_recorder_start.is_none());
+        app.recorder_overlay = Some(preparing_overlay());
+        app.recording_countdown.start(now, 3);
+        app.pending_recorder_start = Some(now);
+        assert_eq!(
+            app.recorder_frame_action_at(RecorderOverlayAction::None, now),
+            RecorderOverlayAction::None
+        );
+        assert!(app.pending_recorder_start.is_none());
     }
 
     #[test]

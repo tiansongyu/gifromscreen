@@ -33,6 +33,8 @@ mod path_picker;
 mod project_insert_ui;
 mod project_library_ui;
 mod recorder_shortcuts;
+#[cfg(test)]
+mod recorder_toolbar_tests;
 mod retarget;
 mod shortcut_ui;
 mod static_sequence_ui;
@@ -768,7 +770,7 @@ struct RecorderOverlayFrame {
 }
 
 struct GifFromScreenApp {
-    pending_recorder_action: Option<RecorderOverlayAction>,
+    pending_recorder_start: Option<Instant>,
     shortcut_tool: shortcut_ui::ShortcutTool,
     view: AppView,
     notice: Option<String>,
@@ -827,7 +829,7 @@ struct GifFromScreenApp {
 impl Default for GifFromScreenApp {
     fn default() -> Self {
         Self {
-            pending_recorder_action: None,
+            pending_recorder_start: None,
             shortcut_tool: shortcut_ui::ShortcutTool::default(),
             view: AppView::Landing,
             notice: None,
@@ -2464,6 +2466,7 @@ impl GifFromScreenApp {
             )
         });
         let toolbar_notice = input_notice
+            .or(self.notice.as_deref())
             .map(|notice| {
                 format!(
                     "{notice} {}",
@@ -2546,7 +2549,13 @@ impl GifFromScreenApp {
         match action {
             RecorderOverlayAction::None => {}
             RecorderOverlayAction::Start => {
-                if let Err(error) = self.begin_recording(context) {
+                let result = self.begin_recording(context);
+                recorder_shortcuts::trace(format_args!(
+                    "begin-start success={} stage={:?}",
+                    result.is_ok(),
+                    self.recorder_stage()
+                ));
+                if let Err(error) = result {
                     self.notice = Some(error);
                 }
             }
@@ -2614,7 +2623,7 @@ impl GifFromScreenApp {
     }
 
     fn close_recorder_overlay(&mut self) {
-        self.pending_recorder_action = None;
+        self.pending_recorder_start = None;
         self.shortcut_tool.reset_recording_scope();
         self.recording_countdown.cancel();
         self.recorder_overlay = None;
@@ -3225,7 +3234,7 @@ impl GifFromScreenApp {
     }
 
     fn close_wayland_crop_controller(&mut self) {
-        self.pending_recorder_action = None;
+        self.pending_recorder_start = None;
         self.shortcut_tool.reset_recording_scope();
         self.recording_countdown.cancel();
         self.wayland_crop_controller = None;
@@ -3678,7 +3687,7 @@ impl GifFromScreenApp {
     }
 
     fn finish_recording_job(&mut self) {
-        self.pending_recorder_action = None;
+        self.pending_recorder_start = None;
         self.shortcut_tool.reset_recording_scope();
         self.job = None;
         self.progress = None;
@@ -4778,21 +4787,21 @@ fn draw_recorder_toolbar(
         .show(context, |ui| {
             match stage {
                 RecorderStage::Ready => {
-                    ui.horizontal_centered(|ui| {
+                    ui.horizontal(|ui| {
                         action = show_ready_recorder_controls(ui, context, input_ready);
                     });
                 }
                 RecorderStage::Countdown(remaining) => {
-                    ui.horizontal_centered(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.strong(format!("Recording starts in {remaining}s"));
                         if ui.button("Cancel").clicked() {
                             action = RecorderOverlayAction::CancelCountdown;
                         }
                     });
-                    ui.horizontal_centered(|ui| show_recorder_position_controls(ui, context));
+                    ui.horizontal(|ui| show_recorder_position_controls(ui, context));
                 }
                 RecorderStage::Recording => {
-                    ui.horizontal_centered(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         show_overlay_progress(ui, progress);
                         if manual_snapshots && ui.button("Take snapshot").clicked() {
                             action = RecorderOverlayAction::Snapshot;
@@ -4807,10 +4816,10 @@ fn draw_recorder_toolbar(
                             action = RecorderOverlayAction::Discard;
                         }
                     });
-                    ui.horizontal_centered(|ui| show_recorder_position_controls(ui, context));
+                    ui.horizontal(|ui| show_recorder_position_controls(ui, context));
                 }
                 RecorderStage::Paused => {
-                    ui.horizontal_centered(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("Paused");
                         if ui.button("Resume").clicked() {
                             action = RecorderOverlayAction::Resume;
@@ -4822,10 +4831,10 @@ fn draw_recorder_toolbar(
                             action = RecorderOverlayAction::Discard;
                         }
                     });
-                    ui.horizontal_centered(|ui| show_recorder_position_controls(ui, context));
+                    ui.horizontal(|ui| show_recorder_position_controls(ui, context));
                 }
                 RecorderStage::Finalizing => {
-                    ui.horizontal_centered(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.spinner();
                         ui.label("Finalizing recoverable project…");
                         if ui.button("Cancel").clicked() {

@@ -188,4 +188,47 @@ mod tests {
         assert!(!input.ready());
         assert!(!input.task.is_running());
     }
+
+    #[test]
+    fn pending_start_runs_only_after_the_current_geometry_acknowledgement() {
+        use crate::{GifFromScreenApp, RecorderOverlay, RecorderOverlayAction};
+        let context = egui::Context::default();
+        let geometry = Geometry::new(
+            egui::vec2(648.0, 584.0),
+            egui::Rect::from_min_size(egui::pos2(4.0, 4.0), egui::vec2(640.0, 480.0)),
+            1.0,
+        )
+        .unwrap();
+        let mut app = GifFromScreenApp::default();
+        app.recorder_overlay = Some(RecorderOverlay {
+            window_title: "synthetic-input-ack".into(),
+            input: RecorderInput::default(),
+            last_region_valid: true,
+            initial_position: egui::Pos2::ZERO,
+            initial_size: egui::vec2(648.0, 584.0),
+            initialized: true,
+            source_geometry: PhysicalRect::new(0, 0, 1440, 1000).unwrap(),
+        });
+        app.recorder_overlay.as_mut().unwrap().input.update(
+            &context,
+            "synthetic-input-ack",
+            Some(geometry),
+        );
+        app.pending_recorder_start = Some(Instant::now());
+        assert_eq!(
+            app.recorder_frame_action(RecorderOverlayAction::None),
+            RecorderOverlayAction::None
+        );
+        assert!(app.pending_recorder_start.is_some());
+        // This is the same geometry-keyed acknowledgement assigned by task.poll.
+        app.recorder_overlay.as_mut().unwrap().input.ready = Some(geometry);
+        assert_eq!(
+            app.recorder_frame_action(RecorderOverlayAction::None),
+            RecorderOverlayAction::Start
+        );
+        assert_eq!(
+            app.recorder_frame_action(RecorderOverlayAction::None),
+            RecorderOverlayAction::None
+        );
+    }
 }
