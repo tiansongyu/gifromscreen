@@ -620,6 +620,10 @@ mod schema3_migration;
 #[path = "schema4_migration.rs"]
 mod schema4_migration;
 
+#[cfg(test)]
+#[path = "schema5_migration.rs"]
+mod schema5_migration;
+
 fn validate_raw_recording_asset(
     manifest: &ProjectManifest,
     descriptor: &AssetDescriptor,

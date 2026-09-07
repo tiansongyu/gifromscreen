@@ -127,7 +127,7 @@ fn save_as_preserves_ordered_geometry_and_hidden_stage_artwork() {
     for frame in &source.manifest().timeline.frames {
         let mut replacement = frame.clone();
         replacement.render_steps = vec![
-            FrameRenderStep::Composite { stage_id: 7 },
+            FrameRenderStep::composite(7),
             FrameRenderStep::Resize {
                 size: PhysicalSize::new(1, 2).unwrap(),
             },

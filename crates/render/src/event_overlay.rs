@@ -319,7 +319,7 @@ mod tests {
                 stage: None,
                 z_index: item.z_index,
                 track_opacity: 255,
-                blend_mode: BlendMode::Normal,
+                blend_mode: BlendMode::Normal.into(),
                 track_index: 0,
                 item_index: 0,
             },

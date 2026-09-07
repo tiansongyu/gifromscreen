@@ -9,10 +9,10 @@ use std::{
 };
 
 use gif_from_screen_domain::{
-    AssetId, BlendMode, CaptureBinding, CaptureMetadata, ClipTransform, DurationUs, FrameClip,
-    FrameId, FrameOverlayCell, FrameOverlayMark, FrameRenderStep, ImageBorderStyle,
-    ImageShadowStyle, OverlayContent, OverlayId, OverlayTrack, PhysicalPoint, PhysicalPx,
-    PhysicalSize, TimeUs, TrackId,
+    AssetId, BlendMode, CaptureBinding, CaptureMetadata, ClipTransform, CompositePrecision,
+    DurationUs, FrameClip, FrameId, FrameOverlayCell, FrameOverlayMark, FrameRenderStep,
+    ImageBorderStyle, ImageShadowStyle, OverlayContent, OverlayId, OverlayTrack, PhysicalPoint,
+    PhysicalPx, PhysicalSize, TimeUs, TrackId,
 };
 use gif_from_screen_render::{
     AssetProviderError, CpuRenderer, NeverCancel, RenderLimits, RgbaSurface,
@@ -473,7 +473,7 @@ impl Graph {
                 }
                 self.frame
                     .render_steps
-                    .push(FrameRenderStep::Composite { stage_id: identity });
+                    .push(FrameRenderStep::composite(identity));
                 self.frame.render_steps.push(match operation {
                     Operation::ImageShadow { style } => {
                         FrameRenderStep::ImageShadow { style: *style }
@@ -485,13 +485,20 @@ impl Graph {
                 });
             }
             Operation::Overlay { x, y, image } => {
+                if self.frame.render_steps.is_empty() {
+                    self.frame.render_steps.push(FrameRenderStep::composite(1));
+                }
+                self.frame.render_steps.push(FrameRenderStep::Composite {
+                    stage_id: identity,
+                    precision: CompositePrecision::WpfPbgra8PngV1,
+                });
                 let mut digest = [0; 32];
                 digest[..4].copy_from_slice(&identity.to_le_bytes());
                 let asset_id = AssetId::from_digest(digest);
                 let surface = image.surface()?;
                 let size = surface.size();
                 self.assets.insert(asset_id, surface);
-                let cell = FrameOverlayCell::whole(
+                let mut cell = FrameOverlayCell::whole(
                     self.frame.id,
                     1,
                     vec![FrameOverlayMark {
@@ -508,6 +515,7 @@ impl Graph {
                         },
                     }],
                 );
+                cell.stage = Some(identity);
                 self.tracks.push(OverlayTrack {
                     id: TrackId::from_u128(u128::from(identity)),
                     name: format!("Fixture overlay {identity}"),
@@ -1049,7 +1057,10 @@ mod mechanical_tests {
             &[255, 0, 0, 255, 0, 255, 0, 255, 2, 2, 2, 255]
         );
         graph.append(&overlay(2, [0, 0, 255, 255])).unwrap();
-        assert_eq!(graph.tracks[1].frame_cells.as_ref().unwrap()[0].stage, None);
+        assert_eq!(
+            graph.tracks[1].frame_cells.as_ref().unwrap()[0].stage,
+            Some(4)
+        );
         assert_eq!(
             graph.render().unwrap().pixels(),
             &[255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255]

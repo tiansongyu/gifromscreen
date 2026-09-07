@@ -52,4 +52,4 @@ pub use task_run::*;
 pub use units::*;
 
 /// Current on-disk manifest schema understood by this version of the domain.
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;

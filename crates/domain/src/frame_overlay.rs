@@ -247,6 +247,20 @@ pub(crate) fn validate_cells(
     Ok(())
 }
 
+/// Checks frame-owned cell structure against known owners without copying a
+/// project or requiring newly prepared raster assets to be registered yet.
+/// Final command validation still verifies asset and global mark identities.
+///
+/// # Errors
+/// Rejects mixed representations, unknown/repeated owners, invalid scopes or
+/// replay data, and excessive per-track metadata counts.
+pub fn validate_frame_overlay_cells(
+    track: &crate::OverlayTrack,
+    frame_ids: &std::collections::BTreeSet<FrameId>,
+) -> Result<(), String> {
+    validate_cells(track, frame_ids)
+}
+
 #[cfg(test)]
 #[path = "frame_overlay_tests.rs"]
 mod model_tests;

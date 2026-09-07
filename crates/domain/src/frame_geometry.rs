@@ -11,23 +11,67 @@ pub const MAX_FRAME_RENDER_STEPS: usize = 4_096;
 /// Radius accepted by the deterministic blur/shadow implementations.
 pub const MAX_FRAME_RENDER_EFFECT_RADIUS: u16 = 256;
 
+/// Persisted precision at a paint boundary. Existing projects retain their
+/// original straight-alpha arithmetic unless a new authoring edit opts in.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompositePrecision {
+    #[default]
+    LegacyStraightRgba8,
+    WpfPbgra8PngV1,
+}
+
+impl CompositePrecision {
+    pub const fn is_legacy(&self) -> bool {
+        matches!(self, Self::LegacyStraightRgba8)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FrameRenderStep {
-    Composite { stage_id: u32 },
-    Crop { rect: PhysicalRect },
-    Resize { size: PhysicalSize },
-    Rotate { rotation: QuarterTurn },
+    Composite {
+        stage_id: u32,
+        #[serde(default, skip_serializing_if = "CompositePrecision::is_legacy")]
+        precision: CompositePrecision,
+    },
+    Crop {
+        rect: PhysicalRect,
+    },
+    Resize {
+        size: PhysicalSize,
+    },
+    Rotate {
+        rotation: QuarterTurn,
+    },
     FlipHorizontal,
     FlipVertical,
-    Effect { effect: Effect },
-    ImageBorder { style: crate::ImageBorderStyle },
-    ImageShadow { style: crate::ImageShadowStyle },
+    Effect {
+        effect: Effect,
+    },
+    ImageBorder {
+        style: crate::ImageBorderStyle,
+    },
+    ImageShadow {
+        style: crate::ImageShadowStyle,
+    },
 }
 
 impl FrameRenderStep {
+    /// Constructs the legacy boundary without changing its serialized shape.
+    pub const fn composite(stage_id: u32) -> Self {
+        Self::Composite {
+            stage_id,
+            precision: CompositePrecision::LegacyStraightRgba8,
+        }
+    }
+
     pub const fn required_schema_version(&self) -> u32 {
         match self {
+            Self::Composite {
+                precision: CompositePrecision::WpfPbgra8PngV1,
+                ..
+            } => 5,
             Self::ImageBorder { .. } | Self::ImageShadow { .. } => 4,
             _ => 3,
         }
@@ -60,9 +104,20 @@ pub fn validate_frame_render_steps(steps: &[FrameRenderStep]) -> Result<(), Stri
     if !steps.is_empty() && !matches!(steps.first(), Some(FrameRenderStep::Composite { .. })) {
         return Err("Render step 1 must be a Composite stage.".to_owned());
     }
+    if matches!(
+        steps.first(),
+        Some(FrameRenderStep::Composite {
+            precision: CompositePrecision::WpfPbgra8PngV1,
+            ..
+        })
+    ) {
+        return Err(
+            "Render step 1 must retain legacy precision for time-anchored overlays.".to_owned(),
+        );
+    }
     let mut identities = BTreeSet::new();
     for (index, step) in steps.iter().enumerate() {
-        if let FrameRenderStep::Composite { stage_id } = step
+        if let FrameRenderStep::Composite { stage_id, .. } = step
             && (*stage_id == 0 || !identities.insert(*stage_id))
         {
             return Err(format!(
@@ -194,7 +249,7 @@ fn apply_geometry_step(
     stages: &mut BTreeMap<u32, PhysicalSize>,
 ) -> Result<PhysicalSize, String> {
     match step {
-        FrameRenderStep::Composite { stage_id } => {
+        FrameRenderStep::Composite { stage_id, .. } => {
             if *stage_id == 0 || stages.insert(*stage_id, size).is_some() {
                 return Err("Composite stage identities must be unique and nonzero.".to_owned());
             }

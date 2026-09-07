@@ -22,7 +22,7 @@ pub(super) enum GeometryOperation {
 
 pub(crate) fn legacy_annotation_stage(frame: &FrameClip) -> Option<u32> {
     match frame.render_steps.first() {
-        Some(FrameRenderStep::Composite { stage_id }) => Some(*stage_id),
+        Some(FrameRenderStep::Composite { stage_id, .. }) => Some(*stage_id),
         _ => None,
     }
 }
@@ -53,7 +53,7 @@ pub(super) fn geometry_to_stage(
     }];
     let mut size = plan.base_size();
     for step in &frame.render_steps {
-        if matches!(step, FrameRenderStep::Composite { stage_id } if Some(*stage_id) == stage) {
+        if matches!(step, FrameRenderStep::Composite { stage_id, .. } if Some(*stage_id) == stage) {
             break;
         }
         let mut transform = ClipTransform::default();

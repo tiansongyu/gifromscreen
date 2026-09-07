@@ -91,7 +91,8 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [x] Distinguish same-name annotation/text groups by layer number and coverage without changing their saved names or identities.
 - [x] Apply crop/resize/rotation/flips/effects to the complete image in editing order with schema-3 stages, stage-aware re-authoring and shared preview/GIF execution; [native geometry and conversion acceptance](ORDERED-GEOMETRY-QA-2026-09-07.md).
 - [x] Add schema-4 expanded-canvas software-reference shadows and signed inner/outer borders, with shared placement, stage-aware authors, settings v2, whole-program resource preflight and [native effect/reopen/GIF acceptance](IMAGE-EFFECTS-QA-2026-09-07.md).
-- [ ] Close hidden intermediate-stage baking and numerical Windows/WPF/WIC pixel-comparison gates. Reference algorithms alone are not full upstream pixel certification.
+- [x] Add schema-5 explicit paint precision without changing legacy stages; pass the first independent Windows WPF/WIC corpus in strict local replay (5 inputs and 8 operation stages), with [exact scope and evidence](WPF-PAINT-PRECISION.md).
+- [ ] Close hidden intermediate-stage baking and broader numerical WPF/WIC coverage gates. The bounded corpus is not full upstream pixel certification.
 - [x] Save an independently identified project copy without switching the current editor, and retain a bounded recent-project list.
 - [x] Build and verify an Ubuntu-22-compatible x86_64 portable tarball with exact-file installation, checksums, license notices, and CI artifacts.
 

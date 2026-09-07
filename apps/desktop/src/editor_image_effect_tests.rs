@@ -200,7 +200,7 @@ fn ordered_image_effects_expand_all_frames_and_survive_undo_reopen_and_gif_expor
         workspace.selection.selected(),
         &BTreeSet::from([frame_id(1)])
     );
-    assert_eq!(workspace.manifest().schema_version, 4);
+    assert_eq!(workspace.manifest().schema_version, 5);
     for frame in &workspace.manifest().timeline.frames {
         assert_eq!(image(&workspace, frame.id).size(), size(9, 5));
         assert_eq!(
@@ -217,7 +217,14 @@ fn ordered_image_effects_expand_all_frames_and_survive_undo_reopen_and_gif_expor
     }
     let tracks = &workspace.manifest().timeline.overlay_tracks;
     assert!(tracks[0].frame_cells.as_ref().unwrap()[0].stage.is_some());
-    assert_eq!(tracks[1].frame_cells.as_ref().unwrap()[0].stage, None);
+    let last_stage = tracks[1].frame_cells.as_ref().unwrap()[0].stage.unwrap();
+    assert_eq!(
+        workspace.manifest().timeline.frames[0].render_steps.last(),
+        Some(&FrameRenderStep::Composite {
+            stage_id: last_stage,
+            precision: gif_from_screen_domain::CompositePrecision::WpfPbgra8PngV1,
+        })
+    );
     let expected = image(&workspace, frame_id(1));
     assert_chain_pixels(&expected);
     assert!(workspace.undo().unwrap());
@@ -251,7 +258,8 @@ fn ordered_image_effects_expand_all_frames_and_survive_undo_reopen_and_gif_expor
         raw
     );
     let revision = workspace.manifest().revision;
-    // Deliberately do not checkpoint: reopen must recover the schema4 steps
+    // Deliberately do not checkpoint: reopen must recover schema 4 image steps,
+    // schema 5 paint precision,
     // and owner-stage anchors from the actual project journal.
     drop(workspace);
     let workspace = EditorWorkspace::open(directory.path(), LockPolicy::FailIfPresent, 32).unwrap();
@@ -376,7 +384,7 @@ fn copied_and_yoyo_frame_owners_keep_image_steps_and_save_as_keeps_pixels_and_as
     .unwrap();
     let copy = EditorWorkspace::open(&target, LockPolicy::FailIfPresent, 32).unwrap();
     assert_ne!(copy.manifest().project_id, workspace.manifest().project_id);
-    assert_eq!(copy.manifest().schema_version, 4);
+    assert_eq!(copy.manifest().schema_version, 5);
     assert_eq!(copy.manifest().assets, workspace.manifest().assets);
     assert_eq!(
         copy.manifest().timeline.overlay_tracks,

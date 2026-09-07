@@ -333,19 +333,19 @@ impl EditorWorkspace {
         }
         let cells = self.generic_overlay_cells(content, z_index)?;
         let track_id = TrackId::from_u128(Uuid::new_v4().as_u128());
-        self.execute(EditCommand::UpsertOverlayTrack {
-            track: OverlayTrack {
-                frame_cells: Some(cells),
-                annotation: None,
-                annotation_scope: None,
-                id: track_id,
-                name,
-                visible: true,
-                opacity: track_opacity,
-                blend_mode,
-                items: Vec::new(),
-            },
-        })?;
+        let track = OverlayTrack {
+            frame_cells: Some(cells),
+            annotation: None,
+            annotation_scope: None,
+            id: track_id,
+            name,
+            visible: true,
+            opacity: track_opacity,
+            blend_mode,
+            items: Vec::new(),
+        };
+        let commands = gif_from_screen_editor::author_frame_owned_track(self.manifest(), track)?;
+        self.execute(EditCommand::Compound { commands })?;
         Ok(track_id)
     }
 
@@ -400,22 +400,19 @@ impl EditorWorkspace {
         let asset = self.raster_asset_descriptor(edit.source_size, rgba)?;
         let cells = self.generic_overlay_cells(content(asset.id), edit.z_index)?;
         let track_id = TrackId::from_u128(Uuid::new_v4().as_u128());
-        self.commit_with_raster_assets(
-            &[(asset.clone(), rgba)],
-            vec![EditCommand::UpsertOverlayTrack {
-                track: OverlayTrack {
-                    frame_cells: Some(cells),
-                    annotation: None,
-                    annotation_scope: None,
-                    id: track_id,
-                    name: edit.name,
-                    visible: true,
-                    opacity: edit.track_opacity,
-                    blend_mode: edit.blend_mode,
-                    items: Vec::new(),
-                },
-            }],
-        )?;
+        let track = OverlayTrack {
+            frame_cells: Some(cells),
+            annotation: None,
+            annotation_scope: None,
+            id: track_id,
+            name: edit.name,
+            visible: true,
+            opacity: edit.track_opacity,
+            blend_mode: edit.blend_mode,
+            items: Vec::new(),
+        };
+        let commands = gif_from_screen_editor::author_frame_owned_track(self.manifest(), track)?;
+        self.commit_with_raster_assets(&[(asset, rgba)], commands)?;
         Ok(track_id)
     }
 

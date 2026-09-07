@@ -153,7 +153,7 @@ pub fn edit_composed_frames(
                 let stage_id = next_stage_id(frame)?;
                 replacement
                     .render_steps
-                    .push(FrameRenderStep::Composite { stage_id });
+                    .push(FrameRenderStep::composite(stage_id));
                 sealed.insert(frame.id, stage_id);
             }
             replacement.render_steps.push(step.clone());
@@ -284,7 +284,7 @@ fn next_stage_id(frame: &FrameClip) -> Result<u32, EditorError> {
         .render_steps
         .iter()
         .filter_map(|step| match step {
-            FrameRenderStep::Composite { stage_id } => Some(*stage_id),
+            FrameRenderStep::Composite { stage_id, .. } => Some(*stage_id),
             _ => None,
         })
         .collect();

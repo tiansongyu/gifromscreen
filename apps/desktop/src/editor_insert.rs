@@ -1391,7 +1391,7 @@ mod tests {
         assert!(referenced_assets(&raw).contains(&mask));
         raw.timeline.frames[0].effects.clear();
         raw.timeline.frames[0].render_steps = vec![
-            gif_from_screen_domain::FrameRenderStep::Composite { stage_id: 1 },
+            gif_from_screen_domain::FrameRenderStep::composite(1),
             gif_from_screen_domain::FrameRenderStep::Effect {
                 effect: Effect::Cinemagraph {
                     mask_asset: mask,

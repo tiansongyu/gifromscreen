@@ -7,7 +7,9 @@ use gif_from_screen_domain::{
     ShapeKind, SignedEdgeWidths, TimeUs, TrackId,
 };
 
-use super::{GaussianKernel, alpha_from_float, border, shadow, shadow_pixel};
+use super::{
+    GaussianKernel, alpha_from_float, border, shadow, shadow_pixel, software_shadow_color,
+};
 use crate::{
     AssetProviderError, CancellationToken, CpuRenderer, NeverCancel, OverlayRenderPlan,
     RenderError, RenderLimits, RgbaSurface,
@@ -66,7 +68,9 @@ fn render_shadow(source: &RgbaSurface, style: &ImageShadowStyle) -> RgbaSurface 
 #[test]
 fn cardinal_hard_shadows_follow_wpf_software_offset_and_alpha() {
     let source = surface(1, 1, &[RED]);
-    let shadow_pixel = [0, 0, 255, 253];
+    // Real WPF/WIC run 34071253697: [0,0,253,253] PBGRA decodes
+    // with the fixed reciprocal to blue 254, not ideal division's 255.
+    let shadow_pixel = [0, 0, 254, 253];
     for (direction, width, height, expected) in [
         (0, 2, 1, [RED, shadow_pixel]),
         (9_000, 1, 2, [shadow_pixel, RED]),
@@ -95,7 +99,7 @@ fn fractional_geometry_is_not_replaced_by_integer_kernel_or_offset() {
     assert_eq!(style.pixel_offset().unwrap(), (1, 0));
     assert_eq!(
         render_shadow(&source, &style),
-        surface(3, 1, &[RED, [0, 0, 255, 253], CLEAR])
+        surface(3, 1, &[RED, [0, 0, 254, 253], CLEAR])
     );
     let diagonal = ImageShadowStyle {
         direction_hundredths: 13_500,
@@ -104,7 +108,7 @@ fn fractional_geometry_is_not_replaced_by_integer_kernel_or_offset() {
     assert_eq!(diagonal.pixel_offset().unwrap(), (-1, -1));
     assert_eq!(
         render_shadow(&source, &diagonal),
-        surface(2, 2, &[[0, 0, 255, 253], CLEAR, CLEAR, RED])
+        surface(2, 2, &[[0, 0, 254, 253], CLEAR, CLEAR, RED])
     );
 }
 
@@ -118,7 +122,7 @@ fn independent_opacity_ignores_shadow_color_alpha_and_composites_background_last
     };
     assert_eq!(
         render_shadow(&source, &style),
-        surface(2, 1, &[RED, [0, 0, 255, 151]])
+        surface(2, 1, &[RED, [0, 0, 254, 151]])
     );
     let no_shadow = ImageShadowStyle {
         opacity_basis_points: 0,
@@ -141,7 +145,7 @@ fn independent_opacity_ignores_shadow_color_alpha_and_composites_background_last
     );
     assert_eq!(
         shadow_pixel([255, 0, 0, 128], 128, 255, rgba(BLUE), rgba(CLEAR)),
-        [171, 0, 84, 191]
+        [170, 0, 84, 191]
     );
 }
 
@@ -165,7 +169,7 @@ fn gaussian_is_not_box_and_each_pass_uses_nearest_even() {
     // Both passes saturate the radius-one center to 255 and negative edges to 0.
     assert_eq!(
         render_shadow(&source, &style),
-        surface(3, 2, &[RED, [0, 0, 255, 253], CLEAR, CLEAR, CLEAR, CLEAR])
+        surface(3, 2, &[RED, [0, 0, 254, 253], CLEAR, CLEAR, CLEAR, CLEAR])
     );
 }
 
@@ -179,8 +183,8 @@ fn radius_two_impulse_matches_separate_8bit_vertical_and_horizontal_reference() 
     // Reference kernel center/side/edge: .59836107/.19422404/.006595425.
     // Vertical alpha is 50,153,50; horizontal then rounds each sample again.
     // Software opacity maps those alphas with /65536, not ideal /65025.
-    let nine = [0, 0, 255, 9];
-    let twenty_nine = [0, 0, 255, 29];
+    let nine = [0, 0, 254, 9];
+    let twenty_nine = [0, 0, 254, 29];
     assert_eq!(
         render_shadow(&source, &style),
         surface(
@@ -193,7 +197,7 @@ fn radius_two_impulse_matches_separate_8bit_vertical_and_horizontal_reference() 
                 nine,
                 CLEAR,
                 RED,
-                [0, 0, 255, 91],
+                [0, 0, 254, 91],
                 twenty_nine,
                 CLEAR,
                 nine,
@@ -257,7 +261,7 @@ fn fractional_border_uses_cast_background_extent_not_whole_rounded_canvas() {
     // for the background, leaving .75 coverage and one completely clear pixel.
     assert_eq!(
         border(&source, &asymmetric, RenderLimits::default(), &NeverCancel).unwrap(),
-        surface(3, 1, &[RED, [255, 255, 255, 191], CLEAR])
+        surface(3, 1, &[RED, [254, 254, 254, 191], CLEAR])
     );
 }
 
@@ -319,7 +323,7 @@ fn shape_cell(stage: Option<u32>, id: u128, color: [u8; 4]) -> FrameOverlayCell 
 #[test]
 fn expanding_steps_transform_already_composited_layers_in_both_entrypoints() {
     let owner = clip(vec![
-        FrameRenderStep::Composite { stage_id: 1 },
+        FrameRenderStep::composite(1),
         FrameRenderStep::ImageShadow {
             style: ImageShadowStyle {
                 direction_hundredths: 18_000,
@@ -333,7 +337,7 @@ fn expanding_steps_transform_already_composited_layers_in_both_entrypoints() {
                 ..border_style(-1_000, 0, 0, 0)
             },
         },
-        FrameRenderStep::Composite { stage_id: 2 },
+        FrameRenderStep::composite(2),
     ]);
     let tracks = [OverlayTrack {
         id: TrackId::from_u128(1),
@@ -354,7 +358,10 @@ fn expanding_steps_transform_already_composited_layers_in_both_entrypoints() {
     let direct = renderer
         .render_clip_with_overlays(&owner, &tracks, TimeUs::ZERO, &provider, &NeverCancel)
         .unwrap();
-    assert_eq!(direct, surface(3, 1, &[GREEN, [0, 0, 255, 253], RED]));
+    // Two real bitmap operations mean two separate lossy PNG boundaries:
+    // shadow unpremultiplies to 254; the transparent border's next round trip
+    // premultiplies 254 to 252 and unpremultiplies it to 253.
+    assert_eq!(direct, surface(3, 1, &[GREEN, [0, 0, 253, 253], RED]));
     let plan = OverlayRenderPlan::for_frame(&tracks, owner.id, TimeUs::ZERO, &NeverCancel).unwrap();
     assert_eq!(
         renderer
@@ -540,7 +547,7 @@ fn buffered_gaussian_matches_scalar_model_for_partial_alpha_and_fractional_direc
                             original,
                             blurred,
                             u32::from(style.opacity_basis_points) * 255 / 10_000,
-                            style.color,
+                            software_shadow_color(style.color),
                             style.background,
                         )
                     };
@@ -635,5 +642,117 @@ fn full_parameter_bounds_remain_safe_before_allocation_or_pixel_loops() {
     assert_eq!(
         output.size(),
         maximum.placement(source.size()).unwrap().output_size
+    );
+}
+
+// These hashes are immutable RGBA bytes produced by the real .NET 9.0.19 WPF
+// RenderTargetBitmap/WIC run 34071253697, generator commit 1004943ef8292f05.
+// They are not generated by this renderer or adjusted to its output.
+fn assert_hosted_wpf_sha(actual: &RgbaSurface, expected: &str) {
+    use sha2::{Digest, Sha256};
+    assert_eq!(format!("{:x}", Sha256::digest(actual.pixels())), expected);
+}
+
+fn hosted_border_source() -> RgbaSurface {
+    let source = surface(
+        4,
+        3,
+        &[
+            CLEAR,
+            [190, 25, 71, 128],
+            CLEAR,
+            [0, 128, 255, 64],
+            [60, 200, 15, 170],
+            [230, 100, 10, 50],
+            [10, 20, 30, 255],
+            CLEAR,
+            RED,
+            CLEAR,
+            [40, 90, 180, 192],
+            CLEAR,
+        ],
+    );
+    assert_hosted_wpf_sha(
+        &source,
+        "b75e4361481ae30d309901b8d72834f55ffeeffc425f20ad8f48d8cd0128bc8e",
+    );
+    source
+}
+
+#[test]
+fn hosted_wpf_inner_border_matches_separately_quantized_premultiplied_blending() {
+    let source = hosted_border_source();
+    let style = ImageBorderStyle {
+        color: rgba([40, 80, 180, 128]),
+        ..border_style(1_000, 1_000, 1_000, 1_000)
+    };
+    let output = border(&source, &style, RenderLimits::default(), &NeverCancel).unwrap();
+    assert_eq!(output.size(), size(4, 3));
+    assert_hosted_wpf_sha(
+        &output,
+        "80534e0dab38d14df6cd95992c57439fb517743778ec3d23c3d0ae284e75edd9",
+    );
+}
+
+#[test]
+fn hosted_wpf_mixed_border_matches_all_108_real_pixels() {
+    let source = hosted_border_source();
+    let style = ImageBorderStyle {
+        color: rgba([20, 40, 100, 200]),
+        ..border_style(-8_000, 2_000, 0, -6_000)
+    };
+    let output = border(&source, &style, RenderLimits::default(), &NeverCancel).unwrap();
+    assert_eq!(output.size(), size(12, 9));
+    assert_hosted_wpf_sha(
+        &output,
+        "80712aa1bff4be02552f440d016bfed96b9380045e615228a4420f5e24e0c2a1",
+    );
+}
+
+#[test]
+fn hosted_wpf_hard_shadow_matches_fixed_reciprocal_png_unpremultiplication() {
+    let source = surface(2, 2, &[RED, [20, 70, 190, 128], CLEAR, [0, 255, 0, 64]]);
+    let style = ImageShadowStyle {
+        depth_hundredths: 200,
+        direction_hundredths: 18_000,
+        color: rgba([0, 0, 255, 0]),
+        ..shadow_style()
+    };
+    let output = render_shadow(&source, &style);
+    assert_eq!(output.size(), size(4, 2));
+    assert_hosted_wpf_sha(
+        &output,
+        "aeccd1718920ff737674bb8f9d9b714ad27e90a307c88a5c556b81c0c28d0570",
+    );
+}
+
+#[test]
+fn hosted_wpf_colored_gaussian_shadow_uses_scrgb_not_srgb_shadow_bytes() {
+    let source = surface(
+        3,
+        3,
+        &[
+            CLEAR,
+            CLEAR,
+            CLEAR,
+            [30, 80, 220, 128],
+            [210, 80, 20, 255],
+            CLEAR,
+            CLEAR,
+            CLEAR,
+            CLEAR,
+        ],
+    );
+    let style = ImageShadowStyle {
+        blur_radius_hundredths: 200,
+        color: rgba([15, 50, 100, 255]),
+        ..shadow_style()
+    };
+    assert_eq!(software_shadow_color(style.color), rgba([1, 8, 32, 255]));
+    let output = render_shadow(&source, &style);
+    assert_eq!(output.size(), size(6, 5));
+    assert_hosted_wpf_sha(
+        &output,
+        "e026ce5654bbcdec0b693a75e0be6a25e08932bf9c47d4fa4ec2440be1312e70",
     );
 }

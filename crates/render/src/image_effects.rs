@@ -11,7 +11,10 @@ use gif_from_screen_domain::{
     CanvasPlacement, ImageBorderStyle, ImageShadowStyle, PhysicalSize, Rgba,
 };
 
-use crate::{CancellationToken, RenderError, RenderLimits, RgbaSurface, surface::checked_byte_len};
+use crate::{
+    CancellationToken, RenderError, RenderLimits, RgbaSurface, surface::checked_byte_len,
+    wpf_pixels,
+};
 
 const PIXEL_CHECK_INTERVAL: usize = 1_024;
 const MILLIS_PER_PIXEL: i64 = 1_000;
@@ -59,6 +62,19 @@ pub(crate) fn border<C: CancellationToken + ?Sized>(
     // their geometric meaning, including repeated alpha at genuine overlaps.
     for rectangle in geometry.strokes {
         paint_rectangle(&mut output, rectangle, style.color, cancel)?;
+    }
+    // Border paint passes share an 8-bit premultiplied surface, just like one
+    // RenderTargetBitmap; quantize to WIC straight RGBA only at the boundary.
+    for row in output
+        .pixels_mut()
+        .as_chunks_mut::<4>()
+        .0
+        .chunks_mut(PIXEL_CHECK_INTERVAL)
+    {
+        check_cancelled(cancel)?;
+        for pixel in row {
+            *pixel = wpf_pixels::unpremultiply(*pixel);
+        }
     }
     check_cancelled(cancel)?;
     Ok(output)
@@ -211,23 +227,11 @@ fn composite_source<C: CancellationToken + ?Sized>(
     Ok(())
 }
 
-// Integer source-over is local to the new image effects. Legacy blend functions
-// must not acquire extra premultiplication or quantization through this change.
+// Destination is premultiplied for this entire new image-effect operation;
+// source is a straight pixel or brush color. No legacy blend path calls this.
 fn source_over(destination: &mut [u8], source: [u8; 4]) {
-    let alpha = u32::from(source[3]);
-    if alpha == 0 {
-        return;
-    }
-    let destination_alpha = u32::from(destination[3]);
-    let inverse = 255 - alpha;
-    let combined = alpha * 255 + destination_alpha * inverse;
-    for channel in 0..3 {
-        let numerator = u32::from(source[channel]) * alpha * 255
-            + u32::from(destination[channel]) * destination_alpha * inverse;
-        destination[channel] =
-            u8::try_from((numerator + combined / 2) / combined).expect("weighted color remains u8");
-    }
-    destination[3] = u8::try_from((combined + 127) / 255).expect("source-over alpha remains u8");
+    let previous = destination.try_into().expect("validated RGBA pixel");
+    destination.copy_from_slice(&wpf_pixels::over(wpf_pixels::premultiply(source), previous));
 }
 
 pub(crate) fn shadow<C: CancellationToken + ?Sized>(
@@ -405,6 +409,7 @@ impl ShadowRaster<'_> {
     ) -> Result<(), RenderError> {
         let width = usize::try_from(output.width()).expect("surface width fits usize");
         let opacity = u32::from(self.style.opacity_basis_points) * 255 / 10_000;
+        let shadow_color = software_shadow_color(self.style.color);
         for (y, row) in output.pixels_mut().chunks_exact_mut(width * 4).enumerate() {
             check_cancelled(cancel)?;
             for (x, pixel) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
@@ -425,7 +430,7 @@ impl ShadowRaster<'_> {
                     original,
                     blurred,
                     opacity,
-                    self.style.color,
+                    shadow_color,
                     self.style.background,
                 );
             }
@@ -470,6 +475,37 @@ impl ShadowRaster<'_> {
     }
 }
 
+// WPF ColorToMilColorF sends ScR/ScG/ScB, while the software shadow's
+// ConvertColor truncates those linear values directly to bytes. It does not
+// convert them back to sRGB as an ordinary SolidColorBrush does.
+fn software_shadow_color(color: Rgba) -> Rgba {
+    Rgba {
+        red: software_shadow_channel(color.red),
+        green: software_shadow_channel(color.green),
+        blue: software_shadow_channel(color.blue),
+        alpha: 255,
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "matches WPF's bounded byte-to-f32 scRGB conversion then native f64-to-byte truncation"
+)]
+fn software_shadow_channel(channel: u8) -> u8 {
+    let value = f32::from(channel) / 255.0;
+    let linear = if value == 0.0 {
+        0.0
+    } else if f64::from(value) <= 0.040_45 {
+        value / 12.92
+    } else if value < 1.0 {
+        ((f64::from(value) + 0.055) / 1.055).powf(2.4) as f32
+    } else {
+        1.0
+    };
+    (f64::from(linear) * 255.0) as u8
+}
+
 fn shadow_pixel(
     source: [u8; 4],
     blurred_alpha: u8,
@@ -479,30 +515,21 @@ fn shadow_pixel(
 ) -> [u8; 4] {
     let alpha = u32::from(source[3]);
     let extra = u32::from(blurred_alpha) * (255 - alpha) * opacity / 65_536;
-    let result_alpha = alpha + extra;
-    let background_alpha = u32::from(background.alpha);
-    let background_remainder = (background_alpha * (255 - result_alpha) + 127) / 255;
-    let output_alpha = result_alpha + background_remainder;
-    if output_alpha == 0 {
-        return [0; 4];
-    }
-    let mut result = [0; 4];
+    let mut result = wpf_pixels::premultiply(source);
     let shadow_channels = [color.red, color.green, color.blue];
-    let background_channels = [background.red, background.green, background.blue];
     for channel in 0..3 {
-        let source_premultiplied = (u32::from(source[channel]) * alpha + 127) / 255;
         let shadow_premultiplied = extra * u32::from(shadow_channels[channel]) / 255;
-        let background_premultiplied =
-            (u32::from(background_channels[channel]) * background_alpha + 127) / 255;
-        let composite = source_premultiplied
-            + shadow_premultiplied
-            + (background_premultiplied * (255 - result_alpha) + 127) / 255;
-        result[channel] =
-            u8::try_from(((composite * 255 + output_alpha / 2) / output_alpha).min(255))
-                .expect("unpremultiplied color is clamped");
+        result[channel] = u8::try_from(u32::from(result[channel]) + shadow_premultiplied)
+            .expect("source plus occluded shadow remains within its combined alpha");
     }
-    result[3] = u8::try_from(output_alpha).expect("source-over alpha remains u8");
-    result
+    result[3] = u8::try_from(alpha + extra).expect("source-over alpha remains u8");
+    let background = wpf_pixels::premultiply([
+        background.red,
+        background.green,
+        background.blue,
+        background.alpha,
+    ]);
+    wpf_pixels::unpremultiply(wpf_pixels::over(result, background))
 }
 
 #[cfg(test)]

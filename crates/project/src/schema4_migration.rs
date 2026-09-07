@@ -33,7 +33,7 @@ fn image_steps() -> [FrameRenderStep; 2] {
 
 fn expanded_frame(project: &ActiveProject, step: FrameRenderStep) -> FrameClip {
     let mut frame = project.manifest().timeline.frames[0].clone();
-    frame.render_steps = vec![FrameRenderStep::Composite { stage_id: 1 }, step];
+    frame.render_steps = vec![FrameRenderStep::composite(1), step];
     frame
 }
 

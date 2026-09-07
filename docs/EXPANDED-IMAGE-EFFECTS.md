@@ -77,11 +77,13 @@ source-over with denominator 65025. Source premultiplied RGB and shadow RGB
 contribute before the explicit background. Legacy blending functions are not
 changed by these new rounding rules.
 
-This is an implementation derived from primary software algorithms, not a
-claim of final Windows PNG bit equality. Windows/WIC premultiply/unpremultiply,
-libm/SIMD details, antialiasing and fractional DPI still need Windows golden
-image comparison. Radius/offset/opacity rules and independent fixture pixels
-are covered by automated tests.
+Real Windows WPF/WIC comparison has now identified and verified the integer
+premultiply/source-over/reciprocal rules and the software shadow's scRGB color
+conversion. The first five independent fixtures match all 13 inputs/stages
+exactly after the corrections; see [paint precision and reference evidence](WPF-PAINT-PRECISION.md).
+This is bounded pixel evidence, not coverage of every parameter, antialiasing,
+libm/SIMD difference or fractional DPI behavior. New authoring stages use an
+explicit schema-5 precision marker; old straight-alpha stages remain unchanged.
 
 ## Editing, persistence and safety
 

@@ -57,11 +57,11 @@ pub(super) fn project(root: &Path, schema: u32) -> ActiveProject {
 fn staged_frame(project: &ActiveProject) -> FrameClip {
     let mut frame = project.manifest().timeline.frames[0].clone();
     frame.render_steps = vec![
-        FrameRenderStep::Composite { stage_id: 7 },
+        FrameRenderStep::composite(7),
         FrameRenderStep::Resize {
             size: PhysicalSize::new(1, 2).unwrap(),
         },
-        FrameRenderStep::Composite { stage_id: 9 },
+        FrameRenderStep::composite(9),
     ];
     frame
 }
@@ -158,9 +158,7 @@ fn invalid_stage_payload_never_upgrades_a_legacy_snapshot() {
     let disk = fs::read(&project.layout().manifest).unwrap();
     let journal = fs::read(&project.layout().journal).unwrap();
     let mut frame = staged_frame(&project);
-    frame
-        .render_steps
-        .push(FrameRenderStep::Composite { stage_id: 7 });
+    frame.render_steps.push(FrameRenderStep::composite(7));
     assert!(
         project
             .commit(EditCommand::ReplaceFrame {
@@ -176,7 +174,7 @@ fn invalid_stage_payload_never_upgrades_a_legacy_snapshot() {
 
 #[test]
 fn raw_recording_fast_path_rejects_render_steps_in_every_supported_schema() {
-    for schema in [1, 2, 3, 4] {
+    for schema in [1, 2, 3, 4, 5] {
         let directory = tempfile::tempdir().unwrap();
         let mut project = project(directory.path(), schema);
         let before = project.manifest().clone();

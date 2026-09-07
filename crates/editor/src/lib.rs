@@ -17,6 +17,7 @@ mod frame_clipboard;
 mod frame_effect;
 mod frame_selection;
 mod frame_transition;
+mod paint_stage;
 mod selection;
 mod statistics;
 mod virtual_filmstrip;
@@ -49,6 +50,7 @@ pub use frame_selection::{
 pub use frame_transition::{
     FrameTransitionSettings, remove_transition_after, set_transition_after,
 };
+pub use paint_stage::author_frame_owned_track;
 pub use selection::{TimelineSelection, TimelineSelectionError};
 pub use statistics::{
     CurrentFrameStatistics, EditorStatistics, EditorStatisticsError, project_statistics,
@@ -641,6 +643,14 @@ fn ensure_known_selection(
 /// Errors produced while building or applying editor commands.
 #[derive(Debug, Error)]
 pub enum EditorError {
+    /// A new group cannot be authored without changing existing paint semantics.
+    #[error("group {track_id}: {reason}")]
+    InvalidPaintTrack {
+        /// Identity of the proposed frame-owned group.
+        track_id: gif_from_screen_domain::TrackId,
+        /// Specific identity, authoring-scope or paint-stage failure.
+        reason: String,
+    },
     /// An ordered edit cannot be represented safely for this frame.
     #[error("frame {frame_id}: {reason}")]
     InvalidRenderPipeline {

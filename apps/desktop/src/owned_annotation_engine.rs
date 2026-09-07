@@ -111,7 +111,16 @@ pub(super) fn prepare_new(
     let clocks = missing_sample_contexts(manifest, &cells);
     track.annotation_scope = None;
     track.frame_cells = Some(cells.into_values().collect());
-    let track_command = prepared.commands.pop().expect("prepared track");
+    let EditCommand::UpsertOverlayTrack { track } =
+        prepared.commands.pop().expect("prepared track")
+    else {
+        return Err("Annotation preparation did not produce its new frame-owned track.".to_owned());
+    };
+    let mut paint_commands = gif_from_screen_editor::author_frame_owned_track(manifest, track)
+        .map_err(|error| error.to_string())?;
+    let track_command = paint_commands
+        .pop()
+        .ok_or("The annotation paint stage did not return a track.")?;
     for (asset, bytes) in pool_assets {
         if let Some(existing) = manifest.assets.get(&asset.id) {
             if *existing != asset {
@@ -126,6 +135,10 @@ pub(super) fn prepare_new(
         }
         prepared.assets.push((asset, bytes));
     }
+    // Frame replacements keep immutable capture fields. Apply clock-only
+    // fallback context after those replacements, never overwrite it with the
+    // pre-authoring frame snapshot.
+    prepared.commands.extend(paint_commands);
     if !clocks.is_empty() {
         prepared
             .commands

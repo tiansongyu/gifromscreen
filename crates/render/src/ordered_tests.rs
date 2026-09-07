@@ -65,7 +65,7 @@ fn clip() -> FrameClip {
 }
 
 fn composite(stage_id: u32) -> FrameRenderStep {
-    FrameRenderStep::Composite { stage_id }
+    FrameRenderStep::composite(stage_id)
 }
 
 fn glyph(number: u8, x: u32, y: u32) -> OverlayContent {

@@ -1,9 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use gif_from_screen_domain::{
-    AssetId, BlendMode, FrameClip, FrameId, FrameRenderStep, OverlayContent, OverlayId,
-    OverlayItem, OverlayTrack, PhysicalPoint, PhysicalRect, PhysicalSize, ProgressDirection,
-    ProgressStyle, Rgba, ShapeKind, StrokePoint, TimeUs, TimelineSpan, validate_frame_render_steps,
+    AssetId, BlendMode, CompositePrecision, FrameClip, FrameId, FrameRenderStep, OverlayContent,
+    OverlayId, OverlayItem, OverlayTrack, PhysicalPoint, PhysicalRect, PhysicalSize,
+    ProgressDirection, ProgressStyle, Rgba, ShapeKind, StrokePoint, TimeUs, TimelineSpan,
+    validate_frame_render_steps,
 };
 
 use crate::{
@@ -15,6 +16,22 @@ const CANCELLATION_PIXEL_INTERVAL: u32 = 1_024;
 
 #[path = "event_overlay.rs"]
 mod events;
+
+#[cfg(test)]
+#[path = "stage_precision_tests.rs"]
+mod precision_tests;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaintBlend {
+    Legacy(BlendMode),
+    WpfSourceOver,
+}
+
+impl From<BlendMode> for PaintBlend {
+    fn from(mode: BlendMode) -> Self {
+        Self::Legacy(mode)
+    }
+}
 
 /// Freezes one legacy timed item's content at a half-open sampling point.
 ///
@@ -72,7 +89,7 @@ struct OverlayLayer<'a> {
     stage: Option<u32>,
     z_index: i32,
     track_opacity: u8,
-    blend_mode: BlendMode,
+    blend_mode: PaintBlend,
     track_index: usize,
     item_index: usize,
 }
@@ -93,7 +110,7 @@ struct OwnedOverlayLayer {
     span: Option<TimelineSpan>,
     stage: Option<u32>,
     track_opacity: u8,
-    blend_mode: BlendMode,
+    blend_mode: PaintBlend,
 }
 
 impl OverlayRenderPlan {
@@ -178,8 +195,11 @@ impl CpuRenderer {
     /// frame, regardless of its authoring scopes or sample time. Raster images are
     /// nearest-neighbor sampled without a resized allocation. Shapes and drawings are hard-edged,
     /// clipped directly to the destination, and allocate no geometry-sized buffers. Track opacity
-    /// and raster item opacity multiply source alpha. Normal, Multiply, and Screen use deterministic
-    /// straight-alpha source-over composition. Drawing `width` is a base diameter: each normalized
+    /// and raster item opacity multiply source alpha. Legacy stages preserve deterministic
+    /// straight-alpha Normal/Multiply/Screen composition. Explicit WPF stages require Normal,
+    /// convert the complete surface to premultiplied bytes once, compose every active mark,
+    /// then cross one WIC-compatible straight-RGBA boundary. Empty stages do not quantize.
+    /// Drawing `width` is a base diameter: each normalized
     /// `pressure_milli` in `0..=1000` scales it with half-up integer rounding, positive pressure is
     /// at least one pixel, zero pressure is invisible, and width interpolates linearly along each
     /// segment. Line and Arrow run from the centers of the bounds' top-left and bottom-right pixels;
@@ -256,11 +276,16 @@ impl CpuRenderer {
         let mut surface = self.render_clip_prefix(clip, provider, cancellation)?;
         for step in &clip.render_steps {
             check_cancelled(cancellation)?;
-            if let FrameRenderStep::Composite { stage_id } = step {
+            if let FrameRenderStep::Composite {
+                stage_id,
+                precision,
+            } = step
+            {
                 if let Some(layers) = groups.remove(&Some(*stage_id)) {
-                    composite_overlay_layers(
+                    composite_stage(
                         &mut surface,
                         layers,
+                        *precision,
                         sample_time,
                         provider,
                         self.limits(),
@@ -324,20 +349,23 @@ fn stage_overlay_layers<'a, C: CancellationToken + ?Sized>(
             reason,
         }
     })?;
-    let stages: BTreeSet<_> = clip
+    let stages: BTreeMap<_, _> = clip
         .render_steps
         .iter()
         .filter_map(|step| match step {
-            FrameRenderStep::Composite { stage_id } => Some(*stage_id),
+            FrameRenderStep::Composite {
+                stage_id,
+                precision,
+            } => Some((*stage_id, *precision)),
             _ => None,
         })
         .collect();
     let first = match clip.render_steps.first() {
-        Some(FrameRenderStep::Composite { stage_id }) => Some(*stage_id),
+        Some(FrameRenderStep::Composite { stage_id, .. }) => Some(*stage_id),
         _ => None,
     };
     let mut groups: BTreeMap<_, Vec<_>> = BTreeMap::new();
-    for layer in layers {
+    for mut layer in layers {
         check_cancelled(cancellation)?;
         let stage = if layer.span.is_some() {
             first
@@ -345,13 +373,27 @@ fn stage_overlay_layers<'a, C: CancellationToken + ?Sized>(
             layer.stage
         };
         if let Some(stage_id) = stage
-            && !stages.contains(&stage_id)
+            && !stages.contains_key(&stage_id)
         {
             return Err(RenderError::OverlayStageMissing {
                 frame_id: clip.id,
                 overlay_id: layer.id,
                 stage_id,
             });
+        }
+        if let Some(stage_id) = stage
+            && stages.get(&stage_id) == Some(&CompositePrecision::WpfPbgra8PngV1)
+        {
+            if layer.blend_mode != PaintBlend::Legacy(BlendMode::Normal) {
+                return Err(RenderError::InvalidRenderSteps {
+                    frame_id: clip.id,
+                    reason: format!(
+                        "WPF paint stage {stage_id} requires Normal blend for overlay {}.",
+                        layer.id
+                    ),
+                });
+            }
+            layer.blend_mode = PaintBlend::WpfSourceOver;
         }
         let group = groups.entry(stage).or_default();
         group
@@ -533,6 +575,56 @@ where
     Ok(())
 }
 
+fn composite_stage<P: FrameAssetProvider + ?Sized, C: CancellationToken + ?Sized>(
+    destination: &mut RgbaSurface,
+    layers: Vec<OverlayLayer<'_>>,
+    precision: CompositePrecision,
+    sample_time: TimeUs,
+    provider: &P,
+    limits: RenderLimits,
+    cancellation: &C,
+) -> Result<(), RenderError> {
+    if layers.is_empty() {
+        return Ok(());
+    }
+    if precision == CompositePrecision::WpfPbgra8PngV1 {
+        convert_surface_precision(destination, crate::wpf_pixels::premultiply, cancellation)?;
+    }
+    composite_overlay_layers(
+        destination,
+        layers,
+        sample_time,
+        provider,
+        limits,
+        cancellation,
+    )?;
+    if precision == CompositePrecision::WpfPbgra8PngV1 {
+        convert_surface_precision(destination, crate::wpf_pixels::unpremultiply, cancellation)?;
+    }
+    Ok(())
+}
+
+fn convert_surface_precision<C: CancellationToken + ?Sized>(
+    surface: &mut RgbaSurface,
+    convert: fn([u8; 4]) -> [u8; 4],
+    cancellation: &C,
+) -> Result<(), RenderError> {
+    check_cancelled(cancellation)?;
+    for (index, pixel) in surface
+        .pixels_mut()
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
+        if index.is_multiple_of(CANCELLATION_PIXEL_INTERVAL as usize) {
+            check_cancelled(cancellation)?;
+        }
+        *pixel = convert(*pixel);
+    }
+    check_cancelled(cancellation)
+}
+
 fn active_overlay_layers<'a, C>(
     tracks: &'a [OverlayTrack],
     frame_id: Option<FrameId>,
@@ -568,7 +660,7 @@ where
                     stage: None,
                     z_index: item.z_index,
                     track_opacity: track.opacity,
-                    blend_mode: track.blend_mode,
+                    blend_mode: track.blend_mode.into(),
                     track_index,
                     item_index,
                 },
@@ -599,7 +691,7 @@ where
                         stage: cell.stage,
                         z_index: mark.z_index,
                         track_opacity: track.opacity,
-                        blend_mode: track.blend_mode,
+                        blend_mode: track.blend_mode.into(),
                         track_index,
                         item_index,
                     },
@@ -697,7 +789,7 @@ fn composite_raster_overlay<P, C>(
     size: PhysicalSize,
     item_opacity: u8,
     track_opacity: u8,
-    blend_mode: BlendMode,
+    blend_mode: impl Into<PaintBlend>,
     provider: &P,
     limits: RenderLimits,
     cancellation: &C,
@@ -706,6 +798,7 @@ where
     P: FrameAssetProvider + ?Sized,
     C: CancellationToken + ?Sized,
 {
+    let blend_mode = blend_mode.into();
     if position.x.get() >= destination.width() || position.y.get() >= destination.height() {
         return Ok(());
     }
@@ -786,12 +879,13 @@ fn composite_shape<C>(
     stroke: Rgba,
     fill: Option<Rgba>,
     track_opacity: u8,
-    blend_mode: BlendMode,
+    blend_mode: impl Into<PaintBlend>,
     cancellation: &C,
 ) -> Result<(), RenderError>
 where
     C: CancellationToken + ?Sized,
 {
+    let blend_mode = blend_mode.into();
     validate_shape(overlay_id, kind, bounds, stroke_width, fill)?;
     let padding = match kind {
         ShapeKind::Line => u32::from(stroke_width).div_ceil(2),
@@ -996,12 +1090,13 @@ fn composite_drawing<C>(
     width: u16,
     color: Rgba,
     track_opacity: u8,
-    blend_mode: BlendMode,
+    blend_mode: impl Into<PaintBlend>,
     cancellation: &C,
 ) -> Result<(), RenderError>
 where
     C: CancellationToken + ?Sized,
 {
+    let blend_mode = blend_mode.into();
     if points.is_empty() || color.alpha == 0 {
         return Ok(());
     }
@@ -1211,7 +1306,7 @@ fn paint_pixel(
     y: u32,
     color: Rgba,
     track_opacity: u8,
-    blend_mode: BlendMode,
+    blend_mode: impl Into<PaintBlend>,
 ) {
     let offset = destination.byte_offset(x, y);
     blend_pixel(
@@ -1224,6 +1319,39 @@ fn paint_pixel(
 }
 
 fn blend_pixel(
+    destination: &mut [u8],
+    source: &[u8],
+    item_opacity: u8,
+    track_opacity: u8,
+    blend_mode: impl Into<PaintBlend>,
+) {
+    match blend_mode.into() {
+        PaintBlend::Legacy(mode) => {
+            blend_legacy_pixel(destination, source, item_opacity, track_opacity, mode);
+        }
+        PaintBlend::WpfSourceOver => {
+            let mut source =
+                crate::wpf_pixels::premultiply([source[0], source[1], source[2], source[3]]);
+            // WPF quantizes each opacity application in premultiplied space;
+            // multiplying the alphas first is observably a different operation.
+            for opacity in [item_opacity, track_opacity] {
+                source = source.map(|channel| crate::wpf_pixels::mul_byte(channel, opacity));
+            }
+            let output = crate::wpf_pixels::over(
+                source,
+                [
+                    destination[0],
+                    destination[1],
+                    destination[2],
+                    destination[3],
+                ],
+            );
+            destination.copy_from_slice(&output);
+        }
+    }
+}
+
+fn blend_legacy_pixel(
     destination: &mut [u8],
     source: &[u8],
     item_opacity: u8,

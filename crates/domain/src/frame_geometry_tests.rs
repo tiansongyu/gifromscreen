@@ -14,7 +14,7 @@ fn clip() -> FrameClip {
 }
 
 fn composite(id: u32) -> FrameRenderStep {
-    FrameRenderStep::Composite { stage_id: id }
+    FrameRenderStep::composite(id)
 }
 
 fn staged_project() -> ProjectManifest {
@@ -327,7 +327,7 @@ fn legacy_manifest_acceptance_is_preserved_but_planning_uses_real_effect_input_s
         region: PhysicalRect::new(80, 80, 10, 10).unwrap(),
         radius: 1,
     }];
-    for version in [1, 2, 3, 4] {
+    for version in [1, 2, 3, 4, 5] {
         project.schema_version = version;
         project.validate().unwrap();
     }
@@ -594,6 +594,86 @@ fn failed_stage_or_anchor_commands_roll_back_schema_and_all_other_state() {
             .is_err()
     );
     assert_eq!(project, before);
+}
+
+fn wpf_composite(stage_id: u32) -> FrameRenderStep {
+    FrameRenderStep::Composite {
+        stage_id,
+        precision: CompositePrecision::WpfPbgra8PngV1,
+    }
+}
+
+#[test]
+fn explicit_paint_precision_preserves_legacy_wire_and_requires_schema_five() {
+    let legacy_json = r#"{"type":"composite","stage_id":7}"#;
+    let legacy: FrameRenderStep = serde_json::from_str(legacy_json).unwrap();
+    assert_eq!(legacy, FrameRenderStep::composite(7));
+    assert_eq!(serde_json::to_string(&legacy).unwrap(), legacy_json);
+    assert_eq!(legacy.required_schema_version(), 3);
+    let wpf = wpf_composite(99);
+    let json = serde_json::to_string(&wpf).unwrap();
+    assert!(json.contains("wpf_pbgra8_png_v1"));
+    assert_eq!(serde_json::from_str::<FrameRenderStep>(&json).unwrap(), wpf);
+    assert_eq!(wpf.required_schema_version(), 5);
+    let mut project = staged_project();
+    project.timeline.frames[0].render_steps.push(wpf);
+    for schema in [1, 2, 3, 4] {
+        project.schema_version = schema;
+        assert!(project.validate().is_err());
+    }
+    project.schema_version = 5;
+    project.validate().unwrap();
+    let owner = &project.timeline.frames[0];
+    assert_eq!(
+        FrameGeometryPlan::new(owner, size(100, 100))
+            .unwrap()
+            .stage_size(Some(99))
+            .unwrap(),
+        size(20, 20)
+    );
+    let command = EditCommand::Compound {
+        commands: vec![EditCommand::RestoreFrameEdit {
+            edit: Box::new(EditCommand::ReplaceFrame {
+                frame_id: owner.id,
+                replacement: Box::new(owner.clone()),
+            }),
+            overlay_tracks: Vec::new(),
+        }],
+    };
+    assert_eq!(command.required_schema_version(), 5);
+}
+
+#[test]
+fn first_boundary_stays_legacy_and_all_wpf_owned_groups_require_normal_blending() {
+    assert!(
+        validate_frame_render_steps(&[wpf_composite(1)])
+            .unwrap_err()
+            .contains("legacy precision")
+    );
+    let mut project = staged_project();
+    project.timeline.frames[0]
+        .render_steps
+        .push(wpf_composite(99));
+    let mut track = anchored_track(project.timeline.frames[0].id, Some(99));
+    for mode in [BlendMode::Multiply, BlendMode::Screen] {
+        track.blend_mode = mode;
+        project.timeline.overlay_tracks = vec![track.clone()];
+        let DomainError::InvalidManifest(issues) = project.validate().unwrap_err() else {
+            panic!("expected invalid manifest");
+        };
+        assert!(issues.iter().any(|issue| matches!(issue,
+            ValidationIssue::InvalidFrameOverlay { reason, .. } if reason.contains("Normal blending")
+        )));
+    }
+    track.blend_mode = BlendMode::Normal;
+    project.timeline.overlay_tracks = vec![track.clone()];
+    project.validate().unwrap();
+    // Existing enhanced blending is still valid on legacy boundaries, even
+    // in a v5 project that also contains a WPF precision stage.
+    track.blend_mode = BlendMode::Multiply;
+    track.frame_cells.as_mut().unwrap()[0].stage = Some(7);
+    project.timeline.overlay_tracks = vec![track];
+    project.validate().unwrap();
 }
 
 #[test]

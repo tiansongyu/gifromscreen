@@ -245,7 +245,13 @@ impl EditorWorkspace {
         let text_asset = self.raster_asset_descriptor(image.size, &image.rgba)?;
         let frame_id = FrameId::from_u128(Uuid::new_v4().as_u128());
         let frame = FrameClip {
-            render_steps: Vec::new(),
+            render_steps: vec![
+                gif_from_screen_domain::FrameRenderStep::composite(1),
+                gif_from_screen_domain::FrameRenderStep::Composite {
+                    stage_id: 2,
+                    precision: gif_from_screen_domain::CompositePrecision::WpfPbgra8PngV1,
+                },
+            ],
             capture_clock: None,
             capture_binding: gif_from_screen_domain::CaptureBinding::NotRecorded,
             id: frame_id,
@@ -259,22 +265,19 @@ impl EditorWorkspace {
             effects: Vec::new(),
         };
         let mut commands = self.title_insertion_commands(index, start, request.duration, frame)?;
+        let mut cell = FrameOverlayCell::whole(
+            frame_id,
+            1,
+            vec![FrameOverlayMark {
+                id: OverlayId::from_u128(Uuid::new_v4().as_u128()),
+                z_index: 3,
+                content: text_content(&request.text, image, request.position, text_asset.id),
+            }],
+        );
+        cell.stage = Some(2);
         commands.push(EditCommand::UpsertOverlayTrack {
             track: OverlayTrack {
-                frame_cells: Some(vec![FrameOverlayCell::whole(
-                    frame_id,
-                    1,
-                    vec![FrameOverlayMark {
-                        id: OverlayId::from_u128(Uuid::new_v4().as_u128()),
-                        z_index: 3,
-                        content: text_content(
-                            &request.text,
-                            image,
-                            request.position,
-                            text_asset.id,
-                        ),
-                    }],
-                )]),
+                frame_cells: Some(vec![cell]),
                 annotation: None,
                 annotation_scope: None,
                 id: TrackId::from_u128(Uuid::new_v4().as_u128()),
@@ -750,69 +753,95 @@ mod tests {
 
     #[test]
     fn frame_owned_text_reedit_preserves_ids_partial_scopes_and_layer_settings_after_reorder() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut workspace = create_rendered_duplicate_workspace(&directory);
-        workspace.select_only(frame_id(1)).unwrap();
-        workspace.toggle_selection(frame_id(3)).unwrap();
-        let (request, image) = text("Before", GREEN);
-        let id = workspace
-            .add_text_overlay_for_selection(&request, &image, PhysicalPoint::default())
-            .unwrap();
-        let mut track = workspace.manifest().timeline.overlay_tracks[0].clone();
-        track.name = "Hidden editable caption".to_owned();
-        track.visible = false;
-        track.opacity = 177;
-        track.blend_mode = BlendMode::Screen;
-        let cells = track.frame_cells.as_mut().unwrap();
-        cells[0].scopes[0].span =
-            gif_from_screen_domain::FrameLocalSpan::new(1, 2, DurationUs::new(3).unwrap()).unwrap();
-        cells[0].scopes[0].run_id = 9;
-        cells[0].marks[0].z_index = -7;
-        cells[1].marks[0].z_index = 9;
-        cells.push(FrameOverlayCell::whole(frame_id(2), 10, Vec::new()));
-        workspace
-            .execute(EditCommand::UpsertOverlayTrack {
+        for blend_mode in [BlendMode::Normal, BlendMode::Screen] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut workspace = create_rendered_duplicate_workspace(&directory);
+            workspace.select_only(frame_id(1)).unwrap();
+            workspace.toggle_selection(frame_id(3)).unwrap();
+            let (request, image) = text("Before", GREEN);
+            let id = workspace
+                .add_text_overlay_for_selection(&request, &image, PhysicalPoint::default())
+                .unwrap();
+            let mut track = workspace.manifest().timeline.overlay_tracks[0].clone();
+            track.name = "Hidden editable caption".to_owned();
+            track.visible = false;
+            track.opacity = 177;
+            track.blend_mode = blend_mode;
+            let cells = track.frame_cells.as_mut().unwrap();
+            cells[0].scopes[0].span =
+                gif_from_screen_domain::FrameLocalSpan::new(1, 2, DurationUs::new(3).unwrap())
+                    .unwrap();
+            cells[0].scopes[0].run_id = 9;
+            cells[0].marks[0].z_index = -7;
+            cells[1].marks[0].z_index = 9;
+            cells.push(FrameOverlayCell::whole(frame_id(2), 10, Vec::new()));
+            // Screen is an existing-project enhancement, not WPF source-over.
+            // Construct that legacy fixture explicitly; Normal exercises new authoring.
+            let mut commands = Vec::new();
+            if blend_mode == BlendMode::Screen {
+                for frame in &workspace.manifest().timeline.frames {
+                    let mut replacement = frame.clone();
+                    for step in &mut replacement.render_steps {
+                        if let gif_from_screen_domain::FrameRenderStep::Composite {
+                            precision,
+                            ..
+                        } = step
+                        {
+                            *precision =
+                                gif_from_screen_domain::CompositePrecision::LegacyStraightRgba8;
+                        }
+                    }
+                    commands.push(EditCommand::ReplaceFrame {
+                        frame_id: frame.id,
+                        replacement: Box::new(replacement),
+                    });
+                }
+            }
+            commands.push(EditCommand::UpsertOverlayTrack {
                 track: track.clone(),
-            })
-            .unwrap();
-        workspace
-            .execute(EditCommand::ReorderFrames {
-                order: vec![frame_id(3), frame_id(2), frame_id(1), frame_id(4)],
-            })
-            .unwrap();
-        workspace.clear_selection();
-        let before = workspace.manifest().clone();
-        let draft = workspace.text_overlay_draft(id).unwrap();
-        assert_eq!(draft.request.text, "Before");
-        let (request, image) = text("After", BLUE);
-        workspace
-            .replace_text_overlay(id, &request, &image, draft.position)
-            .unwrap();
-        let after = workspace.manifest().clone();
-        let updated = &after.timeline.overlay_tracks[0];
-        let content = updated.all_mark_contents().next().unwrap().1.clone();
-        for mark in track
-            .frame_cells
-            .iter_mut()
-            .flatten()
-            .flat_map(|cell| &mut cell.marks)
-        {
-            mark.content.clone_from(&content);
+            });
+            workspace
+                .execute(EditCommand::Compound { commands })
+                .unwrap();
+            workspace
+                .execute(EditCommand::ReorderFrames {
+                    order: vec![frame_id(3), frame_id(2), frame_id(1), frame_id(4)],
+                })
+                .unwrap();
+            workspace.clear_selection();
+            let before = workspace.manifest().clone();
+            let draft = workspace.text_overlay_draft(id).unwrap();
+            assert_eq!(draft.request.text, "Before");
+            let (request, image) = text("After", BLUE);
+            workspace
+                .replace_text_overlay(id, &request, &image, draft.position)
+                .unwrap();
+            let after = workspace.manifest().clone();
+            let updated = &after.timeline.overlay_tracks[0];
+            let content = updated.all_mark_contents().next().unwrap().1.clone();
+            for mark in track
+                .frame_cells
+                .iter_mut()
+                .flatten()
+                .flat_map(|cell| &mut cell.marks)
+            {
+                mark.content.clone_from(&content);
+            }
+            assert_eq!(updated, &track);
+            assert!(updated.frame_cells.as_ref().unwrap()[2].marks.is_empty());
+            workspace.undo().unwrap();
+            assert_project_content(workspace.manifest(), &before);
+            workspace.redo().unwrap();
+            assert_project_content(workspace.manifest(), &after);
+            drop(workspace);
+            let reopened =
+                EditorWorkspace::open(directory.path(), LockPolicy::FailIfPresent, 16).unwrap();
+            assert_project_content(reopened.manifest(), &after);
+            assert_eq!(
+                reopened.text_overlay_draft(id).unwrap().request.text,
+                "After"
+            );
         }
-        assert_eq!(updated, &track);
-        assert!(updated.frame_cells.as_ref().unwrap()[2].marks.is_empty());
-        workspace.undo().unwrap();
-        assert_project_content(workspace.manifest(), &before);
-        workspace.redo().unwrap();
-        assert_project_content(workspace.manifest(), &after);
-        drop(workspace);
-        let reopened =
-            EditorWorkspace::open(directory.path(), LockPolicy::FailIfPresent, 16).unwrap();
-        assert_project_content(reopened.manifest(), &after);
-        assert_eq!(
-            reopened.text_overlay_draft(id).unwrap().request.text,
-            "After"
-        );
     }
 
     #[test]
@@ -1212,6 +1241,76 @@ mod tests {
             decoded.frames()[1].rgba(),
             &[0, 0, 255, 255, 0, 255, 0, 255]
         );
+    }
+
+    #[test]
+    fn transparent_title_keeps_wpf_text_precision_through_undo_redo_and_journal_reopen() {
+        use gif_from_screen_domain::{CaptureBinding, CompositePrecision, FrameRenderStep};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = create_rendered_duplicate_workspace(&directory);
+        let before = workspace.manifest().clone();
+        let (request, image) = text("Translucent title", Rgba { alpha: 253, ..BLUE });
+        let title = TitleFrameRequest {
+            after: None,
+            duration: DurationUs::new(50).unwrap(),
+            background: Rgba::TRANSPARENT,
+            text: request,
+            position: PhysicalPoint::default(),
+        };
+        let id = workspace.insert_title_frame(&title, &image).unwrap();
+        let inserted = &workspace.manifest().timeline.frames[0];
+        assert_eq!(inserted.id, id);
+        assert_eq!(inserted.capture_binding, CaptureBinding::NotRecorded);
+        assert_eq!(inserted.capture_clock, None);
+        assert_eq!(
+            inserted.render_steps,
+            [
+                FrameRenderStep::composite(1),
+                FrameRenderStep::Composite {
+                    stage_id: 2,
+                    precision: CompositePrecision::WpfPbgra8PngV1,
+                },
+            ]
+        );
+        let cell = &workspace
+            .manifest()
+            .timeline
+            .overlay_tracks
+            .last()
+            .unwrap()
+            .frame_cells
+            .as_ref()
+            .unwrap()[0];
+        assert_eq!(cell.frame_id, id);
+        assert_eq!(cell.stage, Some(2));
+        let render = |workspace: &EditorWorkspace| {
+            crate::editor_preview::render_frame_surface(workspace.active_project(), id, 1024)
+                .unwrap()
+        };
+        let rendered = render(&workspace);
+        assert_eq!(rendered.size(), PhysicalSize::new(2, 1).unwrap());
+        // Hosted WPF run 34071253697 confirmed the reciprocal conversion:
+        // premultiplied blue 253 / alpha 253 decodes to straight blue 254.
+        assert_eq!(rendered.pixels(), &[0, 0, 254, 253, 0, 0, 0, 0]);
+        let authored = workspace.manifest().clone();
+        assert!(workspace.undo().unwrap());
+        assert_eq!(workspace.manifest().timeline, before.timeline);
+        assert_eq!(workspace.manifest().assets, before.assets);
+        assert_eq!(workspace.manifest().canvas, before.canvas);
+        assert!(workspace.redo().unwrap());
+        assert_project_content(workspace.manifest(), &authored);
+        assert_eq!(render(&workspace), rendered);
+        let journaled = workspace.manifest().clone();
+        // No checkpoint: the precision-bearing title and its caption must be
+        // restored from their journaled insertion/undo/redo commands.
+        drop(workspace);
+        let reopened =
+            EditorWorkspace::open(directory.path(), LockPolicy::FailIfPresent, 16).unwrap();
+        assert!(reopened.asset_issues().is_empty());
+        assert!(reopened.journal_recovery().unwrap().replayed_records > 0);
+        assert_eq!(reopened.manifest(), &journaled);
+        assert_eq!(render(&reopened), rendered);
     }
 
     #[test]

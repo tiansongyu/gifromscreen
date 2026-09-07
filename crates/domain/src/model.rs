@@ -716,7 +716,7 @@ impl ProjectManifest {
         }
 
         let mut frame_ids = BTreeSet::new();
-        let mut frame_stages = BTreeMap::<FrameId, BTreeSet<u32>>::new();
+        let mut frame_stages = BTreeMap::<FrameId, BTreeMap<u32, crate::CompositePrecision>>::new();
         for (index, frame) in self.timeline.frames.iter().enumerate() {
             if frame.id.is_nil() {
                 issues.push(ValidationIssue::NilFrameId { index });
@@ -740,8 +740,12 @@ impl ProjectManifest {
                                 .render_steps
                                 .iter()
                                 .filter_map(|step| {
-                                    if let crate::FrameRenderStep::Composite { stage_id } = step {
-                                        Some(*stage_id)
+                                    if let crate::FrameRenderStep::Composite {
+                                        stage_id,
+                                        precision,
+                                    } = step
+                                    {
+                                        Some((*stage_id, *precision))
                                     } else {
                                         None
                                     }
@@ -880,7 +884,7 @@ impl ProjectManifest {
                     }
                     if !frame_stages
                         .get(&cell.frame_id)
-                        .is_some_and(|stages| stages.contains(&stage))
+                        .is_some_and(|stages| stages.contains_key(&stage))
                     {
                         issues.push(ValidationIssue::InvalidFrameOverlay {
                             track_id: track.id,
@@ -888,6 +892,19 @@ impl ProjectManifest {
                                 "Composite stage {stage} does not exist on overlay owner {}.",
                                 cell.frame_id
                             ),
+                        });
+                    }
+                    if track.blend_mode != BlendMode::Normal
+                        && frame_stages
+                            .get(&cell.frame_id)
+                            .and_then(|stages| stages.get(&stage))
+                            == Some(&crate::CompositePrecision::WpfPbgra8PngV1)
+                    {
+                        issues.push(ValidationIssue::InvalidFrameOverlay {
+                            track_id: track.id,
+                            reason:
+                                "WPF paint stages require Normal blending, including hidden groups."
+                                    .to_owned(),
                         });
                     }
                 }

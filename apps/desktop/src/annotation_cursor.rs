@@ -316,14 +316,14 @@ mod tests {
             },
             effects: Vec::new(),
             render_steps: vec![
-                FrameRenderStep::Composite { stage_id: 11 },
+                FrameRenderStep::composite(11),
                 FrameRenderStep::Crop {
                     rect: PhysicalRect::new(1, 0, 7, 5).unwrap(),
                 },
                 FrameRenderStep::Resize {
                     size: PhysicalSize::new(5, 7).unwrap(),
                 },
-                FrameRenderStep::Composite { stage_id: 22 },
+                FrameRenderStep::composite(22),
                 FrameRenderStep::Rotate {
                     rotation: QuarterTurn::Clockwise90,
                 },
@@ -338,7 +338,7 @@ mod tests {
                     size: PhysicalSize::new(11, 8).unwrap(),
                 },
                 FrameRenderStep::FlipVertical,
-                FrameRenderStep::Composite { stage_id: 33 },
+                FrameRenderStep::composite(33),
                 FrameRenderStep::Crop {
                     rect: PhysicalRect::new(0, 1, 11, 6).unwrap(),
                 },
@@ -381,7 +381,8 @@ mod tests {
             .transform_surface(source, frame.transform, &NeverCancel)
             .unwrap();
         for step in &frame.render_steps {
-            if matches!(step, FrameRenderStep::Composite { stage_id } if Some(*stage_id) == stage) {
+            if matches!(step, FrameRenderStep::Composite { stage_id, .. } if Some(*stage_id) == stage)
+            {
                 break;
             }
             let placement = match step {
@@ -432,7 +433,7 @@ mod tests {
         let mut frame = staged_frame();
         frame.transform = ClipTransform::default();
         frame.render_steps = vec![
-            FrameRenderStep::Composite { stage_id: 11 },
+            FrameRenderStep::composite(11),
             FrameRenderStep::ImageBorder {
                 style: ImageBorderStyle {
                     widths: SignedEdgeWidths {
@@ -455,7 +456,7 @@ mod tests {
                     },
                 },
             },
-            FrameRenderStep::Composite { stage_id: 22 },
+            FrameRenderStep::composite(22),
             FrameRenderStep::ImageShadow {
                 style: ImageShadowStyle {
                     blur_radius_hundredths: 425,
@@ -480,7 +481,7 @@ mod tests {
                 rotation: QuarterTurn::Clockwise90,
             },
             FrameRenderStep::FlipHorizontal,
-            FrameRenderStep::Composite { stage_id: 33 },
+            FrameRenderStep::composite(33),
             FrameRenderStep::Resize {
                 size: PhysicalSize::new(11, 8).unwrap(),
             },

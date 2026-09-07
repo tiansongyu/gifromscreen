@@ -164,7 +164,7 @@ fn staged_input_project() -> (ProjectManifest, RgbaSurface) {
         ..ClipTransform::default()
     };
     frame.render_steps = vec![
-        FrameRenderStep::Composite { stage_id: 11 },
+        FrameRenderStep::composite(11),
         FrameRenderStep::Resize {
             size: PhysicalSize::new(20, 10).unwrap(),
         },
@@ -211,7 +211,7 @@ fn seal_and_extend_input_program(manifest: &mut ProjectManifest) {
         .unwrap()[0]
         .stage = Some(22);
     manifest.timeline.frames[0].render_steps.extend([
-        FrameRenderStep::Composite { stage_id: 22 },
+        FrameRenderStep::composite(22),
         FrameRenderStep::Rotate {
             rotation: QuarterTurn::Clockwise90,
         },
@@ -300,7 +300,7 @@ fn recorded_click_and_cursor_creation_reedit_and_legacy_replay_use_their_distinc
                 .as_ref()
                 .unwrap()[0]
                 .stage,
-            None
+            Some(2)
         );
         let legacy = super::super::prepare_legacy_annotations_with_assets(
             &manifest,
@@ -415,7 +415,7 @@ fn expanding_effects_shift_new_input_marks_but_reedit_preserves_the_original_sta
             .unwrap()[0]
             .stage = Some(22);
         manifest.timeline.frames[0].render_steps.extend([
-            FrameRenderStep::Composite { stage_id: 22 },
+            FrameRenderStep::composite(22),
             FrameRenderStep::ImageBorder { style: border },
             FrameRenderStep::ImageShadow { style: shadow },
             FrameRenderStep::FlipHorizontal,

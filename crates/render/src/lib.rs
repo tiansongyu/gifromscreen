@@ -14,7 +14,9 @@
 //! is accepted with overflow-free clipping. Active timed items join the first
 //! Composite stage, stage-anchored marks join their named stage, and unanchored
 //! marks draw at the tail. Each stage uses stable z/track/item order with hard-edged,
-//! allocation-free vector rasterization and straight-alpha blend modes. Keeping
+//! allocation-free vector rasterization. Legacy stages use straight-alpha blend
+//! modes; explicit WPF stages share one premultiplied RGBA8 surface and one
+//! PNG/WIC-compatible fixed-reciprocal boundary. Keeping
 //! this pipeline CPU-only gives exports a stable reference implementation across
 //! Linux machines and graphics drivers.
 //!
@@ -22,8 +24,9 @@
 //! changing legacy effects. `ImageShadow` uses the WPF software-reference Gaussian
 //! kernel, separate per-pass 8-bit quantization and independent shadow opacity;
 //! its chosen background is composited last. Fractional border strokes use
-//! pixel-area coverage. These are explicit reference algorithms, not a claim of
-//! bit equality with Windows `RenderTargetBitmap`/WIC output.
+//! pixel-area coverage. The first independent Windows `RenderTargetBitmap`/WIC
+//! corpus matches exactly; this bounded coverage is not a claim of equality for
+//! every parameter, vector antialiasing or historical fractional-DPI behavior.
 
 #![forbid(unsafe_code)]
 
@@ -34,6 +37,7 @@ mod overlay;
 mod renderer;
 mod surface;
 mod transition;
+mod wpf_pixels;
 
 #[cfg(test)]
 mod ordered_tests;

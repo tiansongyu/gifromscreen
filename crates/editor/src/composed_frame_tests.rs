@@ -194,7 +194,7 @@ fn imported_maximum_stage_identity_does_not_exhaust_available_ids() {
     let mut project = fixture();
     project.schema_version = 3;
     project.timeline.frames[0].render_steps = vec![
-        FrameRenderStep::Composite { stage_id: u32::MAX },
+        FrameRenderStep::composite(u32::MAX),
         FrameRenderStep::FlipHorizontal,
     ];
     owned(&mut project, 20, true, 255);
@@ -211,7 +211,7 @@ fn imported_maximum_stage_identity_does_not_exhaust_available_ids() {
     assert!(
         project.timeline.frames[0]
             .render_steps
-            .contains(&FrameRenderStep::Composite { stage_id: u32::MAX })
+            .contains(&FrameRenderStep::composite(u32::MAX))
     );
 }
 
