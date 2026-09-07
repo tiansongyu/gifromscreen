@@ -31,7 +31,7 @@
 
 这些标记描述平台能力和设计目标，不代表已完成全部原生验收。当前开发优先 Linux，macOS 尚未进入本轮实现；本轮计时／录制时钟的实现及自动化证据见 [计时契约](CAPTURE-PLAYBACK-TIMING.md)，原生验收范围与未完成硬件门禁见 [下一轮工作](NEXT-LINUX-ITERATION.md)。
 
-Linux 已接入[有序整帧编辑](ORDERED-FRAME-EDITING.md)。Schema 4 进一步实现[扩画布阴影与混合内外边框](EXPANDED-IMAGE-EFFECTS.md)，包括方向、距离、模糊、独立透明度、背景和自动任务；[原生验收](IMAGE-EFFECTS-QA-2026-09-07.md)覆盖效果顺序、清除／撤销、重开与 GIF 一致性。隐藏中间阶段烘焙、Windows/WIC 数值黄金图对比及物理平台门禁仍未完成，不能据此宣称完全一比一。
+Linux 已接入[有序整帧编辑](ORDERED-FRAME-EDITING.md)、[扩画布阴影与混合边框](EXPANDED-IMAGE-EFFECTS.md)及[显式 WPF 绘制精度](WPF-PAINT-PRECISION.md)，首组独立 Windows/WIC 图像已逐字节通过。[矩形冻结扩展](NONDESTRUCTIVE-CINEMAGRAPH.md)已支持隐藏中间图层并通过[原生重开/GIF 验收](NATIVE-FREEZE-QA-2026-09-07.md)。但它不等于上游 Cinemagraph：参考版取第一帧、使用自由笔迹和透明度合成，见[最新行为审计](CINEMAGRAPH-REFERENCE.md)。该路径、更广的数值覆盖与物理平台门禁仍未完成，不能据局部验收宣称完全一比一。
 
 ## 2. 启动器与应用级能力
 

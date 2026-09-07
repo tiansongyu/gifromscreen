@@ -225,7 +225,7 @@ fn same_raw_asset_can_be_a_rotated_frozen_view_without_changing_its_canonical_sh
     workspace
         .apply_motion_edit(
             &workspace.project_edit_anchor(),
-            MotionOperation::Cinemagraph {
+            MotionOperation::RectangularFreeze {
                 region: PhysicalRect::new(0, 0, 1, 2).unwrap(),
                 invert: true,
             },

@@ -132,7 +132,7 @@ fn transformed_cinemagraph_preserves_source_binding_but_blocks_new_output_replay
     workspace
         .apply_motion_edit(
             &workspace.project_edit_anchor(),
-            MotionOperation::Cinemagraph {
+            MotionOperation::RectangularFreeze {
                 region: rect(),
                 invert: false,
             },
@@ -226,7 +226,7 @@ fn baked_binding_and_raw_input_survive_clipboard_and_project_insertion() {
     source
         .apply_motion_edit(
             &source.project_edit_anchor(),
-            MotionOperation::Cinemagraph {
+            MotionOperation::RectangularFreeze {
                 region: rect(),
                 invert: false,
             },
@@ -353,7 +353,7 @@ fn cinemagraph_preserves_hidden_zero_opacity_and_remaining_authoring_scope() {
     workspace
         .apply_motion_edit(
             &workspace.project_edit_anchor(),
-            MotionOperation::Cinemagraph {
+            MotionOperation::RectangularFreeze {
                 region: rect(),
                 invert: false,
             },
@@ -654,7 +654,7 @@ fn bake_whole_selected(workspace: &mut EditorWorkspace) {
     workspace
         .apply_motion_edit(
             &workspace.project_edit_anchor(),
-            MotionOperation::Cinemagraph {
+            MotionOperation::RectangularFreeze {
                 region: PhysicalRect::new(0, 0, 2, 1).unwrap(),
                 invert: false,
             },
@@ -731,7 +731,7 @@ fn hidden_intermediate_artwork_survives_freeze_and_reveals_only_in_the_live_regi
     let before = workspace.manifest().clone();
     let result = workspace.apply_motion_edit(
         &workspace.project_edit_anchor(),
-        MotionOperation::Cinemagraph {
+        MotionOperation::RectangularFreeze {
             region: PhysicalRect::new(0, 0, 1, 1).unwrap(),
             invert: false,
         },
@@ -969,7 +969,7 @@ fn cinemagraph_freezes_transparent_pixels_and_does_not_touch_selection_gaps() {
     workspace
         .apply_motion_edit(
             &anchor,
-            MotionOperation::Cinemagraph {
+            MotionOperation::RectangularFreeze {
                 region: rect(),
                 invert: false,
             },
@@ -1013,7 +1013,7 @@ fn inverted_cinemagraph_only_freezes_inside_the_rectangle() {
     workspace
         .apply_motion_edit(
             &anchor,
-            MotionOperation::Cinemagraph {
+            MotionOperation::RectangularFreeze {
                 region: rect(),
                 invert: true,
             },
@@ -1139,14 +1139,14 @@ fn motion_rejects_stale_selection_invalid_rectangles_canvas_mismatch_and_limits(
             frames: 3,
             duration_us: 2,
         },
-        MotionOperation::Cinemagraph {
+        MotionOperation::RectangularFreeze {
             region: PhysicalRect {
                 origin: PhysicalPoint::default(),
                 size: PhysicalSize::new(3, 1).unwrap(),
             },
             invert: false,
         },
-        MotionOperation::Cinemagraph {
+        MotionOperation::RectangularFreeze {
             region: PhysicalRect {
                 origin: PhysicalPoint::default(),
                 size: PhysicalSize {

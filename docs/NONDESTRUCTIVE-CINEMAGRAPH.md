@@ -1,9 +1,15 @@
-# Non-destructive rectangular Cinemagraph
+# Non-destructive rectangular freeze
 
-Schema 6 replaces new Cinemagraph flattening with an ordered `FreezeRegion`
+Schema 6 replaces the earlier rectangular-freeze flattening with an ordered `FreezeRegion`
 step. It retains the original frame asset, capture input, clock, transforms,
 effects, and every existing layer. One immutable rendered reference is shared
 by the selected frames. Unselected frames and their cells stay unchanged.
+
+This is an extension, now labeled **Rectangular freeze** in the UI, not exact
+ScreenToGif Cinemagraph parity. The [pinned reference audit](CINEMAGRAPH-REFERENCE.md)
+establishes that upstream uses the first frame, freehand ink geometry and
+premultiplied source-over. This tool keeps its chosen current-frame/rectangle/
+RGBA-overwrite behavior; opening an existing project does not reinterpret it.
 
 ## Render contract
 
@@ -89,7 +95,7 @@ deletion protection, copy after source deletion, Save As/reopen, exact Undo/Redo
 and local/global-palette GIF export with frozen transition endpoints.
 
 This resolves the prior **hidden intermediate-stage rejection for rectangular
-Cinemagraph**. It does not implement freeform masks, certify every upstream
+freeze**. It does not implement the reference Cinemagraph path, certify every upstream
 compositing nuance, or close physical desktop release gates. The bounded
 [native freeze/reveal/Undo/reopen/GIF sequence](NATIVE-FREEZE-QA-2026-09-07.md)
 now passes with a byte-identical export after reopening. WPF fixtures remain a separate,

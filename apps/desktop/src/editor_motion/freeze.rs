@@ -7,12 +7,12 @@ use gif_from_screen_editor::{ComposedFrameEdit, edit_composed_frames};
 use gif_from_screen_project::AssetStore;
 
 use super::{
-    AtomicBool, EditorWorkspace, MAX_CINEMAGRAPH_FRAMES, MAX_SURFACE_BYTES, MotionProgress,
+    AtomicBool, EditorWorkspace, MAX_FREEZE_FRAMES, MAX_SURFACE_BYTES, MotionProgress,
     check_cancelled, render,
 };
 
 impl EditorWorkspace {
-    pub(super) fn cinemagraph_command(
+    pub(super) fn freeze_region_command(
         &self,
         region: PhysicalRect,
         invert: bool,
@@ -32,10 +32,8 @@ impl EditorWorkspace {
             .filter(|frame| self.selection().contains(frame.id))
             .map(|frame| frame.id)
             .collect();
-        if selected.is_empty() || selected.len() > MAX_CINEMAGRAPH_FRAMES {
-            return Err(
-                "Select between 1 and 1,000 frames for a rectangular cinemagraph.".to_owned(),
-            );
+        if selected.is_empty() || selected.len() > MAX_FREEZE_FRAMES {
+            return Err("Select between 1 and 1,000 frames for a rectangular freeze.".to_owned());
         }
         let canvas = self.manifest().canvas.size;
         if region.size.validate().is_err() || !region.fits_within(canvas) {

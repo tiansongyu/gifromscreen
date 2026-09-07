@@ -23,7 +23,7 @@ type WorkspaceLoan = Arc<Mutex<Option<EditorWorkspace>>>;
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 enum Mode {
     #[default]
-    Cinemagraph,
+    RectangularFreeze,
     SmoothLoop,
     LoopCrossfade,
 }
@@ -96,12 +96,12 @@ impl MotionTools {
             self.sync_canvas(workspace);
             ui.add_enabled_ui(!self.is_running(), |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.selectable_value(&mut self.mode, Mode::Cinemagraph, "Cinemagraph");
+                    ui.selectable_value(&mut self.mode, Mode::RectangularFreeze, "Rectangular freeze");
                     ui.selectable_value(&mut self.mode, Mode::SmoothLoop, "Smooth loop");
                     ui.selectable_value(&mut self.mode, Mode::LoopCrossfade, "Loop crossfade");
                 });
                 match self.mode {
-                    Mode::Cinemagraph => {
+                    Mode::RectangularFreeze => {
                         ui.label("Use the current frame as a frozen image. Only the rectangular motion area continues animating in selected frames.");
                         let size = workspace.manifest().canvas.size;
                         ui.horizontal_wrapped(|ui| {
@@ -232,11 +232,11 @@ impl MotionTools {
             return Err("A motion edit is already pending or running.".to_owned());
         }
         let operation = match self.mode {
-            Mode::Cinemagraph => {
+            Mode::RectangularFreeze => {
                 if workspace.selection().is_empty() {
                     return Err("Select frames and a current frozen reference first.".to_owned());
                 }
-                MotionOperation::Cinemagraph {
+                MotionOperation::RectangularFreeze {
                     region: PhysicalRect {
                         origin: PhysicalPoint {
                             x: PhysicalPx::new(self.x),

@@ -20,7 +20,7 @@ use crate::editor_preview::PreviewRenderPlan;
 
 const MAX_BAKED_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SURFACE_BYTES: usize = 64 * 1024 * 1024;
-const MAX_CINEMAGRAPH_FRAMES: usize = 1_000;
+const MAX_FREEZE_FRAMES: usize = 1_000;
 const MAX_LOOP_FRAMES: u16 = 120;
 const MAX_RESULTING_FRAMES: usize = 100_000;
 #[path = "editor_motion/freeze.rs"]
@@ -29,7 +29,7 @@ mod freeze;
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum MotionOperation {
     /// Preserve current-frame pixels outside the rectangle; invert freezes inside instead.
-    Cinemagraph { region: PhysicalRect, invert: bool },
+    RectangularFreeze { region: PhysicalRect, invert: bool },
     /// Append fully rendered cross-fade frames from the last original to the first original.
     LoopCrossfade { frames: u16, duration_us: u64 },
     /// Find a frame matching the first and remove frames after that match.
@@ -43,7 +43,7 @@ pub(crate) enum MotionOperation {
 impl MotionOperation {
     pub(crate) const fn label(&self) -> &'static str {
         match self {
-            Self::Cinemagraph { .. } => "Rectangular cinemagraph",
+            Self::RectangularFreeze { .. } => "Rectangular freeze",
             Self::LoopCrossfade { .. } => "Loop crossfade",
             Self::FindSmoothLoop { .. } => "Smooth loop search",
         }
@@ -89,8 +89,8 @@ impl EditorWorkspace {
             );
         }
         let (command, count) = match operation {
-            MotionOperation::Cinemagraph { region, invert } => {
-                self.cinemagraph_command(region, invert, cancellation, &mut progress)?
+            MotionOperation::RectangularFreeze { region, invert } => {
+                self.freeze_region_command(region, invert, cancellation, &mut progress)?
             }
             MotionOperation::LoopCrossfade {
                 frames,

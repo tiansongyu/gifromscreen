@@ -42,6 +42,14 @@ Cinemagraph now preserves hidden/zero-opacity intermediate-stage artwork through
 
 The [native freeze/reveal/Undo/reopen/GIF acceptance](NATIVE-FREEZE-QA-2026-09-07.md) now passes. Layers provides undoable Hide/Show controls and the reopened GIF is byte-identical. Next: broader replay and numeric corpora, freeform-mask parity where required by the reference audit, and the remaining feature-matrix/platform gates. Retaining raw metadata is still not proof that a newly authored cursor matches mixed output pixels.
 
+The [new pinned Cinemagraph audit](CINEMAGRAPH-REFERENCE.md) confirms an additional
+semantic gap: first-frame clipped ink geometry and premultiplied source-over,
+not current-frame rectangular RGBA overwrite. The implemented extension is now
+explicitly labeled Rectangular freeze. Preserve its saved semantics and implement
+the actual Cinemagraph path separately; do not reinterpret its prior acceptance
+as upstream parity. The independent clip/PNG-boundary probe precedes that pixel
+representation decision.
+
 ## Monitor controller and remaining platform acceptance
 
 The native monitor test proves that a controller overlapping the crop appears in the GIF. The app cannot promise automatic self-exclusion on a general Wayland monitor source. The visible warning remains, alongside the implemented 720×480 compact controller and responsive controls. Global-shortcut integration and further timed-capture fallbacks remain work; compact sizing is not a physical-position or self-exclusion guarantee.
