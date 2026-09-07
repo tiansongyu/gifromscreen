@@ -5,11 +5,15 @@ use gif_from_screen_application::{
 use gif_from_screen_domain::{
     AnnotationMode, AnnotationRequest, BlendMode, CaptureBinding, CaptureMetadata,
     FrameAuthoringSpan, FrameLocalSpan, FrameOverlayCell, FrameOverlayMark, KeyStroke, MouseButton,
-    MouseInputEvent, OverlayContent, OverlayTrack, PhysicalPoint, PhysicalPx, ProjectId,
-    ProjectManifest, Rgba, ShapeKind, TrackId, UnixTimeMs,
+    MouseInputEvent, OverlayContent, OverlayId, OverlayItem, OverlayTrack, PhysicalPoint,
+    PhysicalPx, ProjectId, ProjectManifest, Rgba, ShapeKind, TimeUs, TimelineSpan, TrackId,
+    UnixTimeMs,
 };
 use gif_from_screen_gif::RgbaFrame;
 use gif_from_screen_project::LockPolicy;
+
+#[path = "freeze_tests.rs"]
+mod freeze_tests;
 
 fn workspace(root: &std::path::Path) -> EditorWorkspace {
     let mut writer = IncrementalRecordingProject::create(
@@ -104,7 +108,7 @@ fn add_raw_input(workspace: &mut EditorWorkspace) {
 }
 
 #[test]
-fn transformed_cinemagraph_archives_input_without_duplicate_replay_and_undo_restores_it() {
+fn transformed_cinemagraph_preserves_source_binding_but_blocks_new_output_replay() {
     use crate::annotation_engine::{load_annotation_asset, prepare_annotations_with_assets};
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("bound.gfsproj");
@@ -137,10 +141,7 @@ fn transformed_cinemagraph_archives_input_without_duplicate_replay_and_undo_rest
         )
         .unwrap();
     let frame = &workspace.manifest().timeline.frames[0];
-    assert_eq!(
-        frame.capture_binding,
-        CaptureBinding::ArchivedAfterComposite
-    );
+    assert_eq!(frame.capture_binding, CaptureBinding::Original);
     assert_eq!(serde_json::to_vec(&frame.capture_metadata).unwrap(), raw);
     assert!(!frame.capture_metadata.cursor_embedded);
     assert_eq!(pixels(&workspace, 1), visible);
@@ -183,7 +184,7 @@ fn transformed_cinemagraph_archives_input_without_duplicate_replay_and_undo_rest
     let reopened = EditorWorkspace::open(root, LockPolicy::FailIfPresent, 32).unwrap();
     assert_eq!(
         reopened.manifest().timeline.frames[0].capture_binding,
-        CaptureBinding::ArchivedAfterComposite
+        CaptureBinding::Original
     );
     assert_eq!(
         serde_json::to_vec(&reopened.manifest().timeline.frames[0].capture_metadata).unwrap(),
@@ -380,7 +381,7 @@ fn cinemagraph_preserves_hidden_zero_opacity_and_remaining_authoring_scope() {
     assert!(kept.items.is_empty());
     assert_eq!(
         kept.annotation_scope.as_ref().unwrap(),
-        &authored.annotation_scope.unwrap()[1..]
+        authored.annotation_scope.as_ref().unwrap()
     );
     assert_eq!(
         workspace.manifest().timeline.frames[1].capture_binding,
@@ -680,11 +681,16 @@ fn staged_cinemagraph_consumes_geometry_once_and_undo_restores_owned_stages() {
     .unwrap();
     assert!(!before.frames[0].render_steps.is_empty());
     bake_whole_selected(&mut workspace);
-    assert!(
-        workspace.manifest().timeline.frames[0]
-            .render_steps
-            .is_empty()
+    let frozen = &workspace.manifest().timeline.frames[0];
+    assert_eq!(frozen.asset_id, before.frames[0].asset_id);
+    assert_eq!(
+        &frozen.render_steps[..frozen.render_steps.len() - 1],
+        &before.frames[0].render_steps
     );
+    assert!(matches!(
+        frozen.render_steps.last(),
+        Some(gif_from_screen_domain::FrameRenderStep::FreezeRegion { .. })
+    ));
     assert_eq!(
         render(
             workspace.active_project(),
@@ -713,7 +719,7 @@ fn staged_cinemagraph_consumes_geometry_once_and_undo_restores_owned_stages() {
 }
 
 #[test]
-fn hidden_intermediate_artwork_blocks_bake_before_any_project_or_asset_change() {
+fn hidden_intermediate_artwork_survives_freeze_and_reveals_only_in_the_live_region() {
     let directory = tempfile::tempdir().unwrap();
     let mut workspace = workspace(&directory.path().join("staged-hidden.gfsproj"));
     let mut hidden = add_owned_overlay(&mut workspace);
@@ -726,22 +732,34 @@ fn hidden_intermediate_artwork_blocks_bake_before_any_project_or_asset_change() 
     let result = workspace.apply_motion_edit(
         &workspace.project_edit_anchor(),
         MotionOperation::Cinemagraph {
-            region: PhysicalRect::new(0, 0, 2, 1).unwrap(),
+            region: PhysicalRect::new(0, 0, 1, 1).unwrap(),
             invert: false,
         },
         &AtomicBool::new(false),
         |_| {},
     );
-    assert!(
-        result
-            .unwrap_err()
-            .contains("hidden or zero-opacity artwork")
+    assert_eq!(result.unwrap(), MotionOutcome::Edited(3));
+    assert_eq!(
+        workspace.manifest().timeline.overlay_tracks,
+        before.timeline.overlay_tracks
     );
-    assert_eq!(workspace.manifest(), &before);
+    let hidden_pixels = pixels(&workspace, 1);
+    let mut revealed = workspace.manifest().timeline.overlay_tracks[0].clone();
+    revealed.visible = true;
+    workspace
+        .execute(EditCommand::UpsertOverlayTrack { track: revealed })
+        .unwrap();
+    let visible_pixels = pixels(&workspace, 1);
+    assert_ne!(&hidden_pixels[..4], &visible_pixels[..4]);
+    assert_eq!(&hidden_pixels[4..], &visible_pixels[4..]);
+    workspace.undo().unwrap();
+    assert_eq!(pixels(&workspace, 1), hidden_pixels);
+    workspace.undo().unwrap();
+    equal_except_revision(workspace.manifest(), &before);
 }
 
 #[test]
-fn frame_owned_cinemagraph_bakes_once_preserving_unselected_owners_and_raw_input() {
+fn frame_owned_cinemagraph_preserves_all_owners_and_raw_input_without_double_paint() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("owned-cinemagraph.gfsproj");
     let mut workspace = workspace(&root);
@@ -766,10 +784,7 @@ fn frame_owned_cinemagraph_bakes_once_preserving_unselected_owners_and_raw_input
         visible
     );
     let kept = &workspace.manifest().timeline.overlay_tracks[0];
-    assert_eq!(
-        kept.frame_cells.as_ref().unwrap(),
-        &original_track.frame_cells.as_ref().unwrap()[1..2]
-    );
+    assert_eq!(kept, &sealed_tail(&original_track, &[1, 3]));
     assert_eq!(
         serde_json::to_vec(
             &workspace
@@ -818,6 +833,20 @@ fn kept_from(manifest: &ProjectManifest, id: TrackId) -> &OverlayTrack {
         .unwrap()
 }
 
+fn sealed_tail(track: &OverlayTrack, owners: &[u128]) -> OverlayTrack {
+    let mut track = track.clone();
+    for cell in track.frame_cells.iter_mut().flatten() {
+        if owners
+            .iter()
+            .any(|id| FrameId::from_u128(*id) == cell.frame_id)
+            && cell.stage.is_none()
+        {
+            cell.stage = Some(1);
+        }
+    }
+    track
+}
+
 fn renamed_track(original: &OverlayTrack, id: u128) -> OverlayTrack {
     let mut track = original.clone();
     track.id = TrackId::from_u128(id);
@@ -835,7 +864,7 @@ fn renamed_track(original: &OverlayTrack, id: u128) -> OverlayTrack {
 }
 
 #[test]
-fn frame_owned_bake_keeps_hidden_zero_tracks_and_zero_marks_with_their_scopes() {
+fn frame_owned_freeze_keeps_hidden_zero_tracks_and_zero_marks_with_their_scopes() {
     let dir = tempfile::tempdir().unwrap();
     let mut workspace = workspace(&dir.path().join("invisible-owned.gfsproj"));
     let original = add_owned_overlay(&mut workspace);
@@ -857,7 +886,7 @@ fn frame_owned_bake_keeps_hidden_zero_tracks_and_zero_marks_with_their_scopes() 
     let mut retained_zero = zero_marks.frame_cells.as_ref().unwrap()[0].marks[0].clone();
     retained_zero.id = OverlayId::from_u128(94_000);
     cells[0].marks.push(retained_zero.clone());
-    // Selected empty coverage is consumed; unselected empty coverage survives.
+    // Both selected and unselected empty authoring coverage must survive.
     cells[1].marks.clear();
     cells[2].marks.clear();
     for track in [&hidden, &zero, &zero_marks, &mixed] {
@@ -875,30 +904,25 @@ fn frame_owned_bake_keeps_hidden_zero_tracks_and_zero_marks_with_their_scopes() 
         (1..=3).map(|id| pixels(&workspace, id)).collect::<Vec<_>>(),
         visible
     );
-    for track in [&hidden, &zero, &zero_marks] {
-        assert_eq!(kept_from(workspace.manifest(), track.id), track);
+    for track in [&hidden, &zero, &zero_marks, &mixed] {
+        assert_eq!(
+            kept_from(workspace.manifest(), track.id),
+            &sealed_tail(track, &[1, 3])
+        );
     }
-    let remaining = kept_from(workspace.manifest(), original.id)
-        .frame_cells
-        .as_ref()
-        .unwrap();
-    assert_eq!(remaining.len(), 2);
-    assert_eq!(remaining[0].marks, vec![retained_zero]);
-    assert_eq!(
-        remaining[0].scopes,
-        mixed.frame_cells.as_ref().unwrap()[0].scopes
-    );
-    assert_eq!(remaining[1], mixed.frame_cells.as_ref().unwrap()[1]);
 }
 
 #[test]
-fn frame_owned_bake_removes_exhausted_track_but_loop_preserves_source_owners() {
+fn frame_owned_freeze_and_loop_preserve_source_owners() {
     let dir = tempfile::tempdir().unwrap();
     let mut workspace = workspace(&dir.path().join("whole-owned.gfsproj"));
     let original = add_owned_overlay(&mut workspace);
     let visible = (1..=3).map(|id| pixels(&workspace, id)).collect::<Vec<_>>();
     bake_whole_selected(&mut workspace);
-    assert!(workspace.manifest().timeline.overlay_tracks.is_empty());
+    assert_eq!(
+        workspace.manifest().timeline.overlay_tracks,
+        vec![sealed_tail(&original, &[1, 2, 3])]
+    );
     assert_eq!(
         (1..=3).map(|id| pixels(&workspace, id)).collect::<Vec<_>>(),
         visible
@@ -964,9 +988,10 @@ fn cinemagraph_freezes_transparent_pixels_and_does_not_touch_selection_gaps() {
         0,
         "transparent frozen pixels must erase moving pixels"
     );
-    let overlay = &workspace.manifest().timeline.overlay_tracks[0].items[0];
-    assert_eq!(overlay.span.start.get(), 10_000);
-    assert_eq!(overlay.span.duration.get(), 10_000);
+    assert_eq!(
+        workspace.manifest().timeline.overlay_tracks,
+        before.timeline.overlay_tracks
+    );
     assert!(workspace.undo().unwrap());
     equal_except_revision(workspace.manifest(), &before);
     assert!(workspace.redo().unwrap());
@@ -1193,18 +1218,6 @@ fn cancelling_after_pixel_preparation_preserves_timeline_and_undo_history() {
     assert!(error.contains("cancelled"));
     equal_except_revision(workspace.manifest(), &before);
     assert!(!workspace.can_undo());
-}
-
-#[test]
-fn removing_selected_overlay_intervals_retains_every_gap_exactly() {
-    let span = |start, duration| TimelineSpan {
-        start: TimeUs::new(start),
-        duration: DurationUs::new(duration).unwrap(),
-    };
-    assert_eq!(
-        subtract_spans(span(0, 100), &[span(10, 20), span(50, 10), span(80, 20)]).unwrap(),
-        [span(0, 10), span(30, 20), span(60, 20)]
-    );
 }
 
 #[test]

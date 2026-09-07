@@ -114,7 +114,9 @@ pub(super) fn validate_program(
     if !frame.render_steps.iter().any(|step| {
         matches!(
             step,
-            FrameRenderStep::ImageBorder { .. } | FrameRenderStep::ImageShadow { .. }
+            FrameRenderStep::ImageBorder { .. }
+                | FrameRenderStep::ImageShadow { .. }
+                | FrameRenderStep::FreezeRegion { .. }
         )
     }) {
         return Ok(());
@@ -126,6 +128,19 @@ pub(super) fn validate_program(
             .step_input_size(index)
             .map_err(|reason| pipeline_error(frame.id, reason))?;
         validate_buffer(frame.id, input)?;
+        if matches!(
+            frame.render_steps[index],
+            FrameRenderStep::FreezeRegion { .. }
+        ) && input
+            .area()
+            .and_then(|pixels| pixels.checked_mul(8))
+            .is_none_or(|bytes| bytes > MAX_COMPOSED_IMAGE_BYTES)
+        {
+            return Err(pipeline_error(
+                frame.id,
+                "The freeze operation's image and baseline exceed the 64 MiB working-memory budget. Resize before creating the freeze region.",
+            ));
+        }
     }
     let output = plan.output_size();
     validate_buffer(frame.id, output)?;

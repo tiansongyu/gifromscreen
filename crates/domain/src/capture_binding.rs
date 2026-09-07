@@ -20,6 +20,8 @@ pub struct CaptureBindingSummary {
     pub selected_legacy_unknown: usize,
     pub selected_archived_after_composite: usize,
     pub selected_not_recorded: usize,
+    /// Current output follows a freeze; earlier source-bound paint stages survive.
+    pub selected_mixed_image_stage: usize,
     /// Original/legacy frames without a confirmed shared capture-clock identity.
     pub selected_missing_clock: usize,
 }
@@ -44,6 +46,9 @@ pub fn capture_binding_summary<'a>(
 ) -> CaptureBindingSummary {
     let mut summary = CaptureBindingSummary::default();
     for frame in frames {
+        if mixed_before_stage(frame, None) {
+            summary.selected_mixed_image_stage += 1;
+        }
         if matches!(
             frame.capture_binding,
             CaptureBinding::Original | CaptureBinding::LegacyUnknown
@@ -74,13 +79,40 @@ pub fn capture_binding_summary<'a>(
 
 /// Even an input-empty derived frame is a barrier to carrying labels from its neighbor.
 pub fn recorded_annotation_barrier(frame: &FrameClip, mode: &AnnotationMode) -> bool {
-    frame.capture_binding != CaptureBinding::Original
-        && matches!(
-            mode,
-            AnnotationMode::RecordedKeys
-                | AnnotationMode::RecordedClicks
-                | AnnotationMode::RecordedCursor
-        )
+    recorded_annotation_barrier_at_stage(frame, mode, None)
+}
+
+/// A source binding can be used before a mixed-image step, but not after it.
+/// Unknown target stages conservatively interrupt held input as well. Manual
+/// annotations and progress do not consume original screen coordinates.
+pub fn recorded_annotation_barrier_at_stage(
+    frame: &FrameClip,
+    mode: &AnnotationMode,
+    stage: Option<u32>,
+) -> bool {
+    matches!(
+        mode,
+        AnnotationMode::RecordedKeys
+            | AnnotationMode::RecordedClicks
+            | AnnotationMode::RecordedCursor
+    ) && (frame.capture_binding != CaptureBinding::Original || mixed_before_stage(frame, stage))
+}
+
+fn mixed_before_stage(frame: &FrameClip, stage: Option<u32>) -> bool {
+    if stage == Some(0) || frame.render_steps.len() > crate::MAX_FRAME_RENDER_STEPS {
+        return true;
+    }
+    let mut mixed = false;
+    for step in &frame.render_steps {
+        match step {
+            crate::FrameRenderStep::Composite { stage_id, .. } if Some(*stage_id) == stage => {
+                return mixed;
+            }
+            crate::FrameRenderStep::FreezeRegion { .. } => mixed = true,
+            _ => {}
+        }
+    }
+    stage.is_some() || mixed
 }
 
 /// Whether original capture coordinates still describe this frame before its current transform.
@@ -104,6 +136,7 @@ pub enum CaptureReplayBlock {
     LegacyUnknown,
     ArchivedAfterComposite,
     NotRecorded,
+    MixedImageStage,
 }
 
 impl CaptureReplayBlock {
@@ -118,6 +151,9 @@ impl CaptureReplayBlock {
             Self::NotRecorded => {
                 "This frame was imported or generated without a screen-input coordinate source. Use manual annotations; it cannot be confirmed as original screen input."
             }
+            Self::MixedImageStage => {
+                "Original input is preserved, but this paint stage follows frozen mixed-source pixels or is unknown. Edit recorded annotations at their earlier stage, undo the freeze, or use manual annotations."
+            }
         }
     }
 }
@@ -127,6 +163,17 @@ impl CaptureReplayBlock {
 pub fn recorded_annotation_block(
     frame: &FrameClip,
     mode: &AnnotationMode,
+) -> Option<CaptureReplayBlock> {
+    recorded_annotation_block_at_stage(frame, mode, None)
+}
+
+/// Stage-aware counterpart of [`recorded_annotation_block`]. Source-level
+/// archival/unknown bindings remain blocked even before a frozen-image step.
+/// Input-empty frames still produce no warning; use the barrier for held input.
+pub fn recorded_annotation_block_at_stage(
+    frame: &FrameClip,
+    mode: &AnnotationMode,
+    stage: Option<u32>,
 ) -> Option<CaptureReplayBlock> {
     let metadata = &frame.capture_metadata;
     let relevant = match mode {
@@ -145,6 +192,9 @@ pub fn recorded_annotation_block(
         return None;
     }
     match frame.capture_binding {
+        CaptureBinding::Original if mixed_before_stage(frame, stage) => {
+            Some(CaptureReplayBlock::MixedImageStage)
+        }
         CaptureBinding::Original => None,
         CaptureBinding::LegacyUnknown => Some(CaptureReplayBlock::LegacyUnknown),
         CaptureBinding::ArchivedAfterComposite => Some(CaptureReplayBlock::ArchivedAfterComposite),
@@ -257,6 +307,152 @@ mod tests {
         assert_eq!(
             recorded_annotation_block(&clip, &AnnotationMode::RecordedCursor),
             None
+        );
+    }
+
+    fn staged_input() -> FrameClip {
+        let mut clip = frame(1, asset(1).id);
+        clip.capture_metadata.key_strokes.push(KeyStroke {
+            physical_key: "C".into(),
+            display_text: Some("C".into()),
+            pressed: true,
+            at: TimeUs::ZERO,
+            repeat: false,
+            modifiers: 0,
+        });
+        clip.capture_metadata
+            .pressed_mouse_buttons
+            .push(crate::MouseButton::Left);
+        clip.capture_metadata.cursor_visible = true;
+        clip.capture_metadata.cursor_position = Some(PhysicalPoint::default());
+        clip.render_steps = vec![
+            crate::FrameRenderStep::composite(1),
+            crate::FrameRenderStep::composite(2),
+            crate::FrameRenderStep::FreezeRegion {
+                baseline_asset: asset(2).id,
+                baseline_size: crate::PhysicalSize::new(320, 200).unwrap(),
+                region: crate::PhysicalRect::new(1, 1, 10, 10).unwrap(),
+                invert: false,
+            },
+            crate::FrameRenderStep::composite(3),
+        ];
+        clip
+    }
+
+    #[test]
+    fn original_input_remains_replayable_before_freeze_but_not_after_or_at_unknown_stages() {
+        let clip = staged_input();
+        let before = clip.clone();
+        for mode in [
+            AnnotationMode::RecordedKeys,
+            AnnotationMode::RecordedClicks,
+            AnnotationMode::RecordedCursor,
+        ] {
+            for stage in [Some(1), Some(2)] {
+                assert!(!recorded_annotation_barrier_at_stage(&clip, &mode, stage));
+                assert_eq!(
+                    recorded_annotation_block_at_stage(&clip, &mode, stage),
+                    None
+                );
+            }
+            for stage in [None, Some(3), Some(0), Some(999)] {
+                assert!(recorded_annotation_barrier_at_stage(&clip, &mode, stage));
+                assert_eq!(
+                    recorded_annotation_block_at_stage(&clip, &mode, stage),
+                    Some(CaptureReplayBlock::MixedImageStage)
+                );
+            }
+            assert_eq!(
+                recorded_annotation_block(&clip, &mode),
+                recorded_annotation_block_at_stage(&clip, &mode, None)
+            );
+            assert_eq!(
+                recorded_annotation_barrier(&clip, &mode),
+                recorded_annotation_barrier_at_stage(&clip, &mode, None)
+            );
+        }
+        for mode in [
+            AnnotationMode::BuiltinCursor,
+            AnnotationMode::ManualKeys {
+                text: "manual".into(),
+            },
+            AnnotationMode::Progress(Default::default()),
+        ] {
+            assert!(!recorded_annotation_barrier_at_stage(
+                &clip,
+                &mode,
+                Some(999)
+            ));
+            assert_eq!(recorded_annotation_block_at_stage(&clip, &mode, None), None);
+        }
+        assert_eq!(clip, before);
+    }
+
+    #[test]
+    fn empty_and_embedded_input_remain_no_event_cases_while_freeze_stops_neighbor_holds() {
+        let mut clip = staged_input();
+        clip.capture_metadata = crate::CaptureMetadata::default();
+        for mode in [
+            AnnotationMode::RecordedKeys,
+            AnnotationMode::RecordedClicks,
+            AnnotationMode::RecordedCursor,
+        ] {
+            assert!(recorded_annotation_barrier(&clip, &mode));
+            assert_eq!(recorded_annotation_block(&clip, &mode), None);
+            assert!(!recorded_annotation_barrier_at_stage(&clip, &mode, Some(2)));
+        }
+        clip.capture_metadata.cursor_visible = true;
+        clip.capture_metadata.cursor_position = Some(PhysicalPoint::default());
+        clip.capture_metadata.cursor_embedded = true;
+        assert_eq!(
+            recorded_annotation_block(&clip, &AnnotationMode::RecordedCursor),
+            None
+        );
+        clip.render_steps
+            .retain(|step| !matches!(step, crate::FrameRenderStep::FreezeRegion { .. }));
+        assert!(!recorded_annotation_barrier(
+            &clip,
+            &AnnotationMode::RecordedKeys
+        ));
+        assert!(recorded_annotation_barrier_at_stage(
+            &clip,
+            &AnnotationMode::RecordedKeys,
+            Some(999)
+        ));
+    }
+
+    #[test]
+    fn source_binding_blocks_cannot_be_recovered_by_choosing_a_pre_freeze_stage() {
+        let mut clip = staged_input();
+        for (binding, reason) in [
+            (
+                CaptureBinding::LegacyUnknown,
+                CaptureReplayBlock::LegacyUnknown,
+            ),
+            (
+                CaptureBinding::ArchivedAfterComposite,
+                CaptureReplayBlock::ArchivedAfterComposite,
+            ),
+            (CaptureBinding::NotRecorded, CaptureReplayBlock::NotRecorded),
+        ] {
+            clip.capture_binding = binding;
+            for stage in [Some(1), Some(3), None, Some(999)] {
+                assert!(recorded_annotation_barrier_at_stage(
+                    &clip,
+                    &AnnotationMode::RecordedKeys,
+                    stage
+                ));
+                assert_eq!(
+                    recorded_annotation_block_at_stage(&clip, &AnnotationMode::RecordedKeys, stage),
+                    Some(reason)
+                );
+            }
+        }
+        clip.capture_binding = CaptureBinding::ArchivedAfterComposite;
+        clip.render_steps.clear();
+        assert_eq!(
+            recorded_annotation_block(&clip, &AnnotationMode::RecordedKeys),
+            Some(CaptureReplayBlock::ArchivedAfterComposite)
         );
     }
 }

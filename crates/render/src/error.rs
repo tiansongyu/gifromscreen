@@ -1,4 +1,4 @@
-use gif_from_screen_domain::{AssetId, FrameId, OverlayId, PhysicalRect};
+use gif_from_screen_domain::{AssetId, FrameId, OverlayId, PhysicalRect, PhysicalSize};
 use thiserror::Error;
 
 use crate::AssetProviderError;
@@ -56,6 +56,41 @@ impl std::fmt::Display for UnsupportedEffect {
 /// Errors produced by the deterministic CPU renderer.
 #[derive(Debug, Error)]
 pub enum RenderError {
+    /// A frozen reference view must retain the canvas on which it was authored.
+    #[error("freeze reference canvas {expected:?} does not match current canvas {actual:?}")]
+    FreezeRegionSizeMismatch {
+        /// Persisted reference view dimensions.
+        expected: PhysicalSize,
+        /// Current stage dimensions.
+        actual: PhysicalSize,
+    },
+    /// The frozen region must be a nonempty rectangle inside its input canvas.
+    #[error("freeze region {region:?} is outside its {canvas:?} input canvas")]
+    InvalidFreezeRegion {
+        /// Requested inside/outside boundary.
+        region: PhysicalRect,
+        /// Canvas to which the rectangle belongs.
+        canvas: PhysicalSize,
+    },
+    /// A stored baseline could not be loaded as normalized RGBA8 bytes.
+    #[error("could not load frozen reference asset {asset_id}: {source}")]
+    FreezeBaselineLoad {
+        /// Immutable baseline asset identity.
+        asset_id: AssetId,
+        /// Provider-specific cause.
+        #[source]
+        source: AssetProviderError,
+    },
+    /// A baseline may use another canonical shape but must contain exactly the view's bytes.
+    #[error("frozen reference {asset_id} has {actual} RGBA bytes; its view requires {expected}")]
+    FreezeBaselineLengthMismatch {
+        /// Immutable baseline asset identity.
+        asset_id: AssetId,
+        /// Byte count required by the persisted view.
+        expected: usize,
+        /// Normalized bytes supplied by the provider.
+        actual: usize,
+    },
     /// An expanding image effect has invalid parameters or canvas geometry.
     #[error("invalid {effect}: {reason}")]
     InvalidImageEffect {

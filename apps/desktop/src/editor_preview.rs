@@ -9,8 +9,8 @@ use std::{
 use eframe::egui;
 use gif_from_screen_application::{PresentationTransitionStep, transition_step_progress};
 use gif_from_screen_domain::{
-    AssetDescriptor, AssetId, AssetKind, FrameClip, FrameId, OverlayId, ProjectId, ProjectRevision,
-    RasterEncoding, TimeUs, Transition, TransitionId,
+    AssetDescriptor, AssetId, AssetKind, FrameClip, FrameId, FrameRenderStep, OverlayId, ProjectId,
+    ProjectRevision, RasterEncoding, TimeUs, Transition, TransitionId,
 };
 use gif_from_screen_project::{ActiveProject, AssetStore, ProjectError};
 use gif_from_screen_render::{
@@ -571,6 +571,14 @@ impl PreviewRenderPlan {
             },
         )?;
         descriptors.insert(clip.asset_id, descriptor.clone());
+        for asset_id in freeze_region_assets(clip) {
+            let descriptor = project
+                .manifest()
+                .assets
+                .get(&asset_id)
+                .ok_or(EditorPreviewError::MissingAssetDescriptor { frame_id, asset_id })?;
+            descriptors.insert(asset_id, descriptor.clone());
+        }
         for overlay in overlays.raster_assets() {
             let descriptor = project.manifest().assets.get(&overlay.asset_id).ok_or(
                 EditorPreviewError::MissingOverlayAssetDescriptor {
@@ -627,6 +635,23 @@ impl PreviewRenderPlan {
             &mut retained_bytes,
             &mut provider.assets,
         )?;
+        for asset_id in freeze_region_assets(&self.clip) {
+            if cancellation.is_cancelled() {
+                return Err(EditorPreviewError::Render {
+                    frame_id,
+                    source: RenderError::Cancelled,
+                });
+            }
+            load_preview_raster(
+                &self.store,
+                &self.descriptors,
+                asset_id,
+                PreviewRasterRole::Frame { frame_id },
+                render_surface_limit_bytes,
+                &mut retained_bytes,
+                &mut provider.assets,
+            )?;
+        }
         for overlay in self.overlays.raster_assets() {
             if cancellation.is_cancelled() {
                 return Err(EditorPreviewError::Render {
@@ -652,6 +677,15 @@ impl PreviewRenderPlan {
         .render_clip_with_overlay_plan(&self.clip, &self.overlays, &provider, cancellation)
         .map_err(|source| EditorPreviewError::Render { frame_id, source })
     }
+}
+
+// Only executable new-step assets are preload requirements. The old
+// Cinemagraph mask remains unsupported and must retain its renderer error.
+fn freeze_region_assets(clip: &FrameClip) -> impl Iterator<Item = AssetId> + '_ {
+    clip.render_steps.iter().filter_map(|step| match step {
+        FrameRenderStep::FreezeRegion { baseline_asset, .. } => Some(*baseline_asset),
+        _ => None,
+    })
 }
 
 #[derive(Clone, Copy)]

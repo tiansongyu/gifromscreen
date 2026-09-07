@@ -200,7 +200,10 @@ fn ordered_image_effects_expand_all_frames_and_survive_undo_reopen_and_gif_expor
         workspace.selection.selected(),
         &BTreeSet::from([frame_id(1)])
     );
-    assert_eq!(workspace.manifest().schema_version, 5);
+    assert_eq!(
+        workspace.manifest().schema_version,
+        gif_from_screen_domain::CURRENT_SCHEMA_VERSION
+    );
     for frame in &workspace.manifest().timeline.frames {
         assert_eq!(image(&workspace, frame.id).size(), size(9, 5));
         assert_eq!(
@@ -384,7 +387,10 @@ fn copied_and_yoyo_frame_owners_keep_image_steps_and_save_as_keeps_pixels_and_as
     .unwrap();
     let copy = EditorWorkspace::open(&target, LockPolicy::FailIfPresent, 32).unwrap();
     assert_ne!(copy.manifest().project_id, workspace.manifest().project_id);
-    assert_eq!(copy.manifest().schema_version, 5);
+    assert_eq!(
+        copy.manifest().schema_version,
+        gif_from_screen_domain::CURRENT_SCHEMA_VERSION
+    );
     assert_eq!(copy.manifest().assets, workspace.manifest().assets);
     assert_eq!(
         copy.manifest().timeline.overlay_tracks,

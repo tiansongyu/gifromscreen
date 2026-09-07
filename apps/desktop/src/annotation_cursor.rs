@@ -409,6 +409,9 @@ mod tests {
             }
             let mut transform = ClipTransform::default();
             match step {
+                FrameRenderStep::FreezeRegion { .. } => {
+                    panic!("test input cannot map through frozen pixels")
+                }
                 FrameRenderStep::Crop { rect } => transform.crop = Some(*rect),
                 FrameRenderStep::Resize { size } => transform.output_size = Some(*size),
                 FrameRenderStep::Rotate { rotation } => transform.rotation = *rotation,

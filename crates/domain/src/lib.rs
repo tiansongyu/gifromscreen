@@ -33,7 +33,8 @@ pub use annotation_scope::*;
 pub use capture_binding::{
     CaptureBinding, CaptureBindingSummary, CaptureReplayBlock, FrameCaptureBindingChange,
     capture_binding_summary, has_recorded_input, recorded_annotation_barrier,
-    recorded_annotation_block,
+    recorded_annotation_barrier_at_stage, recorded_annotation_block,
+    recorded_annotation_block_at_stage,
 };
 pub use capture_clock::{CaptureClockContext, FrameCaptureClockChange};
 pub use command::{AppliedEdit, EditCommand, FrameDurationChange, IndexedFrame};
@@ -52,4 +53,4 @@ pub use task_run::*;
 pub use units::*;
 
 /// Current on-disk manifest schema understood by this version of the domain.
-pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+pub const CURRENT_SCHEMA_VERSION: u32 = 6;

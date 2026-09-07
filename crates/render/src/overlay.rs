@@ -293,7 +293,7 @@ impl CpuRenderer {
                     )?;
                 }
             } else {
-                surface = self.apply_render_step(surface, step, cancellation)?;
+                surface = self.apply_render_step(surface, step, provider, cancellation)?;
             }
         }
         if let Some(layers) = groups.remove(&None) {

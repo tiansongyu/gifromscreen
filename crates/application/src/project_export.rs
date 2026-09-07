@@ -4,8 +4,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use gif_from_screen_domain::{
-    AssetId, AssetKind, FrameClip, FrameId, OverlayId, ProjectId, ProjectManifest, ProjectRevision,
-    RasterEncoding, TimeUs, Transition, TransitionId,
+    AssetId, AssetKind, FrameClip, FrameId, FrameRenderStep, OverlayId, ProjectId, ProjectManifest,
+    ProjectRevision, RasterEncoding, TimeUs, Transition, TransitionId,
 };
 use gif_from_screen_gif::{
     BuiltinGifEncoder, CancellationToken as GifCancellationToken, EncodeOptions, EncodeProgress,
@@ -1252,37 +1252,47 @@ fn load_selected_assets(
     let mut loaded = BTreeMap::new();
     let mut visited = BTreeSet::new();
     let mut loaded_bytes = 0_u64;
-    for clip in clips {
+    for (frame_id, asset_id) in clips.iter().flat_map(|clip| {
+        std::iter::once((clip.id, clip.asset_id)).chain(clip.render_steps.iter().filter_map(
+            |step| {
+                // Do not preload legacy unsupported Cinemagraph mask assets.
+                if let FrameRenderStep::FreezeRegion { baseline_asset, .. } = step {
+                    Some((clip.id, *baseline_asset))
+                } else {
+                    None
+                }
+            },
+        ))
+    }) {
         ensure_not_cancelled(cancellation)?;
-        if !visited.insert(clip.asset_id) {
+        if !visited.insert(asset_id) {
             continue;
         }
-        let descriptor = snapshot.manifest.assets.get(&clip.asset_id).ok_or(
-            ProjectGifExportError::MissingAssetDescriptor {
-                frame_id: clip.id,
-                asset_id: clip.asset_id,
-            },
-        )?;
+        let descriptor = snapshot
+            .manifest
+            .assets
+            .get(&asset_id)
+            .ok_or(ProjectGifExportError::MissingAssetDescriptor { frame_id, asset_id })?;
         let Some((size, encoding)) = descriptor.kind.raster_descriptor() else {
             return Err(ProjectGifExportError::InvalidAssetKind {
-                frame_id: clip.id,
-                asset_id: clip.asset_id,
+                frame_id,
+                asset_id,
                 kind: descriptor.kind.clone(),
             });
         };
         if encoding != RasterEncoding::Rgba8 {
             return Err(ProjectGifExportError::UnsupportedAssetEncoding {
-                frame_id: clip.id,
-                asset_id: clip.asset_id,
+                frame_id,
+                asset_id,
                 encoding,
             });
         }
-        let asset_path = snapshot.assets.asset_path(clip.asset_id);
-        let actual = asset_file_length(&asset_path, clip)?;
+        let asset_path = snapshot.assets.asset_path(asset_id);
+        let actual = asset_file_length(&asset_path, frame_id, asset_id)?;
         if actual != descriptor.byte_len {
             return Err(ProjectGifExportError::AssetLengthMismatch {
-                frame_id: clip.id,
-                asset_id: clip.asset_id,
+                frame_id,
+                asset_id,
                 expected: descriptor.byte_len,
                 actual,
             });
@@ -1296,15 +1306,15 @@ fn load_selected_assets(
                 limit_bytes: buffer_limit_bytes,
             });
         }
-        let pixels = read_asset(snapshot, clip)?;
+        let pixels = read_asset(snapshot, frame_id, asset_id)?;
         let surface = RgbaSurface::new(size, pixels).map_err(|source| {
             ProjectGifExportError::InvalidAssetSurface {
-                frame_id: clip.id,
-                asset_id: clip.asset_id,
+                frame_id,
+                asset_id,
                 source,
             }
         })?;
-        loaded.insert(clip.asset_id, surface);
+        loaded.insert(asset_id, surface);
         loaded_bytes = required_bytes;
     }
     let render_cancellation = RenderCancellationAdapter(cancellation);
@@ -1448,13 +1458,17 @@ fn read_overlay_asset(
     }
 }
 
-fn asset_file_length(path: &Path, clip: &FrameClip) -> Result<u64, ProjectGifExportError> {
+fn asset_file_length(
+    path: &Path,
+    frame_id: FrameId,
+    asset_id: AssetId,
+) -> Result<u64, ProjectGifExportError> {
     match fs::metadata(path) {
         Ok(metadata) => Ok(metadata.len()),
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
             Err(ProjectGifExportError::MissingAssetFile {
-                frame_id: clip.id,
-                asset_id: clip.asset_id,
+                frame_id,
+                asset_id,
                 path: path.to_path_buf(),
             })
         }
@@ -1468,9 +1482,10 @@ fn asset_file_length(path: &Path, clip: &FrameClip) -> Result<u64, ProjectGifExp
 
 fn read_asset(
     snapshot: &ProjectExportSnapshot,
-    clip: &FrameClip,
+    frame_id: FrameId,
+    asset_id: AssetId,
 ) -> Result<Vec<u8>, ProjectGifExportError> {
-    match snapshot.assets.read(clip.asset_id) {
+    match snapshot.assets.read(asset_id) {
         Ok(pixels) => Ok(pixels),
         Err(error) => {
             if matches!(
@@ -1478,21 +1493,21 @@ fn read_asset(
                 ProjectError::Io { source, .. } if source.kind() == io::ErrorKind::NotFound
             ) {
                 return Err(ProjectGifExportError::MissingAssetFile {
-                    frame_id: clip.id,
-                    asset_id: clip.asset_id,
-                    path: snapshot.assets.asset_path(clip.asset_id),
+                    frame_id,
+                    asset_id,
+                    path: snapshot.assets.asset_path(asset_id),
                 });
             }
             if matches!(error, ProjectError::CorruptAsset { .. }) {
                 return Err(ProjectGifExportError::CorruptAsset {
-                    frame_id: clip.id,
-                    asset_id: clip.asset_id,
+                    frame_id,
+                    asset_id,
                     source: error,
                 });
             }
             Err(ProjectGifExportError::ReadAsset {
-                frame_id: clip.id,
-                asset_id: clip.asset_id,
+                frame_id,
+                asset_id,
                 source: error,
             })
         }

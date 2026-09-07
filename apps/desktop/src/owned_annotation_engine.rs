@@ -57,7 +57,12 @@ pub(super) fn prepare_new(
     let Some(EditCommand::UpsertOverlayTrack { track }) = prepared.commands.last_mut() else {
         return Ok(prepared);
     };
-    let (blocked, _) = replay_filter(manifest, &plan.selected, &request.mode);
+    let (blocked, _) = replay_filter(
+        manifest,
+        &plan.selected,
+        &request.mode,
+        AnnotationPlacement::Tail,
+    );
     let mut cells: BTreeMap<FrameId, FrameOverlayCell> = BTreeMap::new();
     let mut by_start = BTreeMap::new();
     for sample in &plan.samples {
@@ -121,20 +126,7 @@ pub(super) fn prepare_new(
     let track_command = paint_commands
         .pop()
         .ok_or("The annotation paint stage did not return a track.")?;
-    for (asset, bytes) in pool_assets {
-        if let Some(existing) = manifest.assets.get(&asset.id) {
-            if *existing != asset {
-                return Err(
-                    "Input replay asset descriptor conflicts with existing data.".to_owned(),
-                );
-            }
-        } else {
-            prepared.commands.push(EditCommand::RegisterAsset {
-                asset: asset.clone(),
-            });
-        }
-        prepared.assets.push((asset, bytes));
-    }
+    append_replay_assets(manifest, &mut prepared, pool_assets)?;
     // Frame replacements keep immutable capture fields. Apply clock-only
     // fallback context after those replacements, never overwrite it with the
     // pre-authoring frame snapshot.
@@ -148,6 +140,28 @@ pub(super) fn prepare_new(
     serde_json::to_writer(&mut CommandBudget(MAX_REPLAY_BYTES), &prepared.commands)
         .map_err(|_| "Annotation commands exceed 64 MiB.".to_owned())?;
     Ok(prepared)
+}
+
+fn append_replay_assets(
+    manifest: &ProjectManifest,
+    prepared: &mut PreparedAnnotations,
+    assets: Vec<(AssetDescriptor, Vec<u8>)>,
+) -> Result<(), String> {
+    for (asset, bytes) in assets {
+        if let Some(existing) = manifest.assets.get(&asset.id) {
+            if *existing != asset {
+                return Err(
+                    "Input replay asset descriptor conflicts with existing data.".to_owned(),
+                );
+            }
+        } else {
+            prepared.commands.push(EditCommand::RegisterAsset {
+                asset: asset.clone(),
+            });
+        }
+        prepared.assets.push((asset, bytes));
+    }
+    Ok(())
 }
 
 fn missing_sample_contexts(
@@ -395,7 +409,7 @@ pub(crate) fn prepare_replacement(
             check_cancelled(cancellation)?;
             let (index, end) = intervals[&cell.frame_id];
             let frame = &manifest.timeline.frames[index];
-            ensure_original_binding(frame, request)?;
+            ensure_original_binding(frame, request, cell.stage)?;
             let sample = AnnotationFrame {
                 frame,
                 stage: cell.stage,
@@ -490,8 +504,12 @@ fn frame_intervals(manifest: &ProjectManifest) -> Result<BTreeMap<FrameId, (usiz
     Ok(result)
 }
 
-fn ensure_original_binding(frame: &FrameClip, request: &AnnotationRequest) -> Result<(), String> {
-    if gif_from_screen_domain::recorded_annotation_barrier(frame, &request.mode) {
+fn ensure_original_binding(
+    frame: &FrameClip,
+    request: &AnnotationRequest,
+    stage: Option<u32>,
+) -> Result<(), String> {
+    if gif_from_screen_domain::recorded_annotation_barrier_at_stage(frame, &request.mode, stage) {
         return Err("This group's owner frames include unverified, non-recorded or composited pixels. Recorded-input re-edit is unavailable; the whole group remains unchanged.".to_owned());
     }
     Ok(())
@@ -581,7 +599,7 @@ fn replay_cells(
     for cell in cells {
         check_cancelled(labels.cancellation)?;
         let frame = &labels.manifest.timeline.frames[intervals[&cell.frame_id].0];
-        ensure_original_binding(frame, labels.request)?;
+        ensure_original_binding(frame, labels.request, cell.stage)?;
         let replay = cell.input_replay.as_ref().ok_or("This frame-owned group has no complete recorded-input replay context. Existing marks are preserved; create a new group from the original recording instead.")?;
         replay.validate(&cell.scopes)?;
         let mut contributions = BTreeSet::new();

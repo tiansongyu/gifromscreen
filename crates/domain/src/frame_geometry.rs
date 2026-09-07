@@ -55,6 +55,12 @@ pub enum FrameRenderStep {
     ImageShadow {
         style: crate::ImageShadowStyle,
     },
+    FreezeRegion {
+        baseline_asset: AssetId,
+        baseline_size: PhysicalSize,
+        region: PhysicalRect,
+        invert: bool,
+    },
 }
 
 impl FrameRenderStep {
@@ -68,6 +74,7 @@ impl FrameRenderStep {
 
     pub const fn required_schema_version(&self) -> u32 {
         match self {
+            Self::FreezeRegion { .. } => 6,
             Self::Composite {
                 precision: CompositePrecision::WpfPbgra8PngV1,
                 ..
@@ -85,9 +92,12 @@ impl FrameRenderStep {
     }
 
     pub const fn referenced_asset(&self) -> Option<AssetId> {
-        match self.effect() {
-            Some(effect) => effect.referenced_asset(),
-            None => None,
+        match self {
+            Self::FreezeRegion { baseline_asset, .. } => Some(*baseline_asset),
+            _ => match self.effect() {
+                Some(effect) => effect.referenced_asset(),
+                None => None,
+            },
         }
     }
 }
@@ -138,7 +148,14 @@ impl FrameClip {
     }
 
     pub fn referenced_effect_assets(&self) -> impl Iterator<Item = AssetId> + '_ {
-        self.all_effects().filter_map(Effect::referenced_asset)
+        self.effects
+            .iter()
+            .filter_map(Effect::referenced_asset)
+            .chain(
+                self.render_steps
+                    .iter()
+                    .filter_map(FrameRenderStep::referenced_asset),
+            )
     }
 
     pub fn required_schema_version(&self) -> u32 {
@@ -268,8 +285,43 @@ fn apply_geometry_step(
         FrameRenderStep::Effect { effect } => validate_render_effect(effect, size)?,
         FrameRenderStep::ImageBorder { style } => return Ok(style.placement(size)?.output_size),
         FrameRenderStep::ImageShadow { style } => return Ok(style.placement(size)?.output_size),
+        FrameRenderStep::FreezeRegion {
+            baseline_size,
+            region,
+            ..
+        } => {
+            if *baseline_size != size {
+                return Err("Freeze baseline dimensions must match the current step input without resizing.".to_owned());
+            }
+            validate_crop(*region, size).map_err(|reason| format!("Freeze region: {reason}"))?;
+        }
     }
     Ok(size)
+}
+
+/// Validates a tightly packed raw RGBA8 view without loading pixels. Content
+/// identities hash bytes, not dimensions: equal-area views may intentionally
+/// have a different shape from the immutable descriptor. No resize is implied.
+///
+/// # Errors
+/// Rejects non-raster or compressed assets, empty/overflowing dimensions, and
+/// any descriptor/view whose exact RGBA byte count differs from the asset length.
+pub fn validate_raw_rgba_view(
+    asset: &crate::AssetDescriptor,
+    view: PhysicalSize,
+) -> Result<(), String> {
+    let Some((canonical, crate::RasterEncoding::Rgba8)) = asset.kind.raster_descriptor() else {
+        return Err("A frozen baseline requires a raw RGBA8 raster asset.".to_owned());
+    };
+    for size in [canonical, view] {
+        size.validate()
+            .map_err(|error| format!("Invalid raw RGBA view: {error}"))?;
+        let expected = size.area().and_then(|area| area.checked_mul(4));
+        if expected != Some(asset.byte_len) {
+            return Err("Frozen baseline descriptor and view must both match the exact raw RGBA byte length.".to_owned());
+        }
+    }
+    Ok(())
 }
 
 fn rotated_size(size: PhysicalSize, rotation: QuarterTurn) -> PhysicalSize {
@@ -338,3 +390,7 @@ pub fn validate_render_effect(effect: &Effect, size: PhysicalSize) -> Result<(),
 #[cfg(test)]
 #[path = "frame_geometry_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "freeze_region_tests.rs"]
+mod freeze_region_tests;

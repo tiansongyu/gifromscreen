@@ -54,6 +54,91 @@ fn fixture() -> ProjectManifest {
     }
 }
 
+#[test]
+fn freeze_seals_selected_hidden_cells_and_clipboard_rejects_a_removed_baseline() {
+    let mut project = fixture();
+    owned(&mut project, 7, false, 0);
+    let id = AssetId::from_digest([2; 32]);
+    let mut descriptor = project.assets.values().next().unwrap().clone();
+    descriptor.id = id;
+    project.assets.insert(id, descriptor);
+    let before = project.clone();
+    let baseline_size = project.canvas.size;
+    let inverse = apply(
+        &mut project,
+        ComposedFrameEdit::FreezeRegion {
+            baseline_asset: id,
+            baseline_size,
+            region: PhysicalRect::new(1, 0, 2, 4).unwrap(),
+            invert: false,
+        },
+    );
+    assert_eq!(
+        project.timeline.frames[0].asset_id,
+        before.timeline.frames[0].asset_id
+    );
+    assert_eq!(project.timeline.frames[1], before.timeline.frames[1]);
+    let cells = project.timeline.overlay_tracks[0]
+        .frame_cells
+        .as_ref()
+        .unwrap();
+    assert_eq!(cells[0].stage, Some(1));
+    assert_eq!(
+        cells[1],
+        before.timeline.overlay_tracks[0]
+            .frame_cells
+            .as_ref()
+            .unwrap()[1]
+    );
+    assert!(project.references_asset(id));
+    let clipboard = copy_selected_frames(&project, [FrameId::from_u128(1)]).unwrap();
+    let mut restored = project.clone();
+    restored.apply_command(&inverse).unwrap();
+    assert_eq!(restored.timeline, before.timeline);
+    assert_eq!(restored.assets, before.assets);
+    project
+        .apply_command(&crate::delete_frames([FrameId::from_u128(1)]))
+        .unwrap();
+    project
+        .apply_command(&EditCommand::UnregisterAsset { asset_id: id })
+        .unwrap();
+    let before_paste = project.clone();
+    let error = paste_frame_clipboard(&project, &clipboard, Some(FrameId::from_u128(2)), || {
+        FrameId::from_u128(100)
+    })
+    .unwrap_err();
+    assert!(matches!(error, EditorError::MissingFrameAsset { asset_id, .. } if asset_id == id));
+    assert_eq!(project, before_paste);
+}
+
+#[test]
+fn freeze_checks_image_plus_reference_working_budget_before_returning_a_command() {
+    let mut project = fixture();
+    let size = PhysicalSize::new(4096, 2160).unwrap();
+    project.canvas.size = size;
+    let asset = project.assets.values_mut().next().unwrap();
+    asset.kind = AssetKind::Frame {
+        size,
+        encoding: RasterEncoding::Rgba8,
+    };
+    asset.byte_len = size.area().unwrap() * 4;
+    let id = asset.id;
+    let before = project.clone();
+    let error = edit_composed_frames(
+        &project,
+        [FrameId::from_u128(1)],
+        &ComposedFrameEdit::FreezeRegion {
+            baseline_asset: id,
+            baseline_size: size,
+            region: PhysicalRect::new(0, 0, 1, 1).unwrap(),
+            invert: false,
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("working-memory"));
+    assert_eq!(project, before);
+}
+
 fn owned(project: &mut ProjectManifest, track_id: u128, visible: bool, opacity: u8) {
     project.timeline.overlay_tracks.push(OverlayTrack {
         id: TrackId::from_u128(track_id),

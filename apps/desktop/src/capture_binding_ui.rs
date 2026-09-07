@@ -28,6 +28,9 @@ impl CaptureBindingUi {
                 if self.counts.selected_archived_after_composite > 0 {
                     ui.label("Baked frames retain their original recorded events for recovery, but those events are not automatically replayed onto mixed-source pixels. Undo the bake or use manual annotations.");
                 }
+                if self.counts.selected_mixed_image_stage > 0 {
+                    ui.label("Frozen output mixes pixels from different frames. Existing recorded annotations can still be re-edited at their earlier paint stage; new annotations after the freeze must be manual. Confirming the source or its clock does not make the frozen output a new recording.");
+                }
                 if self.counts.selected_not_recorded > 0 {
                     ui.label("Some selected frames were created without screen-input metadata, such as titles or imported images. They cannot be relabeled as screen recordings; unselect them before confirming a legacy recording interval.");
                 }

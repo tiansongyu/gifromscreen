@@ -105,6 +105,15 @@ enum AnnotationPlacement {
     Tail,
 }
 
+impl AnnotationPlacement {
+    fn stage(self, frame: &FrameClip) -> Option<u32> {
+        match self {
+            Self::Legacy => legacy_annotation_stage(frame),
+            Self::Tail => None,
+        }
+    }
+}
+
 impl Labels<'_> {
     fn cursor_overlay(
         &mut self,
@@ -370,7 +379,11 @@ pub(crate) fn prepare_annotations_in_scope(
     }
     if manifest.timeline.frames.iter().any(|frame| {
         plan.selected.contains(&frame.id)
-            && gif_from_screen_domain::recorded_annotation_barrier(frame, &request.mode)
+            && gif_from_screen_domain::recorded_annotation_barrier_at_stage(
+                frame,
+                &request.mode,
+                legacy_annotation_stage(frame),
+            )
     }) {
         return Err("This group's authoring scope includes frames without verified original input coordinates. The whole group is unchanged: confirm eligible legacy coordinates, undo the composite, or use manual annotations.".to_owned());
     }
@@ -395,7 +408,7 @@ fn prepare_annotation_plan(
     placement: AnnotationPlacement,
 ) -> Result<PreparedAnnotations, String> {
     request.validate_settings()?;
-    let (blocked, replay_skips) = replay_filter(manifest, &plan.selected, &request.mode);
+    let (blocked, replay_skips) = replay_filter(manifest, &plan.selected, &request.mode, placement);
     let replayable = plan.selected.difference(&blocked).copied().collect();
     if plan.selected.is_empty()
         || no_recorded_candidates(manifest, &replayable, &request.mode, cancellation)?
@@ -439,9 +452,11 @@ fn replay_filter(
     manifest: &ProjectManifest,
     selected: &BTreeSet<FrameId>,
     mode: &AnnotationMode,
+    placement: AnnotationPlacement,
 ) -> (BTreeSet<FrameId>, AnnotationReplaySkips) {
     use gif_from_screen_domain::{
-        CaptureReplayBlock, recorded_annotation_barrier, recorded_annotation_block,
+        CaptureReplayBlock, recorded_annotation_barrier_at_stage,
+        recorded_annotation_block_at_stage,
     };
     let mut blocked = BTreeSet::new();
     let mut skips = AnnotationReplaySkips::default();
@@ -459,12 +474,15 @@ fn replay_filter(
         .iter()
         .filter(|frame| selected.contains(&frame.id))
     {
-        if recorded_annotation_barrier(frame, mode) {
+        let stage = placement.stage(frame);
+        if recorded_annotation_barrier_at_stage(frame, mode, stage) {
             blocked.insert(frame.id);
         }
-        match recorded_annotation_block(frame, mode) {
+        match recorded_annotation_block_at_stage(frame, mode, stage) {
             Some(CaptureReplayBlock::LegacyUnknown) => skips.legacy_unknown += 1,
-            Some(CaptureReplayBlock::ArchivedAfterComposite) => skips.archived_after_composite += 1,
+            Some(
+                CaptureReplayBlock::ArchivedAfterComposite | CaptureReplayBlock::MixedImageStage,
+            ) => skips.archived_after_composite += 1,
             Some(CaptureReplayBlock::NotRecorded) => skips.not_recorded += 1,
             None => {}
         }

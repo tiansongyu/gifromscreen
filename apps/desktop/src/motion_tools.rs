@@ -111,8 +111,8 @@ impl MotionTools {
                             ui.add(egui::DragValue::new(&mut self.height).prefix("Height ").range(1..=size.height.get().saturating_sub(self.y).max(1)));
                         });
                         ui.checkbox(&mut self.invert, "Invert: freeze inside the rectangle");
-                        ui.weak("Composite frames retain original input as archival data. Add recorded-input annotations before this edit; afterwards use manual annotations or Undo. Hidden overlays are preserved.");
-                        ui.weak("Selected frames and their visible overlays are baked into pixels. Gaps in the selection stay untouched. Rectangles only, not freeform masks.");
+                        ui.weak("The frozen image is saved once. Original frames and all layers, including hidden artwork, stay editable. Revealing earlier artwork changes only the live region; the frozen region keeps its saved pixels.");
+                        ui.weak("Existing recorded-input annotations remain editable before the freeze. New annotations after it must be manual. Selection gaps stay untouched. Rectangles only, not freeform masks.");
                     }
                     Mode::SmoothLoop => {
                         ui.label("Find an ending frame similar to the first frame, then remove everything after the match.");
@@ -139,7 +139,7 @@ impl MotionTools {
                         ui.weak("Creates baked new frames, not a live transition. Original frames stay unchanged; the final added frame exactly matches the first.");
                     }
                 }
-                ui.weak("One undo restores the original edit. Up to 256 MiB of generated pixels. Rendering and saving run in the background.");
+                ui.weak("One undo restores the original edit. Freeze uses a 64 MiB image-plus-reference working budget; crossfade can generate up to 256 MiB. Rendering and saving run in the background.");
                 if ui.button("Apply motion edit").clicked() && let Err(error) = self.queue(workspace) { self.notice = Some(error); }
             });
             if self.is_running() { self.show_running(ui); }

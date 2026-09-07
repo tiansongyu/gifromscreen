@@ -830,12 +830,21 @@ impl ProjectManifest {
                 }
             }
             if frame.render_steps.len() <= crate::MAX_FRAME_RENDER_STEPS {
-                for asset_id in frame
-                    .render_steps
-                    .iter()
-                    .filter_map(crate::FrameRenderStep::referenced_asset)
-                {
-                    if !self.assets.contains_key(&asset_id) {
+                for (index, step) in frame.render_steps.iter().enumerate() {
+                    let Some(asset_id) = step.referenced_asset() else {
+                        continue;
+                    };
+                    if let Some(asset) = self.assets.get(&asset_id) {
+                        if let crate::FrameRenderStep::FreezeRegion { baseline_size, .. } = step
+                            && let Err(reason) =
+                                crate::validate_raw_rgba_view(asset, *baseline_size)
+                        {
+                            issues.push(ValidationIssue::InvalidFrameRenderSteps {
+                                frame_id: frame.id,
+                                reason: format!("Render step {}: {reason}", index + 1),
+                            });
+                        }
+                    } else {
                         issues.push(ValidationIssue::MissingEffectAsset {
                             frame_id: frame.id,
                             asset_id,

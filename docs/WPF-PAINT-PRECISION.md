@@ -84,7 +84,7 @@ WPF replay also passed explicitly on 1.88.0. Coverage includes durable schema
 upgrade/recovery, legacy wire defaults and blend modes, multiple marks versus
 multiple PNG boundaries, cancellation, hidden stages, source clocks, asset
 registration, exact Undo/Redo, clipboard ownership and GIF export.
-One additional transparent-title/half-alpha-text regression passed on both
+One additional transparent-title/translucent-text regression passed on both
 toolchains after those full runs, bringing the tested total to 1,199. It checks
 the explicit title stage, exact reference pixels, Undo/Redo and journal reopen.
 

@@ -1,14 +1,13 @@
-//! Bounded baked motion edits. The caller lends the workspace to a background worker.
+//! Bounded motion edits. The caller lends the workspace to a background worker.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     sync::atomic::{AtomicBool, Ordering},
 };
 
 use gif_from_screen_domain::{
     AssetDescriptor, AssetId, AssetKind, CaptureMetadata, ClipTransform, DurationUs, EditCommand,
-    FrameClip, FrameId, OverlayId, OverlayItem, PhysicalRect, PhysicalSize, RasterEncoding, TimeUs,
-    TimelineSpan, TransitionKind,
+    FrameClip, FrameId, PhysicalRect, PhysicalSize, RasterEncoding, TimeUs, TransitionKind,
 };
 use gif_from_screen_project::ActiveProject;
 use gif_from_screen_render::{
@@ -24,7 +23,8 @@ const MAX_SURFACE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CINEMAGRAPH_FRAMES: usize = 1_000;
 const MAX_LOOP_FRAMES: u16 = 120;
 const MAX_RESULTING_FRAMES: usize = 100_000;
-const MAX_OVERLAY_FRAGMENTS: usize = 10_000;
+#[path = "editor_motion/freeze.rs"]
+mod freeze;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum MotionOperation {
@@ -186,81 +186,6 @@ impl EditorWorkspace {
         Ok(MotionOutcome::TrimmedTail(removed))
     }
 
-    fn cinemagraph_command(
-        &self,
-        region: PhysicalRect,
-        invert: bool,
-        cancellation: &AtomicBool,
-        progress: &mut impl FnMut(MotionProgress),
-    ) -> Result<(EditCommand, usize), String> {
-        let current = self
-            .selection()
-            .current()
-            .ok_or_else(|| "Select the frame to use as the frozen image first.".to_owned())?;
-        let selected: Vec<_> = self
-            .manifest()
-            .timeline
-            .frames
-            .iter()
-            .filter(|frame| self.selection().contains(frame.id))
-            .cloned()
-            .collect();
-        if selected.is_empty() || selected.len() > MAX_CINEMAGRAPH_FRAMES {
-            return Err(
-                "Select between 1 and 1,000 frames for a rectangular cinemagraph.".to_owned(),
-            );
-        }
-        let canvas = self.manifest().canvas.size;
-        validate_budget(canvas, selected.len())?;
-        if region.size.validate().is_err() || !region.fits_within(canvas) {
-            return Err(
-                "The motion rectangle must have nonzero dimensions and fit inside the canvas."
-                    .to_owned(),
-            );
-        }
-        let spans = self
-            .selected_timeline_spans()
-            .map_err(|error| error.to_string())?;
-        let owners = selected.iter().map(|frame| frame.id).collect();
-        let mut commands = remove_baked_overlay_spans(
-            &self.manifest().timeline.overlay_tracks,
-            &spans,
-            &owners,
-            cancellation,
-        )?;
-        validate_baked_stage_survivors(self.manifest(), &owners, &commands, cancellation)?;
-        let baseline = render(self.active_project(), current, canvas, cancellation)?;
-        let mut registered = BTreeSet::new();
-        for (index, original) in selected.iter().enumerate() {
-            check_cancelled(cancellation)?;
-            let mut pixels = render(self.active_project(), original.id, canvas, cancellation)?;
-            freeze_rectangle(&mut pixels, &baseline, region, invert, cancellation)?;
-            let asset_id = store_surface(
-                self.active_project(),
-                &pixels,
-                &mut registered,
-                &mut commands,
-            )?;
-            let replacement = FrameClip {
-                asset_id,
-                transform: ClipTransform::default(),
-                effects: Vec::new(),
-                render_steps: Vec::new(),
-                capture_binding: gif_from_screen_domain::CaptureBinding::ArchivedAfterComposite,
-                ..original.clone()
-            };
-            commands.push(EditCommand::ReplaceFrame {
-                frame_id: original.id,
-                replacement: Box::new(replacement),
-            });
-            progress(MotionProgress {
-                completed: index + 1,
-                total: selected.len(),
-            });
-        }
-        Ok((EditCommand::Compound { commands }, selected.len()))
-    }
-
     fn loop_crossfade_command(
         &self,
         count: u16,
@@ -364,65 +289,6 @@ impl EditorWorkspace {
     }
 }
 
-/// A baked source is already in final coordinates. Keeping a hidden layer's
-/// old intermediate anchor would either orphan it or transform the baked source
-/// twice. Refuse that ambiguous bake before pixel/asset I/O; ordinary staged
-/// frames and hidden tail layers are safe and retain their existing behavior.
-fn validate_baked_stage_survivors(
-    project: &gif_from_screen_domain::ProjectManifest,
-    owners: &BTreeSet<FrameId>,
-    changes: &[EditCommand],
-    cancellation: &AtomicBool,
-) -> Result<(), String> {
-    let mut staged = BTreeSet::new();
-    let mut sample_times = BTreeSet::new();
-    let mut time = TimeUs::ZERO;
-    for frame in &project.timeline.frames {
-        check_cancelled(cancellation)?;
-        if owners.contains(&frame.id) && !frame.render_steps.is_empty() {
-            staged.insert(frame.id);
-            sample_times.insert(time);
-        }
-        time = time
-            .checked_add_duration(frame.duration)
-            .ok_or("Motion frame clock overflow.")?;
-    }
-    if staged.is_empty() {
-        return Ok(());
-    }
-    let replacements: BTreeMap<_, _> = changes
-        .iter()
-        .filter_map(|command| match command {
-            EditCommand::UpsertOverlayTrack { track } => Some((track.id, Some(track))),
-            EditCommand::RemoveOverlayTrack { track_id } => Some((*track_id, None)),
-            _ => None,
-        })
-        .collect();
-    for original in &project.timeline.overlay_tracks {
-        check_cancelled(cancellation)?;
-        let retained = replacements
-            .get(&original.id)
-            .copied()
-            .unwrap_or(Some(original));
-        let Some(track) = retained else { continue };
-        let intermediate_owned = track.frame_cells.as_ref().is_some_and(|cells| {
-            cells
-                .iter()
-                .any(|cell| staged.contains(&cell.frame_id) && cell.stage.is_some())
-        });
-        let intermediate_timed = track.frame_cells.is_none()
-            && track.items.iter().any(|item| {
-                item.span
-                    .end()
-                    .is_some_and(|end| sample_times.range(item.span.start..end).next().is_some())
-            });
-        if intermediate_owned || intermediate_timed {
-            return Err("Cinemagraph cannot discard the intermediate coordinates of hidden or zero-opacity artwork. Show or remove those layers on the selected frames first, or use Undo to return before the geometry edit. Nothing was changed.".to_owned());
-        }
-    }
-    Ok(())
-}
-
 /// `ScreenToGif` loop search counts equal ARGB pixels, not average color distance.
 /// Integer cross multiplication preserves inclusive decimal thresholds without rounding up.
 fn matching_pixels_at_least(
@@ -495,44 +361,6 @@ fn render(
     Ok(pixels)
 }
 
-fn freeze_rectangle(
-    animated: &mut RgbaSurface,
-    baseline: &RgbaSurface,
-    region: PhysicalRect,
-    invert: bool,
-    cancellation: &AtomicBool,
-) -> Result<(), String> {
-    let row_bytes =
-        usize::try_from(u64::from(animated.width()) * 4).map_err(|error| error.to_string())?;
-    let x =
-        usize::try_from(u64::from(region.origin.x.get()) * 4).map_err(|error| error.to_string())?;
-    let right = x + usize::try_from(u64::from(region.size.width.get()) * 4)
-        .map_err(|error| error.to_string())?;
-    let top = region.origin.y.get();
-    let bottom = top + region.size.height.get();
-    for (index, (output, frozen)) in animated
-        .pixels_mut()
-        .chunks_exact_mut(row_bytes)
-        .zip(baseline.pixels().chunks_exact(row_bytes))
-        .enumerate()
-    {
-        check_cancelled(cancellation)?;
-        let row = u32::try_from(index).map_err(|error| error.to_string())?;
-        let within = row >= top && row < bottom;
-        if invert {
-            if within {
-                output[x..right].copy_from_slice(&frozen[x..right]);
-            }
-        } else if within {
-            output[..x].copy_from_slice(&frozen[..x]);
-            output[right..].copy_from_slice(&frozen[right..]);
-        } else {
-            output.copy_from_slice(frozen);
-        }
-    }
-    Ok(())
-}
-
 fn store_surface(
     project: &ActiveProject,
     surface: &RgbaSurface,
@@ -563,150 +391,6 @@ fn store_surface(
         });
     }
     Ok(id)
-}
-
-fn remove_baked_overlay_spans(
-    tracks: &[gif_from_screen_domain::OverlayTrack],
-    selected: &[TimelineSpan],
-    owners: &BTreeSet<FrameId>,
-    cancellation: &AtomicBool,
-) -> Result<Vec<EditCommand>, String> {
-    let mut commands = Vec::new();
-    let mut total_fragments = 0_usize;
-    for track in tracks {
-        check_cancelled(cancellation)?;
-        if !track.visible || track.opacity == 0 {
-            continue;
-        }
-        if track.frame_cells.is_some() {
-            if let Some(command) = remove_baked_frame_cells(track, owners, cancellation)? {
-                commands.push(command);
-            }
-            continue;
-        }
-        let mut replacement = track.clone();
-        if let Some(scope) = &track.annotation_scope {
-            replacement.annotation_scope = Some(gif_from_screen_domain::subtract_annotation_scope(
-                scope, selected,
-            )?);
-        }
-        replacement.items.clear();
-        for item in &track.items {
-            if matches!(
-                item.content,
-                gif_from_screen_domain::OverlayContent::Raster { opacity: 0, .. }
-            ) {
-                replacement.items.push(item.clone());
-                continue;
-            }
-            for (index, span) in subtract_spans(item.span, selected)?.into_iter().enumerate() {
-                total_fragments += 1;
-                if total_fragments > MAX_OVERLAY_FRAGMENTS {
-                    return Err(
-                        "Motion edit would create more than 10,000 overlay fragments.".to_owned(),
-                    );
-                }
-                replacement.items.push(OverlayItem {
-                    id: if index == 0 {
-                        item.id
-                    } else {
-                        OverlayId::from_u128(Uuid::new_v4().as_u128())
-                    },
-                    span,
-                    ..item.clone()
-                });
-            }
-        }
-        if replacement != *track {
-            commands.push(
-                if replacement.items.is_empty()
-                    && replacement
-                        .annotation_scope
-                        .as_ref()
-                        .is_none_or(Vec::is_empty)
-                {
-                    EditCommand::RemoveOverlayTrack { track_id: track.id }
-                } else {
-                    EditCommand::UpsertOverlayTrack { track: replacement }
-                },
-            );
-        }
-    }
-    Ok(commands)
-}
-
-/// Whole-frame marks have already been included in each selected owner's baked
-/// pixels. Authoring fractions do not describe visible sub-frame intervals.
-fn remove_baked_frame_cells(
-    track: &gif_from_screen_domain::OverlayTrack,
-    owners: &BTreeSet<FrameId>,
-    cancellation: &AtomicBool,
-) -> Result<Option<EditCommand>, String> {
-    let mut replacement = track.clone();
-    let cells = replacement
-        .frame_cells
-        .as_mut()
-        .expect("frame-owned branch");
-    for cell in cells.iter_mut() {
-        check_cancelled(cancellation)?;
-        if owners.contains(&cell.frame_id) {
-            // This mirrors the renderer's explicit per-mark visibility rule.
-            // Retained zero-opacity marks keep their shared authoring scopes;
-            // they were not part of the baked image and may be enabled later.
-            cell.marks.retain(|mark| {
-                matches!(
-                    mark.content,
-                    gif_from_screen_domain::OverlayContent::Raster { opacity: 0, .. }
-                )
-            });
-        }
-    }
-    cells.retain(|cell| !owners.contains(&cell.frame_id) || !cell.marks.is_empty());
-    let empty = cells.is_empty();
-    check_cancelled(cancellation)?;
-    if replacement == *track {
-        return Ok(None);
-    }
-    Ok(Some(if empty {
-        EditCommand::RemoveOverlayTrack { track_id: track.id }
-    } else {
-        EditCommand::UpsertOverlayTrack { track: replacement }
-    }))
-}
-
-fn subtract_spans(
-    span: TimelineSpan,
-    selected: &[TimelineSpan],
-) -> Result<Vec<TimelineSpan>, String> {
-    let end = span
-        .end()
-        .ok_or_else(|| "Overlay span overflows the timeline.".to_owned())?
-        .get();
-    let mut cursor = span.start.get();
-    let mut output = Vec::new();
-    for cut in selected {
-        let cut_end = cut
-            .end()
-            .ok_or_else(|| "Selected span overflows the timeline.".to_owned())?
-            .get();
-        if cut_end <= cursor || cut.start.get() >= end {
-            continue;
-        }
-        if cut.start.get() > cursor {
-            output.push(TimelineSpan {
-                start: TimeUs::new(cursor),
-                duration: DurationUs::new(cut.start.get() - cursor).unwrap(),
-            });
-        }
-        cursor = cursor.max(cut_end).min(end);
-    }
-    if cursor < end {
-        output.push(TimelineSpan {
-            start: TimeUs::new(cursor),
-            duration: DurationUs::new(end - cursor).unwrap(),
-        });
-    }
-    Ok(output)
 }
 
 fn check_cancelled(cancellation: &AtomicBool) -> Result<(), String> {

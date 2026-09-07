@@ -502,6 +502,33 @@ fn validate_clipboard_assets(
                 asset_id: frame.asset_id,
             });
         }
+        for asset_id in frame.referenced_effect_assets() {
+            if !project.assets.contains_key(&asset_id) {
+                return Err(EditorError::MissingFrameAsset {
+                    frame_id: frame.id,
+                    asset_id,
+                });
+            }
+        }
+        for step in &frame.render_steps {
+            if let gif_from_screen_domain::FrameRenderStep::FreezeRegion {
+                baseline_asset,
+                baseline_size,
+                ..
+            } = step
+            {
+                // A persisted baseline view may reinterpret the same raw bytes
+                // without changing this project's canonical descriptor shape.
+                gif_from_screen_domain::validate_raw_rgba_view(
+                    &project.assets[baseline_asset],
+                    *baseline_size,
+                )
+                .map_err(|reason| EditorError::InvalidRenderPipeline {
+                    frame_id: frame.id,
+                    reason,
+                })?;
+            }
+        }
     }
     Ok(())
 }

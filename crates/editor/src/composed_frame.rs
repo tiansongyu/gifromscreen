@@ -6,7 +6,7 @@ use std::{
 };
 
 use gif_from_screen_domain::{
-    EditCommand, FrameClip, FrameGeometryPlan, FrameId, FrameRenderStep, PhysicalRect,
+    AssetId, EditCommand, FrameClip, FrameGeometryPlan, FrameId, FrameRenderStep, PhysicalRect,
     PhysicalSize, ProjectManifest, QuarterTurn,
 };
 
@@ -40,6 +40,17 @@ pub enum ComposedFrameEdit {
     Effect(FrameEffectEdit),
     /// Add, replace or clear current-image effects, including canvas expansion.
     ImageEffect(ComposedEffectEdit),
+    /// Freeze selected current-image regions without discarding earlier artwork.
+    FreezeRegion {
+        /// Immutable raw RGBA reference, registered by the enclosing atomic command.
+        baseline_asset: AssetId,
+        /// Explicit byte view; must equal the current image size at this step.
+        baseline_size: PhysicalSize,
+        /// Motion rectangle; pixels outside it are frozen by default.
+        region: PhysicalRect,
+        /// Freeze inside the rectangle instead of outside it.
+        invert: bool,
+    },
 }
 
 impl ComposedFrameEdit {
@@ -63,6 +74,17 @@ impl ComposedFrameEdit {
                 effect: effect.clone(),
             },
             Self::ImageEffect(ComposedEffectEdit::Add(effect)) => effect.step(),
+            Self::FreezeRegion {
+                baseline_asset,
+                baseline_size,
+                region,
+                invert,
+            } => FrameRenderStep::FreezeRegion {
+                baseline_asset: *baseline_asset,
+                baseline_size: *baseline_size,
+                region: *region,
+                invert: *invert,
+            },
             _ => return None,
         })
     }

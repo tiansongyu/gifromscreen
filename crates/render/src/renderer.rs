@@ -9,6 +9,9 @@ use crate::{
     CancellationToken, RenderError, RgbaSurface, UnsupportedEffect, surface::checked_byte_len,
 };
 
+#[path = "freeze_region.rs"]
+mod freeze_region;
+
 /// Largest supported radius for deterministic blur and shadow effects.
 ///
 /// The cap bounds parameter-driven work at region edges and keeps horizontal
@@ -112,7 +115,7 @@ impl CpuRenderer {
         })?;
         let mut surface = self.render_clip_prefix(clip, provider, cancellation)?;
         for step in &clip.render_steps {
-            surface = self.apply_render_step(surface, step, cancellation)?;
+            surface = self.apply_render_step(surface, step, provider, cancellation)?;
         }
         Ok(surface)
     }
@@ -207,14 +210,35 @@ impl CpuRenderer {
         Ok(surface)
     }
 
-    pub(crate) fn apply_render_step<C: CancellationToken + ?Sized>(
+    pub(crate) fn apply_render_step<
+        P: FrameAssetProvider + ?Sized,
+        C: CancellationToken + ?Sized,
+    >(
         &self,
         mut surface: RgbaSurface,
         step: &FrameRenderStep,
+        provider: &P,
         cancellation: &C,
     ) -> Result<RgbaSurface, RenderError> {
         check_cancelled(cancellation)?;
         match step {
+            FrameRenderStep::FreezeRegion {
+                baseline_asset,
+                baseline_size,
+                region,
+                invert,
+            } => {
+                freeze_region::apply(
+                    &mut surface,
+                    *baseline_asset,
+                    *baseline_size,
+                    *region,
+                    *invert,
+                    provider,
+                    self.limits,
+                    cancellation,
+                )?;
+            }
             FrameRenderStep::Crop { rect } => surface = self.crop(&surface, *rect, cancellation)?,
             FrameRenderStep::Resize { size } if *size != surface.size() => {
                 surface = self.resize_nearest(&surface, *size, cancellation)?;
