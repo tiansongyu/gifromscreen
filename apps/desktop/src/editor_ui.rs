@@ -573,6 +573,7 @@ pub(crate) enum EditorUiOperation {
     AddShapeOverlay,
     AddDrawingOverlay,
     RemoveOverlayTrack,
+    SetOverlayVisibility,
     ConvertOverlayTrack,
     SetTransition,
     DeleteTransition,
@@ -2531,6 +2532,7 @@ fn show_overlay_track_list(
                 track.mark_count(),
                 track.frame_cells.is_some(),
                 track.annotation.is_none() || track.annotation_scope.is_some(),
+                track.visible,
             )
         })
         .collect::<Vec<_>>();
@@ -2549,13 +2551,23 @@ fn show_overlay_track_list(
         }
     ));
     let mut remove = None;
-    for (layer_number, track_id, name, kind, item_count, frame_owned, known_coverage) in tracks {
+    let mut visibility = None;
+    for (layer_number, track_id, name, kind, item_count, frame_owned, known_coverage, visible) in
+        tracks
+    {
         ui.horizontal_wrapped(|ui| {
             ui.label(format!(
                 "Layer {layer_number} · {name} · {} · {item_count} item(s) · {}",
                 kind.unwrap_or("Empty"),
                 if frame_owned { "Frame-owned" } else { "Time-anchored" },
             ));
+            ui.push_id(track_id, |ui| {
+                if ui.small_button(if visible { "Hide" } else { "Show" })
+                    .on_hover_text("Toggle this layer in previews and GIF export, keeping its artwork, assets and paint stage. Previously frozen reference pixels are unchanged; earlier artwork changes only the live region. Undo restores visibility.")
+                    .clicked() {
+                    visibility = Some((track_id, !visible));
+                }
+            });
             if !frame_owned && ui.add_enabled(known_coverage, egui::Button::new("Attach to frames").small())
                 .on_hover_text(if known_coverage {
                     "Preserve this entire layer's current frame appearances, including hidden content. Future frame moves and copies carry its marks. Original input history is not inferred; some older input groups cannot be regenerated. Undo restores the timed layer, but the project format stays upgraded."
@@ -2579,6 +2591,16 @@ fn show_overlay_track_list(
             now,
             results,
             EditorUiOperation::RemoveOverlayTrack,
+            result,
+        );
+    } else if let Some((track_id, visible)) = visibility {
+        let result = workspace.set_overlay_track_visibility(track_id, visible);
+        record_project_result(
+            workspace,
+            state,
+            now,
+            results,
+            EditorUiOperation::SetOverlayVisibility,
             result,
         );
     }

@@ -19,6 +19,10 @@ their paint stages. Previously unanchored selected cells are sealed at a legacy
 boundary before the freeze. Showing earlier hidden artwork changes the live
 region; the frozen region keeps the saved reference. Later artwork still draws
 after the freeze. Existing precision boundaries are neither removed nor merged.
+The Layers inspector now provides explicit Hide/Show controls for this workflow.
+They change only visibility, retain all content and assets, and support Undo/Redo
+and journal recovery. The tooltip explains why previously frozen copies remain
+unchanged when an earlier layer is hidden or shown.
 
 The source image at this step must match the saved baseline view exactly.
 Earlier geometry edits that would invalidate that size are rejected atomically;

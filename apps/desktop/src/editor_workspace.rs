@@ -357,6 +357,29 @@ impl EditorWorkspace {
         self.execute(EditCommand::RemoveOverlayTrack { track_id })
     }
 
+    /// Changes only layer visibility; pixels, authoring stages and assets are retained.
+    pub(crate) fn set_overlay_track_visibility(
+        &mut self,
+        track_id: TrackId,
+        visible: bool,
+    ) -> Result<(), EditorWorkspaceError> {
+        let original = self
+            .manifest()
+            .timeline
+            .overlay_tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .ok_or_else(|| {
+                EditorError::from(gif_from_screen_domain::DomainError::UnknownTrack(track_id))
+            })?;
+        if original.visible == visible {
+            return Ok(());
+        }
+        let mut track = original.clone();
+        track.visible = visible;
+        self.execute(EditCommand::UpsertOverlayTrack { track })
+    }
+
     pub(crate) fn add_raster_overlay_for_selection(
         &mut self,
         edit: RasterOverlayEdit,
