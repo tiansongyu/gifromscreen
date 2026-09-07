@@ -13,7 +13,7 @@ thiserror.workspace = true
 [dev-dependencies]
 image.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 sha2 = "0.10"
 tempfile.workspace = true
 

@@ -93,3 +93,13 @@ jobs:
           cargo test --locked -p gif-from-screen-render --test cinemagraph_reference
           real_windows_clipped_snapshots_match_all_compositor_routes_exactly
           -- --ignored --exact --nocapture --test-threads=1
+      - name: Build the strict ink center-sample comparator
+        run: cargo test --locked -p gif-from-screen-render --test ink_reference --no-run
+      - name: Verify original and fitted center samples, not outline or erasure pixels
+        env:
+          GFS_CINEMAGRAPH_PROBE_DIR: ${{ runner.temp }}/gfs-cinemagraph-reference
+        run: >-
+          timeout --signal=TERM --kill-after=10s 120s
+          cargo test --locked -p gif-from-screen-render --test ink_reference
+          compare_windows_ink_samples
+          -- --ignored --exact --nocapture --test-threads=1

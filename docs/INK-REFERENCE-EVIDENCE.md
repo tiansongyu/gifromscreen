@@ -46,6 +46,27 @@ enabling `serde_json/float_roundtrip` removed those without changing the fitter,
 expected values or allowed error. Temporary source/report are under
 `/tmp/gfs-ink-geometry-review.X6Wir79y/`.
 
+The comparison is now a repository regression in
+`crates/render/tests/ink_reference.rs`, with eight synthetic verifier tests that
+do not masquerade as Windows evidence. It rejects incomplete/repeated cases,
+wrong source inventories/hashes, unsafe paths, inconsistent effective samples,
+unbounded metadata and single-ULP differences. The real test is opt-in with no
+fallback. It verified 1,645,977 index/source/diagnostic bytes and compared
+150 raw, 238 forced-fit and 194 effective samples across the 38 cases.
+Real replay passes on Rust 1.98.0 and 1.88.0. The complete repository cohort
+passes 1,357 workspace tests on both toolchains plus strict Clippy; opt-in
+hardware/external-evidence tests are not counted as ordinary passes.
+
+```sh
+GFS_CINEMAGRAPH_PROBE_DIR=/path/to/unmodified/windows-artifact \
+  cargo test --locked -p gif-from-screen-render --test ink_reference \
+  compare_windows_ink_samples -- --ignored --exact --nocapture --test-threads=1
+```
+
+The manual Windows-producer/Linux-comparator workflow also runs this sample
+gate separately from snapshot composition. It does not turn the known line
+outline mismatches below into passing producer tests.
+
 ## Actual production outline → clipped PM result
 
 A second bounded program passed original fixture samples and dimensions to
