@@ -32,8 +32,7 @@ internal static class WpfRenderer
 
     internal static BitmapSource Apply(BitmapSource input, Operation operation)
     {
-        if (Math.Abs(input.DpiX - 96) > 0.001 || Math.Abs(input.DpiY - 96) > 0.001)
-            throw new InvalidDataException("This fixture set is explicitly 96 DPI.");
+        DpiNormalization.RequireWorkingDpi(input);
         return operation switch
         {
             BorderOperation border => ApplyBorder(input, border.Style),

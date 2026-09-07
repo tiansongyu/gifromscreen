@@ -39,7 +39,7 @@ internal static class Program
             {
                 Limits.Check($"{fixture.Id}: input");
                 var initial = writer.Snapshot(fixture.Id, "input", WpfRenderer.CreateBitmap(fixture.Source));
-                var current = initial.Decoded;
+                var current = initial.Working;
                 var stages = new List<BitmapArtifact>();
                 for (var index = 0; index < fixture.Operations.Count; index++)
                 {
@@ -47,7 +47,7 @@ internal static class Program
                     var rendered = WpfRenderer.Apply(current, fixture.Operations[index]);
                     var stageName = "stage-" + (index + 1).ToString("00", CultureInfo.InvariantCulture);
                     var snapshot = writer.Snapshot(fixture.Id, stageName, rendered);
-                    current = snapshot.Decoded;
+                    current = snapshot.Working;
                     stages.Add(snapshot.Artifact);
                     Limits.Check($"{fixture.Id}: after stage {index + 1}");
                 }

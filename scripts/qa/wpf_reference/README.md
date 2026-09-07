@@ -24,6 +24,17 @@ next operation, mirroring destructive Apply's actual quantization boundary.
 Expected pixels are never calculated with the Rust renderer or a reimplemented
 Gaussian kernel.
 
+PNG stores integer pixels per metre, so a nominal 96 DPI image can decode as
+95.9866 DPI (3779 ppm, observed on the first real run) or 96.012 DPI (3780 ppm).
+This suite measures an explicitly physical, 96-DPI coordinate space. It records
+the original decoded DPI and retains its exact WIC pixels/format/palette, then
+rebuilds only the working bitmap's DPI metadata at 96 for the next draw. The
+generator asserts that this does not change any stored pixels, dimensions,
+format or palette. The comparator validates both decoded and working DPI; it
+does not use a pixel tolerance. This normalization does not claim to reproduce
+ScreenToGif's historical mixture of rounded ImageDpi and unrounded bitmap DIP
+sizes. Actual fractional-DPI behavior remains a separate gate.
+
 The generator writes `index.json`, input/stage PNGs, straight-alpha RGBA8 and
 pre-PNG PBGRA bytes to a new directory. The index records dimensions, SHA-256
 for each file, exact input-definition and generator-source hashes, and actual

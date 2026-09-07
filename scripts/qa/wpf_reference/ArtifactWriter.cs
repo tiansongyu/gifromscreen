@@ -5,8 +5,9 @@ using System.Windows.Media.Imaging;
 namespace GifFromScreen.WpfReference;
 
 internal sealed record BitmapArtifact(int Width, int Height, string RgbaFile, string RgbaSha256,
-    string PngFile, string PngSha256, string PremultipliedFile, string PremultipliedSha256);
-internal sealed record BitmapSnapshot(BitmapSource Decoded, BitmapArtifact Artifact);
+    string PngFile, string PngSha256, string PremultipliedFile, string PremultipliedSha256,
+    double DecodedDpiX, double DecodedDpiY, double WorkingDpiX, double WorkingDpiY);
+internal sealed record BitmapSnapshot(BitmapSource Working, BitmapArtifact Artifact);
 
 internal sealed class ArtifactWriter
 {
@@ -29,6 +30,7 @@ internal sealed class ArtifactWriter
     {
         Limits.Size(rendered.PixelWidth, rendered.PixelHeight);
         Limits.Check($"{id}/{name}: snapshot");
+        DpiNormalization.RequireWorkingDpi(rendered);
         var png = Encode(rendered);
         var decoded = Decode(png);
         if (decoded.PixelWidth != rendered.PixelWidth || decoded.PixelHeight != rendered.PixelHeight)
@@ -43,10 +45,14 @@ internal sealed class ArtifactWriter
         Write($"{stem}.png", png);
         Write($"{stem}.rgba", rgba);
         Write($"{stem}.pbgra", premultiplied);
+        // Keep the codec outputs above exactly as observed. Only the bitmap
+        // passed to the next physical-pixel operation gets new DPI metadata.
+        var working = DpiNormalization.ForNextOperation(decoded);
         var artifact = new BitmapArtifact(decoded.PixelWidth, decoded.PixelHeight,
             $"{stem}.rgba", Hashing.Bytes(rgba), $"{stem}.png", Hashing.Bytes(png),
-            $"{stem}.pbgra", Hashing.Bytes(premultiplied));
-        return new BitmapSnapshot(decoded, artifact);
+            $"{stem}.pbgra", Hashing.Bytes(premultiplied),
+            decoded.DpiX, decoded.DpiY, working.DpiX, working.DpiY);
+        return new BitmapSnapshot(working, artifact);
     }
 
     internal void Write(string relative, byte[] bytes)

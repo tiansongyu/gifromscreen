@@ -88,6 +88,10 @@ struct ReferenceFixture {
 struct ReferenceImage {
     width: u32,
     height: u32,
+    decoded_dpi_x: f64,
+    decoded_dpi_y: f64,
+    working_dpi_x: f64,
+    working_dpi_y: f64,
     rgba_file: String,
     rgba_sha256: String,
     png_file: String,
@@ -96,6 +100,31 @@ struct ReferenceImage {
     premultiplied_file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     premultiplied_sha256: Option<String>,
+}
+
+impl ReferenceImage {
+    fn validate_dpi(&self) -> Result<()> {
+        // Pixel coordinates are the protocol's exact physical 96-DPI space.
+        // WIC's PNG integer pixels-per-metre conversion is metadata only;
+        // these accepted readback values never introduce a pixel tolerance.
+        if self.working_dpi_x.to_bits() != 96.0_f64.to_bits()
+            || self.working_dpi_y.to_bits() != 96.0_f64.to_bits()
+        {
+            return Err("Reference working DPI must be exactly 96 on both axes.".into());
+        }
+        for decoded in [self.decoded_dpi_x, self.decoded_dpi_y] {
+            if !decoded.is_finite()
+                || ![96.0, 3779.0 * 0.0254, 3780.0 * 0.0254]
+                    .iter()
+                    .any(|allowed| (decoded - allowed).abs() <= 1e-6)
+            {
+                return Err(
+                    "Reference decoded DPI is not an approved 96-DPI PNG conversion.".into(),
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Image {
@@ -354,6 +383,7 @@ fn load_reference(
     reference: &ReferenceImage,
     budget: &mut usize,
 ) -> Result<RgbaSurface> {
+    reference.validate_dpi()?;
     let expected = surface_bytes(reference.width, reference.height)?;
     let bytes = read_bounded(&safe_file(root, &reference.rgba_file)?, expected, budget)?;
     verify_hash(&bytes, &reference.rgba_sha256)?;
@@ -581,6 +611,7 @@ fn pixel_at(surface: &RgbaSurface, x: u32, y: u32) -> Option<&[u8]> {
 struct StageReport {
     fixture_id: String,
     stage: usize,
+    reference: ReferenceImage,
     actual_sha256: Option<String>,
     difference: Option<PixelDifference>,
     error: Option<String>,
@@ -687,6 +718,7 @@ fn compare_stage(
     let mut report = StageReport {
         fixture_id: fixture.to_owned(),
         stage,
+        reference: reference.clone(),
         actual_sha256: None,
         difference: None,
         error: None,
@@ -1035,6 +1067,10 @@ mod mechanical_tests {
         ReferenceImage {
             width: image.size().width.get(),
             height: image.size().height.get(),
+            decoded_dpi_x: 96.0,
+            decoded_dpi_y: 96.0,
+            working_dpi_x: 96.0,
+            working_dpi_y: 96.0,
             rgba_sha256: sha256(image.pixels()),
             png_sha256: sha256(&fs::read(directory.join(&png_file)).unwrap()),
             rgba_file,
@@ -1057,6 +1093,90 @@ mod mechanical_tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn dpi_envelope_allows_only_documented_png_metadata_conversions() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("synthetic")).unwrap();
+        let source = Image {
+            width: 1,
+            height: 1,
+            pixels: vec![[1, 2, 3, 255]],
+        }
+        .surface()
+        .unwrap();
+        let reference = synthetic_reference(directory.path(), "synthetic", "input", &source);
+        let root = directory.path().canonicalize().unwrap();
+        for decoded in [96.0, 95.9866, 96.012] {
+            let mut changed = reference.clone();
+            changed.decoded_dpi_x = decoded;
+            changed.decoded_dpi_y = decoded;
+            changed.validate_dpi().unwrap();
+            let mut budget = MAX_TOTAL_BYTES;
+            assert_eq!(
+                load_reference(&root, &changed, &mut budget).unwrap(),
+                source
+            );
+        }
+        for invalid in [
+            f64::NAN,
+            f64::INFINITY,
+            72.0,
+            120.0,
+            95.99,
+            96.000_002,
+            95.986_602,
+            96.012_002,
+        ] {
+            let mut changed = reference.clone();
+            changed.decoded_dpi_x = invalid;
+            assert!(changed.validate_dpi().is_err());
+            changed.decoded_dpi_x = 96.0;
+            changed.decoded_dpi_y = invalid;
+            assert!(changed.validate_dpi().is_err());
+        }
+        for invalid in [
+            f64::NAN,
+            f64::INFINITY,
+            95.9866,
+            96.012,
+            96.0 + f64::EPSILON * 128.0,
+        ] {
+            let mut changed = reference.clone();
+            changed.working_dpi_x = invalid;
+            assert!(changed.validate_dpi().is_err());
+            changed.working_dpi_x = 96.0;
+            changed.working_dpi_y = invalid;
+            assert!(changed.validate_dpi().is_err());
+        }
+        for field in [
+            "decoded_dpi_x",
+            "decoded_dpi_y",
+            "working_dpi_x",
+            "working_dpi_y",
+        ] {
+            let mut json = serde_json::to_value(&reference).unwrap();
+            json.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<ReferenceImage>(json).is_err());
+        }
+        let output = directory.path().join("report-output");
+        fs::create_dir(&output).unwrap();
+        let mut budget = MAX_TOTAL_BYTES;
+        let report = compare_stage(
+            &root,
+            &output,
+            "synthetic",
+            0,
+            &reference,
+            Ok(source),
+            &mut budget,
+        );
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["reference"]["decoded_dpi_x"], 96.0);
+        assert_eq!(json["reference"]["decoded_dpi_y"], 96.0);
+        assert_eq!(json["reference"]["working_dpi_x"], 96.0);
+        assert_eq!(json["reference"]["working_dpi_y"], 96.0);
     }
 
     #[test]
