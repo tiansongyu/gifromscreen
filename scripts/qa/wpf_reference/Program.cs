@@ -1,3 +1,6 @@
+// The desktop SDK's implicit usings differ from the console SDK's set.
+global using System.IO;
+
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
