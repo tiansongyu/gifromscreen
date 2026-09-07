@@ -104,12 +104,16 @@ impl MotionTools {
         egui::CollapsingHeader::new("Motion tools").id_salt("motion-tools").show(ui, |ui| {
             self.sync_canvas(workspace);
             ui.add_enabled_ui(!self.is_running(), |ui| {
+                let previous_mode = self.mode;
                 ui.horizontal_wrapped(|ui| {
                     ui.selectable_value(&mut self.mode, Mode::Cinemagraph, "Cinemagraph");
                     ui.selectable_value(&mut self.mode, Mode::RectangularFreeze, "Rectangular freeze");
                     ui.selectable_value(&mut self.mode, Mode::SmoothLoop, "Smooth loop");
                     ui.selectable_value(&mut self.mode, Mode::LoopCrossfade, "Loop crossfade");
                 });
+                if self.mode != previous_mode {
+                    self.reconcile_cinemagraph(workspace);
+                }
                 match self.mode {
                     Mode::Cinemagraph => self.show_cinemagraph_controls(ui, workspace),
                     Mode::RectangularFreeze => {

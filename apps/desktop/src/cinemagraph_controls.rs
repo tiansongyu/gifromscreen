@@ -149,3 +149,7 @@ fn tip_controls(ui: &mut egui::Ui, attributes: &mut InkAttributes) {
         ui.selectable_value(&mut attributes.tip, InkTip::Rectangle, "Rectangle tip");
     });
 }
+
+#[cfg(test)]
+#[path = "cinemagraph_controls/tests.rs"]
+mod tests;

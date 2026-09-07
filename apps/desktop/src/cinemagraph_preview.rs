@@ -1063,6 +1063,190 @@ mod tests {
         assert_eq!(workspace.manifest(), &before);
     }
 
+    struct BoundaryUi {
+        context: egui::Context,
+        preview: CinemagraphPreview,
+        image_extent: egui::Vec2,
+        image_offset: f32,
+        rendered_size: [u32; 2],
+        handle_cinemagraph: bool,
+        text: String,
+        preview_id: Option<egui::Id>,
+    }
+
+    impl Default for BoundaryUi {
+        fn default() -> Self {
+            Self {
+                context: egui::Context::default(),
+                preview: CinemagraphPreview::default(),
+                image_extent: egui::vec2(200.0, 200.0),
+                image_offset: 0.0,
+                rendered_size: [100, 100],
+                handle_cinemagraph: true,
+                text: "abcd".into(),
+                preview_id: None,
+            }
+        }
+    }
+
+    impl BoundaryUi {
+        fn frame(
+            &mut self,
+            draft: &mut CinemagraphDraft,
+            events: Vec<egui::Event>,
+        ) -> (Rect, Rect) {
+            let mut rects = (Rect::NOTHING, Rect::NOTHING);
+            let _ = self.context.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(500.0, 500.0))),
+                    events,
+                    focused: true,
+                    ..egui::RawInput::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.add_space(self.image_offset);
+                        let (_, response) = ui
+                            .allocate_exact_size(self.image_extent, egui::Sense::click_and_drag());
+                        rects.0 = response.rect;
+                        self.preview_id = Some(response.id);
+                        if self.handle_cinemagraph {
+                            self.preview
+                                .show(ui, &response, draft, self.rendered_size, true);
+                        } else if response.clicked() {
+                            response.request_focus();
+                        }
+                        // The narrow editor draws its inspector AFTER the preview.
+                        // Keep this real TextEdit in that order: its focus processing
+                        // must not be replaced by a direct call to event().
+                        rects.1 = ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.text)
+                                    .id(egui::Id::new("cine-boundary-text")),
+                            )
+                            .rect;
+                    });
+                },
+            );
+            rects
+        }
+    }
+
+    #[test]
+    fn actual_egui_mapping_change_before_release_rolls_back_the_entire_gesture() {
+        for change in 0..3 {
+            let (_root, workspace, mut draft) = setup();
+            let manifest = workspace.manifest().clone();
+            add_line(&mut draft);
+            let completed = draft.strokes().to_vec();
+            let mut ui = BoundaryUi::default();
+            let (image, _) = ui.frame(&mut draft, Vec::new());
+            let position = image.center();
+            ui.frame(
+                &mut draft,
+                vec![egui::Event::PointerMoved(position), button(position, true)],
+            );
+            assert!(draft.gesture_active());
+            assert!(ui.preview.drag.is_some());
+            match change {
+                0 => ui.image_extent = egui::vec2(280.0, 160.0),
+                1 => ui.image_offset = 20.0,
+                _ => ui.rendered_size = [200, 100],
+            }
+            ui.frame(
+                &mut draft,
+                vec![
+                    egui::Event::PointerMoved(position + egui::vec2(10.0, 10.0)),
+                    button(position + egui::vec2(20.0, 20.0), false),
+                ],
+            );
+            assert!(!draft.gesture_active(), "mapping case {change}");
+            assert!(ui.preview.drag.is_none(), "mapping case {change}");
+            assert_eq!(draft.strokes(), completed, "mapping case {change}");
+            assert_eq!(workspace.manifest(), &manifest);
+        }
+    }
+
+    #[test]
+    fn actual_egui_click_later_text_edit_then_delete_does_not_delete_selected_ink() {
+        let (_root, workspace, mut draft) = setup();
+        let manifest = workspace.manifest().clone();
+        add_line(&mut draft);
+        draft.select_all().unwrap();
+        draft.tool = CinemagraphTool::Select;
+        let completed = draft.strokes().to_vec();
+        let mut ui = BoundaryUi::default();
+        let (image, _) = ui.frame(&mut draft, Vec::new());
+        let position = image.min + egui::vec2(60.0, 60.0);
+        let (_, text) = ui.frame(
+            &mut draft,
+            vec![
+                egui::Event::PointerMoved(position),
+                button(position, true),
+                button(position, false),
+            ],
+        );
+        assert!(
+            ui.context
+                .memory(|memory| memory.has_focus(ui.preview_id.unwrap()))
+        );
+        assert_eq!(draft.selected_ids().len(), 1);
+        let text_position = egui::pos2(text.min.x + 5.0, text.center().y);
+        ui.frame(
+            &mut draft,
+            vec![
+                egui::Event::PointerMoved(text_position),
+                button(text_position, true),
+                button(text_position, false),
+                key(egui::Key::Delete),
+            ],
+        );
+        assert_eq!(
+            draft.strokes(),
+            completed,
+            "Delete belongs to the clicked TextEdit, not the formerly focused canvas"
+        );
+        let mut control = BoundaryUi {
+            handle_cinemagraph: false,
+            ..BoundaryUi::default()
+        };
+        control.frame(&mut draft, Vec::new());
+        control.frame(
+            &mut draft,
+            vec![
+                egui::Event::PointerMoved(position),
+                button(position, true),
+                button(position, false),
+            ],
+        );
+        assert!(
+            control
+                .context
+                .memory(|memory| memory.has_focus(control.preview_id.unwrap()))
+        );
+        control.frame(
+            &mut draft,
+            vec![
+                egui::Event::PointerMoved(text_position),
+                button(text_position, true),
+                button(text_position, false),
+                key(egui::Key::Delete),
+            ],
+        );
+        // TextEdit chooses its own selection/caret on focus. Compare with the
+        // same real widget without a Cine consumer, not an assumed cursor index.
+        assert_ne!(control.text, "abcd", "Delete must actually reach TextEdit");
+        assert_eq!(
+            ui.text, control.text,
+            "Cine must not consume the text widget's Delete"
+        );
+        assert!(
+            ui.context
+                .memory(|memory| memory.has_focus(egui::Id::new("cine-boundary-text")))
+        );
+        assert_eq!(workspace.manifest(), &manifest);
+    }
+
     #[test]
     fn focus_loss_pointer_loss_and_event_overload_cancel_only_the_transient_gesture() {
         for loss in [
