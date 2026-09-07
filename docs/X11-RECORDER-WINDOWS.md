@@ -1,5 +1,11 @@
 # X11 recorder window and input contract
 
+This document retains the historical combined-window implementation and its
+checkpoint evidence. The desktop now uses the [independent physical selection,
+native border and controller](X11-SPLIT-CONTROLLER.md), with
+[new native acceptance](NATIVE-X11-SPLIT-QA-2026-09-07.md). Do not apply the older
+mapped-parent/child-window layout below as the current architecture.
+
 Native Mutter X11 checks exposed defects not covered by component tests:
 
 - A maximized root window ignored the former 1×1/off-screen geometry requests,

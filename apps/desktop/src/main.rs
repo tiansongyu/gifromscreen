@@ -32,9 +32,8 @@ mod open_project_job;
 mod path_picker;
 mod project_insert_ui;
 mod project_library_ui;
+mod recorder_geometry;
 mod recorder_shortcuts;
-#[cfg(test)]
-mod recorder_toolbar_tests;
 mod retarget;
 mod shortcut_ui;
 mod static_sequence_ui;
@@ -48,7 +47,10 @@ mod wayland_controller_layout;
 #[path = "wayland_controller_tests.rs"]
 mod wayland_controller_tests;
 mod wayland_prepare_job;
-mod x11_recorder_input;
+mod x11_controller_ui;
+mod x11_controller_window;
+mod x11_recorder;
+use x11_recorder::RecorderOverlay;
 
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -142,8 +144,6 @@ use wayland_prepare_job::{
 };
 
 const APP_NAME: &str = "GifFromScreen";
-const RECORDER_BORDER_POINTS: f32 = 4.0;
-const RECORDER_TOOLBAR_POINTS: f32 = 96.0;
 const MAX_RECORDING_DURATION_MS: u64 = 3_600_000;
 const EDITOR_HISTORY_LIMIT: usize = 100;
 const EDITOR_PREVIEW_MAX_SIZE: [u32; 2] = [960, 540];
@@ -693,16 +693,6 @@ struct WaylandCropController {
     drag_initial_region: Option<PhysicalRect>,
 }
 
-struct RecorderOverlay {
-    window_title: String,
-    input: x11_recorder_input::RecorderInput,
-    last_region_valid: bool,
-    initial_position: egui::Pos2,
-    initial_size: egui::Vec2,
-    initialized: bool,
-    source_geometry: PhysicalRect,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct MainWindowSnapshot {
     position: Option<egui::Pos2>,
@@ -766,10 +756,10 @@ impl RecorderStage {
 struct RecorderOverlayFrame {
     action: RecorderOverlayAction,
     region: Option<PhysicalRect>,
-    input_geometry: Option<x11_recorder_input::Geometry>,
 }
 
 struct GifFromScreenApp {
+    x11_window_id: Option<u32>,
     pending_recorder_start: Option<Instant>,
     shortcut_tool: shortcut_ui::ShortcutTool,
     view: AppView,
@@ -830,6 +820,7 @@ impl Default for GifFromScreenApp {
     fn default() -> Self {
         Self {
             pending_recorder_start: None,
+            x11_window_id: None,
             shortcut_tool: shortcut_ui::ShortcutTool::default(),
             view: AppView::Landing,
             notice: None,
@@ -897,8 +888,10 @@ impl Drop for GifFromScreenApp {
 }
 
 impl eframe::App for GifFromScreenApp {
-    fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
-        let closing_controller = self.wayland_crop_controller.is_some()
+    fn update(&mut self, context: &egui::Context, frame: &mut eframe::Frame) {
+        self.x11_window_id = x11_recorder::window_id(frame);
+        let closing_controller = (self.wayland_crop_controller.is_some()
+            || self.recorder_overlay.is_some())
             && context.input(|input| input.viewport().close_requested());
         if closing_controller {
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1056,6 +1049,10 @@ impl GifFromScreenApp {
             return;
         }
         context.send_viewport_cmd(egui::ViewportCommand::Title(APP_NAME.to_owned()));
+        context.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        context.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            egui::WindowLevel::Normal,
+        ));
         if let Some(snapshot) = self
             .main_window_snapshot
             .take()
@@ -1063,15 +1060,16 @@ impl GifFromScreenApp {
         {
             context.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
             context.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
-            context.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-                680.0, 440.0,
-            )));
-            context.send_viewport_cmd(egui::ViewportCommand::InnerSize(snapshot.size));
+            let scale = context.pixels_per_point();
+            context.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(
+                egui::vec2(680.0, 440.0).min(snapshot.size) / scale,
+            ));
+            context.send_viewport_cmd(egui::ViewportCommand::InnerSize(snapshot.size / scale));
             if let Some(maximized) = snapshot.maximized {
                 context.send_viewport_cmd(egui::ViewportCommand::Maximized(maximized));
             }
             if let Some(position) = snapshot.position {
-                context.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
+                context.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position / scale));
             }
         }
         // The transparent X11 parent and dedicated Wayland shell remain mapped.
@@ -2336,190 +2334,14 @@ impl GifFromScreenApp {
         }
     }
 
-    #[allow(clippy::cast_precision_loss)]
-    fn open_recorder_overlay(&mut self, context: &egui::Context) -> Result<(), String> {
-        validate_settings(&self.settings)?;
-        if self.display_server == Some(LinuxDisplayServer::Wayland) {
-            return self.begin_wayland_preparation();
-        }
-        let main_window = context
-            .input(|input| {
-                let viewport = input.viewport();
-                Some(MainWindowSnapshot {
-                    position: Some(viewport.outer_rect?.min),
-                    size: viewport.inner_rect?.size(),
-                    maximized: viewport.maximized,
-                    restore: MainWindowRestore::X11Geometry,
-                })
-            })
-            .ok_or_else(|| "Could not read the main window geometry.".to_owned())?;
-        let source = self
-            .sources
-            .get(self.selected_source)
-            .ok_or_else(|| "No X11 capture source is selected.".to_owned())?;
-        let source_geometry = source
-            .geometry()
-            .ok_or_else(|| "The selected source has no usable geometry.".to_owned())?;
-        let region = if self.settings.region_enabled {
-            PhysicalRect::new(
-                self.settings.region_x,
-                self.settings.region_y,
-                self.settings.region_width,
-                self.settings.region_height,
-            )
-            .map_err(|error| error.to_string())?
-        } else {
-            PhysicalRect::new(
-                0,
-                0,
-                source_geometry.size().width(),
-                source_geometry.size().height(),
-            )
-            .map_err(|error| error.to_string())?
-        };
-        if !region.fits_within(source_geometry.size()) {
-            return Err("The capture rectangle must stay inside the selected source.".into());
-        }
-
-        let pixels_per_point = context.pixels_per_point();
-        let absolute_x = source_geometry
-            .origin()
-            .x
-            .checked_add(region.origin().x)
-            .ok_or_else(|| "Recorder X position overflowed.".to_owned())?;
-        let absolute_y = source_geometry
-            .origin()
-            .y
-            .checked_add(region.origin().y)
-            .ok_or_else(|| "Recorder Y position overflowed.".to_owned())?;
-        let position = egui::pos2(
-            absolute_x as f32 / pixels_per_point - RECORDER_BORDER_POINTS,
-            absolute_y as f32 / pixels_per_point - RECORDER_BORDER_POINTS,
-        );
-        let size = egui::vec2(
-            region.size().width() as f32 / pixels_per_point + RECORDER_BORDER_POINTS * 2.0,
-            region.size().height() as f32 / pixels_per_point
-                + RECORDER_BORDER_POINTS * 2.0
-                + RECORDER_TOOLBAR_POINTS,
-        );
-        self.recorder_overlay = Some(RecorderOverlay {
-            window_title: format!("GifFromScreen recorder [{}]", uuid::Uuid::new_v4().simple()),
-            input: x11_recorder_input::RecorderInput::default(),
-            last_region_valid: false,
-            initial_position: position,
-            initial_size: size,
-            initialized: false,
-            source_geometry,
-        });
-        self.main_window_snapshot = Some(main_window);
-        self.notice = Some("Recorder frame opened. Move or resize it, then press Start.".into());
-        context.request_repaint();
-        context.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
-        context.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
-        Ok(())
-    }
-
-    fn show_recorder_overlay(&mut self, context: &egui::Context) {
-        let Some(overlay) = &self.recorder_overlay else {
-            return;
-        };
-        let stage = self.recorder_stage();
-        if stage == RecorderStage::Finalizing
-            && let Some(job) = &mut self.job
-        {
-            job.stop_retargeting();
-        }
-        let retarget_notice = self
-            .job
-            .as_mut()
-            .and_then(|job| job.poll_retarget(stage.allows_retargeting()));
-        if retarget_notice.is_some() {
-            self.notice = retarget_notice;
-        }
-        if let Some(snapshot_notice) = self.job.as_mut().and_then(RecordingJob::poll_snapshots) {
-            self.notice = Some(snapshot_notice);
-        }
-        let mut builder = egui::ViewportBuilder::default()
-            .with_title(&overlay.window_title)
-            .with_transparent(true)
-            .with_decorations(false)
-            .with_resizable(stage.allows_resizing())
-            .with_movable_by_background(stage.allows_moving())
-            .with_min_inner_size([180.0, 130.0])
-            .with_always_on_top()
-            .with_has_shadow(false)
-            .with_taskbar(false)
-            .with_window_type(egui::X11WindowType::Utility);
-        if !overlay.initialized {
-            builder = builder
-                .with_position(overlay.initial_position)
-                .with_inner_size(overlay.initial_size);
-        }
-        let progress = self.progress;
-        let source_geometry = overlay.source_geometry;
-        let input_ready = overlay.input.ready() && overlay.last_region_valid;
-        let manual_snapshots = self.settings.cadence == RecordingCadenceChoice::Manual;
-        let shortcut_summary = self.shortcut_tool.status_summary();
-        let input_notice = overlay.input.notice().or_else(|| {
-            (!overlay.last_region_valid).then_some(
-                "Keep the capture rectangle inside the selected source; Start remains disabled.",
-            )
-        });
-        let toolbar_notice = input_notice
-            .or(self.notice.as_deref())
-            .map(|notice| {
-                format!(
-                    "{notice} {}",
-                    shortcut_summary.as_deref().unwrap_or_default()
-                )
-            })
-            .or(shortcut_summary);
-        let frame = context.show_viewport_immediate(
-            recorder_viewport_id(),
-            builder,
-            |viewport_context, _class| {
-                draw_recorder_overlay(
-                    viewport_context,
-                    stage,
-                    progress,
-                    source_geometry,
-                    manual_snapshots,
-                    toolbar_notice.as_deref(),
-                    input_ready,
-                )
-            },
-        );
-        if let Some(overlay) = &mut self.recorder_overlay {
-            overlay.initialized = true;
-            overlay.last_region_valid = frame.region.is_some();
-            overlay
-                .input
-                .update(context, &overlay.window_title, frame.input_geometry);
-            if overlay.input.failed()
-                && let Some(job) = &mut self.job
-                && !job.terminal_requested
-            {
-                job.stop_retargeting();
-                let _ = job.controller.stop();
-                self.notice = Some(
-                    "Recorder input preparation failed; stopping and saving the captured project."
-                        .into(),
-                );
-            }
-        }
-        if let Some(region) = frame.region {
-            apply_overlay_region(&mut self.settings, stage, region);
-            if should_sync_retarget(stage, frame.action)
-                && let Some(job) = &mut self.job
-            {
-                job.observe_target(region);
-            }
-        }
-        let action = self.recorder_frame_action(frame.action);
-        self.handle_recorder_overlay_action(context, action);
-    }
-
     fn recorder_stage(&self) -> RecorderStage {
+        if self
+            .recorder_overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.pending_live_start.is_some())
+        {
+            return RecorderStage::Countdown(0);
+        }
         if let Some(remaining) = self.recording_countdown.remaining_seconds() {
             return RecorderStage::Countdown(remaining);
         }
@@ -2560,6 +2382,9 @@ impl GifFromScreenApp {
                 }
             }
             RecorderOverlayAction::CancelCountdown => {
+                if let Some(overlay) = &mut self.recorder_overlay {
+                    overlay.cancel_start(context);
+                }
                 if self.recording_countdown.cancel() {
                     self.notice = Some("Recording countdown cancelled.".into());
                     context.request_repaint();
@@ -2622,20 +2447,12 @@ impl GifFromScreenApp {
         }
     }
 
-    fn close_recorder_overlay(&mut self) {
-        self.pending_recorder_start = None;
-        self.shortcut_tool.reset_recording_scope();
-        self.recording_countdown.cancel();
-        self.recorder_overlay = None;
-        self.restore_main_window = true;
-    }
-
     fn begin_recording(&mut self, context: &egui::Context) -> Result<(), String> {
         validate_settings(&self.settings)?;
         if self
             .recorder_overlay
             .as_ref()
-            .is_some_and(|overlay| !overlay.last_region_valid || !overlay.input.ready())
+            .is_some_and(|overlay| !overlay.ready())
         {
             return Err("Wait for the current input hole and keep the recorder inside its source before starting.".into());
         }
@@ -2646,7 +2463,7 @@ impl GifFromScreenApp {
             .recording_countdown
             .start(Instant::now(), self.settings.countdown_seconds)
         {
-            CountdownStart::Immediate => self.start_recording(),
+            CountdownStart::Immediate => self.prepare_live_recording(),
             CountdownStart::Started => {
                 self.notice = Some(format!(
                     "Recording starts in {} seconds…",
@@ -2672,11 +2489,20 @@ impl GifFromScreenApp {
                 context.request_repaint();
                 if (self.recorder_overlay.is_some() || self.wayland_crop_controller.is_some())
                     && self.job.is_none()
-                    && let Err(error) = self.start_recording()
+                    && let Err(error) = self.prepare_live_recording()
                 {
                     self.notice = Some(error);
                 }
             }
+        }
+    }
+
+    fn prepare_live_recording(&mut self) -> Result<(), String> {
+        if let Some(overlay) = &mut self.recorder_overlay {
+            overlay.pending_live_start = Some(Instant::now());
+            Ok(())
+        } else {
+            self.start_recording()
         }
     }
 
@@ -4340,11 +4166,7 @@ fn draw_wayland_crop_controller(
         context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         action = RecorderOverlayAction::Close;
     }
-    RecorderOverlayFrame {
-        action,
-        region,
-        input_geometry: None,
-    }
+    RecorderOverlayFrame { action, region }
 }
 
 fn trace_wayland_controller(marker: &'static str) {
@@ -4701,213 +4523,6 @@ fn translate_source_region(
     .unwrap_or(region)
 }
 
-fn draw_recorder_overlay(
-    context: &egui::Context,
-    stage: RecorderStage,
-    progress: Option<WorkflowProgress>,
-    source_geometry: PhysicalRect,
-    manual_snapshots: bool,
-    shortcuts: Option<&str>,
-    input_ready: bool,
-) -> RecorderOverlayFrame {
-    let mut action = draw_recorder_toolbar(
-        context,
-        stage,
-        progress,
-        manual_snapshots,
-        shortcuts,
-        input_ready,
-    );
-    let central = egui::CentralPanel::default()
-        .frame(
-            egui::Frame::new()
-                .fill(egui::Color32::TRANSPARENT)
-                .inner_margin(0),
-        )
-        .show(context, |ui| {
-            let bounds = ui.max_rect();
-            let capture = bounds.shrink(RECORDER_BORDER_POINTS);
-            ui.painter().rect_stroke(
-                capture,
-                0.0,
-                egui::Stroke::new(
-                    RECORDER_BORDER_POINTS,
-                    egui::Color32::from_rgb(242, 153, 74),
-                ),
-                egui::StrokeKind::Outside,
-            );
-            if stage.allows_moving() {
-                let move_area = capture.shrink(18.0);
-                let move_response = ui
-                    .interact(
-                        move_area,
-                        ui.id().with("recorder-move-area"),
-                        egui::Sense::drag(),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::Move);
-                move_recorder_window(ui.ctx(), &move_response);
-            }
-            if stage.allows_resizing() {
-                add_recorder_resize_grips(ui, bounds);
-            }
-            capture
-        })
-        .inner;
-
-    if context.input(|input| input.viewport().close_requested()) {
-        action = RecorderOverlayAction::Close;
-    }
-    RecorderOverlayFrame {
-        action,
-        region: overlay_region_from_viewport(context, central, source_geometry),
-        input_geometry: context
-            .input(|input| input.viewport().inner_rect.map(|rect| rect.size()))
-            .and_then(|size| {
-                x11_recorder_input::Geometry::new(size, central, context.pixels_per_point())
-            }),
-    }
-}
-
-fn draw_recorder_toolbar(
-    context: &egui::Context,
-    stage: RecorderStage,
-    progress: Option<WorkflowProgress>,
-    manual_snapshots: bool,
-    shortcuts: Option<&str>,
-    input_ready: bool,
-) -> RecorderOverlayAction {
-    let mut action = RecorderOverlayAction::None;
-    egui::TopBottomPanel::bottom("recorder_controls")
-        .exact_height(RECORDER_TOOLBAR_POINTS)
-        .frame(
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgb(28, 30, 34))
-                .inner_margin(8),
-        )
-        .show(context, |ui| {
-            match stage {
-                RecorderStage::Ready => {
-                    ui.horizontal(|ui| {
-                        action = show_ready_recorder_controls(ui, context, input_ready);
-                    });
-                }
-                RecorderStage::Countdown(remaining) => {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.strong(format!("Recording starts in {remaining}s"));
-                        if ui.button("Cancel").clicked() {
-                            action = RecorderOverlayAction::CancelCountdown;
-                        }
-                    });
-                    ui.horizontal(|ui| show_recorder_position_controls(ui, context));
-                }
-                RecorderStage::Recording => {
-                    ui.horizontal_wrapped(|ui| {
-                        show_overlay_progress(ui, progress);
-                        if manual_snapshots && ui.button("Take snapshot").clicked() {
-                            action = RecorderOverlayAction::Snapshot;
-                        }
-                        if ui.button("Pause").clicked() {
-                            action = RecorderOverlayAction::Pause;
-                        }
-                        if ui.button("Stop").clicked() {
-                            action = RecorderOverlayAction::Stop;
-                        }
-                        if ui.button("Discard").clicked() {
-                            action = RecorderOverlayAction::Discard;
-                        }
-                    });
-                    ui.horizontal(|ui| show_recorder_position_controls(ui, context));
-                }
-                RecorderStage::Paused => {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("Paused");
-                        if ui.button("Resume").clicked() {
-                            action = RecorderOverlayAction::Resume;
-                        }
-                        if ui.button("Stop").clicked() {
-                            action = RecorderOverlayAction::Stop;
-                        }
-                        if ui.button("Discard").clicked() {
-                            action = RecorderOverlayAction::Discard;
-                        }
-                    });
-                    ui.horizontal(|ui| show_recorder_position_controls(ui, context));
-                }
-                RecorderStage::Finalizing => {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spinner();
-                        ui.label("Finalizing recoverable project…");
-                        if ui.button("Cancel").clicked() {
-                            action = RecorderOverlayAction::Discard;
-                        }
-                    });
-                }
-            }
-            if let Some(summary) = shortcuts {
-                ui.add(egui::Label::new(egui::RichText::new(summary).small()).truncate())
-                    .on_hover_text(summary);
-            }
-        });
-    action
-}
-
-fn show_ready_recorder_controls(
-    ui: &mut egui::Ui,
-    context: &egui::Context,
-    input_ready: bool,
-) -> RecorderOverlayAction {
-    let mut action = RecorderOverlayAction::None;
-    egui::Grid::new("ready_recorder_controls")
-        .num_columns(6)
-        .spacing([4.0, 3.0])
-        .show(ui, |ui| {
-            show_recorder_position_controls(ui, context);
-            ui.end_row();
-
-            if ui.small_button("W-").clicked() {
-                nudge_recorder_size(context, -10.0, 0.0);
-            }
-            if ui.small_button("W+").clicked() {
-                nudge_recorder_size(context, 10.0, 0.0);
-            }
-            if ui.small_button("H-").clicked() {
-                nudge_recorder_size(context, 0.0, -10.0);
-            }
-            if ui.small_button("H+").clicked() {
-                nudge_recorder_size(context, 0.0, 10.0);
-            }
-            if ui
-                .add_enabled(input_ready, egui::Button::new("Start"))
-                .clicked()
-            {
-                action = RecorderOverlayAction::Start;
-            }
-            if ui.button("Cancel").clicked() {
-                action = RecorderOverlayAction::Close;
-            }
-            ui.end_row();
-        });
-    action
-}
-
-fn show_recorder_position_controls(ui: &mut egui::Ui, context: &egui::Context) {
-    let drag = ui.add(egui::Label::new("Move").sense(egui::Sense::drag()));
-    move_recorder_window(context, &drag);
-    if ui.small_button("X-").clicked() {
-        nudge_recorder_window(context, -10.0, 0.0);
-    }
-    if ui.small_button("X+").clicked() {
-        nudge_recorder_window(context, 10.0, 0.0);
-    }
-    if ui.small_button("Y-").clicked() {
-        nudge_recorder_window(context, 0.0, -10.0);
-    }
-    if ui.small_button("Y+").clicked() {
-        nudge_recorder_window(context, 0.0, 10.0);
-    }
-    ui.label("10 px");
-}
-
 fn show_overlay_progress(ui: &mut egui::Ui, progress: Option<WorkflowProgress>) {
     if let Some(progress) = progress {
         ui.label(format!(
@@ -4921,203 +4536,6 @@ fn show_overlay_progress(ui: &mut egui::Ui, progress: Option<WorkflowProgress>) 
     } else {
         ui.label("Starting…");
     }
-}
-
-fn add_recorder_resize_grips(ui: &mut egui::Ui, bounds: egui::Rect) {
-    let edge = 9.0;
-    let corner = 18.0;
-    let grips = [
-        (
-            egui::Rect::from_min_size(bounds.min, egui::vec2(corner, corner)),
-            egui::ResizeDirection::NorthWest,
-            egui::CursorIcon::ResizeNorthWest,
-        ),
-        (
-            egui::Rect::from_min_size(
-                egui::pos2(bounds.max.x - corner, bounds.min.y),
-                egui::vec2(corner, corner),
-            ),
-            egui::ResizeDirection::NorthEast,
-            egui::CursorIcon::ResizeNorthEast,
-        ),
-        (
-            egui::Rect::from_min_size(
-                egui::pos2(bounds.min.x, bounds.max.y - corner),
-                egui::vec2(corner, corner),
-            ),
-            egui::ResizeDirection::SouthWest,
-            egui::CursorIcon::ResizeSouthWest,
-        ),
-        (
-            egui::Rect::from_min_size(
-                bounds.max - egui::vec2(corner, corner),
-                egui::vec2(corner, corner),
-            ),
-            egui::ResizeDirection::SouthEast,
-            egui::CursorIcon::ResizeSouthEast,
-        ),
-        (
-            egui::Rect::from_min_max(
-                egui::pos2(bounds.min.x + corner, bounds.min.y),
-                egui::pos2(bounds.max.x - corner, bounds.min.y + edge),
-            ),
-            egui::ResizeDirection::North,
-            egui::CursorIcon::ResizeNorth,
-        ),
-        (
-            egui::Rect::from_min_max(
-                egui::pos2(bounds.min.x + corner, bounds.max.y - edge),
-                egui::pos2(bounds.max.x - corner, bounds.max.y),
-            ),
-            egui::ResizeDirection::South,
-            egui::CursorIcon::ResizeSouth,
-        ),
-        (
-            egui::Rect::from_min_max(
-                egui::pos2(bounds.min.x, bounds.min.y + corner),
-                egui::pos2(bounds.min.x + edge, bounds.max.y - corner),
-            ),
-            egui::ResizeDirection::West,
-            egui::CursorIcon::ResizeWest,
-        ),
-        (
-            egui::Rect::from_min_max(
-                egui::pos2(bounds.max.x - edge, bounds.min.y + corner),
-                egui::pos2(bounds.max.x, bounds.max.y - corner),
-            ),
-            egui::ResizeDirection::East,
-            egui::CursorIcon::ResizeEast,
-        ),
-    ];
-    for (index, (rect, direction, cursor)) in grips.into_iter().enumerate() {
-        let response = ui
-            .interact(
-                rect,
-                ui.id().with(("recorder-resize", index)),
-                egui::Sense::drag(),
-            )
-            .on_hover_cursor(cursor);
-        resize_recorder_window(ui.ctx(), &response, direction);
-    }
-}
-
-fn move_recorder_window(context: &egui::Context, response: &egui::Response) {
-    let pointer_down = context.input(|input| input.pointer.primary_down());
-    if !(response.dragged() || response.hovered() && pointer_down) {
-        return;
-    }
-    let delta = context.input(|input| input.pointer.delta());
-    if delta == egui::Vec2::ZERO {
-        return;
-    }
-    if let Some(position) = context.input(|input| input.viewport().outer_rect.map(|rect| rect.min))
-    {
-        context.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position + delta));
-    }
-}
-
-fn nudge_recorder_window(context: &egui::Context, horizontal: f32, vertical: f32) {
-    let pixels_per_point = context.pixels_per_point();
-    let delta = egui::vec2(horizontal, vertical) / pixels_per_point;
-    if let Some(position) = context.input(|input| input.viewport().outer_rect.map(|rect| rect.min))
-    {
-        context.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position + delta));
-    }
-}
-
-fn nudge_recorder_size(context: &egui::Context, horizontal: f32, vertical: f32) {
-    let pixels_per_point = context.pixels_per_point();
-    let delta = egui::vec2(horizontal, vertical) / pixels_per_point;
-    if let Some(size) = context.input(|input| input.viewport().inner_rect.map(|rect| rect.size())) {
-        context.send_viewport_cmd(egui::ViewportCommand::InnerSize(
-            (size + delta).max(egui::vec2(180.0, 130.0)),
-        ));
-    }
-}
-
-fn resize_recorder_window(
-    context: &egui::Context,
-    response: &egui::Response,
-    direction: egui::ResizeDirection,
-) {
-    let pointer_down = context.input(|input| input.pointer.primary_down());
-    if !(response.dragged() || response.hovered() && pointer_down) {
-        return;
-    }
-    let delta = context.input(|input| input.pointer.delta());
-    if delta == egui::Vec2::ZERO {
-        return;
-    }
-    let Some((outer, inner)) = context.input(|input| {
-        let viewport = input.viewport();
-        Some((viewport.outer_rect?, viewport.inner_rect?))
-    }) else {
-        return;
-    };
-    let mut position = outer.min;
-    let mut size = inner.size();
-    match direction {
-        egui::ResizeDirection::North => {
-            position.y += delta.y;
-            size.y -= delta.y;
-        }
-        egui::ResizeDirection::South => size.y += delta.y,
-        egui::ResizeDirection::East => size.x += delta.x,
-        egui::ResizeDirection::West => {
-            position.x += delta.x;
-            size.x -= delta.x;
-        }
-        egui::ResizeDirection::NorthEast => {
-            position.y += delta.y;
-            size.y -= delta.y;
-            size.x += delta.x;
-        }
-        egui::ResizeDirection::SouthEast => {
-            size.x += delta.x;
-            size.y += delta.y;
-        }
-        egui::ResizeDirection::NorthWest => {
-            position += delta;
-            size -= delta;
-        }
-        egui::ResizeDirection::SouthWest => {
-            position.x += delta.x;
-            size.x -= delta.x;
-            size.y += delta.y;
-        }
-    }
-    let minimum = egui::vec2(180.0, 130.0);
-    size = size.max(minimum);
-    context.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
-    context.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-}
-
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss
-)]
-fn overlay_region_from_viewport(
-    context: &egui::Context,
-    capture_rect: egui::Rect,
-    source_geometry: PhysicalRect,
-) -> Option<PhysicalRect> {
-    let outer = context.input(|input| input.viewport().outer_rect)?;
-    let pixels_per_point = context.pixels_per_point();
-    let absolute_left = ((outer.min.x + capture_rect.min.x) * pixels_per_point).round() as i64;
-    let absolute_top = ((outer.min.y + capture_rect.min.y) * pixels_per_point).round() as i64;
-    let width = (capture_rect.width() * pixels_per_point).round().max(1.0) as u32;
-    let height = (capture_rect.height() * pixels_per_point).round().max(1.0) as u32;
-    let local_left = absolute_left - i64::from(source_geometry.origin().x);
-    let local_top = absolute_top - i64::from(source_geometry.origin().y);
-    let region = PhysicalRect::new(
-        i32::try_from(local_left).ok()?,
-        i32::try_from(local_top).ok()?,
-        width,
-        height,
-    )
-    .ok()?;
-    region.fits_within(source_geometry.size()).then_some(region)
 }
 
 const fn wayland_prepare_state_notice(state: WaylandPrepareJobState) -> &'static str {

@@ -19,6 +19,9 @@ pub(crate) struct RegionRetargetPlan {
 }
 
 impl RegionRetargetPlan {
+    pub(crate) const fn applied(&self) -> PhysicalRect {
+        self.applied
+    }
     pub(crate) const fn new(initial: PhysicalRect) -> Self {
         Self {
             canvas_size: initial.size(),

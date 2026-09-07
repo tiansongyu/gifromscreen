@@ -4,7 +4,7 @@ use eframe::egui;
 use gif_from_screen_capture_linux::{ShortcutAction, ShortcutActionHandler};
 use gif_from_screen_workflow::RecordingController;
 use std::sync::{
-    Arc,
+    Arc, Mutex, PoisonError,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -38,12 +38,28 @@ enum Preparation {
 #[derive(Default)]
 pub(super) struct LiveShortcutState {
     terminal: Arc<AtomicBool>,
+    route: Arc<Mutex<GeometryRoute>>,
+}
+
+#[derive(Default)]
+struct GeometryRoute {
+    changing: bool,
+    toggle: bool,
+    rejected_snapshots: u64,
 }
 
 impl LiveShortcutState {
-    fn handler(&self, controller: RecordingController, manual: bool) -> ShortcutActionHandler {
+    pub(super) fn handler(
+        &self,
+        controller: RecordingController,
+        manual: bool,
+    ) -> ShortcutActionHandler {
         let terminal = Arc::clone(&self.terminal);
+        let route = Arc::clone(&self.route);
         Arc::new(move |action| {
+            // Serialize only nonblocking command dispatch, never native work.
+            // Entering a geometry transaction fences every older Resume/Snapshot.
+            let mut route = route.lock().unwrap_or_else(PoisonError::into_inner);
             if terminal.load(Ordering::Acquire) {
                 return true;
             }
@@ -53,8 +69,14 @@ impl LiveShortcutState {
                         let _ = controller.stop();
                     }
                 }
+                ShortcutAction::StartPause if route.changing => {
+                    route.toggle = !route.toggle;
+                }
                 ShortcutAction::StartPause => {
                     let _ = controller.toggle_pause();
+                }
+                ShortcutAction::Snapshot if manual && route.changing => {
+                    route.rejected_snapshots = route.rejected_snapshots.saturating_add(1);
                 }
                 ShortcutAction::Snapshot if manual => {
                     // A disconnected UI receipt does not cancel the accepted snapshot.
@@ -66,6 +88,47 @@ impl LiveShortcutState {
             // A stopped old receiver is still consumed here, not reused as UI Start.
             true
         })
+    }
+
+    pub(super) fn begin_geometry_change(&self) {
+        self.route
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .changing = true;
+    }
+
+    pub(super) fn geometry_wants_resume(&self, base: bool) -> bool {
+        base ^ self
+            .route
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .toggle
+    }
+
+    pub(super) fn reset_geometry_toggle(&self) {
+        self.route
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .toggle = false;
+    }
+
+    /// A paused geometry update resumes only after the caller's final safety gate.
+    /// Return the rejected snapshot count for a visible notice.
+    pub(super) fn finish_geometry_change(
+        &self,
+        controller: &RecordingController,
+        resume: bool,
+    ) -> u64 {
+        let mut route = self.route.lock().unwrap_or_else(PoisonError::into_inner);
+        if !route.changing {
+            return 0;
+        }
+        if (resume ^ route.toggle) && !self.terminal.load(Ordering::Acquire) {
+            let _ = controller.resume();
+        }
+        route.changing = false;
+        route.toggle = false;
+        std::mem::take(&mut route.rejected_snapshots)
     }
 }
 
@@ -241,7 +304,7 @@ impl GifFromScreenApp {
 
     fn shortcut_preparation(&self) -> Preparation {
         if let Some(overlay) = &self.recorder_overlay {
-            if overlay.initialized && overlay.input.ready() && overlay.last_region_valid {
+            if overlay.ready() {
                 Preparation::Controller
             } else {
                 Preparation::InitializingController
@@ -287,15 +350,11 @@ impl GifFromScreenApp {
         let error = if now.saturating_duration_since(requested_at) >= START_WAIT_LIMIT {
             Some("Start request expired while the capture area was changing. Press Start again.")
         } else if let Some(overlay) = &self.recorder_overlay {
-            if overlay.input.failed() {
+            if overlay.failed() {
                 Some(
                     "Start cancelled because mouse-transparent input preparation failed. Close the recorder and retry.",
                 )
-            } else if !overlay.last_region_valid {
-                Some(
-                    "Start cancelled: keep the capture rectangle inside its selected source, then press Start again.",
-                )
-            } else if !overlay.input.ready() {
+            } else if !overlay.ready() {
                 // The just-drawn native geometry can revoke a previously ready shape.
                 // Preserve the intent only within this controller and a short deadline.
                 self.notice = Some("Start pending: waiting for the current capture area to become mouse-transparent…".into());
@@ -599,15 +658,17 @@ mod tests {
     }
 
     fn preparing_overlay() -> crate::RecorderOverlay {
-        crate::RecorderOverlay {
-            window_title: "synthetic-controller".into(),
-            input: crate::x11_recorder_input::RecorderInput::default(),
-            last_region_valid: true,
-            initial_position: egui::Pos2::ZERO,
-            initial_size: egui::vec2(648.0, 584.0),
-            initialized: true,
-            source_geometry: gif_from_screen_capture::PhysicalRect::new(0, 0, 1440, 1000).unwrap(),
-        }
+        let source = gif_from_screen_capture::PhysicalRect::new(0, 0, 1440, 1000).unwrap();
+        crate::RecorderOverlay::new(
+            crate::recorder_geometry::RecorderGeometry::new(
+                source,
+                gif_from_screen_capture::PhysicalRect::new(0, 0, 640, 480).unwrap(),
+            )
+            .unwrap(),
+            vec![source],
+            None,
+            1.0,
+        )
     }
 
     #[test]
@@ -631,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn clicked_start_waits_too_but_cancel_and_invalid_geometry_revoke_the_intent() {
+    fn clicked_start_waits_too_but_cancel_and_failed_geometry_revoke_the_intent() {
         let mut app = GifFromScreenApp::default();
         app.recorder_overlay = Some(preparing_overlay());
         let now = Instant::now();
@@ -640,13 +701,13 @@ mod tests {
             RecorderOverlayAction::None
         );
         assert_eq!(app.pending_recorder_start, Some(now));
-        app.recorder_overlay.as_mut().unwrap().last_region_valid = false;
+        app.recorder_overlay.as_mut().unwrap().fail_for_test();
         assert_eq!(
             app.recorder_frame_action_at(RecorderOverlayAction::None, now),
             RecorderOverlayAction::None
         );
         assert!(app.pending_recorder_start.is_none());
-        assert!(app.notice.as_deref().unwrap().contains("inside"));
+        assert!(app.notice.as_deref().unwrap().contains("failed"));
         app.pending_recorder_start = Some(now);
         assert_eq!(
             app.recorder_frame_action_at(RecorderOverlayAction::Close, now),

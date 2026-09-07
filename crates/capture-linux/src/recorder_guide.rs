@@ -157,12 +157,40 @@ impl fmt::Debug for GuidePointerEvent {
     }
 }
 
+/// Actual X11 geometry of an explicitly owned recorder controller.
+/// Coordinates are physical and relative to the selected X11 root. Debug
+/// output deliberately omits position; no window-manager extent hints are used.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct ControllerGeometry {
+    /// Actual client contents, excluding its native border.
+    pub client: PhysicalRect,
+    /// Actual root-child ancestor bounds, including its native X11 border.
+    pub outer: PhysicalRect,
+    /// Whether the client and all its ancestors are mapped.
+    pub viewable: bool,
+}
+
+impl fmt::Debug for ControllerGeometry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ControllerGeometry")
+            .field("client_size", &self.client.size())
+            .field("outer_size", &self.outer.size())
+            .field("viewable", &self.viewable)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A nonblocking bounded snapshot of the latest guide state.
 pub struct GuideUpdate {
     /// Worker/registration state.
     pub status: GuideStatus,
     /// Retained latest acknowledgement, cleared by a newer request.
     pub ack: Option<GuideAck>,
+    /// Latest optional read-only controller observation; not an atomic server
+    /// snapshot or presentation ACK. Normal window motion can race the reads.
+    /// Cleared on stop/failure, and always None for `RecorderGuide::start`.
+    pub controller: Option<ControllerGeometry>,
     /// At most 64 pointer events. Motion coalesces and overload cancels the gesture.
     pub events: Vec<GuidePointerEvent>,
     /// Input events omitted because the bounded queue was full.
@@ -174,6 +202,7 @@ struct Shared {
     generation: u64,
     status: GuideStatus,
     ack: Option<GuideAck>,
+    controller: Option<ControllerGeometry>,
     events: VecDeque<GuidePointerEvent>,
     dropped: u64,
     active_gesture: Option<u64>,
@@ -225,6 +254,12 @@ impl Context {
         let mut shared = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
         if !self.cancelled() && shared.request.is_none() {
             shared.status = GuideStatus::Ready;
+        }
+    }
+    fn controller(&self, geometry: ControllerGeometry) {
+        let mut shared = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        if !self.cancelled() {
+            shared.controller = Some(geometry);
         }
     }
     fn acknowledge(&self, ack: GuideAck) {
@@ -331,9 +366,39 @@ impl RecorderGuide {
     /// Returns unsupported-build or thread-start errors. Native failures appear in poll.
     /// Gestures have a 30-second watchdog; protocol operations and cleanup are also bounded.
     pub fn start(display: Option<String>) -> Result<Self, String> {
+        Self::start_inner(display, None)
+    }
+
+    /// Starts guides with a read-only observer for this process's controller.
+    /// The observer uses actual client/ancestor geometry, never frame-extent hints.
+    /// Observations run approximately every 33 milliseconds on the same bounded
+    /// worker connection. No controller or window-manager window is modified.
+    ///
+    /// # Errors
+    /// Rejects zero window ids, a PID other than this process, unsupported builds,
+    /// or thread startup failure. Missing/changed native ownership, a lost window,
+    /// or more than four ancestry queries produces a failed update after cleanup.
+    pub fn start_with_controller(
+        display: Option<String>,
+        window_id: u32,
+        expected_pid: u32,
+    ) -> Result<Self, String> {
+        if window_id == 0 || expected_pid != std::process::id() {
+            return Err(
+                "A recorder controller must be a nonzero window owned by this process.".into(),
+            );
+        }
+        Self::start_inner(display, Some((window_id, expected_pid)))
+    }
+
+    fn start_inner(
+        display: Option<String>,
+        controller: Option<(u32, u32)>,
+    ) -> Result<Self, String> {
         #[cfg(not(all(target_os = "linux", feature = "native-x11")))]
         {
             drop(display);
+            let _ = controller;
             Err("Native X11 recorder guides are not included in this build.".into())
         }
         #[cfg(all(target_os = "linux", feature = "native-x11"))]
@@ -347,7 +412,7 @@ impl RecorderGuide {
             thread::Builder::new()
                 .name("x11-recorder-guide".into())
                 .spawn(move || {
-                    let result = native::run(display.as_deref(), &worker);
+                    let result = native::run(display.as_deref(), controller, &worker);
                     let _ = sender.send(result);
                 })
                 .map_err(|error| format!("Could not start recorder guide worker: {error}"))?;
@@ -405,6 +470,7 @@ impl RecorderGuide {
         shared.request = None;
         shared.events.clear();
         shared.ack = None;
+        shared.controller = None;
         shared.active_gesture = None;
         shared.cancel_epoch = shared.cancel_epoch.wrapping_add(1);
         if self.result.is_some() {
@@ -443,6 +509,7 @@ impl RecorderGuide {
                     }
                 };
                 shared.ack = None;
+                shared.controller = None;
                 shared.events.clear();
                 shared.request = None;
                 shared.active_gesture = None;
@@ -456,6 +523,7 @@ impl RecorderGuide {
         GuideUpdate {
             status: shared.status.clone(),
             ack: shared.ack,
+            controller: shared.controller,
             events: shared.events.drain(..).collect(),
             dropped_events: std::mem::take(&mut shared.dropped),
         }
@@ -476,6 +544,7 @@ fn new_context() -> Context {
             generation: 0,
             status: GuideStatus::Starting,
             ack: None,
+            controller: None,
             events: VecDeque::with_capacity(EVENT_LIMIT),
             dropped: 0,
             active_gesture: None,

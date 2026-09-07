@@ -1,8 +1,9 @@
 # Independent X11 selection, border and controls
 
-This is the next integration contract, not a completed feature claim. The current
-desktop still uses the combined recorder viewport described in
-[X11 recorder windows](X11-RECORDER-WINDOWS.md). The full feature/release scope in
+The desktop now uses this split controller instead of the historical combined
+viewport described in [X11 recorder windows](X11-RECORDER-WINDOWS.md). See
+[bounded native acceptance and retained failures](NATIVE-X11-SPLIT-QA-2026-09-07.md).
+The full feature/release scope in
 [Linux status](LINUX-STATUS.md) remains unchanged.
 
 ## Requirements
@@ -28,9 +29,11 @@ Stop-and-save and explicit Discard retain their existing different semantics.
   return existing recorder actions. Primary actions stay outside the settings
   scroll area. This view neither positions native windows nor acknowledges capture.
 
-The prepared desktop modules are not connected until their real application
-callers and regression tests are added. Standalone-harness tests are useful
-preflight checks, not evidence of desktop integration.
+These desktop modules are connected to the real application and its existing
+recording controller. Their tests run in the desktop crate; earlier standalone
+harness results are not used as proof of this connection. The old combined-window
+production path and its superseded UI-only tests have been removed, with history
+retained in Git.
 
 ### Native border primitive
 
@@ -72,9 +75,19 @@ hide, continuous gestures, the watchdog, stale-identity rejection and
 own-window-only cleanup. They pass on Rust
 1.98 and 1.88. They are included by the CI `private_xvfb_ -- --ignored` step, not
 silently skipped as hardware tests. These tests do not establish compositor shadow
-behavior or a working desktop integration. The four visible strips additionally
-set `_GTK_FRAME_EXTENTS` to zero to request Mutter's no-custom-frame-shadow path;
-checking this property is not a substitute for native compositor pixel acceptance.
+behavior on every desktop. Two RGB trials proved that `_GTK_FRAME_EXTENTS=0`
+does not fix override-redirect shadows in Mutter 42.9: its property hook skips
+these windows. The four strips now use an XRender-verified 32-bit TrueColor alpha
+visual, full-alpha colored pixels and a dedicated colormap, without declaring an
+opaque region. No compatible visual is an explicit error, not an RGB fallback.
+The subsequent native raw-pixel comparison passes the previously failing edges.
+
+The service can also observe the process-owned controller identified by its real
+window handle and PID. It reads client geometry and at most four real parent
+links to find the outer boundary, instead of trusting stale `_NET_FRAME_EXTENTS`.
+PID, source root and native border bounds are checked; hidden windows remain
+queryable and loss of identity fails explicitly. No controller/parent property is
+modified by this observer. Its results are not atomic/presentation snapshots.
 
 ## Placement and starting
 
@@ -88,6 +101,14 @@ controller over it. Full-monitor recording needs a hidden controller with an
 explicit, recoverable control path: confirmed global bindings, timed stop, and
 window-switcher restoration that pauses capture before opaque UI is drawn.
 Restoring a transparent/minimized window must not discard captured frames.
+
+In the implementation, the root stays blank before minimizing; Start waits for
+the WM's minimized acknowledgement. Do not require X11 `MapState` to become
+unviewable: native Mutter evidence shows a client can be `Iconic` and have
+`_NET_WM_STATE_HIDDEN` while still `IsViewable` for redirected preview rendering.
+Geometry and WM visibility are different contracts. Recovery first requests and
+acknowledges pause, then paints the controls; Resume is an intent that hides them
+again before native resumption. Timer completion restores the editor normally.
 
 The existing action adapter must validate **after** the control view returns:
 editing a numeric field can change desired geometry in the same input batch as
@@ -111,7 +132,11 @@ has presented fresh pixels. No fixed sleep alone certifies absence of self-captu
 The native primitive now preserves a bounded, explicitly initiated gesture across
 presentation updates. Its Xvfb tests move, update, hide, show and release with the
 same gesture identity. Desktop drag/resize and sampling coordination still need
-their own integration evidence.
+their own integration evidence. The tested desktop drag briefly pauses sampling,
+coalesces desired positions and waits for actual control placement, capture-target
+ACK and the final guide generation before restoring the requested pause state.
+It does not save a frame for every intermediate pointer position. Global toggles
+are fenced/deferred through this transition; Stop remains available.
 
 ## Required integration evidence
 
@@ -130,6 +155,6 @@ their own integration evidence.
 7. Separate physical GNOME/KDE, mixed-DPI/multiple-display and keyboard/device
    acceptance. Software-rendered nested tests do not replace these release gates.
 
-Remove the superseded combined-window production path once the new path is
-integrated and verified. Do not keep it as a silent fallback that changes the
-requested selection or weakens the same controls users rely on.
+Ordinary, 1×1, full-monitor and one reversed live-drag sequence now have bounded
+native evidence. Mixed-DPI/hardware/compositor, arbitrary WM animation and repeated
+stress cases remain open; this contract is not full Linux release certification.

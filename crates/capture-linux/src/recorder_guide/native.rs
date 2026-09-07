@@ -5,11 +5,13 @@ use x11rb::{
     connection::Connection,
     protocol::{
         Event,
+        render::ConnectionExt as _,
         shape::{ConnectionExt as _, SK},
         xfixes::ConnectionExt as _,
         xproto::{
-            AtomEnum, ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt as _,
-            CreateWindowAux, EventMask, PropMode, Rectangle, StackMode, Window, WindowClass,
+            ChangeWindowAttributesAux, Colormap, ColormapAlloc, ConfigureWindowAux,
+            ConnectionExt as _, CreateWindowAux, EventMask, Rectangle, StackMode, Window,
+            WindowClass,
         },
     },
     wrapper::ConnectionExt as _,
@@ -21,9 +23,15 @@ use super::{
 };
 use crate::shortcuts::x11::{Client, stream};
 
+mod argb;
+mod controller;
 mod gesture;
 
-pub(super) fn run(display: Option<&str>, context: &Context) -> Result<(), String> {
+pub(super) fn run(
+    display: Option<&str>,
+    controller: Option<(u32, u32)>,
+    context: &Context,
+) -> Result<(), String> {
     let parsed = x11rb_protocol::parse_display::parse_display(display).map_err(native_error)?;
     let connection = stream::connect(display, &context.cancel)?;
     let version = connection
@@ -49,7 +57,17 @@ pub(super) fn run(display: Option<&str>, context: &Context) -> Result<(), String
         u32::from(screen.height_in_pixels),
     )
     .map_err(native_error)?;
-    let color = root_color(screen)?;
+    let formats = connection
+        .render_query_pict_formats()
+        .map_err(native_error)?
+        .reply()
+        .map_err(native_error)?;
+    let visual = argb::select(screen, usize::from(parsed.screen), &formats)?;
+    let observer = controller
+        .map(|(window, pid)| {
+            controller::ControllerObserver::new(&connection, screen.root, window, pid)
+        })
+        .transpose()?;
     // Select only size/lifetime notifications for THIS client. No root pointer
     // or keyboard feed is installed, and other clients' masks are unaffected.
     connection
@@ -66,35 +84,21 @@ pub(super) fn run(display: Option<&str>, context: &Context) -> Result<(), String
         root_size,
         ids: Vec::with_capacity(4),
         keeper: None,
+        colormap: None,
         current: None,
         visible: [false; 4],
         event_floor: 0,
         gesture: None,
         cancel_epoch: 0,
     };
+    owned.create_colormap(visual)?;
     for _ in 0..4 {
-        owned.create(color)?;
+        owned.create(visual)?;
     }
     owned.create_keeper()?;
     context.connected();
     connection.stream().registration_complete();
-    let result = (|| {
-        while !context.cancelled() {
-            owned.service_gesture(context)?;
-            if let Some(request) = context.request() {
-                connection.stream().begin_operation();
-                let visible = owned.apply(request, context)?;
-                connection.stream().registration_complete();
-                context.acknowledge(GuideAck {
-                    generation: request.generation,
-                    visible,
-                });
-            }
-            owned.events(context)?;
-            thread::sleep(Duration::from_millis(10));
-        }
-        Ok(())
-    })();
+    let result = owned.drive(context, observer);
     drop(owned); // Bounded cleanup before the terminal result is observable.
     drop(connection);
     if context.cancelled() { Ok(()) } else { result }
@@ -106,6 +110,7 @@ struct Windows<'a, 'c> {
     root_size: PhysicalSize,
     ids: Vec<Window>,
     keeper: Option<Window>,
+    colormap: Option<Colormap>,
     current: Option<GuideRequest>,
     visible: [bool; 4],
     event_floor: u64,
@@ -114,11 +119,47 @@ struct Windows<'a, 'c> {
 }
 
 impl Windows<'_, '_> {
-    fn create(&mut self, color: u32) -> Result<(), String> {
+    fn drive(
+        &mut self,
+        context: &Context,
+        mut observer: Option<controller::ControllerObserver>,
+    ) -> Result<(), String> {
+        while !context.cancelled() {
+            self.service_gesture(context)?;
+            if let Some(request) = context.request() {
+                self.connection.stream().begin_operation();
+                let visible = self.apply(request, context)?;
+                self.connection.stream().registration_complete();
+                context.acknowledge(GuideAck {
+                    generation: request.generation,
+                    visible,
+                });
+            }
+            self.events(context)?;
+            if let Some(observer) = &mut observer {
+                observer.update(self.connection, self.root, context)?;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    fn create_colormap(&mut self, visual: argb::ArgbVisual) -> Result<(), String> {
+        let id = self.connection.generate_id().map_err(native_error)?;
+        self.connection
+            .create_colormap(ColormapAlloc::NONE, id, self.root, visual.visual)
+            .map_err(native_error)?
+            .check()
+            .map_err(native_error)?;
+        self.colormap = Some(id);
+        Ok(())
+    }
+
+    fn create(&mut self, visual: argb::ArgbVisual) -> Result<(), String> {
         let id = self.connection.generate_id().map_err(native_error)?;
         self.connection
             .create_window(
-                0,
+                32,
                 id,
                 self.root,
                 0,
@@ -127,30 +168,23 @@ impl Windows<'_, '_> {
                 1,
                 0,
                 WindowClass::INPUT_OUTPUT,
-                0,
+                visual.visual,
                 &CreateWindowAux::new()
                     .override_redirect(1)
-                    .background_pixel(color)
+                    .background_pixel(visual.pixel)
+                    .border_pixel(0)
+                    .colormap(
+                        self.colormap
+                            .ok_or("Recorder guide colormap is unavailable.")?,
+                    )
                     .event_mask(EventMask::BUTTON_PRESS | EventMask::STRUCTURE_NOTIFY),
             )
             .map_err(native_error)?
             .check()
             .map_err(native_error)?;
         self.ids.push(id);
-        // Mutter treats this explicit zero CSD extent as client-managed shadow.
-        // This is a compositor-specific hint, not a universal no-shadow promise.
-        let extents = self
-            .connection
-            .intern_atom(false, b"_GTK_FRAME_EXTENTS")
-            .map_err(native_error)?
-            .reply()
-            .map_err(native_error)?
-            .atom;
-        self.connection
-            .change_property32(PropMode::REPLACE, id, extents, AtomEnum::CARDINAL, &[0; 4])
-            .map_err(native_error)?
-            .check()
-            .map_err(native_error)?;
+        // Do not set _NET_WM_OPAQUE_REGION: it would defeat the alpha texture's
+        // nonopaque classification even though the strip pixels are opaque.
         Ok(())
     }
 
@@ -345,6 +379,9 @@ impl Drop for Windows<'_, '_> {
         if let Some(id) = self.keeper {
             let _ = self.connection.destroy_window(id);
         }
+        if let Some(id) = self.colormap {
+            let _ = self.connection.free_colormap(id);
+        }
         let _ = self.connection.flush();
         let _ = self.connection.sync();
     }
@@ -404,33 +441,6 @@ fn hit_edge(index: usize, point: PhysicalPosition, region: PhysicalRect) -> Guid
         _ if bottom => GuideEdge::BottomRight,
         _ => GuideEdge::Right,
     }
-}
-
-fn root_color(screen: &x11rb::protocol::xproto::Screen) -> Result<u32, String> {
-    let visual = screen
-        .allowed_depths
-        .iter()
-        .flat_map(|depth| &depth.visuals)
-        .find(|visual| visual.visual_id == screen.root_visual)
-        .ok_or("The X11 root visual is unavailable.")?;
-    let mut pixel = 0;
-    for (value, mask) in [
-        (242_u32, visual.red_mask),
-        (153, visual.green_mask),
-        (74, visual.blue_mask),
-    ] {
-        if mask == 0 {
-            return Err("Recorder guides require an RGB root visual.".into());
-        }
-        let shift = mask.trailing_zeros();
-        let range = mask >> shift;
-        if range & range.wrapping_add(1) != 0 {
-            return Err("Recorder guide root RGB masks are unsupported.".into());
-        }
-        let channel = (u64::from(value) * u64::from(range) + 127) / 255;
-        pixel |= u32::try_from(channel).map_err(native_error)? << shift;
-    }
-    Ok(pixel)
 }
 
 fn native_error(error: impl std::fmt::Display) -> String {

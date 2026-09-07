@@ -13,11 +13,12 @@ use x11rb::{
     connection::Connection,
     protocol::{
         Event,
+        render::{ConnectionExt as _, PictType},
         shape::{ConnectionExt as _, SK},
         xproto::{
             AtomEnum, BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, ConnectionExt as _, CreateGCAux,
             CreateWindowAux, EventMask, GrabMode, GrabStatus, ImageFormat, ImageOrder, InputFocus,
-            MOTION_NOTIFY_EVENT, MapState, Rectangle, Window, WindowClass,
+            MOTION_NOTIFY_EVENT, MapState, Rectangle, VisualClass, Window, WindowClass,
         },
         xtest::ConnectionExt as _,
     },
@@ -25,6 +26,8 @@ use x11rb::{
 };
 
 use super::*;
+
+mod controller;
 
 struct PrivateXvfb {
     child: Arc<Mutex<Child>>,
@@ -317,20 +320,120 @@ impl Fixture {
                 .contains(EventMask::POINTER_MOTION),
             "idle strips must not select a hover motion feed"
         );
-        let extents = self
+        let geometry = self
             .connection
-            .intern_atom(true, b"_GTK_FRAME_EXTENTS")
+            .get_geometry(window)
+            .unwrap()
+            .reply()
+            .unwrap();
+        assert_eq!(geometry.depth, 32);
+        let screen = &self.connection.setup().roots[0];
+        assert_ne!(attributes.colormap, screen.default_colormap);
+        assert_ne!(attributes.colormap, x11rb::NONE);
+        let visual = screen
+            .allowed_depths
+            .iter()
+            .filter(|depth| depth.depth == 32)
+            .flat_map(|depth| &depth.visuals)
+            .find(|visual| visual.visual_id == attributes.visual)
+            .unwrap();
+        assert_eq!(visual.class, VisualClass::TRUE_COLOR);
+        let formats = self
+            .connection
+            .render_query_pict_formats()
+            .unwrap()
+            .reply()
+            .unwrap();
+        let render_visual = formats.screens[0]
+            .depths
+            .iter()
+            .filter(|depth| depth.depth == 32)
+            .flat_map(|depth| &depth.visuals)
+            .find(|visual| visual.visual == attributes.visual)
+            .unwrap();
+        let format = formats
+            .formats
+            .iter()
+            .find(|format| format.id == render_visual.format)
+            .unwrap();
+        assert_eq!(format.depth, 32);
+        assert_eq!(format.type_, PictType::DIRECT);
+        assert_ne!(format.direct.alpha_mask, 0);
+        let image = self
+            .connection
+            .get_image(ImageFormat::Z_PIXMAP, window, 0, 0, 1, 1, u32::MAX)
+            .unwrap()
+            .reply()
+            .unwrap();
+        assert_eq!(image.depth, 32);
+        let bytes = image.data.try_into().unwrap();
+        let packed = if self.connection.setup().image_byte_order == ImageOrder::LSB_FIRST {
+            u32::from_le_bytes(bytes)
+        } else {
+            u32::from_be_bytes(bytes)
+        };
+        for (shift, mask, expected) in [
+            (format.direct.red_shift, format.direct.red_mask, 242_u32),
+            (format.direct.green_shift, format.direct.green_mask, 153),
+            (format.direct.blue_shift, format.direct.blue_mask, 74),
+            (format.direct.alpha_shift, format.direct.alpha_mask, 255),
+        ] {
+            assert_eq!(
+                (packed >> shift) & u32::from(mask),
+                (expected * u32::from(mask) + 127) / 255
+            );
+        }
+        self.assert_no_property(window, b"_GTK_FRAME_EXTENTS");
+        self.assert_no_property(window, b"_NET_WM_OPAQUE_REGION");
+    }
+
+    fn assert_no_property(&self, window: Window, name: &[u8]) {
+        let atom = self
+            .connection
+            .intern_atom(false, name)
             .unwrap()
             .reply()
             .unwrap()
             .atom;
-        let extents = self
+        let property = self
             .connection
-            .get_property(false, window, extents, AtomEnum::CARDINAL, 0, 4)
+            .get_property(false, window, atom, AtomEnum::ANY, 0, 4)
             .unwrap()
             .reply()
             .unwrap();
-        assert_eq!(extents.value32().unwrap().collect::<Vec<_>>(), [0; 4]);
+        assert_eq!(property.type_, x11rb::NONE);
+        assert!(property.value.is_empty());
+    }
+
+    fn assert_mapped_argb_strips(&self) -> u32 {
+        let strips = self.strips();
+        assert_eq!(strips.len(), 4);
+        let mut colormap = None;
+        for window in strips {
+            self.assert_strip_contract(window);
+            let geometry = self
+                .connection
+                .get_geometry(window)
+                .unwrap()
+                .reply()
+                .unwrap();
+            assert!(
+                geometry.width == 4 || geometry.height == 4,
+                "each owned window must be a thin strip, not a full-canvas surface"
+            );
+            let attributes = self
+                .connection
+                .get_window_attributes(window)
+                .unwrap()
+                .reply()
+                .unwrap();
+            assert_eq!(attributes.map_state, MapState::VIEWABLE);
+            if let Some(colormap) = colormap {
+                assert_eq!(colormap, attributes.colormap);
+            }
+            colormap = Some(attributes.colormap);
+        }
+        colormap.unwrap()
     }
 
     fn pixels(&self, region: PhysicalRect) -> Vec<u8> {
@@ -594,31 +697,7 @@ fn private_xvfb_ring_preserves_capture_pixels_shapes_clickthrough_and_owned_clea
     let windows = fixture.windows();
     assert_eq!(windows.len(), 5);
     fixture.keeper();
-    let strips = fixture.strips();
-    assert_eq!(strips.len(), 4);
-    for &window in &strips {
-        fixture.assert_strip_contract(window);
-        let geometry = fixture
-            .connection
-            .get_geometry(window)
-            .unwrap()
-            .reply()
-            .unwrap();
-        assert!(
-            geometry.width == 4 || geometry.height == 4,
-            "each owned window must be a thin strip, not a full-canvas surface"
-        );
-        assert_eq!(
-            fixture
-                .connection
-                .get_window_attributes(window)
-                .unwrap()
-                .reply()
-                .unwrap()
-                .map_state,
-            MapState::VIEWABLE
-        );
-    }
+    let colormap = fixture.assert_mapped_argb_strips();
     assert_eq!(
         fixture.pixel_rgb(140, 58),
         0x00f2_994a,
@@ -668,6 +747,15 @@ fn private_xvfb_ring_preserves_capture_pixels_shapes_clickthrough_and_owned_clea
     );
     stop(&mut guide);
     fixture.assert_cleanup();
+    assert!(
+        fixture
+            .connection
+            .query_colors(colormap, &[0])
+            .unwrap()
+            .reply()
+            .is_err(),
+        "the dedicated colormap must be released with its guide"
+    );
     assert!(
         fixture.pixels(protected) == baseline,
         "cleanup must leave the underlay unchanged"

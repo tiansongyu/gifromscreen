@@ -70,10 +70,12 @@ these tasks extend them rather than replace their state machines.
    [native Mutter start/pause/resume/snapshot/stop/GIF evidence](X11-RECORDER-WINDOWS.md).
    Actual KDE/modern-Portal, physical-key repeat and wider hardware acceptance stay
    open. Buttons and timed stop remain available if registration fails.
-2. **Precise region positioning: next integration.** Separate authoritative physical
-   selection, native border and responsive control panel. The old combined viewport
-   cannot represent a full monitor or tiny selection independently of its controls;
-   UI zoom must not change the captured dimensions. Add 1/10 physical-pixel movement and
+2. **Precise region positioning: basic split connected.** Authoritative physical
+   selection, native border and responsive control panel now have
+   [ordinary/1×1/full-monitor and live-drag evidence](NATIVE-X11-SPLIT-QA-2026-09-07.md).
+   Direct numeric movement and 1 px / Shift-10 px buttons are connected; zoom never
+   becomes a selection input. Native DPI/zoom stress remains open. Add direct
+   keyboard movement and
    pre-record window snapping through `RegionRetargetPlan`. Show the backend's
    accepted rectangle, coalesce movement while one request is in flight, and
    retain fixed canvas size during recording. Optional X11 cursor-follow comes

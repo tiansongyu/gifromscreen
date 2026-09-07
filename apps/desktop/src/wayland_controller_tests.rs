@@ -321,6 +321,8 @@ fn x11_shell_restoration_keeps_its_existing_position_and_decoration_commands() {
         geometry_frame(&context, &mut app, egui::vec2(720.0, 480.0), Some(false)),
         [
             egui::ViewportCommand::Title(APP_NAME.to_owned()),
+            egui::ViewportCommand::Minimized(false),
+            egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal),
             egui::ViewportCommand::Decorations(true),
             egui::ViewportCommand::MousePassthrough(false),
             egui::ViewportCommand::MinInnerSize(egui::vec2(680.0, 440.0)),

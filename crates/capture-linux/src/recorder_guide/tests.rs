@@ -22,6 +22,39 @@ fn service() -> (RecorderGuide, mpsc::SyncSender<Result<(), String>>) {
 }
 
 #[test]
+fn controller_observation_is_retained_but_cleared_on_stop_failure_and_new_session() {
+    let (mut guide, send) = service();
+    let geometry = ControllerGeometry {
+        client: PhysicalRect::new(-745, 983, 120, 80).unwrap(),
+        outer: PhysicalRect::new(-747, 950, 124, 115).unwrap(),
+        viewable: true,
+    };
+    assert!(guide.poll().controller.is_none());
+    guide.context.controller(geometry);
+    assert_eq!(guide.poll().controller, Some(geometry));
+    assert_eq!(guide.poll().controller, Some(geometry));
+    let debug = format!("{geometry:?}");
+    assert!(!debug.contains("745") && !debug.contains("983") && !debug.contains("950"));
+    send.send(Err("lost owned controller".into())).unwrap();
+    assert!(guide.poll().controller.is_none());
+    let (mut next, _send) = service();
+    assert!(next.poll().controller.is_none());
+    next.context.controller(geometry);
+    next.stop();
+    next.context.controller(geometry);
+    assert!(next.poll().controller.is_none());
+}
+
+#[test]
+fn controller_constructor_rejects_foreign_pid_and_zero_window_without_connecting() {
+    assert!(RecorderGuide::start_with_controller(Some("invalid-display".into()), 42, 0).is_err());
+    assert!(
+        RecorderGuide::start_with_controller(Some("invalid-display".into()), 0, std::process::id())
+            .is_err()
+    );
+}
+
+#[test]
 fn strict_generations_coalesce_and_never_acknowledge_a_superseded_request() {
     let (mut service, _send) = service();
     service.context.connected();

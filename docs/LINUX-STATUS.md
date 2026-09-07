@@ -18,7 +18,8 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [x] Start, pause, resume, stop-and-save, and discard from the recorder frame.
 - [x] Connect opt-in persisted X11/Portal global recording shortcuts to the same controller, with bounded lifecycle and acknowledged pause state; [backend contract](GLOBAL-SHORTCUTS.md).
 - [x] Validate stationary native X11 hollow-frame click-through and other-app-focused start/pause/resume/snapshots/stop through reopened projects and decoded GIFs; [exact evidence](X11-RECORDER-WINDOWS.md).
-- [ ] Complete independent physical selection/border/controller layout for full-monitor, tiny-region and UI-zoom cases, plus live-move no-self-capture acceptance; the earlier single-frame controls do not close these boundaries.
+- [x] Connect independent physical selection/border/controller layout; pass bounded ordinary-region, 1×1, full-monitor, recovery and one live-drag native acceptance. See [exact evidence and retained failures](NATIVE-X11-SPLIT-QA-2026-09-07.md).
+- [ ] Complete native mixed-DPI/UI-zoom, multiple-monitor/WM, repeated-move stress and broader no-self-capture acceptance; the bounded cases do not close this matrix.
 - [ ] Validate global shortcuts on real modern Portal/KDE and physical keyboards; private-bus tests and XTEST are not those gates.
 - [x] Persist stopped recordings as recoverable editable projects instead of flattening them immediately.
 - [x] Edit frame selection, ordering, deletion, and variable delays in a virtualized timeline.
