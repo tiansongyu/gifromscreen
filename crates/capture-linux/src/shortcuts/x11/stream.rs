@@ -38,8 +38,14 @@ pub(crate) struct BoundedStream<'a> {
     cleanup: AtomicBool,
 }
 impl BoundedStream<'_> {
-    pub(super) fn registration_complete(&self) {
+    pub(crate) fn registration_complete(&self) {
         *self.deadline.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+    /// Bound a new native update on a long-lived owned connection.
+    pub(crate) fn begin_operation(&self) {
+        *self.deadline.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(Instant::now() + SETUP_TIME);
+        self.cleanup.store(false, Ordering::Release);
     }
     pub(crate) fn begin_cleanup(&self) {
         *self.deadline.lock().unwrap_or_else(PoisonError::into_inner) =

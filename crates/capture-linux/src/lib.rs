@@ -16,7 +16,11 @@ use std::env;
 /// Desktop-file and portal identity of the `GifFromScreen` application.
 pub const APPLICATION_ID: &str = "io.github.tiansongyu.gifromscreen";
 
+mod recorder_guide;
 mod recorder_input;
+pub use recorder_guide::{
+    GuideAck, GuideEdge, GuidePointerEvent, GuideRequest, GuideStatus, GuideUpdate, RecorderGuide,
+};
 pub use recorder_input::set_recorder_input_shape;
 
 mod shortcuts;

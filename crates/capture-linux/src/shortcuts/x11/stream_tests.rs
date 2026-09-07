@@ -1,4 +1,39 @@
 use super::*;
+
+#[test]
+fn long_lived_update_restores_deadline_and_cancellation_without_changing_idle_registration() {
+    let (client, _server) = UnixStream::pair().unwrap();
+    let cancellation = AtomicBool::new(false);
+    let stream = BoundedStream {
+        inner: DefaultStream::from_unix_stream(client).unwrap().0,
+        cancellation: &cancellation,
+        deadline: Mutex::new(Some(
+            Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+        )),
+        cleanup: AtomicBool::new(false),
+    };
+    assert_eq!(stream.check().unwrap_err().kind(), io::ErrorKind::TimedOut);
+    stream.registration_complete();
+    assert!(stream.deadline.lock().unwrap().is_none());
+    stream.check().unwrap();
+    let before = Instant::now();
+    stream.begin_operation();
+    let deadline = stream.deadline.lock().unwrap().unwrap();
+    assert!(deadline >= before + SETUP_TIME);
+    assert!(deadline <= Instant::now() + SETUP_TIME);
+    cancellation.store(true, Ordering::Release);
+    assert_eq!(
+        stream.check().unwrap_err().kind(),
+        io::ErrorKind::ConnectionAborted
+    );
+    stream.begin_cleanup();
+    stream.check().unwrap(); // Cleanup still has its cancellation-exempt grace.
+    stream.begin_operation();
+    assert_eq!(
+        stream.check().unwrap_err().kind(),
+        io::ErrorKind::ConnectionAborted
+    );
+}
 #[test]
 fn network_names_are_never_resolved_synchronously() {
     assert!(addresses("example.invalid", 6000).is_err());
