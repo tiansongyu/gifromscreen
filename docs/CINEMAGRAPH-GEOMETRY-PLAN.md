@@ -12,8 +12,9 @@ passes 137 tests; its 14 outline and 15 raster tests also pass on Rust 1.88.
 Five independent compilations of the original WPF C++ curve algorithm matched
 the Rust flattened-vertex digests, including large-coordinate fallback. These
 are component/source-rule checks, not proof of complete Stroke.GetGeometry,
-point-erasure or degenerate VisualBrush equivalence. Native fitting/erasing
-diagnostics and the interactive authoring integration remain in progress.
+point-erasure or degenerate VisualBrush equivalence. The [interactive authoring
+integration](CINEMAGRAPH-AUTHORING.md) now passes automated checks; native
+interaction and independent fitting/erasing diagnostics remain in progress.
 
 ## Verified source rules, not yet a complete Rust ink implementation
 

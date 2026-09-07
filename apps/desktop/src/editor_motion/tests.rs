@@ -15,6 +15,9 @@ use gif_from_screen_project::LockPolicy;
 #[path = "freeze_tests.rs"]
 mod freeze_tests;
 
+#[path = "cinemagraph_tests.rs"]
+mod cinemagraph_tests;
+
 fn workspace(root: &std::path::Path) -> EditorWorkspace {
     let mut writer = IncrementalRecordingProject::create(
         root,
@@ -522,7 +525,7 @@ fn loop_search_noop_invalid_and_cancelled_runs_do_not_write_a_revision() {
         workspace
             .apply_motion_edit(
                 &workspace.project_edit_anchor(),
-                operation,
+                operation.clone(),
                 &AtomicBool::new(false),
                 |_| {}
             )

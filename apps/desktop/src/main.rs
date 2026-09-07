@@ -13,6 +13,8 @@ mod board_recorder_ui;
 mod camera_recorder_ui;
 mod capture_binding_ui;
 mod capture_source_job;
+mod cinemagraph_draft;
+mod cinemagraph_preview;
 mod countdown;
 mod custom_palette_input;
 mod editor_export_presets;
@@ -1974,10 +1976,19 @@ impl GifFromScreenApp {
     }
 
     fn show_editor_work_area(&mut self, ui: &mut egui::Ui) {
+        let cine_input_enabled = !self.source_workers_active()
+            && !self.text_overlay.is_running()
+            && self.watermark_job.state() == WatermarkDecodeJobState::Idle
+            && !export_job_is_active(self.export_job.state());
         let Some(workspace) = &mut self.editor_workspace else {
             ui.label("No active editor project.");
             return;
         };
+        self.motion_tools.reconcile_cinemagraph(workspace);
+        if self.motion_tools.cinemagraph_editing() {
+            self.editor_ui_state.pause_preview();
+            self.editor_ui_state.drawing_overlay.cancel();
+        }
         let watermark_running = self.watermark_job.state() == WatermarkDecodeJobState::Running;
         let mut results = ui
             .add_enabled_ui(!watermark_running, |ui| {
@@ -2009,6 +2020,8 @@ impl GifFromScreenApp {
                     workspace,
                     &mut self.editor_preview_cache,
                     &mut self.editor_ui_state,
+                    &mut self.motion_tools,
+                    cine_input_enabled,
                 );
             });
         } else {
@@ -2017,6 +2030,8 @@ impl GifFromScreenApp {
                 workspace,
                 &mut self.editor_preview_cache,
                 &mut self.editor_ui_state,
+                &mut self.motion_tools,
+                cine_input_enabled,
             );
             ui.separator();
             inspector(ui, workspace, &mut self.editor_ui_state);
@@ -3662,10 +3677,20 @@ fn show_editor_preview_panel(
     workspace: &EditorWorkspace,
     cache: &mut EditorPreviewCache,
     state: &mut EditorUiState,
+    motion: &mut MotionTools,
+    cine_input_enabled: bool,
 ) {
     state.drawing_overlay.reconcile(workspace);
-    let transition = state.preview_transition(workspace);
-    ui.heading(if transition.is_some() {
+    motion.reconcile_cinemagraph(workspace);
+    let cine_reference = motion.cinemagraph_reference();
+    let transition = if cine_reference.is_some() {
+        None
+    } else {
+        state.preview_transition(workspace)
+    };
+    ui.heading(if cine_reference.is_some() {
+        "Cinemagraph reference · frame 1"
+    } else if transition.is_some() {
         "Transition preview"
     } else {
         "Current frame preview"
@@ -3683,7 +3708,7 @@ fn show_editor_preview_panel(
         }
         return;
     }
-    let Some(frame_id) = workspace.selection().current() else {
+    let Some(frame_id) = cine_reference.or_else(|| workspace.selection().current()) else {
         ui.label("Select a frame to preview it.");
         return;
     };
@@ -3695,17 +3720,11 @@ fn show_editor_preview_panel(
         EDITOR_PREVIEW_MAX_SIZE,
     ) {
         Ok(preview) => {
-            let natural = egui::vec2(
-                preview.preview_size[0] as f32,
-                preview.preview_size[1] as f32,
-            );
-            let available_width = ui.available_width().max(1.0);
-            let scale = (available_width / natural.x)
-                .min(360.0 / natural.y)
-                .min(3.0);
-            let image_size = natural * scale;
+            let image_size = editor_preview_extent(preview.preview_size, ui.available_width());
             let editable = transition.is_none() && state.playback.is_none();
-            let sense = if editable && state.drawing_overlay.phase == DrawingDraftPhase::Capturing {
+            let sense = if cine_reference.is_some() && cine_input_enabled {
+                egui::Sense::click_and_drag()
+            } else if editable && state.drawing_overlay.phase == DrawingDraftPhase::Capturing {
                 egui::Sense::drag()
             } else {
                 egui::Sense::hover()
@@ -3715,7 +3734,14 @@ fn show_editor_preview_panel(
                     .fit_to_exact_size(image_size)
                     .sense(sense),
             );
-            if editable {
+            if cine_reference.is_some() {
+                motion.show_cinemagraph_preview(
+                    ui,
+                    &response,
+                    preview.rendered_size,
+                    cine_input_enabled && editable,
+                );
+            } else if editable && !motion.cinemagraph_editing() {
                 update_drawing_draft_from_preview(
                     &response,
                     preview.rendered_size,
@@ -3749,6 +3775,18 @@ fn show_editor_preview_panel(
             );
         }
     }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "preview dimensions are bounded before UI conversion"
+)]
+fn editor_preview_extent(size: [u32; 2], available_width: f32) -> egui::Vec2 {
+    let natural = egui::vec2(size[0] as f32, size[1] as f32);
+    let scale = (available_width.max(1.0) / natural.x)
+        .min(360.0 / natural.y)
+        .min(3.0);
+    natural * scale
 }
 
 fn update_drawing_draft_from_preview(

@@ -26,8 +26,13 @@ const MAX_RESULTING_FRAMES: usize = 100_000;
 #[path = "editor_motion/freeze.rs"]
 mod freeze;
 
-#[derive(Clone, Copy, Debug)]
+#[path = "editor_motion/cinemagraph.rs"]
+mod cinemagraph;
+
+#[derive(Clone, Debug)]
 pub(crate) enum MotionOperation {
+    /// First-frame reference clipped outside authored ink, with typed PM composition.
+    Cinemagraph(Box<crate::cinemagraph_draft::CinemagraphRequest>),
     /// Preserve current-frame pixels outside the rectangle; invert freezes inside instead.
     RectangularFreeze { region: PhysicalRect, invert: bool },
     /// Append fully rendered cross-fade frames from the last original to the first original.
@@ -43,6 +48,7 @@ pub(crate) enum MotionOperation {
 impl MotionOperation {
     pub(crate) const fn label(&self) -> &'static str {
         match self {
+            Self::Cinemagraph(_) => "Cinemagraph",
             Self::RectangularFreeze { .. } => "Rectangular freeze",
             Self::LoopCrossfade { .. } => "Loop crossfade",
             Self::FindSmoothLoop { .. } => "Smooth loop search",
@@ -89,6 +95,9 @@ impl EditorWorkspace {
             );
         }
         let (command, count) = match operation {
+            MotionOperation::Cinemagraph(request) => {
+                self.cinemagraph_command(&request, cancellation, &mut progress)?
+            }
             MotionOperation::RectangularFreeze { region, invert } => {
                 self.freeze_region_command(region, invert, cancellation, &mut progress)?
             }

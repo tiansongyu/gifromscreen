@@ -28,6 +28,66 @@ fn workspace(root: &std::path::Path) -> EditorWorkspace {
     workspace
 }
 
+fn ink_tool(workspace: &EditorWorkspace) -> MotionTools {
+    let mut tool = MotionTools {
+        mode: Mode::Cinemagraph,
+        ..MotionTools::default()
+    };
+    tool.cine.begin(workspace).unwrap();
+    let point = gif_from_screen_render::InkSample {
+        position: gif_from_screen_render::InkPoint { x: 0.5, y: 0.5 },
+        pressure: 0.5,
+    };
+    tool.cine.pointer_down(point).unwrap();
+    tool.cine.pointer_up(point).unwrap();
+    tool
+}
+
+#[test]
+fn cinemagraph_cancel_retains_draft_and_success_returns_workspace_then_clears_draft() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut slot = Some(workspace(&directory.path().join("ink.gfsproj")));
+    let before = slot.as_ref().unwrap().manifest().clone();
+    let mut tool = ink_tool(slot.as_ref().unwrap());
+    tool.queue(slot.as_ref().unwrap()).unwrap();
+    tool.cancel();
+    assert!(wait(&mut tool, &mut slot).contains("cancelled"));
+    assert_eq!(slot.as_ref().unwrap().manifest(), &before);
+    assert!(tool.cine.is_active());
+    assert_eq!(tool.cine.strokes().len(), 1);
+    tool.queue(slot.as_ref().unwrap()).unwrap();
+    assert!(wait(&mut tool, &mut slot).contains("applied to 1"));
+    assert!(!tool.cine.is_active());
+    assert!(tool.cine.strokes().is_empty());
+    let workspace = slot.as_mut().unwrap();
+    assert!(workspace.can_undo());
+    workspace.undo().unwrap();
+    assert_eq!(workspace.manifest().timeline, before.timeline);
+    assert_eq!(workspace.manifest().assets, before.assets);
+}
+
+#[test]
+fn failed_cinemagraph_returns_original_history_and_retains_ink_for_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut slot = Some(workspace(&directory.path().join("bad-ink.gfsproj")));
+    let before = slot.as_ref().unwrap().manifest().clone();
+    let mut tool = ink_tool(slot.as_ref().unwrap());
+    let frame = &before.timeline.frames[0];
+    let path = slot
+        .as_ref()
+        .unwrap()
+        .active_project()
+        .assets()
+        .asset_path(frame.asset_id);
+    std::fs::remove_file(path).unwrap();
+    tool.queue(slot.as_ref().unwrap()).unwrap();
+    assert!(wait(&mut tool, &mut slot).contains("did not complete"));
+    assert_eq!(slot.as_ref().unwrap().manifest(), &before);
+    assert!(tool.cine.is_active());
+    assert_eq!(tool.cine.strokes().len(), 1);
+    assert!(!tool.is_running());
+}
+
 fn wait(tool: &mut MotionTools, slot: &mut Option<EditorWorkspace>) -> String {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {

@@ -13,6 +13,8 @@ use gif_from_screen_domain::{PhysicalPoint, PhysicalPx, PhysicalRect, PhysicalSi
 
 use crate::{
     background_task::BackgroundTask,
+    cinemagraph_draft::CinemagraphDraft,
+    cinemagraph_preview::CinemagraphPreview,
     editor_workspace::{
         EditorWorkspace, MotionOperation, MotionOutcome, MotionProgress, OverlaySelectionAnchor,
     },
@@ -24,6 +26,7 @@ type WorkspaceLoan = Arc<Mutex<Option<EditorWorkspace>>>;
 enum Mode {
     #[default]
     RectangularFreeze,
+    Cinemagraph,
     SmoothLoop,
     LoopCrossfade,
 }
@@ -34,6 +37,9 @@ struct PendingEdit {
 }
 
 pub(crate) struct MotionTools {
+    cine: CinemagraphDraft,
+    cine_preview: CinemagraphPreview,
+    applying_cinemagraph: bool,
     mode: Mode,
     project_id: Option<ProjectId>,
     x: u32,
@@ -58,6 +64,9 @@ pub(crate) struct MotionTools {
 impl Default for MotionTools {
     fn default() -> Self {
         Self {
+            cine: CinemagraphDraft::default(),
+            cine_preview: CinemagraphPreview::default(),
+            applying_cinemagraph: false,
             mode: Mode::default(),
             project_id: None,
             x: 0,
@@ -96,11 +105,13 @@ impl MotionTools {
             self.sync_canvas(workspace);
             ui.add_enabled_ui(!self.is_running(), |ui| {
                 ui.horizontal_wrapped(|ui| {
+                    ui.selectable_value(&mut self.mode, Mode::Cinemagraph, "Cinemagraph");
                     ui.selectable_value(&mut self.mode, Mode::RectangularFreeze, "Rectangular freeze");
                     ui.selectable_value(&mut self.mode, Mode::SmoothLoop, "Smooth loop");
                     ui.selectable_value(&mut self.mode, Mode::LoopCrossfade, "Loop crossfade");
                 });
                 match self.mode {
+                    Mode::Cinemagraph => self.show_cinemagraph_controls(ui, workspace),
                     Mode::RectangularFreeze => {
                         ui.label("Use the current frame as a frozen image. Only the rectangular motion area continues animating in selected frames.");
                         let size = workspace.manifest().canvas.size;
@@ -140,7 +151,7 @@ impl MotionTools {
                     }
                 }
                 ui.weak("One undo restores the original edit. Freeze uses a 64 MiB image-plus-reference working budget; crossfade can generate up to 256 MiB. Rendering and saving run in the background.");
-                if ui.button("Apply motion edit").clicked() && let Err(error) = self.queue(workspace) { self.notice = Some(error); }
+                if self.mode != Mode::Cinemagraph && ui.button("Apply motion edit").clicked() && let Err(error) = self.queue(workspace) { self.notice = Some(error); }
             });
             if self.is_running() { self.show_running(ui); }
             if let Some(notice) = &self.notice { ui.label(notice); }
@@ -177,6 +188,11 @@ impl MotionTools {
             let loan = self.loan.take()?;
             *workspace = loan.lock().unwrap_or_else(PoisonError::into_inner).take();
             let result = self.completed.take()?;
+            if self.applying_cinemagraph && result.is_ok() {
+                self.cine.close();
+                self.cine_preview.cancel();
+            }
+            self.applying_cinemagraph = false;
             let notice = match result {
                 Ok(MotionOutcome::Edited(count)) => format!(
                     "{} applied to {count} frames. Undo restores the original timeline.",
@@ -195,6 +211,7 @@ impl MotionTools {
         }
         let pending = self.pending.take()?;
         if self.cancel_pending.load(Ordering::Acquire) {
+            self.applying_cinemagraph = false;
             return Some("Motion edit cancelled before preparation.".to_owned());
         }
         let Some(current) = workspace.as_ref() else {
@@ -232,6 +249,9 @@ impl MotionTools {
             return Err("A motion edit is already pending or running.".to_owned());
         }
         let operation = match self.mode {
+            Mode::Cinemagraph => {
+                MotionOperation::Cinemagraph(Box::new(self.cine.request(workspace)?))
+            }
             Mode::RectangularFreeze => {
                 if workspace.selection().is_empty() {
                     return Err("Select frames and a current frozen reference first.".to_owned());
@@ -259,6 +279,8 @@ impl MotionTools {
             },
         };
         self.label = operation.label();
+        self.applying_cinemagraph = matches!(&operation, MotionOperation::Cinemagraph(_));
+        self.cine_preview.cancel();
         self.pending = Some(PendingEdit {
             anchor: workspace.project_edit_anchor(),
             operation,
@@ -290,6 +312,9 @@ impl MotionTools {
             .min(size.height.get().saturating_sub(self.y).max(1));
     }
 }
+
+#[path = "cinemagraph_controls.rs"]
+mod cinemagraph_controls;
 
 #[cfg(test)]
 mod tests;
