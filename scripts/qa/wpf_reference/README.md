@@ -25,7 +25,8 @@ Expected pixels are never calculated with the Rust renderer or a reimplemented
 Gaussian kernel.
 
 PNG stores integer pixels per metre, so a nominal 96 DPI image can decode as
-95.9866 DPI (3779 ppm, observed on the first real run) or 96.012 DPI (3780 ppm).
+95.9866 DPI (3779 ppm, observed on the first real run) or 96.012 DPI (3780 ppm),
+including the native f32 values promoted to f64 (95.98660278320312 was observed).
 This suite measures an explicitly physical, 96-DPI coordinate space. It records
 the original decoded DPI and retains its exact WIC pixels/format/palette, then
 rebuilds only the working bitmap's DPI metadata at 96 for the next draw. The

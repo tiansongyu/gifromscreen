@@ -11,8 +11,13 @@ namespace GifFromScreen.WpfReference;
 internal static class DpiNormalization
 {
     private const double WorkingDpi = 96.0;
-    private const double Epsilon = 0.000_001;
-    private static readonly double[] AcceptedDecodedDpi = { WorkingDpi, 3779 * 0.0254, 3780 * 0.0254 };
+    private const double Epsilon = 0.000_000_001;
+    // WPF may expose native single-precision density promoted to a double.
+    // Run 34070959557 reported 95.98660278320312, exactly that representation.
+    private static readonly double[] AcceptedDecodedDpi = {
+        WorkingDpi, 3779 * 0.0254, 3780 * 0.0254,
+        (double)(float)(3779 * 0.0254), (double)(float)(3780 * 0.0254),
+    };
 
     internal static void RequireWorkingDpi(BitmapSource source)
     {

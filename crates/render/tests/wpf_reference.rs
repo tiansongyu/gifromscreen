@@ -114,9 +114,15 @@ impl ReferenceImage {
         }
         for decoded in [self.decoded_dpi_x, self.decoded_dpi_y] {
             if !decoded.is_finite()
-                || ![96.0, 3779.0 * 0.0254, 3780.0 * 0.0254]
-                    .iter()
-                    .any(|allowed| (decoded - allowed).abs() <= 1e-6)
+                || ![
+                    96.0,
+                    3779.0 * 0.0254,
+                    3780.0 * 0.0254,
+                    f64::from(95.9866_f32),
+                    f64::from(96.012_f32),
+                ]
+                .iter()
+                .any(|allowed| (decoded - allowed).abs() <= 1e-9)
             {
                 return Err(
                     "Reference decoded DPI is not an approved 96-DPI PNG conversion.".into(),
@@ -1108,7 +1114,13 @@ mod mechanical_tests {
         .unwrap();
         let reference = synthetic_reference(directory.path(), "synthetic", "input", &source);
         let root = directory.path().canonicalize().unwrap();
-        for decoded in [96.0, 95.9866, 96.012] {
+        for decoded in [
+            96.0,
+            95.9866,
+            96.012,
+            f64::from(95.9866_f32),
+            f64::from(96.012_f32),
+        ] {
             let mut changed = reference.clone();
             changed.decoded_dpi_x = decoded;
             changed.decoded_dpi_y = decoded;
