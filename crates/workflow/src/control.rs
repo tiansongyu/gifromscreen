@@ -32,10 +32,72 @@ impl Drop for SnapshotCompletion {
     }
 }
 
+#[derive(Debug, Default)]
+struct PauseState {
+    pending: usize,
+    acknowledged: Option<bool>,
+    toggle_pending: bool,
+}
+
+/// Pending state and the native acknowledgement are published under one short
+/// lock. No native operation executes while holding that lock.
 #[derive(Debug)]
-enum RecordingCommand {
+struct PauseCompletion {
+    state: Arc<Mutex<PauseState>>,
+    toggle: bool,
+    acknowledged: Option<bool>,
+}
+
+impl PauseCompletion {
+    fn reserve(state: &Arc<Mutex<PauseState>>, toggle: bool) -> Option<Self> {
+        let mut status = state.lock().unwrap_or_else(PoisonError::into_inner);
+        if toggle && status.toggle_pending {
+            return None;
+        }
+        status.pending = status.pending.checked_add(1)?;
+        status.toggle_pending |= toggle;
+        Some(Self {
+            state: Arc::clone(state),
+            toggle,
+            acknowledged: None,
+        })
+    }
+
+    fn acknowledge(mut self, state: CaptureSessionState) {
+        self.acknowledged = match state {
+            CaptureSessionState::Recording => Some(false),
+            CaptureSessionState::Paused => Some(true),
+            _ => None,
+        };
+    }
+}
+
+impl Drop for PauseCompletion {
+    fn drop(&mut self) {
+        let mut status = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        status.pending -= 1;
+        if self.toggle {
+            status.toggle_pending = false;
+        }
+        // Failure, terminal/no-op states and abandoned commands are unknown,
+        // never a stale "safely paused" claim inherited from an older command.
+        status.acknowledged = self.acknowledged;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PauseCommand {
     Pause,
     Resume,
+    Toggle,
+}
+
+#[derive(Debug)]
+enum RecordingCommand {
+    SetPause {
+        request: PauseCommand,
+        completion: PauseCompletion,
+    },
     UpdateTarget {
         target: CaptureTarget,
         completion: Sender<Result<(), CaptureError>>,
@@ -53,6 +115,7 @@ pub struct RecordingController {
     sender: Sender<RecordingCommand>,
     dispatch: Arc<Mutex<()>>,
     outstanding_snapshots: Arc<AtomicUsize>,
+    pause_state: Arc<Mutex<PauseState>>,
 }
 
 /// The worker-side command receiver for one controlled recording.
@@ -227,6 +290,7 @@ impl RecordingController {
                 sender,
                 dispatch: Arc::new(Mutex::new(())),
                 outstanding_snapshots,
+                pause_state: Arc::default(),
             },
             RecordingControl {
                 receiver,
@@ -240,14 +304,52 @@ impl RecordingController {
     ///
     /// Returns `false` when the recording worker has already exited.
     pub fn pause(&self) -> bool {
-        self.send(RecordingCommand::Pause)
+        self.send_pause(PauseCommand::Pause)
     }
 
     /// Requests that a paused capture session resume.
     ///
     /// Returns `false` when the recording worker has already exited.
     pub fn resume(&self) -> bool {
-        self.send(RecordingCommand::Resume)
+        self.send_pause(PauseCommand::Resume)
+    }
+
+    /// Toggles pause using the capture worker's actual session state.
+    ///
+    /// At most one toggle may be queued or executing across all controller
+    /// clones. Returns `false` when another toggle is still pending or the
+    /// worker has exited. `true` means queued, not that capture is already
+    /// paused: read [`Self::pause_status`] for the native acknowledgement.
+    /// Terminal or not-yet-recording sessions ignore the toggle. Existing
+    /// explicit pause/resume commands retain their normal ordered semantics.
+    pub fn toggle_pause(&self) -> bool {
+        self.send_pause(PauseCommand::Toggle)
+    }
+
+    /// Atomically reads the pending pause-command count and last native result.
+    ///
+    /// A nonzero count includes queued and executing explicit pause/resume and
+    /// toggle requests. Do not claim capture is safely paused while it is nonzero.
+    /// `Some(true)` means the last completed transition observed `Paused`;
+    /// `Some(false)` means `Recording`. `None` means no acknowledgement yet,
+    /// a failed/abandoned command, or a terminal/nonrecording session. Progress
+    /// may skip intermediate phases; this snapshot does not rely on UI polling.
+    pub fn pause_status(&self) -> (usize, Option<bool>) {
+        let state = self
+            .pause_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        (state.pending, state.acknowledged)
+    }
+
+    fn send_pause(&self, request: PauseCommand) -> bool {
+        PauseCompletion::reserve(&self.pause_state, matches!(request, PauseCommand::Toggle))
+            .is_some_and(|completion| {
+                self.send(RecordingCommand::SetPause {
+                    request,
+                    completion,
+                })
+            })
     }
 
     /// Requests a new capture target for subsequent frames.
@@ -362,6 +464,31 @@ impl RecordingControl {
         }
     }
 
+    fn apply_pause_change(
+        &mut self,
+        session: &mut dyn CaptureSession,
+        outcome: ControlOutcome,
+        request: PauseCommand,
+        completion: PauseCompletion,
+    ) -> Result<(), CaptureError> {
+        if outcome == ControlOutcome::Continue {
+            match (request, session.state()) {
+                (PauseCommand::Pause | PauseCommand::Toggle, CaptureSessionState::Recording) => {
+                    session.pause()?;
+                    self.snapshot_armed = false;
+                }
+                (PauseCommand::Resume | PauseCommand::Toggle, CaptureSessionState::Paused) => {
+                    session.resume()?;
+                }
+                _ => {}
+            }
+        }
+        // Do not release before the native transition returns; a second hotkey
+        // must not queue the opposite transition while it is still executing.
+        completion.acknowledge(session.state());
+        Ok(())
+    }
+
     pub(crate) fn apply_pending(
         &mut self,
         session: &mut dyn CaptureSession,
@@ -375,20 +502,12 @@ impl RecordingControl {
                 }
             };
             match command {
-                RecordingCommand::Pause
-                    if outcome == ControlOutcome::Continue
-                        && session.state() == CaptureSessionState::Recording =>
-                {
-                    session.pause()?;
-                    self.snapshot_armed = false;
+                RecordingCommand::SetPause {
+                    request,
+                    completion,
+                } => {
+                    self.apply_pause_change(session, outcome, request, completion)?;
                 }
-                RecordingCommand::Resume
-                    if outcome == ControlOutcome::Continue
-                        && session.state() == CaptureSessionState::Paused =>
-                {
-                    session.resume()?;
-                }
-                RecordingCommand::Pause | RecordingCommand::Resume => {}
                 RecordingCommand::UpdateTarget { target, completion } => {
                     let result = match outcome {
                         ControlOutcome::Continue => session.update_target(target),
@@ -470,6 +589,10 @@ impl RecordingControl {
         Ok(outcome)
     }
 }
+
+#[cfg(test)]
+#[path = "toggle_pause_tests.rs"]
+mod toggle_pause_tests;
 
 #[cfg(test)]
 mod tests {
