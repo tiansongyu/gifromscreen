@@ -55,6 +55,12 @@ transparent pixels, untouched targets, stale/cancel/invalid requests, asset
 registration, Undo, reopen and decoded GIF pixels. These are automated tests,
 not a native pointer-device acceptance report.
 
+Initial native QA caught a justified-column layout error: egui's image response
+was wider than its painted pixels. The editor now allocates and paints the exact
+image rectangle and uses that same rectangle for ink hit testing and coordinate
+mapping (including ordinary drawing). A real-egui column regression passes on
+both supported test toolchains. Native acceptance continues with the fixed binary.
+
 The elliptical eraser currently uses a bounded 64-sided polygon approximation.
 The UI discloses this. Full WPF stroke-node pruning, exact erasure cuts, Boolean
 geometry and degenerate Image.Clip/VisualBrush behavior remain unverified.

@@ -3729,11 +3729,7 @@ fn show_editor_preview_panel(
             } else {
                 egui::Sense::hover()
             };
-            let response = ui.add(
-                egui::Image::new(&preview.texture)
-                    .fit_to_exact_size(image_size)
-                    .sense(sense),
-            );
+            let response = show_editor_preview_image(ui, &preview.texture, image_size, sense);
             if cine_reference.is_some() {
                 motion.show_cinemagraph_preview(
                     ui,
@@ -3787,6 +3783,21 @@ fn editor_preview_extent(size: [u32; 2], available_width: f32) -> egui::Vec2 {
         .min(360.0 / natural.y)
         .min(3.0);
     natural * scale
+}
+
+fn show_editor_preview_image(
+    ui: &mut egui::Ui,
+    texture: &egui::TextureHandle,
+    size: egui::Vec2,
+    sense: egui::Sense,
+) -> egui::Response {
+    // Justified columns enlarge Image::ui's Response, but not its painted
+    // rectangle. Ink coordinates and hit testing must use the latter.
+    let (rect, allocation) = ui.allocate_exact_size(size, egui::Sense::hover());
+    egui::Image::new(texture).paint_at(ui, rect);
+    let response = ui.interact(rect, allocation.id.with("image-pixels"), sense);
+    response.widget_info(|| egui::WidgetInfo::new(egui::WidgetType::Image));
+    response
 }
 
 fn update_drawing_draft_from_preview(
@@ -7489,6 +7500,49 @@ mod tests {
             editor_result_notice(Ok(EditorUiAction::Playback { playing: true })),
             None
         );
+    }
+
+    #[test]
+    fn editor_image_hit_rect_matches_pixels_in_justified_columns() {
+        let context = egui::Context::default();
+        let texture = context.load_texture(
+            "bounded-preview-test",
+            egui::ColorImage::filled([173, 91], egui::Color32::WHITE),
+            egui::TextureOptions::NEAREST,
+        );
+        let size = egui::vec2(519.0, 273.0);
+        let mut previous_rect: Option<egui::Rect> = None;
+        for _ in 0..3 {
+            let pointer = previous_rect.map(|rect| rect.right_center() + egui::vec2(20.0, 0.0));
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 720.0),
+                )),
+                events: pointer.into_iter().map(egui::Event::PointerMoved).collect(),
+                ..Default::default()
+            };
+            let _ = context.run(input, |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    ui.columns(2, |columns| {
+                        let column = &mut columns[1];
+                        assert!(column.available_width() > size.x + 20.0);
+                        let response = super::show_editor_preview_image(
+                            column,
+                            &texture,
+                            size,
+                            egui::Sense::click_and_drag(),
+                        );
+                        assert_eq!(response.rect.size(), size);
+                        if let Some(pointer) = pointer {
+                            assert!(!response.rect.contains(pointer));
+                            assert!(!response.hovered());
+                        }
+                        previous_rect = Some(response.rect);
+                    });
+                });
+            });
+        }
     }
 
     #[test]
