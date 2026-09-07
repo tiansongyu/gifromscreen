@@ -8,8 +8,8 @@ use x11rb::{
         shape::{ConnectionExt as _, SK},
         xfixes::ConnectionExt as _,
         xproto::{
-            ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt as _, CreateWindowAux,
-            EventMask, Rectangle, StackMode, Window, WindowClass,
+            AtomEnum, ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt as _,
+            CreateWindowAux, EventMask, PropMode, Rectangle, StackMode, Window, WindowClass,
         },
     },
     wrapper::ConnectionExt as _,
@@ -20,6 +20,8 @@ use super::{
     geometry::{self, Strip},
 };
 use crate::shortcuts::x11::{Client, stream};
+
+mod gesture;
 
 pub(super) fn run(display: Option<&str>, context: &Context) -> Result<(), String> {
     let parsed = x11rb_protocol::parse_display::parse_display(display).map_err(native_error)?;
@@ -63,18 +65,22 @@ pub(super) fn run(display: Option<&str>, context: &Context) -> Result<(), String
         root: screen.root,
         root_size,
         ids: Vec::with_capacity(4),
+        keeper: None,
         current: None,
         visible: [false; 4],
         event_floor: 0,
-        pressed: None,
+        gesture: None,
+        cancel_epoch: 0,
     };
     for _ in 0..4 {
         owned.create(color)?;
     }
+    owned.create_keeper()?;
     context.connected();
     connection.stream().registration_complete();
     let result = (|| {
         while !context.cancelled() {
+            owned.service_gesture(context)?;
             if let Some(request) = context.request() {
                 connection.stream().begin_operation();
                 let visible = owned.apply(request, context)?;
@@ -99,10 +105,12 @@ struct Windows<'a, 'c> {
     root: Window,
     root_size: PhysicalSize,
     ids: Vec<Window>,
+    keeper: Option<Window>,
     current: Option<GuideRequest>,
     visible: [bool; 4],
     event_floor: u64,
-    pressed: Option<u64>,
+    gesture: Option<gesture::Gesture>,
+    cancel_epoch: u64,
 }
 
 impl Windows<'_, '_> {
@@ -123,23 +131,31 @@ impl Windows<'_, '_> {
                 &CreateWindowAux::new()
                     .override_redirect(1)
                     .background_pixel(color)
-                    .event_mask(
-                        EventMask::BUTTON_PRESS
-                            | EventMask::BUTTON_RELEASE
-                            | EventMask::POINTER_MOTION
-                            | EventMask::STRUCTURE_NOTIFY,
-                    ),
+                    .event_mask(EventMask::BUTTON_PRESS | EventMask::STRUCTURE_NOTIFY),
             )
             .map_err(native_error)?
             .check()
             .map_err(native_error)?;
         self.ids.push(id);
+        // Mutter treats this explicit zero CSD extent as client-managed shadow.
+        // This is a compositor-specific hint, not a universal no-shadow promise.
+        let extents = self
+            .connection
+            .intern_atom(false, b"_GTK_FRAME_EXTENTS")
+            .map_err(native_error)?
+            .reply()
+            .map_err(native_error)?
+            .atom;
+        self.connection
+            .change_property32(PropMode::REPLACE, id, extents, AtomEnum::CARDINAL, &[0; 4])
+            .map_err(native_error)?
+            .check()
+            .map_err(native_error)?;
         Ok(())
     }
 
     fn apply(&mut self, request: GuideRequest, context: &Context) -> Result<bool, String> {
         self.check_root()?;
-        self.cancel_gesture(context);
         for id in &self.ids {
             self.connection
                 .unmap_window(*id)
@@ -268,12 +284,6 @@ impl Windows<'_, '_> {
         Ok(())
     }
 
-    fn cancel_gesture(&mut self, context: &Context) {
-        if let Some(generation) = self.pressed.take() {
-            context.event(GuidePointerEvent::Cancelled { generation });
-        }
-    }
-
     fn check_root(&self) -> Result<(), String> {
         let root = self
             .connection
@@ -304,81 +314,20 @@ impl Windows<'_, '_> {
                 {
                     check_root_dimensions(event.width, event.height, self.root_size)?;
                 }
-                Event::DestroyNotify(event) if self.ids.contains(&event.window) => {
+                Event::DestroyNotify(event)
+                    if self.ids.contains(&event.window) || self.keeper == Some(event.window) =>
+                {
                     return Err("An owned recorder guide window disappeared.".into());
+                }
+                Event::UnmapNotify(event) if self.keeper == Some(event.window) => {
+                    return Err("The recorder gesture owner became unavailable.".into());
                 }
                 Event::Error(_) => {
                     return Err("The X11 server rejected a recorder guide request.".into());
                 }
                 _ => {}
             }
-            if sequence < self.event_floor {
-                continue;
-            }
-            let Some(request) = self.current else {
-                continue;
-            };
-            match event {
-                Event::ButtonPress(event)
-                    if event.response_type & 0x80 == 0 && event.detail == 1 =>
-                {
-                    let Some(index) = self.ids.iter().position(|id| *id == event.event) else {
-                        continue;
-                    };
-                    if !self.visible[index] || event.root != self.root {
-                        continue;
-                    }
-                    let Some(region) = request.region else {
-                        continue;
-                    };
-                    let position = PhysicalPosition {
-                        x: i32::from(event.root_x),
-                        y: i32::from(event.root_y),
-                    };
-                    let edge = hit_edge(index, position, region);
-                    self.pressed = Some(request.generation);
-                    context.event(GuidePointerEvent::Pressed {
-                        generation: request.generation,
-                        position,
-                        edge,
-                        modifiers: u16::from(event.state) & 0xff,
-                    });
-                }
-                Event::MotionNotify(event)
-                    if event.response_type & 0x80 == 0 && self.ids.contains(&event.event) =>
-                {
-                    if event.root != self.root {
-                        self.cancel_gesture(context);
-                        continue;
-                    }
-                    if !self.visible.iter().any(|visible| *visible) {
-                        continue;
-                    }
-                    context.event(GuidePointerEvent::Moved {
-                        generation: request.generation,
-                        position: PhysicalPosition {
-                            x: i32::from(event.root_x),
-                            y: i32::from(event.root_y),
-                        },
-                    });
-                }
-                Event::ButtonRelease(event)
-                    if event.response_type & 0x80 == 0
-                        && event.detail == 1
-                        && self.ids.contains(&event.event) =>
-                {
-                    if let Some(generation) = self.pressed.take() {
-                        context.event(GuidePointerEvent::Released {
-                            generation,
-                            position: PhysicalPosition {
-                                x: i32::from(event.root_x),
-                                y: i32::from(event.root_y),
-                            },
-                        });
-                    }
-                }
-                _ => {}
-            }
+            self.pointer_event(&event, sequence, context)?;
         }
         Ok(())
     }
@@ -387,8 +336,14 @@ impl Windows<'_, '_> {
 impl Drop for Windows<'_, '_> {
     fn drop(&mut self) {
         self.connection.stream().begin_cleanup();
+        // UngrabPointer only releases this client's grab. The dedicated keeper
+        // is never used without an explicit primary border press.
+        let _ = self.connection.ungrab_pointer(x11rb::CURRENT_TIME);
         for id in &self.ids {
             let _ = self.connection.destroy_window(*id);
+        }
+        if let Some(id) = self.keeper {
+            let _ = self.connection.destroy_window(id);
         }
         let _ = self.connection.flush();
         let _ = self.connection.sync();

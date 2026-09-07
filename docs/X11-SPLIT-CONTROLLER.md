@@ -35,11 +35,21 @@ preflight checks, not evidence of desktop integration.
 ### Native border primitive
 
 The `capture-linux::RecorderGuide` API is implemented independently of the UI.
-One worker/connection owns four narrow windows. Requests have strictly increasing
+One worker/connection owns four narrow visible windows plus one invisible,
+empty-input `InputOnly` gesture keeper. Requests have strictly increasing
 nonzero generations; pending updates coalesce, and stale acknowledgements cannot
 make a newer request ready. Polling is nonblocking. The event queue is limited to
 64 entries, motion coalesces, and overflow cancels the gesture. Debug output omits
 capture/pointer coordinates.
+
+A real primary-button border press begins a distinct, process-wide non-reused
+`gesture_id`. An asynchronous pointer grab routes only that gesture through the
+stable keeper without changing keyboard focus. Updates and temporary hide preserve
+its motion/release events. Idle strips select no pointer motion, and the service
+never subscribes to a root pointer feed. Explicit cancellation, release, stop,
+drop, failure and a real 30-second watchdog end the grab. Cleanup releases only
+a grab this connection owns; fast-click backlog that cannot acquire its old press
+is cancelled rather than killing the service.
 
 Each update unmaps the owned strips, installs both bounding/input shapes, and
 maps only their visible portions. It can additionally exclude an old capture
@@ -55,13 +65,16 @@ signed X11 coordinates and dimensions no larger than 32,767 px. Unsupported valu
 are rejected before queueing. This is an explicit native representation limit,
 not a license to silently shrink the selected GIF canvas.
 
-Three tests run on their own supervised Xvfb servers verify actual visible border
+Eight tests run on their own supervised Xvfb servers verify actual visible border
 pixels, unchanged captured source bytes, matching Bounding/Input exclusions,
 center-click delivery, owned pointer events, signed positions, full-root/explicit
-hide, generation cancellation and own-window-only cleanup. They pass on Rust
+hide, continuous gestures, the watchdog, stale-identity rejection and
+own-window-only cleanup. They pass on Rust
 1.98 and 1.88. They are included by the CI `private_xvfb_ -- --ignored` step, not
 silently skipped as hardware tests. These tests do not establish compositor shadow
-behavior, continuous gestures or a working desktop integration.
+behavior or a working desktop integration. The four visible strips additionally
+set `_GTK_FRAME_EXTENTS` to zero to request Mutter's no-custom-frame-shadow path;
+checking this property is not a substitute for native compositor pixel acceptance.
 
 ## Placement and starting
 
@@ -95,11 +108,10 @@ old/new rectangles from a guide is an additional safeguard, not a complete
 presentation protocol. An X server ACK or XSync does not prove that the compositor
 has presented fresh pixels. No fixed sleep alone certifies absence of self-capture.
 
-The initial border primitive cancels a pointer gesture when its presentation is
-replaced. Continuous border dragging will need a separately bounded, explicit
-gesture lifetime that survives those updates and always releases input on
-release, cancellation, error or shutdown. Merely emitting pointer events is not
-proof of continuous drag/resize support.
+The native primitive now preserves a bounded, explicitly initiated gesture across
+presentation updates. Its Xvfb tests move, update, hide, show and release with the
+same gesture identity. Desktop drag/resize and sampling coordination still need
+their own integration evidence.
 
 ## Required integration evidence
 

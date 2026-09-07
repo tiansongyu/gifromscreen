@@ -25,8 +25,9 @@ mod native_tests;
 #[cfg(test)]
 mod tests;
 
-#[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
 const EVENT_LIMIT: usize = 64;
+#[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
+static NEXT_GESTURE_ID: Mutex<u64> = Mutex::new(0);
 
 /// Desired physical border. Debug output deliberately omits screen coordinates.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -100,39 +101,43 @@ pub enum GuideEdge {
     TopLeft,
 }
 
-/// Pointer input only from owned guide windows. No global input selection is installed.
+/// Primary pointer gestures begin on owned border windows. A temporary owned grab
+/// keeps motion/release on the same gesture while border presentation changes.
+/// No root pointer feed or idle pointer grab is installed; hover is not reported.
+/// Gesture identities never repeat within this process, even across guide instances.
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[allow(
     missing_docs,
-    reason = "variants share generation and signed physical root-position fields"
+    reason = "gesture_id identifies one press; generation only identifies its initial presentation"
 )]
 pub enum GuidePointerEvent {
     Pressed {
         generation: u64,
+        gesture_id: u64,
         position: PhysicalPosition,
         edge: GuideEdge,
         modifiers: u16,
     },
     Moved {
-        generation: u64,
+        gesture_id: u64,
         position: PhysicalPosition,
     },
     Released {
-        generation: u64,
+        gesture_id: u64,
         position: PhysicalPosition,
     },
     Cancelled {
-        generation: u64,
+        gesture_id: u64,
     },
 }
 
 impl GuidePointerEvent {
-    fn generation(self) -> u64 {
+    fn gesture_id(self) -> u64 {
         match self {
-            Self::Pressed { generation, .. }
-            | Self::Moved { generation, .. }
-            | Self::Released { generation, .. }
-            | Self::Cancelled { generation } => generation,
+            Self::Pressed { gesture_id, .. }
+            | Self::Moved { gesture_id, .. }
+            | Self::Released { gesture_id, .. }
+            | Self::Cancelled { gesture_id } => gesture_id,
         }
     }
 }
@@ -147,7 +152,7 @@ impl fmt::Debug for GuidePointerEvent {
         };
         formatter
             .debug_struct(kind)
-            .field("generation", &self.generation())
+            .field("gesture_id", &self.gesture_id())
             .finish_non_exhaustive()
     }
 }
@@ -171,6 +176,8 @@ struct Shared {
     ack: Option<GuideAck>,
     events: VecDeque<GuidePointerEvent>,
     dropped: u64,
+    active_gesture: Option<u64>,
+    cancel_epoch: u64,
 }
 
 struct Context {
@@ -181,6 +188,27 @@ struct Context {
 impl Context {
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Acquire)
+    }
+
+    fn cancel_gesture(&self) {
+        let mut shared = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        shared.cancel_epoch = shared.cancel_epoch.wrapping_add(1);
+        if let Some(gesture_id) = shared.active_gesture.take() {
+            shared
+                .events
+                .retain(|event| event.gesture_id() != gesture_id);
+            if !self.cancelled() {
+                if shared.events.len() >= EVENT_LIMIT {
+                    shared.dropped = shared
+                        .dropped
+                        .saturating_add(shared.events.len() as u64 + 1);
+                    shared.events.clear();
+                }
+                shared
+                    .events
+                    .push_back(GuidePointerEvent::Cancelled { gesture_id });
+            }
+        }
     }
 }
 
@@ -206,6 +234,49 @@ impl Context {
             shared.status = GuideStatus::Ready;
         }
     }
+
+    fn cancel_epoch(&self) -> u64 {
+        self.shared
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .cancel_epoch
+    }
+
+    fn active_gesture(&self, gesture_id: u64) -> bool {
+        !self.cancelled()
+            && self
+                .shared
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .active_gesture
+                == Some(gesture_id)
+    }
+
+    fn begin_gesture(&self, generation: u64, cancel_epoch: u64) -> Result<Option<u64>, String> {
+        let mut shared = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.cancelled()
+            || shared.cancel_epoch != cancel_epoch
+            || shared.active_gesture.is_some()
+            || shared.generation != generation
+            || shared
+                .ack
+                .is_none_or(|ack| ack.generation != generation || !ack.visible)
+        {
+            return Ok(None);
+        }
+        let id = {
+            let mut next = NEXT_GESTURE_ID
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let id = next
+                .checked_add(1)
+                .ok_or("Recorder gesture identities exhausted.")?;
+            *next = id;
+            id
+        };
+        shared.active_gesture = Some(id);
+        Ok(Some(id))
+    }
     fn event(&self, event: GuidePointerEvent) {
         if self.cancelled() {
             return;
@@ -214,18 +285,13 @@ impl Context {
         if self.cancelled() {
             return;
         }
-        if !matches!(event, GuidePointerEvent::Cancelled { .. })
-            && (shared.generation != event.generation()
-                || shared
-                    .ack
-                    .is_none_or(|ack| ack.generation != event.generation()))
-        {
+        if shared.active_gesture != Some(event.gesture_id()) {
             return;
         }
         if matches!(event, GuidePointerEvent::Moved { .. })
             && shared.events.back().is_some_and(|previous| {
                 matches!(previous, GuidePointerEvent::Moved { .. })
-                    && previous.generation() == event.generation()
+                    && previous.gesture_id() == event.gesture_id()
             })
         {
             shared.events.pop_back();
@@ -235,11 +301,19 @@ impl Context {
                 .dropped
                 .saturating_add(shared.events.len() as u64 + 1);
             shared.events.clear();
+            shared.active_gesture = None;
+            shared.cancel_epoch = shared.cancel_epoch.wrapping_add(1);
             shared.events.push_back(GuidePointerEvent::Cancelled {
-                generation: event.generation(),
+                gesture_id: event.gesture_id(),
             });
         } else {
             shared.events.push_back(event);
+            if matches!(
+                event,
+                GuidePointerEvent::Released { .. } | GuidePointerEvent::Cancelled { .. }
+            ) {
+                shared.active_gesture = None;
+            }
         }
     }
 }
@@ -255,6 +329,7 @@ impl RecorderGuide {
     ///
     /// # Errors
     /// Returns unsupported-build or thread-start errors. Native failures appear in poll.
+    /// Gestures have a 30-second watchdog; protocol operations and cleanup are also bounded.
     pub fn start(display: Option<String>) -> Result<Self, String> {
         #[cfg(not(all(target_os = "linux", feature = "native-x11")))]
         {
@@ -286,8 +361,8 @@ impl RecorderGuide {
     /// Coalesces pending updates; an older request may be superseded without an ACK.
     /// During retargeting, the caller must coordinate capture pause/freshness: neither
     /// double exclusion nor a server ACK proves compositor presentation.
-    /// Updating/hiding cancels an existing pointer gesture. This initial ring primitive
-    /// does not yet support continuous border dragging across position/size updates.
+    /// Updating or temporarily hiding preserves an active gesture. Its events retain
+    /// the same `gesture_id`; only a new press uses the new presentation generation.
     ///
     /// # Errors
     /// Rejects invalid geometry, stale generations, or a stopped registration.
@@ -304,20 +379,19 @@ impl RecorderGuide {
         if request.generation <= shared.generation {
             return Err("Recorder guide generations must strictly increase.".into());
         }
-        if let Some(ack) = shared.ack.take() {
-            shared.events.clear();
-            shared.events.push_back(GuidePointerEvent::Cancelled {
-                generation: ack.generation,
-            });
-        } else {
-            shared.events.clear();
-        }
+        shared.ack = None;
         shared.generation = request.generation;
         shared.status = GuideStatus::Updating {
             generation: request.generation,
         };
         shared.request = Some(request);
         Ok(())
+    }
+
+    /// Cancels only the current gesture, suppressing its queued motion immediately.
+    /// Native pointer ungrab is asynchronous and bounded; later presses get new ids.
+    pub fn cancel_gesture(&self) {
+        self.context.cancel_gesture();
     }
 
     /// Immediately suppresses input. Native destruction finishes asynchronously.
@@ -331,6 +405,8 @@ impl RecorderGuide {
         shared.request = None;
         shared.events.clear();
         shared.ack = None;
+        shared.active_gesture = None;
+        shared.cancel_epoch = shared.cancel_epoch.wrapping_add(1);
         if self.result.is_some() {
             shared.status = GuideStatus::Stopping;
         }
@@ -369,6 +445,7 @@ impl RecorderGuide {
                 shared.ack = None;
                 shared.events.clear();
                 shared.request = None;
+                shared.active_gesture = None;
             }
         }
         let mut shared = self
@@ -401,6 +478,8 @@ fn new_context() -> Context {
             ack: None,
             events: VecDeque::with_capacity(EVENT_LIMIT),
             dropped: 0,
+            active_gesture: None,
+            cancel_epoch: 0,
         })),
         cancel: Arc::new(AtomicBool::new(false)),
     }
