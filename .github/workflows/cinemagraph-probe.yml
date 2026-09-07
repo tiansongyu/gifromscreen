@@ -1,0 +1,61 @@
+name: Manual Cinemagraph WPF probe
+
+# Evidence-only experiment. Do not modify or replace the strict WPF reference gate.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cinemagraph-probe-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the requested probe revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+      - name: Install .NET 9
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: 9.0.x
+      - name: Inspect actual SDK and desktop runtime
+        working-directory: scripts/qa/cinemagraph_probe
+        shell: pwsh
+        run: |
+          dotnet --info
+          if ($LASTEXITCODE -ne 0) { throw "SDK inspection failed" }
+          dotnet --list-runtimes
+          if ($LASTEXITCODE -ne 0) { throw "Runtime inspection failed" }
+      - name: Build only the independent headless probe
+        working-directory: scripts/qa/cinemagraph_probe
+        shell: pwsh
+        run: |
+          dotnet build CinemagraphProbe.csproj --configuration Release
+          if ($LASTEXITCODE -ne 0) { throw "Probe build failed" }
+      - name: Run the bounded actual-WPF experiment
+        shell: pwsh
+        env:
+          GFS_CINEMAGRAPH_PROBE_DIR: ${{ runner.temp }}/gfs-cinemagraph-probe-${{ github.run_id }}-${{ github.run_attempt }}
+        run: ./scripts/qa/cinemagraph_probe/run-probe.ps1 -OutputDirectory "$env:GFS_CINEMAGRAPH_PROBE_DIR"
+      - name: Preserve measured pixels and provenance, including partial failures
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cinemagraph-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gfs-cinemagraph-probe-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Preserve bounded child diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cinemagraph-probe-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gfs-cinemagraph-probe-${{ github.run_id }}-${{ github.run_attempt }}.logs/
+          if-no-files-found: warn
+          retention-days: 7

@@ -3,3 +3,5 @@
 scripts/qa/wpf_reference/** text eol=lf
 scripts/qa/run_wpf_reference.ps1 text eol=lf
 .github/workflows/wpf-reference.yml text eol=lf
+scripts/qa/cinemagraph_probe/** text eol=lf
+.github/workflows/cinemagraph-probe.yml text eol=lf
