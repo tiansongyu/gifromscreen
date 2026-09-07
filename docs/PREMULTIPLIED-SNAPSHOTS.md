@@ -98,6 +98,11 @@ Measured diagnostics across the 10,800 case-pixels:
 The separate Rust test consumes **the actual clipped PM reference as input**,
 encodes/decodes its typed container and compares final RGBA through three render
 routes. All **90 cases × 3 routes** match exactly on Rust 1.98.0 and 1.88.0.
+A fresh complete [hosted run 34080370355](https://github.com/tiansongyu/gifromscreen/actions/runs/34080370355)
+at `e114b72948cbaca679ce5206856140de39f040b4` also passed both the Windows
+producer and Linux/MSRV snapshot comparator. The manual probe workflow now
+performs these two independent stages together, with mismatches failing the
+composition check while the clipping-model diagnostics remain measured findings.
 This proves snapshot storage/composition, not Rust ink geometry generation.
 It validates all indexed artifacts, safe paths, complete source hashes and the
 full fixed case inventory; a copied definition-hash string alone cannot certify
