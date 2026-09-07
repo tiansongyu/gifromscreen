@@ -63,13 +63,17 @@ parallel with the bounded independent numerical checks. The existing movable
 recording frame, pause-excluded clock and fixed playback policy are implemented;
 these tasks extend them rather than replace their state machines.
 
-1. **Global recording shortcuts.** Add a small opt-in Linux shortcut service and
-   desktop action adapter. Route activation through existing recorder actions,
-   acknowledged pause/resume and manual-snapshot receipts. Do not create a second
-   recording controller or register arbitrary global input listeners. Recording
-   must remain stoppable with another application focused and the controller
-   outside the crop. Keep buttons/timed stop if registration fails.
-2. **Precise region positioning.** Add 1/10 physical-pixel keyboard movement and
+1. **Global recording shortcuts: implementation connected.** The opt-in X11/Portal
+   service, persisted bindings and recorder-scoped adapter now route to the existing
+   controller. Active Stop/pause/snapshot commands reach the worker without waiting
+   for UI repaint. See [the contract and backend tests](GLOBAL-SHORTCUTS.md) and
+   [native Mutter start/pause/resume/snapshot/stop/GIF evidence](X11-RECORDER-WINDOWS.md).
+   Actual KDE/modern-Portal, physical-key repeat and wider hardware acceptance stay
+   open. Buttons and timed stop remain available if registration fails.
+2. **Precise region positioning: next integration.** Separate authoritative physical
+   selection, native border and responsive control panel. The old combined viewport
+   cannot represent a full monitor or tiny selection independently of its controls;
+   UI zoom must not change the captured dimensions. Add 1/10 physical-pixel movement and
    pre-record window snapping through `RegionRetargetPlan`. Show the backend's
    accepted rectangle, coalesce movement while one request is in flight, and
    retain fixed canvas size during recording. Optional X11 cursor-follow comes
@@ -104,7 +108,7 @@ until separately exercised; their absence does not block this implementation wor
 
 ## Monitor controller and remaining platform acceptance
 
-The native monitor test proves that a controller overlapping the crop appears in the GIF. The app cannot promise automatic self-exclusion on a general Wayland monitor source. The visible warning remains, alongside the implemented 720×480 compact controller and responsive controls. Global-shortcut integration and further timed-capture fallbacks remain work; compact sizing is not a physical-position or self-exclusion guarantee.
+The native monitor test proves that a controller overlapping the crop appears in the GIF. The app cannot promise automatic self-exclusion on a general Wayland monitor source. The visible warning remains, alongside the implemented 720×480 compact controller and responsive controls. Global shortcuts are now connected, but native Portal acceptance and further timed-capture fallbacks remain work; compact sizing is not a physical-position or self-exclusion guarantee.
 
 Nested GNOME software-rendered tests do not replace KDE, hardware rendering, mixed DPI/multiple monitors, device interruption, physical camera or full-resolution long-duration acceptance. Existing timed layers remain legacy until explicitly converted; the specific remaining geometry and feature-matrix items above still need work.
 

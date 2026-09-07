@@ -24,6 +24,7 @@ GifFromScreen 是一个使用 Rust 实现的本地 GIF 录制与逐帧编辑工�
 - [Cinemagraph 笔迹编辑与原生验收](docs/NATIVE-CINEMAGRAPH-QA-2026-09-07.md)
 - [独立 WPF 数值对照与剩余差异](docs/INK-REFERENCE-EVIDENCE.md)
 - [下一轮录制控制与精确定位计划](docs/NEXT-LINUX-ITERATION.md)
+- [全局录制快捷键](docs/GLOBAL-SHORTCUTS.md) 与 [X11 录制框原生验收](docs/X11-RECORDER-WINDOWS.md)
 
 ## 当前范围
 
@@ -36,6 +37,7 @@ GifFromScreen 是一个使用 Rust 实现的本地 GIF 录制与逐帧编辑工�
 
 - 录制时主界面隐藏，只保留独立、置顶的取景框/源内裁剪控制器和底部控制条。
 - 倒计时、开始、暂停、继续、录制中移动固定尺寸选区、停止和丢弃均由独立控制器完成；支持连续 FPS、按秒/分钟/小时周期快照及手动快照，不会重新打开 Portal 选择器。
+- 可选全局录制快捷键：默认 Ctrl+Shift+F7 开框／开始／暂停／恢复，F8 停止，F9 手动快照（均带 Ctrl+Shift），可改键并保存。X11 已在隔离 Mutter 验证其他应用获焦时的完整控制序列；Wayland 使用独立 GlobalShortcuts Portal，实际可用按键以系统授权返回值为准，真实桌面验收仍待完成。快捷键默认关闭，不提供全局丢弃键。
 - GIF 播放延时可独立于实际采样间隔设置；支持固定每帧延时和按实际有效录制时间计时，暂停不进入录制时间。
 - 首帧到达后即流式写入内容寻址素材和同步 journal；异常失败会保留可恢复项目路径，停止后再完成 checkpoint。
 - 停止后自动创建同名 `.gfsproj`，进入带虚拟胶片条、逐帧预览、选择、排序、删除、延时和 undo/redo 的编辑器。

@@ -109,6 +109,8 @@ checks all four edges/corners against known source content, rather than merely
 searching for the recorder's color. For all 100 continuous raw frames, the visible
 599-pixel fixture top edge starts at the expected local (41,78) and matches the
 fixture colors exactly. These pixel checks apply to these stationary selections.
+Both app supervisors exited with status 0; the lab then stopped with
+`cleanup_complete: true`. The projects, GIFs and screenshots were retained.
 
 This validates the tested stationary rectangles and control sequence, not full
 monitor layout, tiny selections, live movement, physical keyboard repeat,
