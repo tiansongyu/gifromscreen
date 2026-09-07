@@ -13,8 +13,9 @@ Five independent compilations of the original WPF C++ curve algorithm matched
 the Rust flattened-vertex digests, including large-coordinate fallback. These
 are component/source-rule checks, not proof of complete Stroke.GetGeometry,
 point-erasure or degenerate VisualBrush equivalence. The [interactive authoring
-integration](CINEMAGRAPH-AUTHORING.md) now passes automated checks; native
-interaction and independent fitting/erasing diagnostics remain in progress.
+integration](CINEMAGRAPH-AUTHORING.md) now passes automated checks and the
+[bounded native authoring sequence](NATIVE-CINEMAGRAPH-QA-2026-09-07.md).
+Independent fitting/erasing comparison and exact geometry fidelity remain open.
 
 ## Verified source rules, not yet a complete Rust ink implementation
 

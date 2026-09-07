@@ -97,7 +97,8 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [x] Make every layer reachable through bounded 64-layer pages, stable identities and scrollable rows, with deletion/Undo/project-switch and large-font UI regression checks.
 - [x] Add schema-7 typed premultiplied snapshot persistence and composition, with [90 independent Windows inputs × 3 exact Rust render routes](PREMULTIPLIED-SNAPSHOTS.md); this does not certify Linux ink geometry generation.
 - [x] Connect bounded first-frame Cinemagraph pen/erasers/selection drafts to one cancellable, atomic selected-frame PM edit, with [automated recovery/reopen/GIF checks](CINEMAGRAPH-AUTHORING.md).
-- [ ] Complete native Cinemagraph authoring acceptance and exact upstream ink/erase/Boolean geometry fidelity, distinct from Rectangular freeze and typed-snapshot composition.
+- [x] Pass bounded [native Cinemagraph pen/erasers/selection/Undo/reopen/GIF acceptance](NATIVE-CINEMAGRAPH-QA-2026-09-07.md), correcting the actual justified-layout image-coordinate defect.
+- [ ] Complete exact upstream ink/erase/Boolean geometry fidelity and broader Cinemagraph input/platform coverage, distinct from Rectangular freeze and typed-snapshot composition.
 - [ ] Complete broader numerical WPF/WIC coverage and remaining physical desktop gates. Neither bounded corpus is full upstream pixel certification.
 - [x] Save an independently identified project copy without switching the current editor, and retain a bounded recent-project list.
 - [x] Build and verify an Ubuntu-22-compatible x86_64 portable tarball with exact-file installation, checksums, license notices, and CI artifacts.

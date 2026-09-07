@@ -61,6 +61,12 @@ image rectangle and uses that same rectangle for ink hit testing and coordinate
 mapping (including ordinary drawing). A real-egui column regression passes on
 both supported test toolchains. Native acceptance continues with the fixed binary.
 
+The [subsequent bounded native sequence](NATIVE-CINEMAGRAPH-QA-2026-09-07.md)
+passed pen, both erasers, selection transforms, Escape, fitting, gapped-target
+Apply, Undo/Redo and reopen. GIF exports before/after reopening compare byte for
+byte. The final input/controls cohort passes 1,349 workspace tests on both
+toolchains, including 24 small-window/large-font action checks.
+
 The elliptical eraser currently uses a bounded 64-sided polygon approximation.
 The UI discloses this. Full WPF stroke-node pruning, exact erasure cuts, Boolean
 geometry and degenerate Image.Clip/VisualBrush behavior remain unverified.
