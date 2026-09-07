@@ -34,6 +34,7 @@ mod control;
 mod error;
 mod image_effects;
 mod overlay;
+mod premultiplied;
 mod renderer;
 mod surface;
 mod transition;
@@ -48,6 +49,7 @@ pub use overlay::{
     OverlayRenderPlan, RasterOverlayAsset, active_raster_overlay_assets,
     active_raster_overlay_assets_for_frame, freeze_timed_overlay_content,
 };
+pub use premultiplied::{PremultipliedRgbaSurface, PremultipliedSnapshotError};
 pub use renderer::{
     AssetProviderError, CpuRenderer, FrameAssetProvider, MAX_BLUR_RADIUS, RenderLimits,
 };

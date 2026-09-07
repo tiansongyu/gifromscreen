@@ -409,7 +409,8 @@ mod tests {
             }
             let mut transform = ClipTransform::default();
             match step {
-                FrameRenderStep::FreezeRegion { .. } => {
+                FrameRenderStep::FreezeRegion { .. }
+                | FrameRenderStep::CinemagraphOverlay { .. } => {
                     panic!("test input cannot map through frozen pixels")
                 }
                 FrameRenderStep::Crop { rect } => transform.crop = Some(*rect),

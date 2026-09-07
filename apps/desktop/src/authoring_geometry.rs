@@ -58,7 +58,7 @@ pub(super) fn geometry_to_stage(
         }
         let mut transform = ClipTransform::default();
         match step {
-            FrameRenderStep::FreezeRegion { .. } => {
+            FrameRenderStep::FreezeRegion { .. } | FrameRenderStep::CinemagraphOverlay { .. } => {
                 return Err("Recorded input cannot be mapped through mixed frozen pixels. Re-edit its earlier paint stage instead.".to_owned());
             }
             FrameRenderStep::Composite { .. } | FrameRenderStep::Effect { .. } => continue,

@@ -56,6 +56,25 @@ impl std::fmt::Display for UnsupportedEffect {
 /// Errors produced by the deterministic CPU renderer.
 #[derive(Debug, Error)]
 pub enum RenderError {
+    /// A typed clipped reference was unavailable; never substitute ordinary straight pixels.
+    #[error("could not load Cinemagraph snapshot {asset_id}: {source}")]
+    CinemagraphSnapshotLoad {
+        /// Immutable reference identity.
+        asset_id: AssetId,
+        /// Provider or codec failure.
+        #[source]
+        source: AssetProviderError,
+    },
+    /// The clipped snapshot retains its authored canvas, not a resized or reshaped view.
+    #[error("Cinemagraph snapshot {asset_id} has shape {actual:?}, expected {expected:?}")]
+    CinemagraphSnapshotSizeMismatch {
+        /// Reference identity.
+        asset_id: AssetId,
+        /// Required size.
+        expected: PhysicalSize,
+        /// Supplied size.
+        actual: PhysicalSize,
+    },
     /// A frozen reference view must retain the canvas on which it was authored.
     #[error("freeze reference canvas {expected:?} does not match current canvas {actual:?}")]
     FreezeRegionSizeMismatch {

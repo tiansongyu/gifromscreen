@@ -133,6 +133,7 @@ pub(super) fn assert_upgrade_roundtrip(
     let redo = project.commit(receipt.inverse).unwrap().inverse;
     assert_eq!(project.manifest().schema_version, required_schema);
     assert_eq!(project.manifest().timeline, before.timeline);
+    assert_eq!(project.manifest().assets, before.assets);
     project.checkpoint_and_compact().unwrap();
     drop(project);
     let mut opened = ActiveProject::open(root, LockPolicy::FailIfPresent)
@@ -141,6 +142,7 @@ pub(super) fn assert_upgrade_roundtrip(
     assert_eq!(opened.manifest().schema_version, required_schema);
     opened.commit(redo).unwrap();
     assert_eq!(opened.manifest().timeline, after.timeline);
+    assert_eq!(opened.manifest().assets, after.assets);
     assert_eq!(
         opened
             .assets()

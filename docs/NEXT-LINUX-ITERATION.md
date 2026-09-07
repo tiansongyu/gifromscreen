@@ -38,7 +38,7 @@ Schema 5 adds explicit WPF paint precision for new Normal-blend authors while re
 
 A Windows-hosted GitHub Actions fixture job now runs the STA `UseWPF` generator through actual `RenderTargetBitmap`/PNG decode and compares canonical RGBA against the pure Rust domain/render crates. This is algorithm QA for Linux, not a Windows application. Runs remain bounded and preserve exact SDK/runtime/OS provenance; local replay success must not be substituted for the result of a fresh hosted committed-revision run.
 
-Cinemagraph now preserves hidden/zero-opacity intermediate-stage artwork through a schema-6 ordered `FreezeRegion`, instead of rejecting it or flattening away its context. The original source and prior paint stages remain intact, while one immutable baseline supplies frozen RGBA pixels. Earlier recorded groups remain re-editable; output-stage recorded-input replay stays blocked. See [the representation, resource ownership and automated coverage](NONDESTRUCTIVE-CINEMAGRAPH.md).
+The Rectangular freeze extension preserves hidden/zero-opacity intermediate-stage artwork through a schema-6 ordered `FreezeRegion`, instead of rejecting it or flattening away its context. The original source and prior paint stages remain intact, while one immutable baseline supplies frozen RGBA pixels. Earlier recorded groups remain re-editable; output-stage recorded-input replay stays blocked. See [the representation, resource ownership and automated coverage](NONDESTRUCTIVE-CINEMAGRAPH.md).
 
 The [native freeze/reveal/Undo/reopen/GIF acceptance](NATIVE-FREEZE-QA-2026-09-07.md) now passes. Layers provides undoable Hide/Show controls and the reopened GIF is byte-identical. Next: broader replay and numeric corpora, freeform-mask parity where required by the reference audit, and the remaining feature-matrix/platform gates. Retaining raw metadata is still not proof that a newly authored cursor matches mixed output pixels.
 
@@ -47,8 +47,10 @@ semantic gap: first-frame clipped ink geometry and premultiplied source-over,
 not current-frame rectangular RGBA overwrite. The implemented extension is now
 explicitly labeled Rectangular freeze. Preserve its saved semantics and implement
 the actual Cinemagraph path separately; do not reinterpret its prior acceptance
-as upstream parity. The independent clip/PNG-boundary probe precedes that pixel
-representation decision.
+as upstream parity. The independent clip/PNG-boundary probe now supports the
+[schema-7 typed PM snapshot choice](PREMULTIPLIED-SNAPSHOTS.md): 90 native
+snapshots match the storage/composition pipeline exactly. Freehand geometry
+generation and all ink authoring tools remain the next implementation task.
 
 ## Monitor controller and remaining platform acceptance
 

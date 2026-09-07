@@ -15,12 +15,17 @@ use gif_from_screen_gif::{
 use gif_from_screen_project::{ActiveProject, AssetStore, ProjectError};
 use gif_from_screen_render::{
     AssetProviderError, CancellationToken as RenderCancellationToken, FrameAssetProvider,
-    RenderError, RgbaSurface, SurfaceError, active_raster_overlay_assets_for_frame,
+    PremultipliedRgbaSurface, PremultipliedSnapshotError, RenderError, RgbaSurface, SurfaceError,
+    active_raster_overlay_assets_for_frame,
 };
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
 mod streaming;
+
+#[cfg(test)]
+#[path = "project_export/pm_tests.rs"]
+mod pm_tests;
 
 use crate::PresentationPlan;
 #[cfg(test)]
@@ -263,6 +268,27 @@ pub struct ProjectGifExportReport {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ProjectGifExportError {
+    /// A typed snapshot has a wrong kind, shape, format version or declared length.
+    #[error("frame {frame_id} premultiplied snapshot descriptor {asset_id} is invalid: {reason}")]
+    InvalidPremultipliedDescriptor {
+        /// Frame owning the effect.
+        frame_id: FrameId,
+        /// Snapshot identity.
+        asset_id: AssetId,
+        /// Descriptor validation failure.
+        reason: String,
+    },
+    /// Verified snapshot bytes do not satisfy their typed container contract.
+    #[error("frame {frame_id} premultiplied snapshot {asset_id} is invalid: {source}")]
+    InvalidPremultipliedSnapshot {
+        /// Frame owning the effect.
+        frame_id: FrameId,
+        /// Snapshot identity.
+        asset_id: AssetId,
+        /// Container or pixel validation failure.
+        #[source]
+        source: PremultipliedSnapshotError,
+    },
     /// No timeline frame was selected.
     #[error("project GIF export requires at least one frame")]
     EmptySelection,
@@ -1248,7 +1274,7 @@ fn load_selected_assets(
     frame_times: &[TimeUs],
     buffer_limit_bytes: u64,
     cancellation: &dyn GifCancellationToken,
-) -> Result<(BTreeMap<AssetId, RgbaSurface>, u64), ProjectGifExportError> {
+) -> Result<(LoadedAssetProvider, u64), ProjectGifExportError> {
     let mut loaded = BTreeMap::new();
     let mut visited = BTreeSet::new();
     let mut loaded_bytes = 0_u64;
@@ -1399,7 +1425,102 @@ fn load_selected_assets(
         loaded.insert(asset_id, surface);
         loaded_bytes = required_bytes;
     }
-    Ok((loaded, loaded_bytes))
+    let premultiplied = load_selected_premultiplied(
+        snapshot,
+        clips,
+        buffer_limit_bytes,
+        cancellation,
+        &mut loaded_bytes,
+    )?;
+    Ok((
+        LoadedAssetProvider {
+            assets: loaded,
+            premultiplied,
+        },
+        loaded_bytes,
+    ))
+}
+
+fn load_selected_premultiplied(
+    snapshot: &ProjectExportSnapshot,
+    clips: &[FrameClip],
+    limit: u64,
+    cancellation: &dyn GifCancellationToken,
+    loaded_bytes: &mut u64,
+) -> Result<BTreeMap<AssetId, PremultipliedRgbaSurface>, ProjectGifExportError> {
+    let mut loaded = BTreeMap::new();
+    for clip in clips {
+        for step in &clip.render_steps {
+            let FrameRenderStep::CinemagraphOverlay {
+                snapshot_asset: asset_id,
+                snapshot_size: size,
+            } = step
+            else {
+                continue;
+            };
+            ensure_not_cancelled(cancellation)?;
+            let frame_id = clip.id;
+            let asset_id = *asset_id;
+            let descriptor = snapshot
+                .manifest
+                .assets
+                .get(&asset_id)
+                .ok_or(ProjectGifExportError::MissingAssetDescriptor { frame_id, asset_id })?;
+            if descriptor.id != asset_id {
+                return Err(ProjectGifExportError::InvalidPremultipliedDescriptor {
+                    frame_id,
+                    asset_id,
+                    reason: "Asset map identity differs from its descriptor.".to_owned(),
+                });
+            }
+            gif_from_screen_domain::validate_premultiplied_snapshot_view(descriptor, *size)
+                .map_err(
+                    |reason| ProjectGifExportError::InvalidPremultipliedDescriptor {
+                        frame_id,
+                        asset_id,
+                        reason,
+                    },
+                )?;
+            if loaded.contains_key(&asset_id) {
+                continue;
+            }
+            let path = snapshot.assets.asset_path(asset_id);
+            let actual = asset_file_length(&path, frame_id, asset_id)?;
+            if actual != descriptor.byte_len {
+                return Err(ProjectGifExportError::AssetLengthMismatch {
+                    frame_id,
+                    asset_id,
+                    expected: descriptor.byte_len,
+                    actual,
+                });
+            }
+            let required_bytes = loaded_bytes
+                .checked_add(actual)
+                .ok_or(ProjectGifExportError::RenderBufferSizeOverflow)?;
+            if required_bytes > limit {
+                return Err(ProjectGifExportError::RenderBufferLimitExceeded {
+                    required_bytes,
+                    limit_bytes: limit,
+                });
+            }
+            let encoded = read_asset(snapshot, frame_id, asset_id)?;
+            let surface = PremultipliedRgbaSurface::decode(
+                encoded,
+                *size,
+                usize::try_from(limit).unwrap_or(usize::MAX),
+            )
+            .map_err(
+                |source| ProjectGifExportError::InvalidPremultipliedSnapshot {
+                    frame_id,
+                    asset_id,
+                    source,
+                },
+            )?;
+            loaded.insert(asset_id, surface);
+            *loaded_bytes = required_bytes;
+        }
+    }
+    Ok(loaded)
 }
 
 fn overlay_asset_file_length(
@@ -1517,6 +1638,7 @@ fn read_asset(
 #[derive(Debug)]
 struct LoadedAssetProvider {
     assets: BTreeMap<AssetId, RgbaSurface>,
+    premultiplied: BTreeMap<AssetId, PremultipliedRgbaSurface>,
 }
 
 impl FrameAssetProvider for LoadedAssetProvider {
@@ -1525,6 +1647,19 @@ impl FrameAssetProvider for LoadedAssetProvider {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("preloaded frame asset {asset_id} is unavailable"),
+            )
+            .into()
+        })
+    }
+
+    fn load_premultiplied_rgba8(
+        &self,
+        asset_id: AssetId,
+    ) -> Result<PremultipliedRgbaSurface, AssetProviderError> {
+        self.premultiplied.get(&asset_id).cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("preloaded typed snapshot {asset_id} is unavailable"),
             )
             .into()
         })
@@ -1658,7 +1793,7 @@ mod tests {
     use super::*;
 
     #[derive(Clone)]
-    struct TestClip {
+    pub(super) struct TestClip {
         id: FrameId,
         pixels: Vec<u8>,
         duration_us: u64,
@@ -1668,7 +1803,7 @@ mod tests {
     }
 
     impl TestClip {
-        fn rgba(id: u128, pixels: &[u8], duration_us: u64) -> Self {
+        pub(super) fn rgba(id: u128, pixels: &[u8], duration_us: u64) -> Self {
             Self {
                 id: FrameId::from_u128(id),
                 pixels: pixels.to_vec(),
@@ -1680,7 +1815,7 @@ mod tests {
         }
     }
 
-    fn snapshot(
+    pub(super) fn snapshot(
         root: &Path,
         size: PhysicalSize,
         specs: &[TestClip],
@@ -1738,7 +1873,7 @@ mod tests {
         (snapshot, asset_ids)
     }
 
-    fn decode_rgba(path: &Path) -> Vec<(u16, Vec<u8>)> {
+    pub(super) fn decode_rgba(path: &Path) -> Vec<(u16, Vec<u8>)> {
         let mut options = gif::DecodeOptions::new();
         options.set_color_output(gif::ColorOutput::RGBA);
         let mut decoder = options.read_info(File::open(path).unwrap()).unwrap();
@@ -1749,7 +1884,7 @@ mod tests {
         frames
     }
 
-    fn export(
+    pub(super) fn export(
         snapshot: &ProjectExportSnapshot,
         output: &Path,
         options: &ProjectGifExportOptions,
@@ -1772,7 +1907,7 @@ mod tests {
             .count()
     }
 
-    fn add_transition(
+    pub(super) fn add_transition(
         snapshot: &mut ProjectExportSnapshot,
         from: u128,
         to: u128,
@@ -3378,7 +3513,7 @@ mod tests {
         let clips = select_clips(&snapshot.manifest, &options.frames).unwrap();
         let times = selected_frame_start_times(&snapshot.manifest, &clips).unwrap();
         let plan = PresentationPlan::new(&snapshot.manifest, &clips).unwrap();
-        let (assets, source_bytes) = load_selected_assets(
+        let (provider, source_bytes) = load_selected_assets(
             snapshot,
             &clips,
             &times,
@@ -3397,7 +3532,7 @@ mod tests {
             &times,
             plan.transitions(),
             &snapshot.manifest.timeline.overlay_tracks,
-            &LoadedAssetProvider { assets },
+            &provider,
             source_bytes,
             options.render_buffer_limit_bytes,
             &mut execution,

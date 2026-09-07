@@ -51,15 +51,18 @@ The [schema-6 implementation](NONDESTRUCTIVE-CINEMAGRAPH.md) and
 column. Earlier use of the Cinemagraph name for that extension must not be
 treated as full parity evidence. The UI now calls it Rectangular freeze.
 
-## Implementation decisions under verification
+## Implementation status
 
 The reference-compatible path must retain the existing non-destructive ordered
 history, schema upgrade and source-input stage guards. It must also preserve
 the clipped reference's premultiplied precision until final compositing.
-A separate real-WPF probe is being prepared to measure clip coverage and the
-effect of accidental intermediate PNG boundaries before choosing the durable
-pixel representation. An unmarked premultiplied buffer must not be passed as a
-straight-alpha `RgbaSurface` or silently accepted as an ordinary source image.
+The independent real-WPF probe has now run: extra PNG boundaries and ordinary
+A8 masks do change results. Schema 7 therefore implements a [separately typed
+premultiplied snapshot, codec and composition path](PREMULTIPLIED-SNAPSHOTS.md).
+Its storage/composition matches all 90 native clipped references on three Rust
+render routes. This does not implement the Linux ink geometry producer or the
+complete authoring tools yet. An unmarked premultiplied buffer must not be passed
+as a straight-alpha `RgbaSurface` or silently accepted as an ordinary source image.
 
 Acceptance includes differing first/current frames, gapped selections,
 transparent and low-alpha baselines, overlapping strokes, clipped tip edges,

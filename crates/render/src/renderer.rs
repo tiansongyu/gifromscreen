@@ -6,11 +6,15 @@ use gif_from_screen_domain::{
 };
 
 use crate::{
-    CancellationToken, RenderError, RgbaSurface, UnsupportedEffect, surface::checked_byte_len,
+    CancellationToken, PremultipliedRgbaSurface, RenderError, RgbaSurface, UnsupportedEffect,
+    surface::checked_byte_len,
 };
 
 #[path = "freeze_region.rs"]
 mod freeze_region;
+
+#[path = "cinemagraph_overlay.rs"]
+mod cinemagraph_overlay;
 
 /// Largest supported radius for deterministic blur and shadow effects.
 ///
@@ -36,6 +40,21 @@ pub trait FrameAssetProvider: Send + Sync {
     /// Returns a boxed provider-specific error when the asset is absent,
     /// unreadable, or cannot be decoded to RGBA8.
     fn load_rgba8(&self, asset_id: AssetId) -> Result<RgbaSurface, AssetProviderError>;
+
+    /// Loads a separately typed premultiplied reference without a PNG/color conversion.
+    ///
+    /// # Errors
+    /// Implementations that only supply ordinary RGBA images reject this explicitly.
+    fn load_premultiplied_rgba8(
+        &self,
+        asset_id: AssetId,
+    ) -> Result<PremultipliedRgbaSurface, AssetProviderError> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("provider cannot load typed premultiplied snapshot {asset_id}"),
+        )
+        .into())
+    }
 }
 
 impl<F> FrameAssetProvider for F
@@ -222,6 +241,20 @@ impl CpuRenderer {
     ) -> Result<RgbaSurface, RenderError> {
         check_cancelled(cancellation)?;
         match step {
+            FrameRenderStep::CinemagraphOverlay {
+                snapshot_asset,
+                snapshot_size,
+            } => {
+                cinemagraph_overlay::apply(
+                    &mut surface,
+                    *snapshot_asset,
+                    *snapshot_size,
+                    provider,
+                    self.limits(),
+                    cancellation,
+                )?;
+                return Ok(surface);
+            }
             FrameRenderStep::FreezeRegion {
                 baseline_asset,
                 baseline_size,

@@ -15,13 +15,18 @@ use gif_from_screen_domain::{
 use gif_from_screen_project::{ActiveProject, AssetStore, ProjectError};
 use gif_from_screen_render::{
     AssetProviderError, CancellationToken, CpuRenderer, FrameAssetProvider, NeverCancel,
-    OverlayRenderPlan, RenderError, RenderLimits, RgbaSurface, SurfaceError, render_transition,
+    OverlayRenderPlan, PremultipliedRgbaSurface, PremultipliedSnapshotError, RenderError,
+    RenderLimits, RgbaSurface, SurfaceError, render_transition,
 };
 use thiserror::Error;
 
 const DEFAULT_CACHE_ENTRIES: usize = 16;
 const DEFAULT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RENDER_SURFACE_BYTES: usize = 512 * 1024 * 1024;
+
+#[cfg(test)]
+#[path = "editor_preview_pm_tests.rs"]
+mod pm_tests;
 
 /// A texture plus the rendered and downsampled dimensions represented by it.
 #[derive(Clone)]
@@ -34,6 +39,14 @@ pub(crate) struct EditorPreview {
 /// Typed failures while loading, rendering, resizing, or uploading a preview.
 #[derive(Debug, Error)]
 pub(crate) enum EditorPreviewError {
+    #[error("premultiplied snapshot descriptor {asset_id} is invalid: {reason}")]
+    InvalidPremultipliedDescriptor { asset_id: AssetId, reason: String },
+    #[error("premultiplied snapshot {asset_id} is invalid: {source}")]
+    InvalidPremultipliedSnapshot {
+        asset_id: AssetId,
+        #[source]
+        source: PremultipliedSnapshotError,
+    },
     #[error("transition {transition_id} is no longer available for this preview")]
     TransitionNotFound { transition_id: TransitionId },
     #[error("could not render transition {transition_id} step {step}: {source}")]
@@ -571,7 +584,9 @@ impl PreviewRenderPlan {
             },
         )?;
         descriptors.insert(clip.asset_id, descriptor.clone());
-        for asset_id in freeze_region_assets(clip) {
+        for asset_id in
+            freeze_region_assets(clip).chain(premultiplied_assets(clip).map(|(id, _)| id))
+        {
             let descriptor = project
                 .manifest()
                 .assets
@@ -624,6 +639,7 @@ impl PreviewRenderPlan {
         }
         let mut provider = PreviewAssetProvider {
             assets: BTreeMap::new(),
+            premultiplied: BTreeMap::new(),
         };
         let mut retained_bytes = 0_u64;
         load_preview_raster(
@@ -671,6 +687,24 @@ impl PreviewRenderPlan {
                 &mut provider.assets,
             )?;
         }
+        for (asset_id, size) in premultiplied_assets(&self.clip) {
+            if cancellation.is_cancelled() {
+                return Err(EditorPreviewError::Render {
+                    frame_id,
+                    source: RenderError::Cancelled,
+                });
+            }
+            load_preview_premultiplied(
+                &self.store,
+                &self.descriptors,
+                frame_id,
+                asset_id,
+                size,
+                render_surface_limit_bytes,
+                &mut retained_bytes,
+                &mut provider.premultiplied,
+            )?;
+        }
         CpuRenderer::with_limits(RenderLimits {
             max_surface_bytes: render_surface_limit_bytes,
         })
@@ -686,6 +720,84 @@ fn freeze_region_assets(clip: &FrameClip) -> impl Iterator<Item = AssetId> + '_ 
         FrameRenderStep::FreezeRegion { baseline_asset, .. } => Some(*baseline_asset),
         _ => None,
     })
+}
+
+fn premultiplied_assets(
+    clip: &FrameClip,
+) -> impl Iterator<Item = (AssetId, gif_from_screen_domain::PhysicalSize)> + '_ {
+    clip.render_steps.iter().filter_map(|step| match step {
+        FrameRenderStep::CinemagraphOverlay {
+            snapshot_asset,
+            snapshot_size,
+        } => Some((*snapshot_asset, *snapshot_size)),
+        _ => None,
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "typed snapshot identity/view and the shared aggregate budget stay explicit"
+)]
+fn load_preview_premultiplied(
+    store: &AssetStore,
+    descriptors: &BTreeMap<AssetId, AssetDescriptor>,
+    frame_id: FrameId,
+    asset_id: AssetId,
+    size: gif_from_screen_domain::PhysicalSize,
+    limit: usize,
+    retained_bytes: &mut u64,
+    assets: &mut BTreeMap<AssetId, PremultipliedRgbaSurface>,
+) -> Result<(), EditorPreviewError> {
+    let descriptor = descriptors
+        .get(&asset_id)
+        .ok_or(EditorPreviewError::MissingAssetDescriptor { frame_id, asset_id })?;
+    if descriptor.id != asset_id {
+        return Err(EditorPreviewError::DescriptorIdMismatch {
+            asset_id,
+            descriptor_id: descriptor.id,
+        });
+    }
+    gif_from_screen_domain::validate_premultiplied_snapshot_view(descriptor, size).map_err(
+        |reason| EditorPreviewError::InvalidPremultipliedDescriptor { asset_id, reason },
+    )?;
+    if assets.contains_key(&asset_id) {
+        return Ok(());
+    }
+    let path = store.asset_path(asset_id);
+    let actual = fs::metadata(&path)
+        .map_err(|source| EditorPreviewError::AssetMetadata {
+            asset_id,
+            path,
+            source,
+        })?
+        .len();
+    if actual != descriptor.byte_len {
+        return Err(EditorPreviewError::AssetFileLengthMismatch {
+            asset_id,
+            expected: descriptor.byte_len,
+            actual,
+        });
+    }
+    // decode removes the header in place but retains that allocation; count
+    // complete encoded bytes, not merely the shorter pixel slice's length.
+    let required = retained_bytes
+        .checked_add(actual)
+        .ok_or(EditorPreviewError::SourceMemorySizeOverflow { asset_id })?;
+    if required > u64::try_from(limit).unwrap_or(u64::MAX) {
+        return Err(EditorPreviewError::SourceMemoryLimitExceeded {
+            asset_id,
+            required,
+            limit,
+        });
+    }
+    let encoded = store
+        .read(asset_id)
+        .map_err(|source| EditorPreviewError::AssetRead { asset_id, source })?;
+    let decoded = PremultipliedRgbaSurface::decode(encoded, size, limit)
+        .map_err(|source| EditorPreviewError::InvalidPremultipliedSnapshot { asset_id, source })?;
+    assets.insert(asset_id, decoded);
+    *retained_bytes = required;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -826,11 +938,22 @@ struct UnexpectedAsset {
 
 struct PreviewAssetProvider {
     assets: BTreeMap<AssetId, RgbaSurface>,
+    premultiplied: BTreeMap<AssetId, PremultipliedRgbaSurface>,
 }
 
 impl FrameAssetProvider for PreviewAssetProvider {
     fn load_rgba8(&self, asset_id: AssetId) -> Result<RgbaSurface, AssetProviderError> {
         self.assets
+            .get(&asset_id)
+            .cloned()
+            .ok_or_else(|| Box::new(UnexpectedAsset { actual: asset_id }) as AssetProviderError)
+    }
+
+    fn load_premultiplied_rgba8(
+        &self,
+        asset_id: AssetId,
+    ) -> Result<PremultipliedRgbaSurface, AssetProviderError> {
+        self.premultiplied
             .get(&asset_id)
             .cloned()
             .ok_or_else(|| Box::new(UnexpectedAsset { actual: asset_id }) as AssetProviderError)
@@ -965,7 +1088,7 @@ mod tests {
         }
     }
 
-    fn project_with_frame(
+    pub(super) fn project_with_frame(
         pixels: &[u8],
         size: PhysicalSize,
         transform: ClipTransform,
@@ -1099,7 +1222,7 @@ mod tests {
         ));
     }
 
-    fn transition_project(
+    pub(super) fn transition_project(
         kind: TransitionKind,
     ) -> (TempDir, ActiveProject, PresentationTransitionStep) {
         let red = [255, 0, 0, 255];

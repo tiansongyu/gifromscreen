@@ -144,6 +144,7 @@ impl EditCommand {
     /// Minimum format needed to understand the entire serialized command, including inverses.
     pub fn required_schema_version(&self) -> u32 {
         match self {
+            Self::RegisterAsset { asset } => asset.required_schema_version(),
             Self::UpsertOverlayTrack { track } | Self::RestoreOverlayTrack { track, .. } => {
                 track.required_schema_version()
             }

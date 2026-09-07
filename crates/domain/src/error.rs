@@ -56,6 +56,10 @@ impl Error for UnitError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ValidationIssue {
+    InvalidPremultipliedSnapshot {
+        asset_id: AssetId,
+        reason: String,
+    },
     InvalidFrameRenderSteps {
         frame_id: FrameId,
         reason: String,

@@ -11,9 +11,9 @@ use gif_from_screen_gif::{
 use gif_from_screen_render::{CpuRenderer, RenderLimits, RgbaSurface, render_transition};
 
 use super::{
-    ExportExecution, LoadedAssetProvider, ProjectExportPhase, ProjectExportSnapshot,
-    ProjectGifExportError, ProjectGifExportOptions, RenderCancellationAdapter,
-    encode_source_and_commit, encoder_for_options, ensure_not_cancelled, ensure_render_buffer,
+    ExportExecution, ProjectExportPhase, ProjectExportSnapshot, ProjectGifExportError,
+    ProjectGifExportOptions, RenderCancellationAdapter, encode_source_and_commit,
+    encoder_for_options, ensure_not_cancelled, ensure_render_buffer,
     first_frame_requiring_transparency, load_selected_assets, surface_to_gif_frame,
 };
 use crate::{PresentationPlan, transition_step_progress};
@@ -329,7 +329,7 @@ impl<'a> RenderedFrameSource<'a> {
         // only the assets needed for this original frame's identity and source
         // time. Transition endpoints therefore include whole-frame marks too;
         // presentation positions never substitute for the original frame ID.
-        let (assets, source_bytes) = load_selected_assets(
+        let (provider, source_bytes) = load_selected_assets(
             self.snapshot,
             std::slice::from_ref(clip),
             std::slice::from_ref(&time),
@@ -344,7 +344,7 @@ impl<'a> RenderedFrameSource<'a> {
                 clip,
                 &self.snapshot.manifest.timeline.overlay_tracks,
                 time,
-                &LoadedAssetProvider { assets },
+                &provider,
                 &RenderCancellationAdapter(self.cancellation),
             )
             .map_err(|source| {

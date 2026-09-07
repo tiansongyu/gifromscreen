@@ -68,6 +68,11 @@ pub enum AssetKind {
         size: PhysicalSize,
         encoding: RasterEncoding,
     },
+    /// Typed clipped-image snapshot, never a straight-alpha frame or overlay.
+    PremultipliedSnapshot {
+        size: PhysicalSize,
+        format_version: u16,
+    },
     ImportedSource {
         media_type: String,
     },
@@ -84,7 +89,7 @@ impl AssetKind {
             Self::Frame { size, encoding }
             | Self::OverlayImage { size, encoding }
             | Self::Mask { size, encoding } => Some((*size, *encoding)),
-            Self::ImportedSource { .. } => None,
+            Self::ImportedSource { .. } | Self::PremultipliedSnapshot { .. } => None,
         }
     }
 
@@ -106,6 +111,16 @@ pub struct AssetDescriptor {
     pub id: AssetId,
     pub byte_len: u64,
     pub kind: AssetKind,
+}
+
+impl AssetDescriptor {
+    /// Minimum project schema required even when this asset has no consumers.
+    pub const fn required_schema_version(&self) -> u32 {
+        match self.kind {
+            AssetKind::PremultipliedSnapshot { .. } => 7,
+            _ => 1,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -697,6 +712,21 @@ impl ProjectManifest {
         }
 
         for (key, asset) in &self.assets {
+            if matches!(asset.kind, AssetKind::PremultipliedSnapshot { .. }) {
+                if self.schema_version < asset.required_schema_version() {
+                    issues.push(ValidationIssue::InvalidPremultipliedSnapshot {
+                        asset_id: asset.id,
+                        reason: "Premultiplied snapshots require schema 7, even when unreferenced."
+                            .to_owned(),
+                    });
+                }
+                if let Err(reason) = crate::validate_premultiplied_snapshot_descriptor(asset) {
+                    issues.push(ValidationIssue::InvalidPremultipliedSnapshot {
+                        asset_id: asset.id,
+                        reason,
+                    });
+                }
+            }
             if *key != asset.id {
                 issues.push(ValidationIssue::AssetKeyMismatch {
                     key: *key,
@@ -844,6 +874,16 @@ impl ProjectManifest {
                                 reason: format!("Render step {}: {reason}", index + 1),
                             });
                         }
+                        if let crate::FrameRenderStep::CinemagraphOverlay { snapshot_size, .. } =
+                            step
+                            && let Err(reason) =
+                                crate::validate_premultiplied_snapshot_view(asset, *snapshot_size)
+                        {
+                            issues.push(ValidationIssue::InvalidFrameRenderSteps {
+                                frame_id: frame.id,
+                                reason: format!("Render step {}: {reason}", index + 1),
+                            });
+                        }
                     } else {
                         issues.push(ValidationIssue::MissingEffectAsset {
                             frame_id: frame.id,
@@ -954,13 +994,22 @@ impl ProjectManifest {
                 if !overlay_ids.insert(overlay_id) {
                     issues.push(ValidationIssue::DuplicateOverlayId { overlay_id });
                 }
-                if let Some(asset_id) = content.referenced_asset()
-                    && !self.assets.contains_key(&asset_id)
-                {
-                    issues.push(ValidationIssue::MissingOverlayAsset {
-                        overlay_id,
-                        asset_id,
-                    });
+                if let Some(asset_id) = content.referenced_asset() {
+                    match self.assets.get(&asset_id) {
+                        None => issues.push(ValidationIssue::MissingOverlayAsset {
+                            overlay_id,
+                            asset_id,
+                        }),
+                        Some(asset)
+                            if matches!(asset.kind, AssetKind::PremultipliedSnapshot { .. }) =>
+                        {
+                            issues.push(ValidationIssue::InvalidFrameOverlay {
+                                track_id: track.id,
+                                reason: format!("Overlay {overlay_id} cannot consume premultiplied snapshot {asset_id} as straight RGBA."),
+                            });
+                        }
+                        _ => {}
+                    }
                 }
             }
             for asset_id in track

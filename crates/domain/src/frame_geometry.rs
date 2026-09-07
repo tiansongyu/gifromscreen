@@ -61,6 +61,10 @@ pub enum FrameRenderStep {
         region: PhysicalRect,
         invert: bool,
     },
+    CinemagraphOverlay {
+        snapshot_asset: AssetId,
+        snapshot_size: PhysicalSize,
+    },
 }
 
 impl FrameRenderStep {
@@ -74,6 +78,7 @@ impl FrameRenderStep {
 
     pub const fn required_schema_version(&self) -> u32 {
         match self {
+            Self::CinemagraphOverlay { .. } => 7,
             Self::FreezeRegion { .. } => 6,
             Self::Composite {
                 precision: CompositePrecision::WpfPbgra8PngV1,
@@ -93,6 +98,7 @@ impl FrameRenderStep {
 
     pub const fn referenced_asset(&self) -> Option<AssetId> {
         match self {
+            Self::CinemagraphOverlay { snapshot_asset, .. } => Some(*snapshot_asset),
             Self::FreezeRegion { baseline_asset, .. } => Some(*baseline_asset),
             _ => match self.effect() {
                 Some(effect) => effect.referenced_asset(),
@@ -294,6 +300,11 @@ fn apply_geometry_step(
                 return Err("Freeze baseline dimensions must match the current step input without resizing.".to_owned());
             }
             validate_crop(*region, size).map_err(|reason| format!("Freeze region: {reason}"))?;
+        }
+        FrameRenderStep::CinemagraphOverlay { snapshot_size, .. } => {
+            if *snapshot_size != size {
+                return Err("Cinemagraph snapshot dimensions must match the current step input without resizing.".to_owned());
+            }
         }
     }
     Ok(size)

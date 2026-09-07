@@ -108,7 +108,8 @@ fn mixed_before_stage(frame: &FrameClip, stage: Option<u32>) -> bool {
             crate::FrameRenderStep::Composite { stage_id, .. } if Some(*stage_id) == stage => {
                 return mixed;
             }
-            crate::FrameRenderStep::FreezeRegion { .. } => mixed = true,
+            crate::FrameRenderStep::FreezeRegion { .. }
+            | crate::FrameRenderStep::CinemagraphOverlay { .. } => mixed = true,
             _ => {}
         }
     }

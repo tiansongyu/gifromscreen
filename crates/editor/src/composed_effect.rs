@@ -117,6 +117,7 @@ pub(super) fn validate_program(
             FrameRenderStep::ImageBorder { .. }
                 | FrameRenderStep::ImageShadow { .. }
                 | FrameRenderStep::FreezeRegion { .. }
+                | FrameRenderStep::CinemagraphOverlay { .. }
         )
     }) {
         return Ok(());
@@ -130,7 +131,7 @@ pub(super) fn validate_program(
         validate_buffer(frame.id, input)?;
         if matches!(
             frame.render_steps[index],
-            FrameRenderStep::FreezeRegion { .. }
+            FrameRenderStep::FreezeRegion { .. } | FrameRenderStep::CinemagraphOverlay { .. }
         ) && input
             .area()
             .and_then(|pixels| pixels.checked_mul(8))
@@ -138,7 +139,7 @@ pub(super) fn validate_program(
         {
             return Err(pipeline_error(
                 frame.id,
-                "The freeze operation's image and baseline exceed the 64 MiB working-memory budget. Resize before creating the freeze region.",
+                "The composed image and its immutable reference exceed the 64 MiB working-memory budget. Resize before creating the reference.",
             ));
         }
     }

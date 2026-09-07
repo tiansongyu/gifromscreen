@@ -15,6 +15,10 @@ pub const DEFAULT_FRAME_CLIPBOARD_HISTORY_CAPACITY: usize = 8;
 /// Hard bound preventing an accidental UI setting from retaining an unbounded history.
 pub const MAX_FRAME_CLIPBOARD_HISTORY_CAPACITY: usize = 64;
 
+#[cfg(test)]
+#[path = "frame_clipboard_pm_tests.rs"]
+mod pm_tests;
+
 /// One bounded, in-memory snapshot of copied frame clips.
 ///
 /// Clips retain their source identities inside the snapshot so Copy itself is lossless. Paste
@@ -511,6 +515,20 @@ fn validate_clipboard_assets(
             }
         }
         for step in &frame.render_steps {
+            if let gif_from_screen_domain::FrameRenderStep::CinemagraphOverlay {
+                snapshot_asset,
+                snapshot_size,
+            } = step
+            {
+                gif_from_screen_domain::validate_premultiplied_snapshot_view(
+                    &project.assets[snapshot_asset],
+                    *snapshot_size,
+                )
+                .map_err(|reason| EditorError::InvalidRenderPipeline {
+                    frame_id: frame.id,
+                    reason,
+                })?;
+            }
             if let gif_from_screen_domain::FrameRenderStep::FreezeRegion {
                 baseline_asset,
                 baseline_size,
@@ -579,7 +597,7 @@ mod tests {
 
     use super::*;
 
-    fn project(frame_count: usize) -> ProjectManifest {
+    pub(super) fn project(frame_count: usize) -> ProjectManifest {
         let size = PhysicalSize::new(2, 2).unwrap();
         let asset_id = AssetId::from_digest([7; 32]);
         let mut assets = BTreeMap::new();

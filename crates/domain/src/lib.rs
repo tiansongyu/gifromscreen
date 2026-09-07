@@ -24,6 +24,7 @@ mod id;
 mod image_effect;
 mod model;
 mod overlay_timing;
+mod premultiplied_snapshot;
 mod progress_fraction;
 mod task_run;
 mod units;
@@ -48,9 +49,10 @@ pub use frame_overlay::*;
 pub use id::{AssetId, CaptureClockId, FrameId, OverlayId, ProjectId, TrackId, TransitionId};
 pub use image_effect::*;
 pub use model::*;
+pub use premultiplied_snapshot::*;
 pub use progress_fraction::ProgressFraction;
 pub use task_run::*;
 pub use units::*;
 
 /// Current on-disk manifest schema understood by this version of the domain.
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;

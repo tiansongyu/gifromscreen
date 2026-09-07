@@ -51,6 +51,13 @@ pub enum ComposedFrameEdit {
         /// Freeze inside the rectangle instead of outside it.
         invert: bool,
     },
+    /// Composite one already clipped, typed premultiplied Cinemagraph reference.
+    CinemagraphOverlay {
+        /// Immutable PM container, registered by the enclosing atomic command.
+        snapshot_asset: AssetId,
+        /// Exact canvas on which the reference was clipped.
+        snapshot_size: PhysicalSize,
+    },
 }
 
 impl ComposedFrameEdit {
@@ -74,6 +81,13 @@ impl ComposedFrameEdit {
                 effect: effect.clone(),
             },
             Self::ImageEffect(ComposedEffectEdit::Add(effect)) => effect.step(),
+            Self::CinemagraphOverlay {
+                snapshot_asset,
+                snapshot_size,
+            } => FrameRenderStep::CinemagraphOverlay {
+                snapshot_asset: *snapshot_asset,
+                snapshot_size: *snapshot_size,
+            },
             Self::FreezeRegion {
                 baseline_asset,
                 baseline_size,

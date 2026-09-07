@@ -139,6 +139,119 @@ fn freeze_checks_image_plus_reference_working_budget_before_returning_a_command(
     assert_eq!(project, before);
 }
 
+#[test]
+fn premultiplied_reference_edit_seals_hidden_cells_and_undo_restores_source_assets() {
+    let mut project = fixture();
+    owned(&mut project, 9, false, 0);
+    let before = project.clone();
+    let id = AssetId::from_digest([3; 32]);
+    let size = project.canvas.size;
+    let descriptor = AssetDescriptor {
+        id,
+        byte_len: 17 + size.area().unwrap() * 4,
+        kind: AssetKind::PremultipliedSnapshot {
+            size,
+            format_version: 1,
+        },
+    };
+    let edit = edit_composed_frames(
+        &project,
+        [FrameId::from_u128(1)],
+        &ComposedFrameEdit::CinemagraphOverlay {
+            snapshot_asset: id,
+            snapshot_size: size,
+        },
+    )
+    .unwrap();
+    let inverse = project
+        .apply_command(&EditCommand::Compound {
+            commands: vec![EditCommand::RegisterAsset { asset: descriptor }, edit],
+        })
+        .unwrap()
+        .inverse;
+    assert_eq!(project.schema_version, 7);
+    let first = &project.timeline.frames[0];
+    assert_eq!(first.asset_id, before.timeline.frames[0].asset_id);
+    assert_eq!(
+        first.capture_metadata,
+        before.timeline.frames[0].capture_metadata
+    );
+    assert_eq!(first.capture_clock, before.timeline.frames[0].capture_clock);
+    assert_eq!(
+        first.render_steps,
+        [
+            FrameRenderStep::composite(1),
+            FrameRenderStep::CinemagraphOverlay {
+                snapshot_asset: id,
+                snapshot_size: size,
+            }
+        ]
+    );
+    assert_eq!(project.timeline.frames[1], before.timeline.frames[1]);
+    let cells = project.timeline.overlay_tracks[0]
+        .frame_cells
+        .as_ref()
+        .unwrap();
+    assert_eq!(cells[0].stage, Some(1));
+    assert_eq!(
+        cells[1],
+        before.timeline.overlay_tracks[0]
+            .frame_cells
+            .as_ref()
+            .unwrap()[1]
+    );
+    project.apply_command(&inverse).unwrap();
+    assert_eq!(project.timeline, before.timeline);
+    assert_eq!(project.assets, before.assets);
+    assert_eq!(project.schema_version, 7, "format upgrades stay sticky");
+}
+
+#[test]
+fn a_small_final_crop_does_not_hide_an_oversized_cinemagraph_working_set() {
+    let mut project = fixture();
+    project.schema_version = 7;
+    let size = PhysicalSize::new(4096, 2160).unwrap();
+    let source = project.assets.values_mut().next().unwrap();
+    source.kind = AssetKind::Frame {
+        size,
+        encoding: RasterEncoding::Rgba8,
+    };
+    source.byte_len = size.area().unwrap() * 4;
+    let id = AssetId::from_digest([3; 32]);
+    project.assets.insert(
+        id,
+        AssetDescriptor {
+            id,
+            byte_len: 17 + size.area().unwrap() * 4,
+            kind: AssetKind::PremultipliedSnapshot {
+                size,
+                format_version: 1,
+            },
+        },
+    );
+    let rect = PhysicalRect::new(0, 0, 8, 4).unwrap();
+    for frame in &mut project.timeline.frames {
+        frame.render_steps = vec![
+            FrameRenderStep::composite(1),
+            FrameRenderStep::CinemagraphOverlay {
+                snapshot_asset: id,
+                snapshot_size: size,
+            },
+            FrameRenderStep::Crop { rect },
+        ];
+    }
+    project.validate().unwrap();
+    let before = project.clone();
+    let error = edit_composed_frames(
+        &project,
+        [FrameId::from_u128(1)],
+        &ComposedFrameEdit::FlipHorizontal,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("working-memory"));
+    assert_eq!(project, before);
+}
+
 fn owned(project: &mut ProjectManifest, track_id: u128, visible: bool, opacity: u8) {
     project.timeline.overlay_tracks.push(OverlayTrack {
         id: TrackId::from_u128(track_id),

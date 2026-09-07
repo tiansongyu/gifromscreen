@@ -364,6 +364,18 @@ fn same_asset_storage(left: &AssetDescriptor, right: &AssetDescriptor) -> bool {
 fn validate_inserted_asset_descriptor(
     descriptor: &AssetDescriptor,
 ) -> Result<(), ProjectInsertionError> {
+    if matches!(
+        descriptor.kind,
+        gif_from_screen_domain::AssetKind::PremultipliedSnapshot { .. }
+    ) {
+        return gif_from_screen_domain::validate_premultiplied_snapshot_descriptor(descriptor)
+            .map_err(
+                |message| ProjectInsertionError::InvalidPremultipliedSnapshot {
+                    asset_id: descriptor.id,
+                    message,
+                },
+            );
+    }
     if let Some((size, RasterEncoding::Rgba8)) = descriptor.kind.raster_descriptor() {
         let expected = u64::from(size.width.get())
             .checked_mul(u64::from(size.height.get()))
@@ -631,6 +643,15 @@ fn read_asset(
     if AssetStore::id_for_bytes(&bytes) != descriptor.id {
         return Err(ProjectInsertionError::CorruptAsset(descriptor.id));
     }
+    if let gif_from_screen_domain::AssetKind::PremultipliedSnapshot { size, .. } = descriptor.kind {
+        gif_from_screen_render::PremultipliedRgbaSurface::validate_encoded(&bytes, size, expected)
+            .map_err(
+                |error| ProjectInsertionError::InvalidPremultipliedSnapshot {
+                    asset_id: descriptor.id,
+                    message: error.to_string(),
+                },
+            )?;
+    }
     Ok(bytes)
 }
 
@@ -740,6 +761,8 @@ pub(crate) enum ProjectInsertionError {
     InvalidAssetLength(AssetId),
     #[error("asset {0} has a damaged content digest")]
     CorruptAsset(AssetId),
+    #[error("premultiplied snapshot {asset_id} is invalid: {message}")]
+    InvalidPremultipliedSnapshot { asset_id: AssetId, message: String },
     #[error("asset {0} collides with incompatible destination raster metadata")]
     AssetCollision(AssetId),
     #[error("insertion anchor frame {0} no longer exists")]
@@ -759,6 +782,10 @@ mod input_replay_tests;
 #[cfg(test)]
 #[path = "editor_insert_geometry_tests.rs"]
 mod geometry_tests;
+
+#[cfg(test)]
+#[path = "editor_insert_premultiplied_tests.rs"]
+mod premultiplied_tests;
 
 #[cfg(test)]
 mod tests {
