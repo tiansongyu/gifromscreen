@@ -13,6 +13,13 @@ use gif_from_screen_capture::{
 };
 use std::env;
 
+mod shortcuts;
+pub use shortcuts::{
+    GlobalShortcutService, RegisteredShortcut, ShortcutAction, ShortcutActionHandler,
+    ShortcutBinding, ShortcutKey, ShortcutStatus, ShortcutTrigger, ShortcutUpdate,
+    default_shortcut_bindings, validate_bindings,
+};
+
 #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
 mod wayland;
 #[cfg(all(target_os = "linux", feature = "native-wayland"))]

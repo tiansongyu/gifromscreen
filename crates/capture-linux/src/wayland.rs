@@ -24,6 +24,7 @@ use tokio::runtime::{Builder, Runtime};
 
 #[path = "wayland_cancel.rs"]
 mod cancel;
+#[cfg(feature = "native-wayland")]
 pub(crate) use cancel::cancelled_error;
 use cancel::{RequestObjects, cancellable};
 

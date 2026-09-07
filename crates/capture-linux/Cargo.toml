@@ -10,7 +10,7 @@ description = "Linux Wayland/X11 capture adapter for GifFromScreen"
 default = []
 # Native dependencies are deliberately opt-in so the portable workspace and
 # headless CI do not require PipeWire development packages or an X server.
-wayland-portal = ["dep:ashpd", "dep:tokio", "dep:serde"]
+wayland-portal = ["dep:ashpd", "dep:tokio", "dep:serde", "dep:futures-util"]
 native-wayland = [
     "wayland-portal",
     "dep:libspa",
@@ -18,13 +18,14 @@ native-wayland = [
     "dep:pipewire",
     "dep:pipewire-sys",
 ]
-native-x11 = ["dep:x11rb", "dep:xkeysym", "dep:rustix"]
+native-x11 = ["dep:x11rb", "dep:x11rb-protocol", "dep:xkeysym", "dep:rustix"]
 
 [dependencies]
 gif-from-screen-capture = { path = "../capture" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-ashpd = { version = "0.13", optional = true, features = ["screencast"] }
+ashpd = { version = "0.13", optional = true, features = ["screencast", "global_shortcuts"] }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["std"] }
 # pipewire-rs 0.6 declares these native crates with broad `version = "0"`
 # requirements. Exact direct pins keep a fresh lockfile compatible with the
 # PipeWire 0.3.48 ABI instead of silently mixing newer binding generations.
@@ -34,9 +35,10 @@ pipewire = { version = "=0.6.0", optional = true }
 pipewire-sys = { version = "=0.6.0", optional = true }
 tokio = { version = "1", optional = true, features = ["rt", "time", "macros"] }
 serde = { workspace = true, optional = true }
-x11rb = { version = "0.14", optional = true, features = ["randr", "xfixes", "xinput", "xtest"] }
+x11rb = { version = "0.14", optional = true, features = ["randr", "xfixes", "xinput", "xtest", "xkb"] }
+x11rb-protocol = { version = "0.14", optional = true }
 xkeysym = { version = "0.2", optional = true }
-rustix = { version = "1", optional = true, features = ["net"] }
+rustix = { version = "1", optional = true, features = ["net", "event", "fs"] }
 
 [lints]
 workspace = true

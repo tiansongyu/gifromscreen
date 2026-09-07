@@ -860,6 +860,7 @@ fn recording_job() -> (
     let (controller, control) = RecordingController::channel();
     (
         RecordingJob {
+            shortcut_state: crate::recorder_shortcuts::LiveShortcutState::default(),
             receiver,
             controller,
             cancellation: CancellationFlag::default(),

@@ -12,6 +12,10 @@ use std::time::{Duration, Instant};
 #[path = "x11_input.rs"]
 mod input;
 
+#[cfg(all(test, target_os = "linux", feature = "native-x11"))]
+#[path = "x11_cursor_edge_tests.rs"]
+mod cursor_edge_tests;
+
 #[cfg(all(target_os = "linux", feature = "native-x11"))]
 mod native {
     use std::collections::{HashSet, VecDeque};
@@ -1262,9 +1266,7 @@ mod native {
             passive_keyboard: CapabilityStatus::Unavailable(
                 "XInput keyboard metadata is not implemented yet".to_owned(),
             ),
-            global_shortcuts: CapabilityStatus::Unavailable(
-                "X11 global shortcut registration is not implemented yet".to_owned(),
-            ),
+            global_shortcuts: CapabilityStatus::Available,
             camera: CapabilityStatus::Unavailable(
                 "camera capture is provided by the separate camera backend".to_owned(),
             ),
@@ -1585,10 +1587,12 @@ impl X11CursorSnapshot {
                 premultiplied_argb.len()
             )));
         }
+        // Core/Render cursor creation accepts the outer edge (x == width or
+        // y == height). This is a geometric offset, not an image array index.
         if hotspot.x < 0
             || hotspot.y < 0
-            || u32::try_from(hotspot.x).is_ok_and(|x| x >= width)
-            || u32::try_from(hotspot.y).is_ok_and(|y| y >= height)
+            || u32::try_from(hotspot.x).is_ok_and(|x| x > width)
+            || u32::try_from(hotspot.y).is_ok_and(|y| y > height)
         {
             return Err(CaptureError::invalid_frame(
                 "XFixes returned a cursor hotspot outside its image",
@@ -2272,16 +2276,72 @@ mod tests {
         .unwrap_err();
         assert_eq!(malformed_image.kind(), CaptureErrorKind::InvalidFrame);
 
-        let malformed_hotspot = X11CursorSnapshot::new(
+        for hotspot in [
+            PhysicalPosition { x: -1, y: 0 },
+            PhysicalPosition { x: 0, y: -1 },
+            PhysicalPosition { x: 3, y: 0 },
+            PhysicalPosition { x: 0, y: 3 },
+        ] {
+            let malformed_hotspot =
+                X11CursorSnapshot::new(PhysicalPosition::default(), 2, 2, hotspot, 1, vec![0; 4])
+                    .unwrap_err();
+            assert_eq!(malformed_hotspot.kind(), CaptureErrorKind::InvalidFrame);
+        }
+    }
+
+    #[test]
+    fn cursor_hotspot_accepts_server_edge_without_clamping_metadata() {
+        let region = PhysicalRect::new(8, 8, 4, 4).unwrap();
+        for hotspot in [
+            PhysicalPosition { x: 2, y: 0 },
+            PhysicalPosition { x: 0, y: 2 },
+            PhysicalPosition { x: 2, y: 2 },
+        ] {
+            let cursor = X11CursorSnapshot::new(
+                PhysicalPosition { x: 10, y: 10 },
+                2,
+                2,
+                hotspot,
+                1,
+                vec![u32::MAX; 4],
+            )
+            .unwrap();
+            let metadata = cursor.metadata(region).unwrap();
+            assert_eq!(metadata.hotspot, hotspot);
+            assert_eq!(metadata.position, PhysicalPosition { x: 2, y: 2 });
+            assert!(metadata.visible);
+        }
+    }
+
+    #[test]
+    fn edge_hotspots_do_not_bypass_cursor_shape_limits() {
+        for (width, height, message) in [
+            (0, 1, "empty"),
+            (1, 0, "empty"),
+            (513, 1, "512"),
+            (1, 513, "512"),
+        ] {
+            let error = X11CursorSnapshot::new(
+                PhysicalPosition::default(),
+                width,
+                height,
+                PhysicalPosition::default(),
+                1,
+                Vec::new(),
+            )
+            .unwrap_err();
+            assert!(error.message().contains(message));
+        }
+        let error = X11CursorSnapshot::new(
             PhysicalPosition::default(),
             2,
             2,
-            PhysicalPosition { x: 2, y: 0 },
+            PhysicalPosition { x: 2, y: 2 },
             1,
-            vec![0; 4],
+            vec![0; 3],
         )
         .unwrap_err();
-        assert_eq!(malformed_hotspot.kind(), CaptureErrorKind::InvalidFrame);
+        assert!(error.message().contains("4 were expected"));
     }
 
     #[test]

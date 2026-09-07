@@ -1230,6 +1230,7 @@ name = "gif-from-screen-capture-linux"
 version = "0.1.0"
 dependencies = [
  "ashpd",
+ "futures-util",
  "gif-from-screen-capture",
  "libspa",
  "libspa-sys",
@@ -1240,6 +1241,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "x11rb 0.14.0",
+ "x11rb-protocol 0.14.0",
  "xkeysym",
 ]
 

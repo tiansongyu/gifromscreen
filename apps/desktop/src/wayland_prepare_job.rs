@@ -371,6 +371,7 @@ impl WaylandPrepareJob {
         self.result = None;
         self.startup_cancellation = None;
         Ok(RecordingJob {
+            shortcut_state: crate::recorder_shortcuts::LiveShortcutState::default(),
             receiver,
             cancellation,
             controller,
