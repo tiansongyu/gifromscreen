@@ -90,7 +90,7 @@ and local/global-palette GIF export with frozen transition endpoints.
 
 This resolves the prior **hidden intermediate-stage rejection for rectangular
 Cinemagraph**. It does not implement freeform masks, certify every upstream
-compositing nuance, or close native/physical desktop release gates. A native
-visible freeze/reveal/reopen sequence is a separate acceptance task, not implied
-by the automated tests. Existing WPF reference fixtures remain a separate,
+compositing nuance, or close physical desktop release gates. The bounded
+[native freeze/reveal/Undo/reopen/GIF sequence](NATIVE-FREEZE-QA-2026-09-07.md)
+now passes with a byte-identical export after reopening. WPF fixtures remain a separate,
 strict numerical regression gate for borders, shadows and paint precision.

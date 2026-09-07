@@ -40,7 +40,7 @@ A Windows-hosted GitHub Actions fixture job now runs the STA `UseWPF` generator 
 
 Cinemagraph now preserves hidden/zero-opacity intermediate-stage artwork through a schema-6 ordered `FreezeRegion`, instead of rejecting it or flattening away its context. The original source and prior paint stages remain intact, while one immutable baseline supplies frozen RGBA pixels. Earlier recorded groups remain re-editable; output-stage recorded-input replay stays blocked. See [the representation, resource ownership and automated coverage](NONDESTRUCTIVE-CINEMAGRAPH.md).
 
-Next: native visible freeze/reveal/Undo/reopen/GIF acceptance, broader replay and numeric corpora, freeform-mask parity where required by the reference audit, and the remaining feature-matrix/platform gates. Retaining raw metadata is still not proof that a newly authored cursor matches mixed output pixels.
+The [native freeze/reveal/Undo/reopen/GIF acceptance](NATIVE-FREEZE-QA-2026-09-07.md) now passes. Layers provides undoable Hide/Show controls and the reopened GIF is byte-identical. Next: broader replay and numeric corpora, freeform-mask parity where required by the reference audit, and the remaining feature-matrix/platform gates. Retaining raw metadata is still not proof that a newly authored cursor matches mixed output pixels.
 
 ## Monitor controller and remaining platform acceptance
 

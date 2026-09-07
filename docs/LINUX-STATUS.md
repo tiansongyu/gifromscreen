@@ -93,7 +93,8 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [x] Add schema-4 expanded-canvas software-reference shadows and signed inner/outer borders, with shared placement, stage-aware authors, settings v2, whole-program resource preflight and [native effect/reopen/GIF acceptance](IMAGE-EFFECTS-QA-2026-09-07.md).
 - [x] Add schema-5 explicit paint precision without changing legacy stages; pass the first independent Windows WPF/WIC corpus in strict local replay (5 inputs and 8 operation stages), with [exact scope and evidence](WPF-PAINT-PRECISION.md).
 - [x] Preserve hidden intermediate-stage artwork in rectangular Cinemagraph with a schema-6 immutable freeze reference, stage-aware replay guards and [automated resource/recovery/export checks](NONDESTRUCTIVE-CINEMAGRAPH.md).
-- [ ] Complete native freeze/reveal/reopen acceptance and broader numerical WPF/WIC coverage. Neither bounded corpus is full upstream pixel certification.
+- [x] Expose undoable Hide/Show controls and pass [native freeze/reveal/Undo/reopen/GIF acceptance](NATIVE-FREEZE-QA-2026-09-07.md), with one shared reference and a byte-identical export after reopening.
+- [ ] Complete broader numerical WPF/WIC coverage and remaining physical desktop gates. Neither bounded corpus is full upstream pixel certification.
 - [x] Save an independently identified project copy without switching the current editor, and retain a bounded recent-project list.
 - [x] Build and verify an Ubuntu-22-compatible x86_64 portable tarball with exact-file installation, checksums, license notices, and CI artifacts.
 
