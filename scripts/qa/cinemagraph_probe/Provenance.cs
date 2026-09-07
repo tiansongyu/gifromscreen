@@ -12,8 +12,14 @@ internal static class Provenance
     internal static object SourceFiles(string requested)
     {
         var root = Path.GetFullPath(requested);
-        string[] names = { "Program.cs", "Fixtures.cs", "ProbeRenderer.cs", "CoverageAnalysis.cs",
-            "ArtifactWriter.cs", "Provenance.cs", "CinemagraphProbe.csproj", "global.json", "run-probe.ps1", "README.md" };
+        string[] allowedSources = { "Program.cs", "Fixtures.cs", "ProbeRenderer.cs", "CoverageAnalysis.cs",
+            "ArtifactWriter.cs", "Provenance.cs", "InkGeometryProbe.cs" };
+        var sources = Directory.EnumerateFiles(root, "*.cs", SearchOption.TopDirectoryOnly)
+            .Select(path => Path.GetFileName(path) ?? throw new InvalidDataException("Unnamed probe source."))
+            .OrderBy(name => name, StringComparer.Ordinal).ToArray();
+        if (sources.Length > 16 || !new HashSet<string>(sources, StringComparer.Ordinal).SetEquals(allowedSources))
+            throw new InvalidDataException("The top-level probe C# source list differs from its explicit allowlist.");
+        var names = sources.Concat(new[] { "CinemagraphProbe.csproj", "global.json", "run-probe.ps1", "README.md" });
         return names.Select(name => new {
             path = $"scripts/qa/cinemagraph_probe/{name}", sha256 = FileHash(Path.Combine(root, name), 256 * 1024)
         }).ToArray();

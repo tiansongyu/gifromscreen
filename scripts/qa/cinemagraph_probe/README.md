@@ -66,6 +66,36 @@ The design decision under investigation is an immutable **typed premultiplied cl
 not persistence of an arbitrary A8 mask. Even matching tiny cases do not prove a universal
 mask representation for all WPF geometry and image transformations.
 
+## Independent ink geometry diagnostic
+
+`ink-geometry.json` is a separate, version-1 diagnostic referenced by
+`index.json.additional_diagnostics`. It does not change the original 90 cases, their
+definition hash, or their primary Cinemagraph pixel path. It records actual WPF:
+
+- Raw attributes/samples, `GetBezierStylusPoints`, effective samples and
+  `Stroke.GetGeometry` path/bounds for curves, cusps, loops, duplicate nodes and
+  varying pressure, with both tips and FitToCurve on/off; a three-point case is separate.
+- Explicit pressure 0/0.5/1 and IgnorePressure combinations, plus the constructor's
+  implicit default pressure. The pen is 4.25 by 3.25 physical units.
+- Before/after `Stroke.Transform(matrix, false)` samples, attributes and bounds for
+  translation and nonuniform affine scaling. This is the method used by InkCanvas
+  selection, not a simulated pointer/selection-adorner test.
+- Actual swept eraser `HitTest` and `GetEraseResult` fragments for crossing and missed
+  strokes. These outputs do not establish that a separate polygon eraser is equivalent.
+
+`GetBezierStylusPoints` computes a fitted path even when FitToCurve is false;
+`effective_samples` explicitly chooses the samples used by the stroke outline.
+Geometry output is bounded to 64 raw samples, 4096 fitted samples per observation,
+65536 path characters, finite coordinates within +/-64, 128 observations and 65536
+total samples/controls. Its JSON is capped at 2 MiB inside the existing aggregate
+16 MiB and 115/120-second limits. No new pixels or reference tolerances are introduced.
+
+Source hashes now enumerate all top-level `.cs` files and verify an explicit bounded
+allowlist. Adding this diagnostic changes the generator/source and README hashes, so
+a new workflow run must regenerate evidence; old artifacts must not be edited to match.
+The project compiles only top-level `*.cs` files, matching that inventory; nested
+files cannot silently participate through the SDK's default recursive glob.
+
 ## Run and limits
 
 Use the independent **Manual Cinemagraph WPF probe** workflow (`workflow_dispatch` only),

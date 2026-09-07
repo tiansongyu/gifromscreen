@@ -33,9 +33,11 @@ internal static class Program
                 Limits.Check(fixture.Id);
                 results.Add(Run(fixture, writer));
             }
+            var inkGeometry = InkGeometryProbe.Write(writer);
             writer.Write("index.json", "json", JsonSerializer.SerializeToUtf8Bytes(new {
                 format_version = 1, fixture_count = fixtures.Count, definition_sha256 = ArtifactWriter.Hash(JsonSerializer.SerializeToUtf8Bytes(fixtures, Json)),
                 provenance = Provenance.Capture(), source_files = sourceFiles, cases = results,
+                additional_diagnostics = new[] { inkGeometry },
                 interpretation = "Differences are measured findings, not test failures. Neither an A8 nor coverage64 hypothesis is assumed to represent real Image.Clip exactly. Only direct clip RTB -> Overlay -> final PNG is the primary upstream path.",
             }, Json));
             Console.WriteLine($"PROBE_COMPLETE cases={results.Count} artifact_bytes={writer.TotalBytes}");
