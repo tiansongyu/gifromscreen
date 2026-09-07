@@ -6,6 +6,7 @@
 use std::{
     fmt::Display,
     ops::Range,
+    path::{Path, PathBuf},
     str::FromStr,
     time::{Duration, Instant},
 };
@@ -32,8 +33,42 @@ const FILMSTRIP_ITEM_WIDTH: f64 = 112.0;
 const FILMSTRIP_ITEM_GAP: f64 = 8.0;
 const FILMSTRIP_ITEM_HEIGHT: f32 = 78.0;
 const FILMSTRIP_OVERSCAN: usize = 3;
-const MAX_VISIBLE_OVERLAY_TRACKS: usize = 64;
+const OVERLAY_TRACK_PAGE_SIZE: usize = 64;
 pub(crate) const MAX_DRAWING_DRAFT_POINTS: usize = 4_096;
+
+#[derive(Debug, Default)]
+struct OverlayTrackPagination {
+    project: Option<(ProjectId, PathBuf)>,
+    page: usize,
+}
+
+impl OverlayTrackPagination {
+    fn synchronize(&mut self, project_id: ProjectId, root: &Path, total: usize) {
+        if self
+            .project
+            .as_ref()
+            .is_none_or(|(id, path)| *id != project_id || path != root)
+        {
+            self.project = Some((project_id, root.to_owned()));
+            self.page = 0;
+        }
+        self.clamp(total);
+    }
+
+    fn clamp(&mut self, total: usize) {
+        self.page = self
+            .page
+            .min(total.saturating_sub(1) / OVERLAY_TRACK_PAGE_SIZE);
+    }
+
+    fn range(&self, total: usize) -> Range<usize> {
+        let page = self
+            .page
+            .min(total.saturating_sub(1) / OVERLAY_TRACK_PAGE_SIZE);
+        let start = page * OVERLAY_TRACK_PAGE_SIZE;
+        start..start.saturating_add(OVERLAY_TRACK_PAGE_SIZE).min(total)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum EditorToolTab {
@@ -310,6 +345,7 @@ pub(crate) struct EditorUiState {
     pub(crate) effect_color_alpha_input: String,
     pub(crate) image_border: gif_from_screen_domain::ImageBorderStyle,
     pub(crate) image_shadow: gif_from_screen_domain::ImageShadowStyle,
+    overlay_track_pagination: OverlayTrackPagination,
     /// Comma/range expression used to replace the current frame selection.
     pub(crate) frame_expression: String,
     /// Outgoing transition family for the current frame.
@@ -388,6 +424,7 @@ impl Default for EditorUiState {
             effect_color_alpha_input: "255".into(),
             image_border: gif_from_screen_domain::ImageBorderStyle::default(),
             image_shadow: gif_from_screen_domain::ImageShadowStyle::default(),
+            overlay_track_pagination: OverlayTrackPagination::default(),
             frame_expression: "1".into(),
             transition_choice: TransitionChoice::FadeToNext,
             transition_duration_us_input: "100000".into(),
@@ -2513,13 +2550,19 @@ fn show_overlay_track_list(
     now: Instant,
     results: &mut Vec<EditorUiResult>,
 ) {
+    let Some(range) =
+        show_overlay_track_pagination(ui, workspace, &mut state.overlay_track_pagination)
+    else {
+        return;
+    };
     let tracks = workspace
         .manifest()
         .timeline
         .overlay_tracks
         .iter()
-        .take(MAX_VISIBLE_OVERLAY_TRACKS)
         .enumerate()
+        .skip(range.start)
+        .take(range.len())
         .map(|(index, track)| {
             (
                 index + 1,
@@ -2536,53 +2579,47 @@ fn show_overlay_track_list(
             )
         })
         .collect::<Vec<_>>();
-    if tracks.is_empty() {
-        return;
-    }
-    ui.separator();
-    ui.small("Earlier artwork follows later image operations. Layer order applies within each editing stage; newly added artwork is drawn after existing operations.");
-    ui.label(format!(
-        "Overlay tracks: {}{}",
-        workspace.manifest().timeline.overlay_tracks.len(),
-        if workspace.manifest().timeline.overlay_tracks.len() > MAX_VISIBLE_OVERLAY_TRACKS {
-            " (showing first 64)"
-        } else {
-            ""
-        }
-    ));
     let mut remove = None;
     let mut visibility = None;
-    for (layer_number, track_id, name, kind, item_count, frame_owned, known_coverage, visible) in
-        tracks
-    {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(format!(
-                "Layer {layer_number} · {name} · {} · {item_count} item(s) · {}",
-                kind.unwrap_or("Empty"),
-                if frame_owned { "Frame-owned" } else { "Time-anchored" },
-            ));
+    let rows = egui::ScrollArea::vertical()
+        .id_salt((
+            "overlay-track-rows",
+            &state.overlay_track_pagination.project,
+            state.overlay_track_pagination.page,
+        ))
+        .max_height(ui.available_height().clamp(0.0, 360.0))
+        .auto_shrink([false, true]);
+    rows.show(ui, |ui| {
+        for (layer_number, track_id, name, kind, item_count, frame_owned, known_coverage, visible) in tracks {
             ui.push_id(track_id, |ui| {
-                if ui.small_button(if visible { "Hide" } else { "Show" })
-                    .on_hover_text("Toggle this layer in previews and GIF export, keeping its artwork, assets and paint stage. Previously frozen reference pixels are unchanged; earlier artwork changes only the live region. Undo restores visibility.")
-                    .clicked() {
-                    visibility = Some((track_id, !visible));
-                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!(
+                        "Layer {layer_number} · {name} · {} · {item_count} item(s) · {}",
+                        kind.unwrap_or("Empty"),
+                        if frame_owned { "Frame-owned" } else { "Time-anchored" },
+                    ));
+                    if ui.small_button(if visible { "Hide" } else { "Show" })
+                        .on_hover_text("Toggle this layer in previews and GIF export, keeping its artwork, assets and paint stage. Previously frozen reference pixels are unchanged; earlier artwork changes only the live region. Undo restores visibility.")
+                        .clicked() {
+                        visibility = Some((track_id, !visible));
+                    }
+                    if !frame_owned && ui.add_enabled(known_coverage, egui::Button::new("Attach to frames").small())
+                        .on_hover_text(if known_coverage {
+                            "Preserve this entire layer's current frame appearances, including hidden content. Future frame moves and copies carry its marks. Original input history is not inferred; some older input groups cannot be regenerated. Undo restores the timed layer, but the project format stays upgraded."
+                        } else {
+                            "This older annotation group did not save its original authoring coverage. Keep its timed behavior or recreate it from an explicit frame selection; visible marks alone cannot prove that coverage."
+                        }).clicked()
+                    {
+                        state.pause_preview();
+                        results.push(Ok(EditorUiAction::ConvertOverlayTrack(track_id)));
+                    }
+                    if ui.small_button("Remove track").clicked() {
+                        remove = Some(track_id);
+                    }
+                });
             });
-            if !frame_owned && ui.add_enabled(known_coverage, egui::Button::new("Attach to frames").small())
-                .on_hover_text(if known_coverage {
-                    "Preserve this entire layer's current frame appearances, including hidden content. Future frame moves and copies carry its marks. Original input history is not inferred; some older input groups cannot be regenerated. Undo restores the timed layer, but the project format stays upgraded."
-                } else {
-                    "This older annotation group did not save its original authoring coverage. Keep its timed behavior or recreate it from an explicit frame selection; visible marks alone cannot prove that coverage."
-                }).clicked()
-            {
-                state.pause_preview();
-                results.push(Ok(EditorUiAction::ConvertOverlayTrack(track_id)));
-            }
-            if ui.small_button("Remove track").clicked() {
-                remove = Some(track_id);
-            }
-        });
-    }
+        }
+    });
     if let Some(track_id) = remove {
         let result = workspace.remove_overlay_track(track_id);
         record_project_result(
@@ -2604,6 +2641,53 @@ fn show_overlay_track_list(
             result,
         );
     }
+    state
+        .overlay_track_pagination
+        .clamp(workspace.manifest().timeline.overlay_tracks.len());
+}
+
+fn show_overlay_track_pagination(
+    ui: &mut egui::Ui,
+    workspace: &EditorWorkspace,
+    pagination: &mut OverlayTrackPagination,
+) -> Option<Range<usize>> {
+    let total = workspace.manifest().timeline.overlay_tracks.len();
+    pagination.synchronize(
+        workspace.manifest().project_id,
+        workspace.project_root(),
+        total,
+    );
+    if total == 0 {
+        return None;
+    }
+    let pages = total.div_ceil(OVERLAY_TRACK_PAGE_SIZE);
+    ui.separator();
+    // Navigation precedes the potentially long list and wraps at large font sizes.
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(pagination.page > 0, egui::Button::new("Previous page"))
+            .clicked()
+        {
+            pagination.page -= 1;
+        }
+        if ui
+            .add_enabled(pagination.page + 1 < pages, egui::Button::new("Next page"))
+            .clicked()
+        {
+            pagination.page += 1;
+        }
+    });
+    let range = pagination.range(total);
+    ui.label(format!(
+        "Layers {}–{} of {total} · Page {} / {pages}",
+        range.start + 1,
+        range.end,
+        pagination.page + 1
+    ));
+    ui.small("Layer order applies within each editing stage.").on_hover_text(
+        "Earlier artwork follows later image operations. Newly added artwork is drawn after existing operations.",
+    );
+    Some(range)
 }
 
 fn build_shape_overlay(
