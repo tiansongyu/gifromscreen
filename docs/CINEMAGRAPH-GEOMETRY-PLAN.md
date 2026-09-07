@@ -17,6 +17,12 @@ integration](CINEMAGRAPH-AUTHORING.md) now passes automated checks and the
 [bounded native authoring sequence](NATIVE-CINEMAGRAPH-QA-2026-09-07.md).
 Independent fitting/erasing comparison and exact geometry fidelity remain open.
 
+The [independent ink evidence](INK-REFERENCE-EVIDENCE.md) now distinguishes
+114 exact sample-sequence comparisons and 18 exact dot cases from the measured
+two-point line differences. Feeding native post-Boolean paths into the Rust
+scan converter eliminates those differences for all 36 ink cases; original-input
+outline/Boolean production is therefore still an explicit unfinished boundary.
+
 ## Verified source rules, not yet a complete Rust ink implementation
 
 The upstream application is pinned to `a4d0a67`; WPF algorithm sources below

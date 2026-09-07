@@ -59,7 +59,7 @@ Initial native QA caught a justified-column layout error: egui's image response
 was wider than its painted pixels. The editor now allocates and paints the exact
 image rectangle and uses that same rectangle for ink hit testing and coordinate
 mapping (including ordinary drawing). A real-egui column regression passes on
-both supported test toolchains. Native acceptance continues with the fixed binary.
+both supported test toolchains. Subsequent native acceptance used the fixed binary.
 
 The [subsequent bounded native sequence](NATIVE-CINEMAGRAPH-QA-2026-09-07.md)
 passed pen, both erasers, selection transforms, Escape, fitting, gapped-target
@@ -71,6 +71,6 @@ The elliptical eraser currently uses a bounded 64-sided polygon approximation.
 The UI discloses this. Full WPF stroke-node pruning, exact erasure cuts, Boolean
 geometry and degenerate Image.Clip/VisualBrush behavior remain unverified.
 Selection transforms and pressure rules have component coverage, not universal
-upstream equivalence. Native desktop interaction and independent WPF geometry
-diagnostics are the next acceptance steps; see [the geometry plan](CINEMAGRAPH-GEOMETRY-PLAN.md)
+upstream equivalence. Broader native input-device coverage and independent WPF
+outline/erasure comparison remain open; see [the geometry plan](CINEMAGRAPH-GEOMETRY-PLAN.md)
 and [typed snapshot evidence](PREMULTIPLIED-SNAPSHOTS.md).

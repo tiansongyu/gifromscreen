@@ -50,7 +50,57 @@ the actual Cinemagraph path separately; do not reinterpret its prior acceptance
 as upstream parity. The independent clip/PNG-boundary probe now supports the
 [schema-7 typed PM snapshot choice](PREMULTIPLIED-SNAPSHOTS.md): 90 native
 snapshots match the storage/composition pipeline exactly. Freehand geometry
-generation and all ink authoring tools remain the next implementation task.
+generation and authoring are now connected: pen, partial/whole-stroke erasers,
+selection transforms, per-stroke fitting, cancellable atomic Apply and gapped
+targets pass [bounded native Undo/reopen/GIF acceptance](NATIVE-CINEMAGRAPH-QA-2026-09-07.md).
+Exact WPF outline/erasure/Boolean fidelity is still open; do not describe the
+whole authoring tool as absent or the numerical work as complete.
+
+## Next functional priorities: recorder control and precise positioning
+
+After the connected Cinemagraph workflow, prioritize these user-facing gaps in
+parallel with the bounded independent numerical checks. The existing movable
+recording frame, pause-excluded clock and fixed playback policy are implemented;
+these tasks extend them rather than replace their state machines.
+
+1. **Global recording shortcuts.** Add a small opt-in Linux shortcut service and
+   desktop action adapter. Route activation through existing recorder actions,
+   acknowledged pause/resume and manual-snapshot receipts. Do not create a second
+   recording controller or register arbitrary global input listeners. Recording
+   must remain stoppable with another application focused and the controller
+   outside the crop. Keep buttons/timed stop if registration fails.
+2. **Precise region positioning.** Add 1/10 physical-pixel keyboard movement and
+   pre-record window snapping through `RegionRetargetPlan`. Show the backend's
+   accepted rectangle, coalesce movement while one request is in flight, and
+   retain fixed canvas size during recording. Optional X11 cursor-follow comes
+   after those controls; Wayland source-local movement is not global tracking.
+3. **X11 interaction sampling.** Connect bounded XI2 triggers to capture cadence
+   without requiring sensitive key metadata persistence. Keep burst limits,
+   pause exclusion, input-listener teardown and fixed GIF-delay semantics.
+4. **Recover and continue from a lost source.** Preserve the existing project,
+   request a new authorized source explicitly, keep the canvas or request a
+   compatible crop, and use a new capture clock. Cancelled permission must not
+   discard existing frames or include downtime in the GIF.
+5. **Editor viewport and direct crop.** Add Fit/100%/200% and a separate bounded
+   crop draft using the actual painted-image rectangle. Synchronize numeric and
+   drag controls and commit through existing ordered complete-image commands.
+   New interpolation choices must not reinterpret older nearest-neighbor saves.
+
+Shortcut implementation constraints: on X11, use exact passive key grabs with
+checked conflicts and rollback/unregistration, not `AnyKey`/`AnyModifier` or a
+whole-keyboard grab. Lock modifiers, layout changes and autorepeat need tests.
+[X.Org key-grab contract](https://xorg.freedesktop.org/archive/X11R6.7.0/doc/XGrabKey.3.html).
+On Wayland, use a separately owned GlobalShortcuts Portal session, register once
+per session, filter events by session/action, and display the returned bindings
+(a requested trigger is not proof of the chosen binding). Detect version/support;
+configuration UI requires version 2. Retain explicit cancellation/close and a
+usable no-permission fallback.
+[GlobalShortcuts Portal contract](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.GlobalShortcuts.html).
+
+Validate these in isolated X11/private-bus tests and native bounded recording,
+including other-app focus, repeat, conflicts, denied/cancelled permission, stale
+events after restarting capture and teardown. Physical desktop gates stay open
+until separately exercised; their absence does not block this implementation work.
 
 ## Monitor controller and remaining platform acceptance
 

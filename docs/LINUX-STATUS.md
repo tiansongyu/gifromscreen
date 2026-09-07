@@ -67,7 +67,7 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [x] Return to an already-open editor from the launcher; pause preview when leaving the editor.
 - [x] Record a drawing board using pen/highlighter/eraser, automatic or completed-stroke sampling, pause/resume, stop/save, and explicit discard.
 - [x] Enumerate Linux V4L2 cameras and provide opt-in preview, recording, pause/resume, stop/save, and discard (simulated-source acceptance; physical cameras still need verification).
-- [x] Bake rectangular Cinemagraph motion regions and optional loop crossfades in an exclusive background edit with exact undo/redo.
+- [x] Implement Rectangular freeze motion regions and optional loop crossfades in an exclusive background edit with exact undo/redo.
 - [x] Match upstream Smooth Loop's exact-pixel similarity, skip threshold and search direction; trim after the first qualifying candidate, preserving no-op history.
 - [x] Capture opt-in X11 physical key/button events and editable cursor images; preserve the active capture clock, moving origin and metadata in incremental and batch projects.
 - [x] Show paused only after the capture backend acknowledges pause; stop the input listener during pause and after recording.
@@ -92,7 +92,7 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [x] Apply crop/resize/rotation/flips/effects to the complete image in editing order with schema-3 stages, stage-aware re-authoring and shared preview/GIF execution; [native geometry and conversion acceptance](ORDERED-GEOMETRY-QA-2026-09-07.md).
 - [x] Add schema-4 expanded-canvas software-reference shadows and signed inner/outer borders, with shared placement, stage-aware authors, settings v2, whole-program resource preflight and [native effect/reopen/GIF acceptance](IMAGE-EFFECTS-QA-2026-09-07.md).
 - [x] Add schema-5 explicit paint precision without changing legacy stages; pass the first independent Windows WPF/WIC corpus in strict local replay (5 inputs and 8 operation stages), with [exact scope and evidence](WPF-PAINT-PRECISION.md).
-- [x] Preserve hidden intermediate-stage artwork in rectangular Cinemagraph with a schema-6 immutable freeze reference, stage-aware replay guards and [automated resource/recovery/export checks](NONDESTRUCTIVE-CINEMAGRAPH.md).
+- [x] Preserve hidden intermediate-stage artwork in Rectangular freeze with a schema-6 immutable reference, stage-aware replay guards and [automated resource/recovery/export checks](NONDESTRUCTIVE-CINEMAGRAPH.md).
 - [x] Expose undoable Hide/Show controls and pass [native freeze/reveal/Undo/reopen/GIF acceptance](NATIVE-FREEZE-QA-2026-09-07.md), with one shared reference and a byte-identical export after reopening.
 - [x] Make every layer reachable through bounded 64-layer pages, stable identities and scrollable rows, with deletion/Undo/project-switch and large-font UI regression checks.
 - [x] Add schema-7 typed premultiplied snapshot persistence and composition, with [90 independent Windows inputs × 3 exact Rust render routes](PREMULTIPLIED-SNAPSHOTS.md); this does not certify Linux ink geometry generation.
@@ -133,7 +133,7 @@ The [isolated nested GNOME plan](WAYLAND-NESTED-QA-PLAN.md) has been executed; s
 
 - [x] Window capture and capture-only-changes.
 - [x] Manual and periodic snapshots.
-- [ ] Independent fixed GIF playback delay for manual/periodic capture, matching upstream's timing controls (see [next fidelity work](NEXT-LINUX-ITERATION.md)).
+- [x] Independent fixed GIF playback delay for manual/periodic capture, with [bounded native manual/periodic acceptance](NATIVE-PLAYBACK-QA-2026-09-07.md); hardware timing and native fixed-FPS gates remain separate.
 - [x] Duplicate removal, frame reduction, Yoyo, and delay scaling.
 - [x] Text-caption authoring, shaping, durable raster assets, preview, export, and undo/redo.
 - [x] Existing-text editing and title-frame insertion.
@@ -159,9 +159,10 @@ Export presets and the six upstream automatic-task classes are implemented. Anno
 - [x] Video import (local whitelisted formats through system FFmpeg; bounded duration and disk usage).
 - [x] X11 cursor, physical keyboard, and mouse-button metadata with manual annotation fallbacks for unsupported backends.
 - [ ] Complete keyboard layout/repeat and Wayland cursor-metadata coverage, with real-desktop acceptance.
-- [x] Rectangular baked Cinemagraph, optional loop crossfade and upstream-style Smooth Loop search, with limits and undo/redo.
+- [x] Non-destructive Rectangular freeze, optional loop crossfade and upstream-style Smooth Loop search, with limits and undo/redo.
 - [x] Basic progress overlays and the six upstream automatic-task classes.
-- [ ] Freeform Cinemagraph masks and remaining progress/text parameter parity.
+- [x] First-frame freeform Cinemagraph authoring with bounded native recovery/export acceptance.
+- [ ] Exact Cinemagraph geometry/erasure fidelity and remaining progress/text parameter parity.
 
 ### M4 — Linux release
 
