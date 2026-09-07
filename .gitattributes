@@ -1,0 +1,5 @@
+# The cross-platform reference hashes the exact input and generator source.
+# A Windows checkout must not create CRLF-only differences from Linux.
+scripts/qa/wpf_reference/** text eol=lf
+scripts/qa/run_wpf_reference.ps1 text eol=lf
+.github/workflows/wpf-reference.yml text eol=lf
