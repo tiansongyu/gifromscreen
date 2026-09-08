@@ -59,18 +59,26 @@ An English raw diagnostic that happens to match a translated sentence remains ra
 ## Automated verification
 
 On 2026-09-09, explicit Rust 1.98.0 all-target/all-feature workspace verification
-passes 1,731 tests, with 51 environment/benchmark cases explicitly ignored.
-All 786 desktop tests and 41 localization tests also pass on Rust 1.88.0. Strict
+passes 1,737 tests, with 51 environment/benchmark cases explicitly ignored.
+All 792 desktop tests and 41 localization tests also pass on Rust 1.88.0. Strict
 workspace Clippy on Rust 1.98.0, formatting and diff checks pass; this is not a
 claim of whole-workspace strict Clippy on the minimum toolchain.
 
-The 20 added desktop tests include six effect, four shared image-form, seven
+The 26 added desktop tests include eight effect, four shared image-form, eleven
 overlay/project, two notice-argument and one shell-boundary regression. They use
 real egui actions and input where appropriate, not forged response flags. Coverage
 includes explicit frame-selection gaps, stage ordering, Undo/Redo, reopen, invalid
 fields, signed/fractional units, non-opaque stored colors, disabled controls,
 129-layer pagination and stable panel identities. Headless UI checks are not
 physical desktop, pressure-device, font-shaping or IME certification.
+
+Native inspection found orphaned labels in wrapped rows: Radius and track opacity
+could stay on one line while their input moved to the next. The follow-up layout
+fix keeps effect scalar controls paired, uses field grids for shape/drawing
+properties and groups RGBA channels. Six additional tests verify actual label/
+widget geometry, literal numeric edits, locale-independent hit IDs and reachable
+Add/Commit actions through the existing host scroll area at narrow sizes and large
+fonts. This fixes field association without changing parsing or authored values.
 
 The remaining language/tool and physical desktop gates stay in the
 [localization plan](LOCALIZATION-PLAN.md) and [Linux ledger](LINUX-STATUS.md).

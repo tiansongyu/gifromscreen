@@ -2352,24 +2352,26 @@ fn show_effect_inputs(ui: &mut egui::Ui, state: &mut EditorUiState, localizer: L
                 compact_input(ui, &mut state.effect_region_y_input);
                 compact_input(ui, &mut state.effect_region_width_input);
                 compact_input(ui, &mut state.effect_region_height_input);
-                match state.effect_choice {
-                    EffectChoice::Blur => {
-                        ui.label(localizer.text(Message::EffectsRadius));
-                        compact_input(ui, &mut state.effect_blur_radius_input);
-                    }
-                    EffectChoice::Pixelate => {
-                        ui.label(localizer.text(Message::EffectsBlock));
-                        compact_input(ui, &mut state.effect_pixel_block_input);
-                    }
-                    EffectChoice::Darken | EffectChoice::Lighten => {
-                        ui.label(localizer.text(Message::EffectsPercent));
-                        compact_input(ui, &mut state.effect_tone_percent_input);
-                    }
-                    EffectChoice::Border
-                    | EffectChoice::Shadow
-                    | EffectChoice::ImageBorder
-                    | EffectChoice::ImageShadow => {}
+            });
+            // This scalar belongs to the effect, not the fourth region field.
+            // Keep its label and editor together even when region inputs wrap.
+            ui.horizontal(|ui| match state.effect_choice {
+                EffectChoice::Blur => {
+                    ui.label(localizer.text(Message::EffectsRadius));
+                    compact_input(ui, &mut state.effect_blur_radius_input);
                 }
+                EffectChoice::Pixelate => {
+                    ui.label(localizer.text(Message::EffectsBlock));
+                    compact_input(ui, &mut state.effect_pixel_block_input);
+                }
+                EffectChoice::Darken | EffectChoice::Lighten => {
+                    ui.label(localizer.text(Message::EffectsPercent));
+                    compact_input(ui, &mut state.effect_tone_percent_input);
+                }
+                EffectChoice::Border
+                | EffectChoice::Shadow
+                | EffectChoice::ImageBorder
+                | EffectChoice::ImageShadow => {}
             });
         }
         EffectChoice::Border => {
@@ -2379,6 +2381,8 @@ fn show_effect_inputs(ui: &mut egui::Ui, state: &mut EditorUiState, localizer: L
                 compact_input(ui, &mut state.effect_border_right_input);
                 compact_input(ui, &mut state.effect_border_bottom_input);
                 compact_input(ui, &mut state.effect_border_left_input);
+            });
+            ui.horizontal_wrapped(|ui| {
                 show_effect_color_inputs(ui, state, localizer);
             });
         }
@@ -2387,8 +2391,12 @@ fn show_effect_inputs(ui: &mut egui::Ui, state: &mut EditorUiState, localizer: L
                 ui.label(localizer.text(Message::EffectsOffset));
                 compact_input(ui, &mut state.effect_shadow_offset_x_input);
                 compact_input(ui, &mut state.effect_shadow_offset_y_input);
+            });
+            ui.horizontal(|ui| {
                 ui.label(localizer.text(Message::EffectsBlur));
                 compact_input(ui, &mut state.effect_shadow_blur_input);
+            });
+            ui.horizontal_wrapped(|ui| {
                 show_effect_color_inputs(ui, state, localizer);
             });
         }
@@ -2661,71 +2669,110 @@ fn show_shape_overlay_inputs(
     state: &mut ShapeOverlayUiState,
     localizer: Localizer,
 ) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label(localizer.text(Message::EditorOverlayName));
-        ui.add(egui::TextEdit::singleline(&mut state.name).desired_width(120.0));
-        ui.label(localizer.text(Message::EditorOverlayKind));
-        egui::ComboBox::from_id_salt("shape_overlay_kind")
-            .selected_text(shape_overlay_choice_label(state.kind, localizer))
-            .show_ui(ui, |ui| {
-                for choice in [
-                    ShapeOverlayChoice::Line,
-                    ShapeOverlayChoice::Arrow,
-                    ShapeOverlayChoice::Rectangle,
-                    ShapeOverlayChoice::Ellipse,
-                ] {
-                    ui.selectable_value(
-                        &mut state.kind,
-                        choice,
-                        shape_overlay_choice_label(choice, localizer),
-                    );
-                }
-            });
-        ui.label("Z");
-        ui.add(egui::DragValue::new(&mut state.z_index));
-        ui.label(localizer.text(Message::EditorTrackOpacity));
-        ui.add(egui::DragValue::new(&mut state.track_opacity).range(1..=u8::MAX));
-        ui.label(localizer.text(Message::EditorOverlayBlend));
-        egui::ComboBox::from_id_salt("shape_overlay_blend")
-            .selected_text(blend_mode_label(state.blend_mode, localizer))
-            .show_ui(ui, |ui| {
-                for blend in [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen] {
-                    ui.selectable_value(
-                        &mut state.blend_mode,
-                        blend,
-                        blend_mode_label(blend, localizer),
-                    );
-                }
-            });
-    });
-    ui.horizontal_wrapped(|ui| {
-        ui.label(localizer.text(Message::EditorOverlayBounds));
-        ui.add(egui::DragValue::new(&mut state.x));
-        ui.add(egui::DragValue::new(&mut state.y));
-        ui.add(egui::DragValue::new(&mut state.width).range(1..=u32::MAX));
-        ui.add(egui::DragValue::new(&mut state.height).range(1..=u32::MAX));
-        ui.label(localizer.text(Message::EditorStrokeWidth));
-        ui.add(egui::DragValue::new(&mut state.stroke_width));
-    });
-    ui.horizontal_wrapped(|ui| {
+    egui::Grid::new("shape-overlay-metadata")
+        .num_columns(2)
+        .show(ui, |ui| {
+            ui.label(localizer.text(Message::EditorOverlayName));
+            ui.add(
+                egui::TextEdit::singleline(&mut state.name)
+                    .id_salt("shape-overlay-name")
+                    .desired_width(ui.available_width().clamp(40.0, 120.0)),
+            );
+            ui.end_row();
+            ui.label(localizer.text(Message::EditorOverlayKind));
+            egui::ComboBox::from_id_salt("shape_overlay_kind")
+                .selected_text(shape_overlay_choice_label(state.kind, localizer))
+                .show_ui(ui, |ui| {
+                    for choice in [
+                        ShapeOverlayChoice::Line,
+                        ShapeOverlayChoice::Arrow,
+                        ShapeOverlayChoice::Rectangle,
+                        ShapeOverlayChoice::Ellipse,
+                    ] {
+                        ui.selectable_value(
+                            &mut state.kind,
+                            choice,
+                            shape_overlay_choice_label(choice, localizer),
+                        );
+                    }
+                });
+            ui.end_row();
+            ui.label("Z");
+            ui.add(egui::DragValue::new(&mut state.z_index));
+            ui.end_row();
+            ui.label(localizer.text(Message::EditorTrackOpacity));
+            ui.add(egui::DragValue::new(&mut state.track_opacity).range(1..=u8::MAX));
+            ui.end_row();
+            ui.label(localizer.text(Message::EditorOverlayBlend));
+            egui::ComboBox::from_id_salt("shape_overlay_blend")
+                .selected_text(blend_mode_label(state.blend_mode, localizer))
+                .show_ui(ui, |ui| {
+                    for blend in [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen] {
+                        ui.selectable_value(
+                            &mut state.blend_mode,
+                            blend,
+                            blend_mode_label(blend, localizer),
+                        );
+                    }
+                });
+            ui.end_row();
+        });
+    ui.label(localizer.text(Message::EditorOverlayBounds));
+    egui::Grid::new("shape-overlay-bounds")
+        .num_columns(2)
+        .show(ui, |ui| {
+            ui.label("X");
+            ui.add(egui::DragValue::new(&mut state.x));
+            ui.end_row();
+            ui.label("Y");
+            ui.add(egui::DragValue::new(&mut state.y));
+            ui.end_row();
+            ui.label("W");
+            ui.add(egui::DragValue::new(&mut state.width).range(1..=u32::MAX));
+            ui.end_row();
+            ui.label("H");
+            ui.add(egui::DragValue::new(&mut state.height).range(1..=u32::MAX));
+            ui.end_row();
+            ui.label(localizer.text(Message::EditorStrokeWidth));
+            ui.add(egui::DragValue::new(&mut state.stroke_width));
+            ui.end_row();
+        });
+    show_rgba_inputs(
+        ui,
+        "shape-stroke-rgba",
+        localizer.text(Message::EditorStrokeRgba),
+        &mut state.stroke,
+    );
+    ui.checkbox(&mut state.fill_enabled, localizer.text(Message::EditorFill));
+    ui.add_enabled_ui(state.fill_enabled, |ui| {
         show_rgba_inputs(
             ui,
-            localizer.text(Message::EditorStrokeRgba),
-            &mut state.stroke,
+            "shape-fill-rgba",
+            localizer.text(Message::EditorFillRgba),
+            &mut state.fill,
         );
-        ui.checkbox(&mut state.fill_enabled, localizer.text(Message::EditorFill));
-        ui.add_enabled_ui(state.fill_enabled, |ui| {
-            show_rgba_inputs(ui, localizer.text(Message::EditorFillRgba), &mut state.fill);
-        });
     });
 }
 
-fn show_rgba_inputs(ui: &mut egui::Ui, label: &str, color: &mut Rgba) {
-    ui.label(label);
-    ui.add(egui::DragValue::new(&mut color.red));
-    ui.add(egui::DragValue::new(&mut color.green));
-    ui.add(egui::DragValue::new(&mut color.blue));
-    ui.add(egui::DragValue::new(&mut color.alpha));
+fn show_rgba_inputs(ui: &mut egui::Ui, id: &'static str, label: &str, color: &mut Rgba) {
+    ui.group(|ui| {
+        ui.label(label);
+        egui::Grid::new(id).num_columns(4).show(ui, |ui| {
+            for channel in ["R", "G", "B", "A"] {
+                ui.label(channel);
+            }
+            ui.end_row();
+            for value in [
+                &mut color.red,
+                &mut color.green,
+                &mut color.blue,
+                &mut color.alpha,
+            ] {
+                ui.add(egui::DragValue::new(value));
+            }
+            ui.end_row();
+        });
+    });
 }
 
 fn show_drawing_overlay_controls(
@@ -2738,74 +2785,47 @@ fn show_drawing_overlay_controls(
 ) {
     state.drawing_overlay.reconcile(workspace);
     ui.separator();
-    ui.horizontal_wrapped(|ui| {
-        ui.strong(localizer.text(Message::EditorFreeDrawing));
-        ui.label(localizer.text(Message::EditorOverlayName));
-        ui.add(egui::TextEdit::singleline(&mut state.drawing_overlay.name).desired_width(110.0));
-        ui.label(localizer.text(Message::RecorderWidth));
-        ui.add(egui::DragValue::new(&mut state.drawing_overlay.width).range(1..=u16::MAX));
-        show_rgba_inputs(ui, "RGBA", &mut state.drawing_overlay.color);
-    });
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Z");
-        ui.add(egui::DragValue::new(&mut state.drawing_overlay.z_index));
-        ui.label(localizer.text(Message::EditorTrackOpacity));
-        ui.add(egui::DragValue::new(&mut state.drawing_overlay.track_opacity).range(1..=u8::MAX));
-        ui.label(localizer.text(Message::EditorOverlayBlend));
-        egui::ComboBox::from_id_salt("drawing_overlay_blend")
-            .selected_text(blend_mode_label(
-                state.drawing_overlay.blend_mode,
+    ui.strong(localizer.text(Message::EditorFreeDrawing));
+    show_drawing_overlay_inputs(ui, &mut state.drawing_overlay, localizer);
+    ui.horizontal_wrapped(|ui| match state.drawing_overlay.phase {
+        DrawingDraftPhase::Idle => {
+            if ui
+                .add_enabled(
+                    !workspace.selection().is_empty(),
+                    egui::Button::new(localizer.text(Message::EditorDrawStroke)),
+                )
+                .clicked()
+                && let Err(error) = state.drawing_overlay.begin_for_selection(workspace)
+            {
+                push_failure(results, EditorUiOperation::AddDrawingOverlay, error);
+            }
+        }
+        DrawingDraftPhase::Capturing => {
+            ui.strong(localizer.text(Message::EditorDragStroke));
+            if ui
+                .button(localizer.text(Message::EditorCancelStroke))
+                .clicked()
+            {
+                state.drawing_overlay.cancel();
+            }
+        }
+        DrawingDraftPhase::Ready => {
+            ui.label(crate::format_message(
                 localizer,
-            ))
-            .show_ui(ui, |ui| {
-                for blend in [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen] {
-                    ui.selectable_value(
-                        &mut state.drawing_overlay.blend_mode,
-                        blend,
-                        blend_mode_label(blend, localizer),
-                    );
-                }
-            });
-        match state.drawing_overlay.phase {
-            DrawingDraftPhase::Idle => {
-                if ui
-                    .add_enabled(
-                        !workspace.selection().is_empty(),
-                        egui::Button::new(localizer.text(Message::EditorDrawStroke)),
-                    )
-                    .clicked()
-                    && let Err(error) = state.drawing_overlay.begin_for_selection(workspace)
-                {
-                    push_failure(results, EditorUiOperation::AddDrawingOverlay, error);
-                }
+                Message::EditorDrawingPoints,
+                &[("count", &state.drawing_overlay.points.len().to_string())],
+            ));
+            if ui
+                .button(localizer.text(Message::EditorCommitDrawing))
+                .clicked()
+            {
+                commit_drawing_overlay(workspace, state, now, results);
             }
-            DrawingDraftPhase::Capturing => {
-                ui.strong(localizer.text(Message::EditorDragStroke));
-                if ui
-                    .button(localizer.text(Message::EditorCancelStroke))
-                    .clicked()
-                {
-                    state.drawing_overlay.cancel();
-                }
-            }
-            DrawingDraftPhase::Ready => {
-                ui.label(crate::format_message(
-                    localizer,
-                    Message::EditorDrawingPoints,
-                    &[("count", &state.drawing_overlay.points.len().to_string())],
-                ));
-                if ui
-                    .button(localizer.text(Message::EditorCommitDrawing))
-                    .clicked()
-                {
-                    commit_drawing_overlay(workspace, state, now, results);
-                }
-                if ui
-                    .button(localizer.text(Message::EditorCancelStroke))
-                    .clicked()
-                {
-                    state.drawing_overlay.cancel();
-                }
+            if ui
+                .button(localizer.text(Message::EditorCancelStroke))
+                .clicked()
+            {
+                state.drawing_overlay.cancel();
             }
         }
     });
@@ -2819,6 +2839,47 @@ fn show_drawing_overlay_controls(
             ),
         );
     }
+}
+
+fn show_drawing_overlay_inputs(
+    ui: &mut egui::Ui,
+    draft: &mut DrawingOverlayDraft,
+    localizer: Localizer,
+) {
+    egui::Grid::new("drawing-overlay-metadata")
+        .num_columns(2)
+        .show(ui, |ui| {
+            ui.label(localizer.text(Message::EditorOverlayName));
+            ui.add(
+                egui::TextEdit::singleline(&mut draft.name)
+                    .id_salt("drawing-overlay-name")
+                    .desired_width(ui.available_width().clamp(40.0, 110.0)),
+            );
+            ui.end_row();
+            ui.label(localizer.text(Message::RecorderWidth));
+            ui.add(egui::DragValue::new(&mut draft.width).range(1..=u16::MAX));
+            ui.end_row();
+            ui.label("Z");
+            ui.add(egui::DragValue::new(&mut draft.z_index));
+            ui.end_row();
+            ui.label(localizer.text(Message::EditorTrackOpacity));
+            ui.add(egui::DragValue::new(&mut draft.track_opacity).range(1..=u8::MAX));
+            ui.end_row();
+            ui.label(localizer.text(Message::EditorOverlayBlend));
+            egui::ComboBox::from_id_salt("drawing_overlay_blend")
+                .selected_text(blend_mode_label(draft.blend_mode, localizer))
+                .show_ui(ui, |ui| {
+                    for blend in [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen] {
+                        ui.selectable_value(
+                            &mut draft.blend_mode,
+                            blend,
+                            blend_mode_label(blend, localizer),
+                        );
+                    }
+                });
+            ui.end_row();
+        });
+    show_rgba_inputs(ui, "drawing-rgba", "RGBA", &mut draft.color);
 }
 
 fn commit_drawing_overlay(

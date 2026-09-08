@@ -13,6 +13,7 @@ struct Harness {
     state: EditorUiState,
     language: Localizer,
     enabled: bool,
+    size: egui::Vec2,
 }
 
 impl Harness {
@@ -64,6 +65,7 @@ impl Harness {
             state: EditorUiState::default(),
             language: language("zh"),
             enabled: true,
+            size: egui::vec2(760.0, 560.0),
         }
     }
 
@@ -71,10 +73,7 @@ impl Harness {
         let mut results = Vec::new();
         let output = self.context.run(
             egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(760.0, 560.0),
-                )),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)),
                 events,
                 focused: true,
                 ..Default::default()
@@ -423,4 +422,163 @@ fn legacy_effect_color_and_region_validation_keep_numeric_limits_and_translate_n
     state.effect_index_input = " +02 ".into();
     assert_eq!(parse_effect_index(&state).unwrap(), 1);
     assert_eq!(state.effect_index_input, " +02 ");
+}
+
+fn parameter(choice: EffectChoice) -> Message {
+    match choice {
+        EffectChoice::Blur => Message::EffectsRadius,
+        EffectChoice::Pixelate => Message::EffectsBlock,
+        EffectChoice::Darken | EffectChoice::Lighten => Message::EffectsPercent,
+        EffectChoice::Shadow => Message::EffectsBlur,
+        _ => panic!("this fixture needs a scalar effect parameter"),
+    }
+}
+
+fn parameter_value(state: &EditorUiState) -> &str {
+    match state.effect_choice {
+        EffectChoice::Blur => &state.effect_blur_radius_input,
+        EffectChoice::Pixelate => &state.effect_pixel_block_input,
+        EffectChoice::Darken | EffectChoice::Lighten => &state.effect_tone_percent_input,
+        EffectChoice::Shadow => &state.effect_shadow_blur_input,
+        _ => panic!("this fixture needs a scalar effect parameter"),
+    }
+}
+
+fn visible_rect(output: &egui::FullOutput, wanted: &str) -> egui::Rect {
+    output
+        .shapes
+        .iter()
+        .find_map(|shape| {
+            if let egui::Shape::Text(text) = &shape.shape
+                && text.galley.text() == wanted
+            {
+                let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                shape.clip_rect.contains_rect(rect).then_some(rect)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| panic!("missing or clipped parameter {wanted:?}"))
+}
+
+#[test]
+fn scalar_effect_labels_stay_beside_editable_fields_across_languages_widths_and_scale() {
+    for tag in ["en", "zh"] {
+        for (width, font_scale, zoom) in [
+            (500.0, 1.0, 1.0),
+            (320.0, 1.0, 1.25),
+            (320.0, 2.0, 1.0),
+            (760.0, 1.5, 1.25),
+        ] {
+            for choice in [
+                EffectChoice::Blur,
+                EffectChoice::Pixelate,
+                EffectChoice::Darken,
+                EffectChoice::Lighten,
+                EffectChoice::Shadow,
+            ] {
+                let mut harness = Harness::new();
+                harness.language = language(tag);
+                harness.size = egui::vec2(width, 900.0);
+                harness.context.set_zoom_factor(zoom);
+                harness.context.style_mut(|style| {
+                    style.animation_time = 0.0;
+                    for font in style.text_styles.values_mut() {
+                        font.size *= font_scale;
+                    }
+                });
+                harness.state.effect_choice = choice;
+                harness.state.effect_blur_radius_input = "7".into();
+                harness.state.effect_pixel_block_input = "7".into();
+                harness.state.effect_tone_percent_input = "7".into();
+                harness.state.effect_shadow_blur_input = "7".into();
+                harness.frame(Vec::new());
+                let output = harness.frame(Vec::new()).0;
+                let label = visible_rect(&output, harness.language.text(parameter(choice)));
+                let field = visible_rect(&output, "7");
+                // TextEdit has an inset and can use different font metrics.
+                // Same-row glyph boxes must substantially overlap; the native
+                // orphan has disjoint vertical ranges, not a 2px baseline offset.
+                let shared_height =
+                    label.bottom().min(field.bottom()) - label.top().max(field.top());
+                assert!(
+                    shared_height >= label.height().min(field.height()) * 0.5,
+                    "orphan {choice:?}/{tag}, width={width}, font={font_scale}, zoom={zoom}: label={label:?}, field={field:?}"
+                );
+                assert!(
+                    field.left() >= label.right() && field.left() - label.right() <= 20.0,
+                    "parameter label must immediately precede its field"
+                );
+                let before = harness.workspace.manifest().clone();
+                let position = field.center();
+                for pressed in [true, false] {
+                    harness.frame(vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]);
+                }
+                harness.frame(vec![
+                    egui::Event::Key {
+                        key: egui::Key::A,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+                    },
+                    egui::Event::Text("009".into()),
+                    egui::Event::Key {
+                        key: egui::Key::A,
+                        physical_key: None,
+                        pressed: false,
+                        repeat: false,
+                        modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+                    },
+                ]);
+                assert_eq!(parameter_value(&harness.state), "009");
+                assert_eq!(harness.workspace.manifest(), &before);
+            }
+        }
+    }
+}
+
+#[test]
+fn scalar_parameter_hit_ids_remain_language_independent_after_grouping() {
+    let ids = |choice, localizer| {
+        let mut harness = Harness::new();
+        harness.language = localizer;
+        harness.size = egui::vec2(500.0, 900.0);
+        harness.state.effect_choice = choice;
+        harness.state.effect_blur_radius_input = "7".into();
+        harness.state.effect_pixel_block_input = "7".into();
+        harness.state.effect_tone_percent_input = "7".into();
+        harness.state.effect_shadow_blur_input = "7".into();
+        harness.frame(Vec::new());
+        let output = harness.frame(Vec::new()).0;
+        let position = visible_rect(&output, "7").center();
+        harness.frame(vec![egui::Event::PointerMoved(position)]);
+        let mut ids: Vec<_> = harness
+            .context
+            .interaction_snapshot(|snapshot| snapshot.hovered.iter().copied().collect());
+        assert!(!ids.is_empty());
+        assert!(
+            ids.iter()
+                .all(|id| harness.context.read_response(*id).is_some())
+        );
+        ids.sort_by_key(egui::Id::value);
+        ids
+    };
+    for choice in [
+        EffectChoice::Blur,
+        EffectChoice::Pixelate,
+        EffectChoice::Darken,
+        EffectChoice::Lighten,
+        EffectChoice::Shadow,
+    ] {
+        assert_eq!(ids(choice, language("en")), ids(choice, language("zh")));
+    }
 }

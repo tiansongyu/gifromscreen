@@ -16,6 +16,9 @@ use super::{
 };
 use crate::editor_workspace::EditorWorkspace;
 
+#[path = "overlay_field_layout_tests.rs"]
+mod field_layout_tests;
+
 fn language(tag: &str) -> Localizer {
     Localizer::new(find_language(tag).unwrap())
 }
