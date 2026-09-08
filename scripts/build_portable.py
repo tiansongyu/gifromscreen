@@ -19,6 +19,9 @@ TOOLCHAIN = "1.88.0"
 TARGET = "x86_64-unknown-linux-gnu"
 BINARIES = ("gif-from-screen", "gif-from-screen-cli")
 APP_ID = "io.github.tiansongyu.gifromscreen"
+BUILD_RECEIPT_VERSION = 1
+PROFILE = "release"
+PATH_REMAP = "/usr/src/gifromscreen"
 
 
 def run(arguments, **kwargs):
@@ -48,11 +51,30 @@ def tree_digest(pathspecs):
 
 
 def build_binaries(cargo, target_directory, epoch, skip_build):
-    receipt_path = target_directory / "release/gifromscreen-build.json"
+    # Even an empty encoded value takes precedence over RUSTFLAGS in Cargo.
+    # Refuse it rather than recording a path remap which did not take effect.
+    if "CARGO_ENCODED_RUSTFLAGS" in os.environ:
+        raise ValueError("unset CARGO_ENCODED_RUSTFLAGS before packaging; it overrides the recorded RUSTFLAGS path remap")
+    binary_directory = target_directory / TARGET / PROFILE
+    receipt_path = binary_directory / "gifromscreen-build.json"
+    identity = {
+        "schema_version": BUILD_RECEIPT_VERSION,
+        "toolchain": TOOLCHAIN,
+        "rustc": run(["rustc", "+" + TOOLCHAIN, "--version"]),
+        "cargo": run([*cargo, "--version"]),
+        "profile": PROFILE,
+        "target": TARGET,
+        "path_remap": PATH_REMAP,
+    }
     source_hash = tree_digest(["Cargo.toml", "Cargo.lock", "apps", "crates"])
-    binaries = {name: target_directory / "release" / name for name in BINARIES}
+    binaries = {name: binary_directory / name for name in BINARIES}
     if skip_build:
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        if not isinstance(receipt, dict):
+            raise ValueError("invalid build receipt; omit --skip-build")
+        for key, expected in identity.items():
+            if type(receipt.get(key)) is not type(expected) or receipt[key] != expected:
+                raise ValueError("build receipt " + key + " differs from the requested build; omit --skip-build")
         if receipt["source_tree_sha256"] != source_hash:
             raise ValueError("Rust source changed since the recorded build; omit --skip-build")
         for name, path in binaries.items():
@@ -62,20 +84,19 @@ def build_binaries(cargo, target_directory, epoch, skip_build):
     environment = os.environ.copy()
     environment["SOURCE_DATE_EPOCH"] = str(epoch)
     environment["CARGO_TARGET_DIR"] = str(target_directory)
-    environment["RUSTFLAGS"] = "--remap-path-prefix=" + str(ROOT) + "=/usr/src/gifromscreen"
+    environment["RUSTFLAGS"] = "--remap-path-prefix=" + str(ROOT) + "=" + PATH_REMAP
     receipt = {
+        **identity,
         "source_revision": run(["git", "rev-parse", "HEAD"]),
         "source_dirty": bool(run(["git", "status", "--porcelain", "--", "Cargo.toml", "Cargo.lock", "apps", "crates"])),
         "source_tree_sha256": source_hash,
         "cargo_lock_sha256": sha256(ROOT / "Cargo.lock"),
-        "rustc": run(["rustc", "+" + TOOLCHAIN, "--version"]),
-        "cargo": run([*cargo, "--version"]),
-        "profile": "release",
-        "target": TARGET,
         "source_date_epoch": epoch,
-        "path_remap": "/usr/src/gifromscreen",
     }
-    subprocess.run([*cargo, "build", "--locked", "--release", "-p", BINARIES[0], "-p", BINARIES[1]], cwd=ROOT, env=environment, check=True)
+    # An explicit target also overrides CARGO_BUILD_TARGET / build.target. Read
+    # only its target-qualified output; never re-label an old host-path binary.
+    subprocess.run([*cargo, "build", "--locked", "--release", "--target", TARGET,
+                    "-p", BINARIES[0], "-p", BINARIES[1]], cwd=ROOT, env=environment, check=True)
     if tree_digest(["Cargo.toml", "Cargo.lock", "apps", "crates"]) != source_hash:
         raise ValueError("Rust sources changed while building; repeat against a stable worktree")
     receipt["binaries"] = {name: sha256(path) for name, path in binaries.items()}

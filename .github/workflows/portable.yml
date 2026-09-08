@@ -45,6 +45,9 @@ jobs:
       - name: Build real portable archive
         run: python3 scripts/build_portable.py --output-dir target/package-first
 
+      - name: Test build identity and target isolation
+        run: python3 scripts/test_build_portable.py
+
       - name: Verify deterministic repackaging
         run: |
           python3 scripts/build_portable.py --skip-build --output-dir target/package-second

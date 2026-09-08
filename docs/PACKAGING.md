@@ -43,6 +43,7 @@ Use a Linux x86_64 builder with the development libraries listed in `.github/wor
 
 ```sh
 python3 scripts/build_portable.py --output-dir target/package-first
+python3 scripts/test_build_portable.py
 python3 scripts/build_portable.py --skip-build --output-dir target/package-second
 cmp target/package-first/*.tar.gz target/package-second/*.tar.gz
 python3 scripts/test_portable.py target/package-first/*.tar.gz
@@ -52,6 +53,17 @@ xvfb-run --auto-servernum python3 scripts/smoke_portable_desktop.py target/packa
 Existing archive outputs are never overwritten; choose a new output directory when testing a new package. `--target-dir` selects the build cache. `--max-glibc` defaults to 2.35: packaging inspects both ELF symbol-version requirements and refuses newer binaries or missing linked libraries. Changing this option changes the supported baseline; it does not make a newer binary compatible with older systems.
 
 `BUILD-INFO.json` records the source revision, whether Rust sources were dirty, the actual Rust source-tree and Cargo.lock SHA-256 hashes, compiler versions, binary hashes, package-source hash, and ELF requirements. `--skip-build` only reuses binaries whose hashes and source-tree digest match a prior build receipt. A source edit during compilation fails the build rather than assigning an incorrect revision to the result.
+
+Cargo receives an explicit `--target x86_64-unknown-linux-gnu`; the builder reads
+only `TARGET_DIR/x86_64-unknown-linux-gnu/release`, including its versioned build
+receipt. External `CARGO_BUILD_TARGET` or Cargo `build.target` settings cannot
+redirect the new build while old host-directory binaries are packaged. Reuse
+also requires matching receipt schema, toolchain/compiler identity, target,
+profile and declared path remap. Old unversioned receipts require a fresh build;
+they are not silently migrated. If `CARGO_ENCODED_RUSTFLAGS` is set, even empty,
+packaging fails with an explicit unset instruction because that variable would
+override the recorded `RUSTFLAGS` remap. These checks do not make arbitrary
+system linkers or Cargo configuration hermetically reproducible.
 
 The archive uses sorted entries, normalized owners/modes, `SOURCE_DATE_EPOCH` (defaulting to the source commit timestamp), and a zero gzip timestamp. CI proves **byte-identical repackaging of the same compiled binaries and package sources**. This is distinct from reproducible compilation across independent machines: system library versions, native build tools, and OS images are not all hermetically pinned, so that stronger claim is not made.
 
