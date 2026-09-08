@@ -108,6 +108,7 @@ impl RecorderOverlay {
     pub(super) fn ready(&self) -> bool {
         self.initialized
             && !self.snap.is_pending()
+            && !self.snap.is_closing()
             && (self.guide.is_none() || self.controller_geometry.is_some())
             && self.guide_ready()
             && matches!(
@@ -166,7 +167,11 @@ impl RecorderOverlay {
         if self.failure.is_some() {
             return;
         }
-        let region = Some(self.geometry.region());
+        let region = if self.snap.is_picking() {
+            None
+        } else {
+            Some(self.geometry.region())
+        };
         let protected_region = protected_region.filter(|protected| Some(*protected) != region);
         if self.request.is_some_and(|request| {
             request.region == region && request.protected_region == protected_region
@@ -559,6 +564,7 @@ impl GifFromScreenApp {
         let now = Instant::now();
         let before = overlay.geometry.region();
         overlay.poll_guide(stage);
+        overlay.snap.keyboard_control(context);
         overlay
             .snap
             .poll(&mut overlay.geometry, stage, overlay.gesture.is_some());
@@ -589,12 +595,21 @@ impl GifFromScreenApp {
             native.outer,
             paused,
         );
-        let hide_pixels = unsafe_to_paint
+        let hide_pixels = overlay.snap.is_picking()
+            || overlay.snap.is_closing()
+            || unsafe_to_paint
             || (hidden
                 && (overlay.pending_live_start.is_some() || self.job.is_some())
                 && !(overlay.recovering && paused && !wants_resume));
         context.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(hide_pixels));
-        let action = self.draw_x11_controls(context, &mut overlay, stage, paused, !hide_pixels);
+        let mut action = self.draw_x11_controls(context, &mut overlay, stage, paused, !hide_pixels);
+        if action == RecorderOverlayAction::Close && !overlay.snap.request_close() {
+            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            action = RecorderOverlayAction::None;
+        }
+        if overlay.snap.close_ready() {
+            action = RecorderOverlayAction::Close;
+        }
         if overlay.geometry.region() != before {
             // A manual edit supersedes any still-pending snap, including a
             // move away and back while the native worker is finishing.
@@ -608,6 +623,7 @@ impl GifFromScreenApp {
             apply_overlay_region(&mut self.settings, stage, region);
         }
         if let Some(error) = &overlay.failure {
+            overlay.snap.cancel();
             self.notice = Some(error.clone());
             if let Some(job) = &mut self.job {
                 job.stop_retargeting();

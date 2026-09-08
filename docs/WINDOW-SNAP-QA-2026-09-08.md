@@ -67,8 +67,8 @@ filters hidden/helper/own windows and returns an explicit incomplete-list flag
 when a limit is reached. Without EWMH lists, the bounded fallback descends unnamed
 wrappers and stops at named/ICCCM clients instead of treating their widgets as
 independent application windows. Late refreshes share the snap cancellation gate.
-The dropdown is a working explicit selection path, not a completed replacement
-for upstream crosshair selection. A crosshair picker,
+The dropdown remains available alongside the new [click-armed crosshair picker](X11-WINDOW-PICKER-QA-2026-09-08.md).
+Upstream drag-from-button activation and subwindow behavior,
 explicit clipping/partial-window policy, combined decoration/shadow cases and
 mixed-DPI/multiple-monitor/physical GNOME/KDE acceptance stay open.
 

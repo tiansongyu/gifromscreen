@@ -366,7 +366,16 @@ impl RecorderGuide {
     /// Returns unsupported-build or thread-start errors. Native failures appear in poll.
     /// Gestures have a 30-second watchdog; protocol operations and cleanup are also bounded.
     pub fn start(display: Option<String>) -> Result<Self, String> {
-        Self::start_inner(display, None)
+        Self::start_inner(display, None, true)
+    }
+
+    /// Starts a display-only highlight whose input shape is always empty.
+    /// It never starts border gestures or intercepts the target window's input.
+    ///
+    /// # Errors
+    /// Returns the same setup/thread errors as [`Self::start`].
+    pub fn start_passive(display: Option<String>) -> Result<Self, String> {
+        Self::start_inner(display, None, false)
     }
 
     /// Starts guides with a read-only observer for this process's controller.
@@ -388,17 +397,18 @@ impl RecorderGuide {
                 "A recorder controller must be a nonzero window owned by this process.".into(),
             );
         }
-        Self::start_inner(display, Some((window_id, expected_pid)))
+        Self::start_inner(display, Some((window_id, expected_pid)), true)
     }
 
     fn start_inner(
         display: Option<String>,
         controller: Option<(u32, u32)>,
+        interactive: bool,
     ) -> Result<Self, String> {
         #[cfg(not(all(target_os = "linux", feature = "native-x11")))]
         {
             drop(display);
-            let _ = controller;
+            let _ = (controller, interactive);
             Err("Native X11 recorder guides are not included in this build.".into())
         }
         #[cfg(all(target_os = "linux", feature = "native-x11"))]
@@ -412,7 +422,7 @@ impl RecorderGuide {
             thread::Builder::new()
                 .name("x11-recorder-guide".into())
                 .spawn(move || {
-                    let result = native::run(display.as_deref(), controller, &worker);
+                    let result = native::run(display.as_deref(), controller, interactive, &worker);
                     let _ = sender.send(result);
                 })
                 .map_err(|error| format!("Could not start recorder guide worker: {error}"))?;

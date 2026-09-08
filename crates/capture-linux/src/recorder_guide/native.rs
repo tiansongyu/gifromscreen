@@ -30,6 +30,7 @@ mod gesture;
 pub(super) fn run(
     display: Option<&str>,
     controller: Option<(u32, u32)>,
+    interactive: bool,
     context: &Context,
 ) -> Result<(), String> {
     let parsed = x11rb_protocol::parse_display::parse_display(display).map_err(native_error)?;
@@ -90,6 +91,7 @@ pub(super) fn run(
         event_floor: 0,
         gesture: None,
         cancel_epoch: 0,
+        interactive,
     };
     owned.create_colormap(visual)?;
     for _ in 0..4 {
@@ -116,6 +118,7 @@ struct Windows<'a, 'c> {
     event_floor: u64,
     gesture: Option<gesture::Gesture>,
     cancel_epoch: u64,
+    interactive: bool,
 }
 
 impl Windows<'_, '_> {
@@ -308,9 +311,24 @@ impl Windows<'_, '_> {
         }
         // Both changes happen while this owned window is unmapped. Its center
         // never relies on alpha, a compositor effect, or an input-only hole.
+        let empty = if self.interactive {
+            None
+        } else {
+            Some(Region::new(self.connection, None)?)
+        };
         for kind in [SK::BOUNDING, SK::INPUT] {
             self.connection
-                .xfixes_set_window_shape_region(id, kind, 0, 0, base.id)
+                .xfixes_set_window_shape_region(
+                    id,
+                    kind,
+                    0,
+                    0,
+                    if kind == SK::INPUT {
+                        empty.as_ref().map_or(base.id, |region| region.id)
+                    } else {
+                        base.id
+                    },
+                )
                 .map_err(native_error)?
                 .check()
                 .map_err(native_error)?;
@@ -361,7 +379,9 @@ impl Windows<'_, '_> {
                 }
                 _ => {}
             }
-            self.pointer_event(&event, sequence, context)?;
+            if self.interactive {
+                self.pointer_event(&event, sequence, context)?;
+            }
         }
         Ok(())
     }

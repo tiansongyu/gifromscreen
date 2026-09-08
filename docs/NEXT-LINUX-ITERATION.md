@@ -82,7 +82,10 @@ these tasks extend them rather than replace their state machines.
    It changes the unfrozen physical geometry, then uses the existing guide/control
    acknowledgements before Start; live recording still retains a fixed canvas.
    In-controller window-list refresh now preserves the chosen window and capture
-   geometry, with bounded native discovery and legacy-title fallback. A crosshair picker, explicit partial-window
+   geometry, with bounded native discovery and legacy-title fallback. A
+   [click-armed crosshair picker](X11-WINDOW-PICKER-QA-2026-09-08.md) now hides
+   controls, highlights the target and cleans up before selection/close returns.
+   Drag-from-button activation, child-window selection, explicit partial-window
    policy and wider WM/CSD/DPI acceptance remain open. Optional X11 cursor-follow
    comes after those controls; Wayland source-local movement is not global tracking.
 3. **X11 interaction sampling: desktop-wide mode connected.** One bounded XI2

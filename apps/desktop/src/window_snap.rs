@@ -4,7 +4,8 @@ use crate::{RecorderStage, recorder_geometry::RecorderGeometry};
 use eframe::egui;
 use gif_from_screen_capture::{CaptureSource, CaptureSourceKind, PhysicalRect};
 use gif_from_screen_capture_linux::{
-    WindowSnapBounds, WindowSnapCatalog, list_snap_windows, query_window_snap,
+    PickedWindow, WindowSnapBounds, WindowSnapCatalog, list_snap_windows, pick_snap_window,
+    query_window_snap,
 };
 use std::{
     sync::{
@@ -23,17 +24,20 @@ pub(crate) struct WindowSnapUi {
     bounds: WindowSnapBounds,
     pending: Option<Pending>,
     notice: Option<String>,
+    closing: bool,
 }
 
 struct Pending {
     geometry: RecorderGeometry,
     cancellation: Arc<AtomicBool>,
     receiver: Receiver<Result<WorkResult, String>>,
+    picking: bool,
 }
 
 enum WorkResult {
     Region(PhysicalRect),
     Catalog(WindowSnapCatalog),
+    Picked(Option<PickedWindow>),
 }
 
 impl Drop for Pending {
@@ -63,7 +67,42 @@ impl WindowSnapUi {
     pub(crate) fn is_pending(&self) -> bool {
         self.pending
             .as_ref()
-            .is_some_and(|pending| !pending.cancellation.load(Ordering::Acquire))
+            .is_some_and(|pending| pending.picking || !pending.cancellation.load(Ordering::Acquire))
+    }
+
+    /// Remains true through cancelled native cleanup, before controls or Start
+    /// can become available again. A cancellation flag alone is not an ungrab ACK.
+    pub(crate) fn is_picking(&self) -> bool {
+        self.pending.as_ref().is_some_and(|pending| pending.picking)
+    }
+
+    pub(crate) fn is_closing(&self) -> bool {
+        self.closing
+    }
+
+    /// Closing the recorder is also a cancellation, but restoring an ordinary
+    /// interactive window must wait for the picker's native cleanup result.
+    pub(crate) fn request_close(&mut self) -> bool {
+        if self.is_picking() {
+            self.closing = true;
+            self.cancel();
+            false
+        } else {
+            true
+        }
+    }
+
+    pub(crate) fn close_ready(&self) -> bool {
+        self.closing && !self.is_picking()
+    }
+
+    pub(crate) fn keyboard_control(&mut self, context: &egui::Context) {
+        if self.is_picking()
+            && context.input(|input| !input.focused || input.key_pressed(egui::Key::Escape))
+        {
+            self.cancel();
+            self.notice = Some("Window selection cancelled; waiting for native cleanup.".into());
+        }
     }
 
     pub(crate) fn cancel(&mut self) {
@@ -103,6 +142,21 @@ impl WindowSnapUi {
             return;
         }
         self.notice = Some(match result {
+            Ok(WorkResult::Picked(None)) => "Window selection cancelled; original region kept.".into(),
+            Ok(WorkResult::Picked(Some(picked))) => match geometry.snap_to(picked.region) {
+                Ok(()) => {
+                    if let Some(index) = self.candidates.iter().position(|source| source.id() == picked.source.id()) {
+                        self.candidates[index] = picked.source;
+                        self.selected = index;
+                    } else {
+                        if self.candidates.len() == 256 { self.candidates.pop(); }
+                        self.candidates.push(picked.source);
+                        self.selected = self.candidates.len() - 1;
+                    }
+                    "Selected window; recording region updated. This is one-time positioning, not window tracking.".into()
+                }
+                Err(error) => format!("Selected window does not fit; original region kept: {error}"),
+            },
             Ok(WorkResult::Region(region)) => match geometry.snap_to(region) {
                 Ok(()) => "Snapped to the current window bounds. This is a one-time position, not window tracking.".into(),
                 Err(error) => format!("Window snap failed; original selection kept: {error}"),
@@ -125,8 +179,15 @@ impl WindowSnapUi {
             return;
         }
         egui::CollapsingHeader::new("Fit region to a window…").show(ui, |ui| {
-            ui.label("Read the chosen window's current physical bounds. It must fit completely inside the selected screen.");
             ui.add_enabled_ui(self.pending.is_none(), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.selectable_value(&mut self.bounds, WindowSnapBounds::WindowFrame, "Window frame");
+                    ui.selectable_value(&mut self.bounds, WindowSnapBounds::Client, "Client area");
+                    ui.selectable_value(&mut self.bounds, WindowSnapBounds::Outer, "Native bounds");
+                });
+                if ui.button("Pick window on screen…").clicked()
+                    && let Err(error) = self.start_picker(*geometry) { self.notice = Some(error); }
+                ui.small("Click a window and release to select. Right-click or Escape cancels. Controls hide temporarily; the target must fit within the selected screen.");
                 egui::ComboBox::from_id_salt("snap-window-choice")
                     .width(ui.available_width())
                     .truncate()
@@ -138,11 +199,6 @@ impl WindowSnapUi {
                             ui.selectable_value(&mut self.selected, index, source.name()).on_hover_text(source.name());
                         }
                     });
-                ui.horizontal_wrapped(|ui| {
-                    ui.selectable_value(&mut self.bounds, WindowSnapBounds::WindowFrame, "Window frame");
-                    ui.selectable_value(&mut self.bounds, WindowSnapBounds::Client, "Client area");
-                    ui.selectable_value(&mut self.bounds, WindowSnapBounds::Outer, "Native bounds");
-                });
                 ui.horizontal_wrapped(|ui| {
                 if ui.button("Refresh windows").clicked()
                     && let Err(error) = self.start_work(*geometry, |cancel| list_snap_windows(None, cancel).map(WorkResult::Catalog))
@@ -180,6 +236,15 @@ impl WindowSnapUi {
         })
     }
 
+    fn start_picker(&mut self, geometry: RecorderGeometry) -> Result<(), String> {
+        let bounds = self.bounds;
+        self.start_work(geometry, move |cancel| {
+            pick_snap_window(None, bounds, cancel).map(WorkResult::Picked)
+        })?;
+        self.pending.as_mut().expect("new picker job").picking = true;
+        Ok(())
+    }
+
     fn start_work(
         &mut self,
         geometry: RecorderGeometry,
@@ -201,6 +266,7 @@ impl WindowSnapUi {
             geometry,
             cancellation,
             receiver,
+            picking: false,
         });
         self.notice = Some("Reading windows…".into());
         Ok(())
@@ -238,6 +304,102 @@ mod tests {
             1.0,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn recorder_close_waits_for_picker_cleanup_instead_of_restoring_an_interactive_window_early() {
+        let mut ui = WindowSnapUi::default();
+        let mut geometry = geometry();
+        let (release, wait) = mpsc::sync_channel(1);
+        ui.start_work(geometry, move |_| {
+            wait.recv().unwrap();
+            Ok(WorkResult::Picked(None))
+        })
+        .unwrap();
+        ui.pending.as_mut().unwrap().picking = true;
+        assert!(!ui.request_close());
+        assert!(ui.is_closing() && ui.is_picking() && ui.is_pending());
+        assert!(!ui.close_ready());
+        release.send(()).unwrap();
+        complete(&mut ui, &mut geometry, RecorderStage::Ready);
+        assert!(ui.close_ready());
+    }
+
+    #[test]
+    fn cancelled_picker_stays_busy_until_native_cleanup_result_arrives() {
+        let mut ui = WindowSnapUi::default();
+        let mut geometry = geometry();
+        let before = geometry;
+        let (release, wait) = mpsc::sync_channel(1);
+        ui.start_work(geometry, move |_| {
+            wait.recv().unwrap();
+            Ok(WorkResult::Picked(None))
+        })
+        .unwrap();
+        ui.pending.as_mut().unwrap().picking = true;
+        let context = egui::Context::default();
+        let _ = context.run(
+            egui::RawInput {
+                focused: true,
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |context| ui.keyboard_control(context),
+        );
+        assert!(
+            ui.pending
+                .as_ref()
+                .unwrap()
+                .cancellation
+                .load(Ordering::Acquire)
+        );
+        assert!(
+            ui.is_picking() && ui.is_pending(),
+            "cancel requested is not native cleanup completed"
+        );
+        ui.poll(&mut geometry, RecorderStage::Ready, false);
+        assert!(ui.is_picking());
+        release.send(()).unwrap();
+        complete(&mut ui, &mut geometry, RecorderStage::Ready);
+        assert!(!ui.is_picking() && !ui.is_pending());
+        assert_eq!(geometry, before);
+    }
+
+    #[test]
+    fn picked_window_is_applied_once_and_out_of_source_results_keep_the_old_selection() {
+        let mut ui = WindowSnapUi::default();
+        ui.set_candidates(&[source("old", "Old window")]);
+        let mut geometry = geometry();
+        let chosen = PhysicalRect::new(-100, -50, 80, 60).unwrap();
+        ui.start_work(geometry, move |_| {
+            Ok(WorkResult::Picked(Some(PickedWindow {
+                source: source("new", "Picked window"),
+                region: chosen,
+            })))
+        })
+        .unwrap();
+        complete(&mut ui, &mut geometry, RecorderStage::Ready);
+        assert_eq!(geometry.region(), chosen);
+        assert_eq!(ui.candidates[ui.selected].id().as_str(), "new");
+        let before = geometry;
+        let candidates = ui.candidates.clone();
+        ui.start_work(geometry, |_| {
+            Ok(WorkResult::Picked(Some(PickedWindow {
+                source: source("outside", "Outside"),
+                region: PhysicalRect::new(199, 0, 20, 10).unwrap(),
+            })))
+        })
+        .unwrap();
+        complete(&mut ui, &mut geometry, RecorderStage::Ready);
+        assert_eq!(geometry, before);
+        assert_eq!(ui.candidates, candidates);
+        assert!(ui.notice.as_ref().unwrap().contains("does not fit"));
     }
 
     #[test]

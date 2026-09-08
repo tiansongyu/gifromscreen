@@ -24,6 +24,10 @@ mod interaction_tests;
 #[path = "x11_window_snap_tests.rs"]
 mod window_snap_tests;
 
+#[cfg(all(test, target_os = "linux", feature = "native-x11"))]
+#[path = "x11_window_picker_tests.rs"]
+mod window_picker_tests;
+
 #[cfg(all(target_os = "linux", feature = "native-x11"))]
 mod native {
     use std::collections::{HashSet, VecDeque};

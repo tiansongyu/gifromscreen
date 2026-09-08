@@ -34,3 +34,12 @@ identifies source `c8fb5a00e3d1d885ba71254f80e88b7fecaef14e`, Rust 1.88.0 and gl
 maximum 2.35. They establish harness behavior, **not** acceptance of a newly
 built current-source archive. The new portable CI run must establish that
 separately; green local smoke results do not retroactively change the failed run.
+
+The follow-up portable CI run **34186254138** for
+`f758034fc937094f55b802b99edd21ad184fdb46` now passes, including owned-display
+lifecycle tests, packaged desktop launch and artifact upload. Artifact
+`10040698201` is present and unexpired (12,961,653 bytes), named
+`gifromscreen-linux-x86_64-ubuntu22-f758034fc937094f55b802b99edd21ad184fdb46`.
+The corresponding Linux CI run 34186254122 also passes. This establishes the
+current-source archive for that commit; it still does not identify the exact
+cause of the earlier XOpenDisplay failure or certify later commits automatically.

@@ -43,8 +43,13 @@ impl BoundedStream<'_> {
     }
     /// Bound a new native update on a long-lived owned connection.
     pub(crate) fn begin_operation(&self) {
+        self.begin_operation_until(Instant::now() + SETUP_TIME);
+    }
+
+    /// Preserve the shorter lifetime of a temporary native interaction.
+    pub(crate) fn begin_operation_until(&self, deadline: Instant) {
         *self.deadline.lock().unwrap_or_else(PoisonError::into_inner) =
-            Some(Instant::now() + SETUP_TIME);
+            Some(deadline.min(Instant::now() + SETUP_TIME));
         self.cleanup.store(false, Ordering::Release);
     }
     pub(crate) fn begin_cleanup(&self) {

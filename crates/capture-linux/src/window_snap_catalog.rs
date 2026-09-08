@@ -73,7 +73,10 @@ pub(super) fn query(
     Ok(WindowSnapCatalog { windows, truncated })
 }
 
-fn window_ids(connection: &Client<'_>, root: Window) -> Result<(Vec<Window>, bool), String> {
+pub(super) fn window_ids(
+    connection: &Client<'_>,
+    root: Window,
+) -> Result<(Vec<Window>, bool), String> {
     for name in [
         b"_NET_CLIENT_LIST_STACKING".as_slice(),
         b"_NET_CLIENT_LIST".as_slice(),

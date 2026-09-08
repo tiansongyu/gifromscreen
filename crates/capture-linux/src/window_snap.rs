@@ -52,6 +52,48 @@ pub fn list_snap_windows(
 #[path = "window_snap_catalog.rs"]
 mod catalog;
 
+#[cfg(all(target_os = "linux", feature = "native-x11"))]
+#[path = "window_picker.rs"]
+pub(crate) mod picker;
+
+/// A freshly observed target selected by an explicit native pointer gesture.
+#[derive(Debug)]
+pub struct PickedWindow {
+    /// Selected client identity/title, not the window-manager ancestor.
+    pub source: CaptureSource,
+    /// Requested frame/client/native bounds in global physical pixels.
+    pub region: PhysicalRect,
+}
+
+/// Temporarily grabs the pointer with a crosshair and highlights eligible windows.
+/// Left-button release selects; right-button press cancels. The caller supplies
+/// Escape/focus-loss cancellation and must run this on a worker thread. No
+/// keyboard grab is installed. Pointer/highlight ownership ends before return.
+///
+/// # Errors
+/// Returns unavailable/conflicting-grab, invalid target, cancelled/timeout or
+/// bounded native protocol failures. Selection has a 30-second lifetime.
+pub fn pick_snap_window(
+    display: Option<&str>,
+    bounds: WindowSnapBounds,
+    cancellation: &AtomicBool,
+) -> Result<Option<PickedWindow>, String> {
+    #[cfg(all(target_os = "linux", feature = "native-x11"))]
+    {
+        picker::run(
+            display,
+            bounds,
+            cancellation,
+            std::time::Duration::from_secs(30),
+        )
+    }
+    #[cfg(not(all(target_os = "linux", feature = "native-x11")))]
+    {
+        let _ = (display, bounds, cancellation);
+        Err("Crosshair selection requires a native X11 build.".into())
+    }
+}
+
 /// Re-reads an enumerated window's current physical bounds on a dedicated,
 /// cancellable connection. Never moves, focuses, raises or grabs any window.
 ///
@@ -83,7 +125,7 @@ pub fn query_window_snap(
 
 #[cfg(all(target_os = "linux", feature = "native-x11"))]
 mod native {
-    use super::{AtomicBool, CaptureSource, PhysicalRect, WindowSnapBounds};
+    use super::{AtomicBool, CaptureSource, PhysicalRect, PickedWindow, WindowSnapBounds};
     use crate::{
         shortcuts::x11::{Client, stream},
         x11_window::{rectangle, root_child},
@@ -154,8 +196,33 @@ mod native {
             return Err("Cannot snap to the root as a window.".into());
         }
         let atoms = Atoms::new(&connection)?;
-        let identity = inspect(&connection, window, &atoms)?;
-        if identity.0 != source.name() {
+        observe(
+            &connection,
+            screen,
+            window,
+            bounds,
+            &atoms,
+            Some(source.name()),
+        )
+        .map(|picked| picked.region)
+    }
+
+    pub(super) fn observe(
+        connection: &Client<'_>,
+        screen: usize,
+        window: Window,
+        bounds: WindowSnapBounds,
+        atoms: &Atoms,
+        expected_name: Option<&str>,
+    ) -> Result<PickedWindow, String> {
+        let root = connection
+            .setup()
+            .roots
+            .get(screen)
+            .ok_or("The X11 screen is unavailable.")?
+            .root;
+        let identity = inspect(connection, window, atoms)?;
+        if expected_name.is_some_and(|name| identity.0 != name) {
             return Err(
                 "The window title changed since discovery. Refresh sources and choose it again."
                     .into(),
@@ -163,24 +230,38 @@ mod native {
         }
         let mut previous = None;
         for _ in 0..3 {
-            let client = rectangle(&connection, window, root, false)?;
-            let ancestor = root_child(&connection, window, root)?;
-            let outer = rectangle(&connection, ancestor, root, true)?;
+            let client = rectangle(connection, window, root, false)?;
+            let ancestor = root_child(connection, window, root)?;
+            let outer = rectangle(connection, ancestor, root, true)?;
             let requested = match bounds {
                 WindowSnapBounds::Client => client,
                 WindowSnapBounds::Outer => outer,
                 WindowSnapBounds::WindowFrame => {
-                    frame_bounds(&connection, window, &atoms, client, outer)?
+                    frame_bounds(connection, window, atoms, client, outer)?
                 }
             };
-            if inspect(&connection, window, &atoms)? != identity {
+            if inspect(connection, window, atoms)? != identity {
                 return Err(
                     "The window changed identity while snapping. Refresh sources and retry.".into(),
                 );
             }
             let observed = (client, ancestor, outer, requested);
             if previous == Some(observed) {
-                return Ok(requested);
+                let source = CaptureSource::new(
+                    gif_from_screen_capture::CaptureSourceId::new(format!(
+                        "x11:screen:{screen}:window:0x{window:08x}"
+                    ))
+                    .map_err(error)?,
+                    identity.0,
+                    CaptureSourceKind::Window,
+                    Some(client),
+                    1.0,
+                )
+                .map_err(error)?;
+                return Ok(PickedWindow {
+                    source,
+                    region: requested,
+                });
             }
             previous = Some(observed);
         }
