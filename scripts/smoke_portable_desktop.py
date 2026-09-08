@@ -2,6 +2,7 @@
 """Launch the packaged desktop under an existing display (CI uses Xvfb)."""
 
 import argparse
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import subprocess
@@ -9,15 +10,23 @@ import tempfile
 import time
 
 from test_portable import extract_checked
+from owned_xvfb import owned_display, stop_child
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path)
+    parser.add_argument("--owned-xvfb", action="store_true", help="start one bounded owned Xvfb; ignore host DISPLAY")
     arguments = parser.parse_args()
+    display = owned_display() if arguments.owned_xvfb else nullcontext(os.environ.copy())
+    with display as environment:
+        smoke(arguments.archive, environment)
+
+
+def smoke(archive, environment):
     with tempfile.TemporaryDirectory(prefix="gifromscreen-desktop-smoke-") as scratch:
-        bundle = extract_checked(arguments.archive, Path(scratch))
-        environment = os.environ.copy()
+        bundle = extract_checked(archive, Path(scratch))
+        environment = environment.copy()
         environment.pop("WAYLAND_DISPLAY", None)
         environment["XDG_SESSION_TYPE"] = "x11"
         environment["WGPU_BACKEND"] = "gl"
@@ -32,7 +41,7 @@ def main():
                     if process.poll() is not None:
                         output.seek(0)
                         raise RuntimeError("desktop exited before showing a window:\n" + output.read())
-                    result = subprocess.run(["xdotool", "search", "--onlyvisible", "--pid", str(process.pid)], capture_output=True, text=True)
+                    result = subprocess.run(["xdotool", "search", "--onlyvisible", "--pid", str(process.pid)], env=environment, capture_output=True, text=True, timeout=2)
                     if result.returncode == 0 and result.stdout.strip():
                         print("Packaged desktop displayed a visible X11 window.")
                         return
@@ -40,12 +49,7 @@ def main():
                 output.seek(0)
                 raise RuntimeError("desktop did not show a window:\n" + output.read())
             finally:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+                stop_child(process)
 
 
 if __name__ == "__main__":

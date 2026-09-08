@@ -53,8 +53,11 @@ jobs:
       - name: Inspect archives and test safe installation
         run: python3 scripts/test_portable.py target/package-first/*.tar.gz
 
-      - name: Smoke-test packaged native desktop
-        run: xvfb-run --auto-servernum python3 scripts/smoke_portable_desktop.py target/package-first/*.tar.gz
+      - name: Test owned display lifecycle
+        run: python3 scripts/test_owned_xvfb.py
+
+      - name: Launch packaged native desktop
+        run: python3 scripts/smoke_portable_desktop.py --owned-xvfb target/package-first/*.tar.gz
 
       - name: Upload tarball and SHA256 checksum
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
