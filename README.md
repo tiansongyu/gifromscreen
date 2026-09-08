@@ -12,7 +12,9 @@
 
 ## 获取与运行
 
-目前尚未发布 GitHub Release。可从 [Linux portable package 构建](https://github.com/tiansongyu/gifromscreen/actions/workflows/portable.yml)选择成功的运行，下载其 Artifacts 中的 Linux x86_64 便携包。CI 下载需要登录 GitHub，产物保留 30 天；它不是稳定版发布渠道。
+**[下载 Linux x86_64 预览版](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0-preview.1/gifromscreen-0.1.0-linux-x86_64.tar.gz)** · [SHA-256 校验文件](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0-preview.1/gifromscreen-0.1.0-linux-x86_64.tar.gz.sha256) · [版本说明](https://github.com/tiansongyu/gifromscreen/releases/tag/v0.1.0-preview.1)
+
+当前版本为 `v0.1.0-preview.1`（约 26.7 MB），可直接下载，不需要登录。它是未签名的开发预览版，不是稳定版。更新的主分支测试包仍可从 [CI Artifacts](https://github.com/tiansongyu/gifromscreen/actions/workflows/portable.yml)获取（需要登录，保留 30 天）。
 
 便携包以 Ubuntu 22.04 / glibc 2.35 为构建基线，包含桌面程序和命令行工具。按照[安装说明](docs/PACKAGING.md#download-and-run)校验下载的 SHA-256 并解压，进入解压后的目录运行：
 
@@ -24,6 +26,10 @@ sha256sum --check SHA256SUMS
 无需安装，也无需管理员权限。可选的 `./install.sh` 会添加用户级桌面入口；[卸载说明](docs/PACKAGING.md#installation-and-removal)列出了对应操作。AppImage 仍处于开发验收阶段，Flatpak 尚未交付；请勿把仓库中的打包脚本视为已发布安装包。
 
 ## 录制 → 编辑 → GIF
+
+![实际 X11 操作：打开录制框、暂停移动选区、继续录制并进入编辑器](docs/assets/record-and-retarget.gif)
+
+真实 X11 窗口操作，包含暂停后拖动录制框；不是界面模型图。[演示来源与验证](docs/assets/README.md)。
 
 1. **框选并录制。** 打开“屏幕录制”，选择来源和区域。X11 使用独立边框与控制面板；Wayland 先通过系统分享对话框授权，再调整来源内的裁剪区域。开始前可调整尺寸，录制或暂停时可移动固定尺寸区域。
 2. **逐帧整理。** 停止后进入编辑器，删除多余帧、调整播放时间、裁剪画面，或添加文字、箭头和点击提示。编辑支持撤销与重做。
@@ -59,6 +65,8 @@ Wayland 不提供通用的全局透明取景框，也不能保证自动排除控
 默认跟随系统语言，也可在“语言 / Language”中切换并保存选择。目前启动页和语言设置已支持英语、简体中文，其余界面仍在逐步迁移。
 
 语言列表中的 29 项是覆盖目标，不代表 29 套完整译文。尚未提供的译文会明确回退到英语，原选择仍会保存；详细范围见[本地化计划](docs/LOCALIZATION-PLAN.md)。
+
+![真实界面即时切换中英文并自动保存语言选择](docs/assets/language-switch.gif)
 
 ## 运行要求与当前边界
 

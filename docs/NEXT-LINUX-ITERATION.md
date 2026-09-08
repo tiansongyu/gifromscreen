@@ -13,6 +13,14 @@ completion. The [README/Release plan](README-RELEASE-PLAN.md) preserves real pac
 readiness and working links. These additions do not discard the functional and
 platform requirements below or authorize calling a preview build fully complete.
 
+Delivered first slice: System/manual language preferences persist independently
+of projects; launcher/navigation/recent-project controls and the language panel
+have an initial en/zh catalog and licensed CJK fallback. English fallback is
+explicit for other choices. The bilingual README now contains real GIF demos and
+an independently re-downloaded [Linux Preview 1](LINUX-PREVIEW-1-QA.md) tarball.
+Next: migrate the remaining recorder/editor/tool strings, complete and verify the
+other catalogs, and solve complex-script/RTL input before claiming all languages.
+
 ## Playback timing: implemented, bounded native manual acceptance recorded
 
 `PlaybackTiming::Measured` and `PlaybackTiming::Fixed(Duration)` now separate GIF playback from sampling cadence in the workflow. Fixed mode assigns one final delay to each retained frame, including the last; omitted unchanged samples and delivery gaps do not accumulate fixed delay. Raw active capture timestamps and input events remain unchanged. Status distinguishes observed source-sample span from GIF playback duration. The pinned upstream evidence, save-failure exception and measured-mode interval-assignment difference are recorded in [Capture playback timing](CAPTURE-PLAYBACK-TIMING.md).

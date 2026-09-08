@@ -4,7 +4,17 @@ The supported package is a native **x86_64 Linux tar.gz**, built on Ubuntu 22.04
 
 ## Download and run
 
-The `Linux portable package` GitHub Actions workflow uploads a tarball and its `.sha256` file for each successful main-branch build. Artifacts are retained for 30 days; this workflow does not create GitHub Releases or tags. Download the artifact ZIP, extract it, then:
+Download the [Linux Preview 1 tarball](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0-preview.1/gifromscreen-0.1.0-linux-x86_64.tar.gz)
+and its [SHA-256 file](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0-preview.1/gifromscreen-0.1.0-linux-x86_64.tar.gz.sha256).
+This is an unsigned pre-release, not a stable/full-parity release. See the
+[release notes](https://github.com/tiansongyu/gifromscreen/releases/tag/v0.1.0-preview.1)
+and [artifact acceptance record](LINUX-PREVIEW-1-QA.md).
+
+The `Linux portable package` GitHub Actions workflow also uploads a tarball and
+its `.sha256` file for successful main-branch builds. These newer CI artifacts
+require GitHub sign-in and expire after 30 days; that workflow itself does not
+create Releases or tags. After downloading both Release files (or extracting a
+CI artifact ZIP), run:
 
 ```sh
 sha256sum --check gifromscreen-0.1.0-linux-x86_64.tar.gz.sha256

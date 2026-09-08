@@ -5,6 +5,14 @@ selectable/persistent UI languages, default to the machine language, then improv
 the whole project README with real animated demonstrations and convenient Release
 downloads. This plan supplements, not replaces, the Linux feature/release ledger.
 
+Progress on 2026-09-08: Chinese/English product READMEs now replace the audit-heavy
+entry page; the previous detail is preserved in [development status](DEVELOPMENT-STATUS.md).
+Two [actual operation GIFs](assets/README.md) show X11 pause/retarget/stop and saved
+language switching. [Linux Preview 1](https://github.com/tiansongyu/gifromscreen/releases/tag/v0.1.0-preview.1)
+provides a real tarball/checksum, verified again via unauthenticated public
+download. This closes the initial README/demo/download slice, not full UI
+translation, AppImage redistribution or a stable Linux release.
+
 ## Product-facing README
 
 Use the [ScreenToGif README](https://github.com/NickeManarin/ScreenToGif/blob/master/README.md)

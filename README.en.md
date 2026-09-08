@@ -12,7 +12,9 @@ Built in Rust, with recording, editing and export performed locally. Inspired by
 
 ## Get and run
 
-No GitHub Release has been published yet. To try a development build, open a successful [Linux portable package workflow run](https://github.com/tiansongyu/gifromscreen/actions/workflows/portable.yml) and download its Linux x86_64 artifact. GitHub sign-in is required; CI artifacts expire after 30 days and are not a stable release channel.
+**[Download the Linux x86_64 preview](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0-preview.1/gifromscreen-0.1.0-linux-x86_64.tar.gz)** · [SHA-256 file](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0-preview.1/gifromscreen-0.1.0-linux-x86_64.tar.gz.sha256) · [Release notes](https://github.com/tiansongyu/gifromscreen/releases/tag/v0.1.0-preview.1)
+
+Current version: `v0.1.0-preview.1` (about 26.7 MB), available without sign-in. This is an unsigned development preview, not a stable release. Newer main-branch test builds remain available in [CI Artifacts](https://github.com/tiansongyu/gifromscreen/actions/workflows/portable.yml), which require sign-in and expire after 30 days.
 
 The portable package is built against Ubuntu 22.04 / glibc 2.35 and includes the desktop app and CLI. Follow the [download checksum and extraction instructions](docs/PACKAGING.md#download-and-run), then run from the extracted directory:
 
@@ -24,6 +26,10 @@ sha256sum --check SHA256SUMS
 Installation and administrator privileges are not required. Optional `./install.sh` adds a per-user desktop launcher; see [installation and removal](docs/PACKAGING.md#installation-and-removal). AppImage remains under development validation; Flatpak has not been delivered. Packaging scripts are not published installers.
 
 ## Record → edit → GIF
+
+![Actual X11 workflow: open the recording frame, pause and move the region, resume and stop into the editor](docs/assets/record-and-retarget.gif)
+
+Recorded from the running X11 app, including a paused recording-frame drag; not a UI mock-up. [Demonstration provenance and checks](docs/assets/README.md).
 
 1. **Choose and record.** Open Screen recorder and choose your source and region. X11 uses a separate border and control panel. Wayland first asks for sharing permission, then lets you crop inside the authorized source. Resize before recording; move the fixed-size region while recording or paused.
 2. **Edit the frames.** Stop to open the editor. Remove unwanted frames, change playback timing, crop, or add text, arrows and click annotations. Edits support undo and redo.
@@ -59,6 +65,8 @@ Wayland does not offer a universal transparent desktop frame, automatic controll
 The app follows the system locale by default and saves an explicit override from **Language**. English and Simplified Chinese currently cover the launcher and language settings; the rest of the interface is still being migrated.
 
 The 29 entries are translation targets, not 29 completed catalogs. Unavailable translations visibly fall back to English while preserving the selected preference. See the [localization plan](docs/LOCALIZATION-PLAN.md).
+
+![Switching between English and Chinese in the real app with automatically saved language preferences](docs/assets/language-switch.gif)
 
 ## Requirements and limits
 
