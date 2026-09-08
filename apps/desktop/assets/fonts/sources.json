@@ -1,0 +1,36 @@
+{
+  "format_version": 1,
+  "files": [
+    {
+      "file": "NotoSansCJKsc-Regular.otf",
+      "family": "Noto Sans CJK SC",
+      "style": "Regular",
+      "version": "2.004",
+      "face_index": 0,
+      "bytes": 16437364,
+      "sha256": "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b",
+      "repository": "https://github.com/notofonts/noto-cjk",
+      "tag": "Sans2.004",
+      "commit": "523d033d6cb47f4a80c58a35753646f5c3608a78",
+      "source_url": "https://raw.githubusercontent.com/notofonts/noto-cjk/523d033d6cb47f4a80c58a35753646f5c3608a78/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf",
+      "git_blob_sha1": "dc15562470b4f842321894787a0d066879ccff8b",
+      "modified": false,
+      "copyright_name_record_0": "© 2014-2021 Adobe (http://www.adobe.com/).",
+      "license": "OFL-1.1",
+      "license_file": "OFL.txt"
+    },
+    {
+      "file": "OFL.txt",
+      "bytes": 4301,
+      "sha256": "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2",
+      "source_url": "https://raw.githubusercontent.com/notofonts/noto-cjk/523d033d6cb47f4a80c58a35753646f5c3608a78/LICENSE",
+      "modified": false
+    }
+  ],
+  "policy": "Append the SC regular face to default egui proportional and monospace fallback lists. Preserve existing Latin and emoji priorities. UI only; no project asset/font substitution.",
+  "limitations": [
+    "Uses Simplified Chinese regional Han forms; does not switch locl forms for Japanese, Korean or Traditional Chinese UI language.",
+    "Does not add shaping/bidi support for Arabic, Hebrew, Tamil or other complex scripts.",
+    "CJK character sample coverage is tested; not every historic or newly encoded ideograph is promised."
+  ]
+}

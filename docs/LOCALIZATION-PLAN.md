@@ -1,10 +1,14 @@
 # Localization implementation and acceptance plan
 
-Status: locale-selection foundation implemented, 2026-09-08. The new
+Status: first desktop language slice implemented, 2026-09-08. The
 `gif-from-screen-localization` crate provides the registry, validated preference
-wire format and injected-system-locale negotiation. No desktop selector,
-persistence I/O, translation catalog, new font or UI text engine is claimed yet.
+wire format, injected-system-locale negotiation and an initial English/Simplified
+Chinese message catalog. The desktop now offers System plus 29 saved choices,
+asynchronous private preference storage, immediate launcher/navigation switching
+and an embedded licensed CJK fallback. Other catalogs explicitly fall back to
+English; recorder/editor/tool interfaces still require migration.
 The target includes the entire application-owned UI, not merely language selection.
+See [the first desktop acceptance record](LOCALIZATION-QA-2026-09-08.md).
 
 ## Target languages and reference
 
@@ -43,7 +47,8 @@ backend errors, file-dialog titles/filters and native window titles add more tex
 
 - `main.rs::main`/`GifFromScreenApp::update` own initialization and all view routes.
   Preference polling must precede recorder early returns and join the shutdown gate.
-- `appearance.rs::configure` changes style only; there is currently no `set_fonts`.
+- `appearance.rs::configure` changes style only; `preferences::fonts::install`
+  now appends the embedded Noto Sans CJK SC 2.004 face to the original egui fonts.
 - `shortcut_ui/store.rs` provides owner-only bounded files, atomic replacement,
   fsync, locking and stale-writer detection; `persistence.rs` supplies asynchronous
   load/save and “newer in-memory edit beats late load” behavior.
@@ -84,8 +89,14 @@ as an explicit override. No project/capture operation restarts just to change la
 
 ## Messages, catalogs and genuine coverage
 
-Prefer embedded Fluent catalogs with stable message IDs and a small application
-wrapper (`text(id)`, `format(id, named_args)`). `fluent-bundle` 0.16.0's declared
+The initial slice uses a small embedded typed `Message` table with stable IDs,
+mandatory en/zh entries and strict named parameters. No new parser dependency is
+needed for these static sentences; bounded formatting scans the template once
+and never interprets braces inside user data. Per-message fallback and coverage
+are explicit. This is not a substitute for plural rules in the full catalog.
+
+For the full plural/selectable-message migration, evaluate embedded Fluent
+behind the existing `Localizer` interface. `fluent-bundle` 0.16.0's declared
 MSRV is 1.67; still verify its resolved graph on this project's Rust 1.88 baseline.
 Use named typed parameters, plural selectors and full sentences, not concatenated
 translated fragments or positional English `format!` templates:

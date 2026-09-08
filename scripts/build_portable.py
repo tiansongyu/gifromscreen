@@ -137,6 +137,40 @@ def license_files(package):
     return root, sorted(selected)
 
 
+def embedded_font_license(destination):
+    root = ROOT / "apps/desktop/assets/fonts"
+    provenance = json.loads((root / "sources.json").read_text(encoding="utf-8"))
+    if type(provenance.get("format_version")) is not int or provenance["format_version"] != 1:
+        raise ValueError("unsupported embedded font provenance")
+    records = provenance.get("files")
+    if (not isinstance(records, list) or len(records) != 2
+            or {record.get("file") for record in records} != {"NotoSansCJKsc-Regular.otf", "OFL.txt"}):
+        raise ValueError("incomplete embedded font source inventory")
+    for record in records:
+        source = root / record["file"]
+        if (source.is_symlink() or not source.is_file() or type(record.get("bytes")) is not int
+                or not 0 < record["bytes"] <= 20_000_000 or source.stat().st_size != record["bytes"]
+                or sha256(source) != record.get("sha256")):
+            raise ValueError("embedded font/source license checksum mismatch: " + record["file"])
+    font = next(record for record in records if record["file"].endswith(".otf"))
+    relative = Path("fonts/noto-cjk-2.004")
+    target = destination / relative
+    target.mkdir(parents=True)
+    hashes = {}
+    for name in ("OFL.txt", "COPYRIGHT.txt", "sources.json", "README.md"):
+        source = root / name
+        if source.is_symlink() or not source.is_file() or source.stat().st_size > 64 * 1024:
+            raise ValueError("missing or invalid embedded font notice: " + name)
+        shutil.copyfile(source, target / name)
+        hashes[str(relative / name)] = sha256(target / name)
+    return {"name": "Noto Sans CJK SC", "version": "2.004", "license": "OFL-1.1",
+            "repository": font["repository"], "authors": ["Adobe"], "source": font["source_url"],
+            "source_kind": "embedded-font", "source_commit": font["commit"],
+            "source_sha256": font["sha256"], "source_byte_len": font["bytes"], "face_index": font["face_index"],
+            "font_modified": font["modified"], "license_files": [str(relative / name) for name in ("OFL.txt", "COPYRIGHT.txt")],
+            "provenance_file": str(relative / "sources.json"), "notice_sha256": hashes}
+
+
 def collect_licenses(metadata, destination):
     shutil.copytree(ROOT / "packaging/licenses", destination)
     sources = json.loads((destination / "upstream/sources.json").read_text(encoding="utf-8"))
@@ -168,8 +202,9 @@ def collect_licenses(metadata, destination):
         if not record["license_files"]:
             raise ValueError("missing distributable license text for " + identifier + ": " + expression)
         inventory.append(record)
+    inventory.append(embedded_font_license(destination))
     write_json(destination / "THIRD-PARTY.json", inventory)
-    text = "Third-party normal/build dependency inventory (Cargo.lock-resolved)\n\n"
+    text = "Third-party normal/build dependencies (Cargo.lock-resolved) and embedded font inventory\n\n"
     for record in inventory:
         text += record["name"] + " " + record["version"] + " — " + str(record["license"]) + "\n"
         text += "  " + str(record["repository"] or record["source"]) + "\n"

@@ -14,6 +14,7 @@ gif-from-screen-capture-linux = { path = "../../crates/capture-linux", features 
 gif-from-screen-domain = { path = "../../crates/domain" }
 gif-from-screen-editor = { path = "../../crates/editor" }
 gif-from-screen-gif = { path = "../../crates/gif" }
+gif-from-screen-localization = { path = "../../crates/localization" }
 gif-from-screen-media = { path = "../../crates/media" }
 gif-from-screen-project = { path = "../../crates/project" }
 gif-from-screen-render = { path = "../../crates/render" }
@@ -26,6 +27,11 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 fs2 = "0.4.3"
+rustix = { version = "1", features = ["fs", "process"] }
+
+[dev-dependencies]
+ttf-parser = "0.25.1"
+sha2 = "0.10.9"
 
 [lints]
 workspace = true

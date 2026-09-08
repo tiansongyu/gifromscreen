@@ -3,6 +3,7 @@
 
 import json
 import os
+import shutil
 from contextlib import ExitStack
 from pathlib import Path
 import subprocess
@@ -175,6 +176,71 @@ class BuildReceiptTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Rust sources changed while building"):
                 self.build()
         self.assertFalse(self.receipt_path().exists())
+
+
+class EmbeddedFontNoticeTests(unittest.TestCase):
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory(prefix="gifromscreen-font-notices-")
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        self.fonts = portable.ROOT / "apps/desktop/assets/fonts"
+        self.destination = self.root / "licenses"
+
+    def test_license_collector_includes_verified_embedded_font_notices_without_duplicating_font_binary(self):
+        with patch.object(portable, "dependency_packages", return_value=[]), \
+                patch.object(portable, "run", side_effect=AssertionError("no external command")):
+            self.assertEqual(portable.collect_licenses({}, self.destination), 1)
+        inventory = json.loads((self.destination / "THIRD-PARTY.json").read_text())
+        font = inventory[0]
+        self.assertEqual(font["name"], "Noto Sans CJK SC")
+        self.assertEqual(font["version"], "2.004")
+        self.assertEqual(font["source_kind"], "embedded-font")
+        self.assertEqual(font["license"], "OFL-1.1")
+        self.assertEqual(font["source_commit"], "523d033d6cb47f4a80c58a35753646f5c3608a78")
+        self.assertEqual(font["source_sha256"], "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b")
+        self.assertEqual(font["source_byte_len"], 16_437_364)
+        self.assertEqual(font["face_index"], 0)
+        self.assertFalse(font["font_modified"])
+        copied = self.destination / "fonts/noto-cjk-2.004"
+        self.assertEqual({path.name for path in copied.iterdir()}, {"OFL.txt", "COPYRIGHT.txt", "sources.json", "README.md"})
+        for name in font["notice_sha256"]:
+            self.assertEqual(portable.sha256(self.destination / name), font["notice_sha256"][name])
+            self.assertEqual((self.destination / name).read_bytes(), (self.fonts / Path(name).name).read_bytes())
+        self.assertIn("Noto Sans CJK SC 2.004", (self.destination / "THIRD-PARTY.txt").read_text())
+
+    def private_sources(self):
+        root = self.root / "source"
+        source = root / "apps/desktop/assets/fonts"
+        shutil.copytree(self.fonts, source)
+        return root, source
+
+    def test_changed_font_or_ofl_cannot_be_packaged_with_stale_source_evidence(self):
+        root, source = self.private_sources()
+        for name in ("NotoSansCJKsc-Regular.otf", "OFL.txt"):
+            with self.subTest(name=name):
+                path = source / name
+                original = path.read_bytes()
+                changed = bytearray(original)
+                changed[-1] ^= 1
+                path.write_bytes(changed)
+                with patch.object(portable, "ROOT", root), self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                    portable.embedded_font_license(self.destination)
+                self.assertFalse(self.destination.exists())
+                path.write_bytes(original)
+
+    def test_missing_or_redirected_font_notice_is_rejected(self):
+        root, source = self.private_sources()
+        font = source / "NotoSansCJKsc-Regular.otf"
+        font.unlink()
+        font.symlink_to(self.fonts / font.name)
+        with patch.object(portable, "ROOT", root), self.assertRaisesRegex(ValueError, "checksum mismatch"):
+            portable.embedded_font_license(self.destination)
+        self.assertFalse(self.destination.exists())
+        font.unlink()
+        shutil.copyfile(self.fonts / font.name, font)
+        (source / "COPYRIGHT.txt").unlink()
+        with patch.object(portable, "ROOT", root), self.assertRaisesRegex(ValueError, "font notice"):
+            portable.embedded_font_license(self.destination)
 
 
 if __name__ == "__main__":

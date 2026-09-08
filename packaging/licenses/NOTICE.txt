@@ -20,6 +20,12 @@ and the source license paths copied for each included package. The inventory
 conservatively includes normal and build dependencies; it is not a claim
 that every package is statically linked into both binaries.
 
+The desktop UI also embeds unmodified Noto Sans CJK SC Regular 2.004.
+Copyright © 2014-2021 Adobe (http://www.adobe.com/).
+See fonts/noto-cjk-2.004/ for the complete SIL Open Font License 1.1,
+copyright notice, immutable source URL/checksums and regional-glyph limits.
+THIRD-PARTY.json marks this separately as an embedded font, not a Cargo crate.
+
 FFmpeg, ffprobe, system libraries, graphics drivers, portals, and system fonts
 are not bundled. Their licenses are supplied by their system distributors.
 

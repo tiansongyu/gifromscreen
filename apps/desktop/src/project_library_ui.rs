@@ -12,6 +12,7 @@ use gif_from_screen_application::{
     save_project_copy,
 };
 use gif_from_screen_domain::{ProjectId, UnixTimeMs};
+use gif_from_screen_localization::{Localizer, Message};
 use uuid::Uuid;
 
 use crate::{background_task::BackgroundTask, editor_workspace::EditorWorkspace};
@@ -185,15 +186,19 @@ impl ProjectLibraryTool {
     }
 
     /// Returns a project only after an explicit Open click.
-    pub(crate) fn show_recent(&mut self, ui: &mut egui::Ui) -> Option<PathBuf> {
+    pub(crate) fn show_recent(
+        &mut self,
+        ui: &mut egui::Ui,
+        localizer: Localizer,
+    ) -> Option<PathBuf> {
         let mut open = None;
         let mut remove = None;
         ui.horizontal(|ui| {
-            ui.heading("Recent projects");
+            ui.heading(localizer.text(Message::HomeRecentProjects));
             if ui
                 .add_enabled(
                     !self.history_task.is_running(),
-                    egui::Button::new("Refresh"),
+                    egui::Button::new(localizer.text(Message::RecentRefresh)),
                 )
                 .clicked()
             {
@@ -201,29 +206,39 @@ impl ProjectLibraryTool {
             }
         });
         if self.recent.is_empty() {
-            ui.weak("Projects you open or create appear here. Removing an entry never deletes the project.");
+            ui.weak(localizer.text(Message::RecentEmpty));
         }
         for entry in &self.recent {
-            ui.horizontal_wrapped(|ui| {
-                let label = entry
-                    .path
-                    .file_name()
-                    .unwrap_or(entry.path.as_os_str())
-                    .to_string_lossy();
-                if ui
-                    .add_enabled(entry.available, egui::Button::new(label.as_ref()))
-                    .on_hover_text(entry.path.display().to_string())
-                    .clicked()
-                {
-                    open = Some(entry.path.clone());
-                }
-                ui.weak(entry.path.display().to_string());
-                if !entry.available {
-                    ui.colored_label(ui.visuals().warn_fg_color, "Missing or moved");
-                }
-                if ui.small_button("Remove from list").clicked() {
-                    remove = Some(entry.path.clone());
-                }
+            // Project identity is its original path, never its localized label
+            // or a basename shared with another entry.
+            ui.push_id(&entry.path, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let label = entry
+                        .path
+                        .file_name()
+                        .unwrap_or(entry.path.as_os_str())
+                        .to_string_lossy();
+                    if ui
+                        .add_enabled(entry.available, egui::Button::new(label.as_ref()))
+                        .on_hover_text(entry.path.display().to_string())
+                        .clicked()
+                    {
+                        open = Some(entry.path.clone());
+                    }
+                    ui.weak(entry.path.display().to_string());
+                    if !entry.available {
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            localizer.text(Message::RecentMissing),
+                        );
+                    }
+                    if ui
+                        .small_button(localizer.text(Message::RecentRemove))
+                        .clicked()
+                    {
+                        remove = Some(entry.path.clone());
+                    }
+                })
             });
         }
         if let Some(path) = remove {
@@ -406,5 +421,206 @@ mod tests {
         assert_eq!(library.pending.len(), 40);
         library.shutdown();
         assert!(library.closing);
+    }
+
+    struct RecentFrame {
+        text: Vec<(String, egui::Rect)>,
+        open: Option<PathBuf>,
+    }
+
+    impl RecentFrame {
+        fn contains(&self, label: &str) -> bool {
+            self.text.iter().any(|(text, _)| text == label)
+        }
+
+        fn position(&self, label: &str, index: usize) -> egui::Pos2 {
+            self.text
+                .iter()
+                .filter(|(text, _)| text == label)
+                .nth(index)
+                .unwrap_or_else(|| panic!("missing recent-project label {label}"))
+                .1
+                .center()
+        }
+    }
+
+    fn recent_frame(
+        context: &egui::Context,
+        library: &mut ProjectLibraryTool,
+        localizer: Localizer,
+        events: Vec<egui::Event>,
+    ) -> RecentFrame {
+        fn collect(shape: &egui::Shape, clip: egui::Rect, text: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(shape) => text.push((
+                    shape.galley.text().to_owned(),
+                    shape
+                        .galley
+                        .rect
+                        .translate(shape.pos.to_vec2())
+                        .intersect(clip),
+                )),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, clip, text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut open = None;
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    open = library.show_recent(ui, localizer);
+                });
+            },
+        );
+        let mut text = Vec::new();
+        for clipped in output.shapes {
+            collect(&clipped.shape, clipped.clip_rect, &mut text);
+        }
+        RecentFrame { text, open }
+    }
+
+    fn click_recent(
+        context: &egui::Context,
+        library: &mut ProjectLibraryTool,
+        localizer: Localizer,
+        position: egui::Pos2,
+    ) -> RecentFrame {
+        let mut result = None;
+        for pressed in [true, false] {
+            result = Some(recent_frame(
+                context,
+                library,
+                localizer,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            ));
+        }
+        result.unwrap()
+    }
+
+    fn localizer(tag: &str) -> Localizer {
+        Localizer::new(gif_from_screen_localization::find_language(tag).unwrap())
+    }
+
+    #[test]
+    fn recent_empty_state_switches_language_and_refresh_stays_an_explicit_action() {
+        let context = egui::Context::default();
+        let mut library = ProjectLibraryTool::empty();
+        library.loaded = true;
+        for tag in ["en", "zh", "en"] {
+            let localizer = localizer(tag);
+            let frame = recent_frame(&context, &mut library, localizer, Vec::new());
+            for key in [
+                Message::HomeRecentProjects,
+                Message::RecentRefresh,
+                Message::RecentEmpty,
+            ] {
+                assert!(frame.contains(localizer.text(key)));
+            }
+            assert!(frame.open.is_none());
+            assert!(library.loaded && library.pending.is_empty());
+            let position = frame.position(localizer.text(Message::RecentRefresh), 0);
+            assert!(
+                click_recent(&context, &mut library, localizer, position)
+                    .open
+                    .is_none()
+            );
+            assert!(!library.loaded);
+            assert!(library.pending.is_empty());
+            library.loaded = true;
+        }
+    }
+
+    #[test]
+    fn translated_recent_buttons_keep_same_named_project_paths_and_raw_diagnostics() {
+        let context = egui::Context::default();
+        let mut library = ProjectLibraryTool::empty();
+        library.loaded = true;
+        let first = PathBuf::from("/projects/first/movie{subtitle}.gfsproj");
+        let second = PathBuf::from("/projects/second/movie{subtitle}.gfsproj");
+        for path in [&first, &second] {
+            library.recent.push(RecentEntry {
+                path: path.clone(),
+                available: true,
+            });
+        }
+        let raw = "EIO: 原始诊断 {path} /projects/unchanged";
+        library.notice = Some(raw.to_owned());
+        let _ = recent_frame(&context, &mut library, localizer("en"), Vec::new());
+        let chinese = localizer("zh");
+        let frame = recent_frame(&context, &mut library, chinese, Vec::new());
+        assert!(frame.contains(raw));
+        assert!(frame.contains(first.to_str().unwrap()));
+        assert!(frame.contains(second.to_str().unwrap()));
+        let position = frame.position("movie{subtitle}.gfsproj", 1);
+        assert_eq!(
+            click_recent(&context, &mut library, chinese, position).open,
+            Some(second.clone())
+        );
+        let frame = recent_frame(&context, &mut library, chinese, Vec::new());
+        let position = frame.position(chinese.text(Message::RecentRemove), 0);
+        assert!(
+            click_recent(&context, &mut library, chinese, position)
+                .open
+                .is_none()
+        );
+        assert_eq!(library.pending.len(), 1);
+        assert!(
+            matches!(library.pending.front(), Some(RecentProjectEdit::Remove(path)) if path == &first)
+        );
+        assert_eq!(library.recent[0].path, first);
+        assert_eq!(library.recent[1].path, second);
+        assert_eq!(library.notice.as_deref(), Some(raw));
+    }
+
+    #[test]
+    fn unavailable_recent_project_cannot_open_and_removing_entry_never_deletes_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("保留{data}.gfsproj");
+        let workspace = workspace(&root);
+        let before = fs::read(root.join("manifest.json")).unwrap();
+        let context = egui::Context::default();
+        let mut library = ProjectLibraryTool::empty();
+        library.loaded = true;
+        library.recent.push(RecentEntry {
+            path: root.clone(),
+            available: false,
+        });
+        let localizer = localizer("zh");
+        let frame = recent_frame(&context, &mut library, localizer, Vec::new());
+        assert!(frame.contains(localizer.text(Message::RecentMissing)));
+        let position = frame.position("保留{data}.gfsproj", 0);
+        assert!(
+            click_recent(&context, &mut library, localizer, position)
+                .open
+                .is_none()
+        );
+        let frame = recent_frame(&context, &mut library, localizer, Vec::new());
+        let position = frame.position(localizer.text(Message::RecentRemove), 0);
+        let _ = click_recent(&context, &mut library, localizer, position);
+        assert!(
+            matches!(library.pending.front(), Some(RecentProjectEdit::Remove(path)) if path == &root)
+        );
+        assert_eq!(fs::read(root.join("manifest.json")).unwrap(), before);
+        assert_eq!(workspace.project_root(), root);
     }
 }

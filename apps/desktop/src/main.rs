@@ -31,6 +31,7 @@ mod import_static_sequence_job;
 mod motion_tools;
 mod open_project_job;
 mod path_picker;
+mod preferences;
 mod project_insert_ui;
 mod project_library_ui;
 mod recorder_geometry;
@@ -52,6 +53,7 @@ mod window_snap;
 mod x11_controller_ui;
 mod x11_controller_window;
 mod x11_recorder;
+use gif_from_screen_localization::Message;
 use x11_recorder::RecorderOverlay;
 
 use std::{
@@ -770,6 +772,7 @@ struct RecorderOverlayFrame {
 }
 
 struct GifFromScreenApp {
+    language_settings: preferences::LanguageSettings,
     x11_window_id: Option<u32>,
     pending_recorder_start: Option<Instant>,
     shortcut_tool: shortcut_ui::ShortcutTool,
@@ -830,6 +833,7 @@ struct GifFromScreenApp {
 impl Default for GifFromScreenApp {
     fn default() -> Self {
         Self {
+            language_settings: preferences::LanguageSettings::default(),
             pending_recorder_start: None,
             x11_window_id: None,
             shortcut_tool: shortcut_ui::ShortcutTool::default(),
@@ -900,6 +904,10 @@ impl Drop for GifFromScreenApp {
 
 impl eframe::App for GifFromScreenApp {
     fn update(&mut self, context: &egui::Context, frame: &mut eframe::Frame) {
+        // Do not accept a last UI edit after this frame's close gate has already
+        // decided to exit. Also cover the final frame of a deferred shutdown.
+        let allow_preference_changes = self.shutdown == ShutdownState::Active
+            && !context.input(|input| input.viewport().close_requested());
         self.x11_window_id = x11_recorder::window_id(frame);
         let closing_controller = (self.wayland_crop_controller.is_some()
             || self.recorder_overlay.is_some())
@@ -908,6 +916,7 @@ impl eframe::App for GifFromScreenApp {
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
         self.receive_background_messages(context);
+        self.language_settings.poll(context);
         if !closing_controller {
             self.handle_worker_shutdown(context);
         }
@@ -994,6 +1003,9 @@ impl eframe::App for GifFromScreenApp {
             }
             AppView::Editor => self.show_editor(ui),
         });
+        if allow_preference_changes && self.shutdown == ShutdownState::Active {
+            self.language_settings.show(context);
+        }
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -1089,6 +1101,7 @@ impl GifFromScreenApp {
     }
 
     fn show_app_header(&mut self, context: &egui::Context) {
+        let localizer = self.language_settings.localizer();
         egui::TopBottomPanel::top("app_header").show(context, |ui| {
             ui.horizontal(|ui| {
                 let back_enabled = self.watermark_job.state() != WatermarkDecodeJobState::Running
@@ -1103,7 +1116,10 @@ impl GifFromScreenApp {
                     );
                 if self.view != AppView::Landing
                     && ui
-                        .add_enabled(back_enabled, egui::Button::new("Back"))
+                        .add_enabled(
+                            back_enabled,
+                            egui::Button::new(localizer.text(Message::BackToHome)),
+                        )
                         .clicked()
                 {
                     if self.view == AppView::Editor {
@@ -1118,7 +1134,10 @@ impl GifFromScreenApp {
                 }
                 ui.heading(APP_NAME);
                 ui.separator();
-                ui.label("Linux capture preview");
+                ui.label(localizer.text(Message::HeaderPreview));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.language_settings.show_button(ui);
+                });
             });
         });
     }
@@ -1210,6 +1229,7 @@ impl GifFromScreenApp {
                 || self.project_library.is_active()
                 || self.auto_tasks.is_loading()
                 || self.shortcut_tool.is_active()
+                || self.language_settings.is_active()
                 || self.job.is_some())
         {
             self.video_import.cancel();
@@ -1233,7 +1253,10 @@ impl GifFromScreenApp {
             && self.job.is_none()
         {
             self.project_library.shutdown();
-            if self.project_library.is_active() || self.shortcut_tool.is_active() {
+            if self.project_library.is_active()
+                || self.shortcut_tool.is_active()
+                || self.language_settings.is_active()
+            {
                 return;
             }
             self.shutdown = ShutdownState::Active;
@@ -1380,27 +1403,28 @@ impl GifFromScreenApp {
     }
 
     fn show_landing_contents(&mut self, ui: &mut egui::Ui) {
+        let localizer = self.language_settings.localizer();
         ui.vertical_centered(|ui| {
             ui.add_space(48.0);
-            ui.heading("Create an animated GIF");
-            ui.label("Capture, edit frame by frame, and export locally.");
+            ui.heading(localizer.text(Message::HomeTitle));
+            ui.label(localizer.text(Message::HomeDescription));
             self.show_resume_editor(ui);
-            if let Some(path) = self.project_library.show_recent(ui) { self.open_library_project(&path); }
+            if let Some(path) = self.project_library.show_recent(ui, localizer) { self.open_library_project(&path); }
             ui.add_space(28.0);
 
             ui.columns(LANDING_COLUMN_COUNT, |columns| {
                 if landing_action(
                     &mut columns[0],
-                    "Screen recorder",
-                    "Record a Linux monitor, window, or physical-pixel region.",
+                    localizer.text(Message::HomeScreenRecorder),
+                    localizer.text(Message::HomeScreenDescription),
                     true,
                 ) {
                     self.view = AppView::ScreenRecorder;
                 }
                 if landing_action(
                     &mut columns[1],
-                    "Open project",
-                    "Open an existing editable .gfsproj directory.",
+                    localizer.text(Message::HomeOpenProject),
+                    localizer.text(Message::HomeOpenDescription),
                     true,
                 ) {
                     self.view = AppView::OpenProject;
@@ -1413,8 +1437,8 @@ impl GifFromScreenApp {
             ui.columns(LANDING_COLUMN_COUNT, |columns| {
                 if landing_action(
                     &mut columns[0],
-                    "Import GIF",
-                    "Decode a GIF safely into a new editable project.",
+                    localizer.text(Message::HomeImportGif),
+                    localizer.text(Message::HomeGifDescription),
                     true,
                 ) {
                     self.view = AppView::ImportGif;
@@ -1425,8 +1449,8 @@ impl GifFromScreenApp {
                 }
                 if landing_action(
                     &mut columns[1],
-                    "Import image",
-                    "Import PNG, JPEG, BMP, or WebP as a one-frame project.",
+                    localizer.text(Message::HomeImportImage),
+                    localizer.text(Message::HomeImageDescription),
                     true,
                 ) {
                     self.view = AppView::ImportImage;
@@ -1441,8 +1465,8 @@ impl GifFromScreenApp {
             ui.columns(LANDING_COLUMN_COUNT, |columns| {
                 if landing_action(
                     &mut columns[0],
-                    "New blank animation",
-                    "Start with a transparent or solid-color canvas.",
+                    localizer.text(Message::HomeNewAnimation),
+                    localizer.text(Message::HomeNewDescription),
                     true,
                 ) {
                     self.blank_project_ui = BlankProjectUiState::default();
@@ -1454,8 +1478,8 @@ impl GifFromScreenApp {
                 }
                 if landing_action(
                     &mut columns[1],
-                    "Import image sequence",
-                    "Build an animation from ordered PNG, JPEG, BMP, or WebP files.",
+                    localizer.text(Message::HomeImportSequence),
+                    localizer.text(Message::HomeSequenceDescription),
                     true,
                 ) {
                     self.view = AppView::ImportImageSequence;
@@ -1475,12 +1499,13 @@ impl GifFromScreenApp {
     }
 
     fn show_additional_sources(&mut self, ui: &mut egui::Ui) {
+        let localizer = self.language_settings.localizer();
         ui.add_space(12.0);
         ui.columns(LANDING_COLUMN_COUNT, |columns| {
             if landing_action(
                 &mut columns[0],
-                "Camera recorder",
-                "Preview and record a local camera. Audio is not captured.",
+                localizer.text(Message::HomeCameraRecorder),
+                localizer.text(Message::HomeCameraDescription),
                 true,
             ) {
                 self.view = AppView::CameraRecorder;
@@ -1488,8 +1513,8 @@ impl GifFromScreenApp {
             }
             if landing_action(
                 &mut columns[1],
-                "Drawing board",
-                "Record a canvas with pen, highlighter, and eraser tools.",
+                localizer.text(Message::HomeBoardRecorder),
+                localizer.text(Message::HomeBoardDescription),
                 true,
             ) {
                 self.view = AppView::BoardRecorder;
@@ -1499,8 +1524,8 @@ impl GifFromScreenApp {
         ui.add_space(12.0);
         if landing_action(
             ui,
-            "Import video",
-            "Trim a local video into an editable GIF project with FFmpeg.",
+            localizer.text(Message::HomeImportVideo),
+            localizer.text(Message::HomeVideoDescription),
             true,
         ) {
             self.view = AppView::ImportVideo;
@@ -1529,7 +1554,11 @@ impl GifFromScreenApp {
     }
 
     fn show_resume_editor(&mut self, ui: &mut egui::Ui) {
-        if ui.button("Automatic editing tasks…").clicked() {
+        let localizer = self.language_settings.localizer();
+        if ui
+            .button(localizer.text(Message::HomeAutomaticTasks))
+            .clicked()
+        {
             self.view = AppView::Automation;
         }
         let Some(workspace) = &self.editor_workspace else {
@@ -1540,7 +1569,10 @@ impl GifFromScreenApp {
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
-        if ui.button(format!("Continue editing {name}")).clicked() {
+        let label = localizer
+            .format(Message::HomeContinueEditing, &[("name", &name)])
+            .unwrap_or_else(|error| error.to_string());
+        if ui.button(label).clicked() {
             self.resume_editor();
         }
     }
@@ -6210,7 +6242,9 @@ fn main() -> eframe::Result {
         native_options(),
         Box::new(move |creation_context| {
             appearance::configure(&creation_context.egui_ctx);
+            preferences::fonts::install(&creation_context.egui_ctx);
             let mut app = GifFromScreenApp::default();
+            app.language_settings = preferences::LanguageSettings::from_environment();
             app.apply_startup_intent(startup_intent);
             Ok(Box::new(app))
         }),

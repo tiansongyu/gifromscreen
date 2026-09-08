@@ -49,6 +49,15 @@ class PortableTests(unittest.TestCase):
         self.assertTrue(any(path.endswith("OFL.txt") for path in font["license_files"]))
         self.assertTrue(any(path.endswith("UFL.txt") for path in font["license_files"]))
         self.assertTrue(any(path.endswith("Hack-Regular.txt") for path in font["license_files"]))
+        cjk = next(package for package in inventory if package["name"] == "Noto Sans CJK SC")
+        self.assertEqual(cjk["source_kind"], "embedded-font")
+        self.assertEqual(cjk["license"], "OFL-1.1")
+        self.assertEqual(cjk["source_sha256"], "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b")
+        provenance = json.loads((licenses / cjk["provenance_file"]).read_text())
+        self.assertEqual(provenance["files"][0]["face_index"], 0)
+        for name, digest in cjk["notice_sha256"].items():
+            self.assertEqual(hashlib.sha256((licenses / name).read_bytes()).hexdigest(), digest)
+        self.assertIn("© 2014-2021 Adobe", (licenses / cjk["license_files"][1]).read_text())
         for package in inventory:
             self.assertTrue(package["license_files"])
             for name in package["license_files"]:

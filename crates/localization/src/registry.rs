@@ -7,10 +7,11 @@ pub enum Direction {
     RightToLeft,
 }
 
-/// Translation status of this foundation's registry entries.
+/// Complete-application translation status of the target registry entries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TranslationReadiness {
-    /// This crate contains no translated catalog or validated UI text engine.
+    /// No complete UI catalog/rendering validation is supplied. Initial message
+    /// slices have their own explicit [`crate::catalog_coverage`] query.
     NotProvided,
 }
 
@@ -25,7 +26,7 @@ pub struct Language {
     pub english_name: &'static str,
     /// Required base text direction.
     pub direction: Direction,
-    /// Honest catalog status: no translations are supplied by this foundation.
+    /// Whole-UI status, distinct from initial [`crate::catalog_coverage`].
     pub readiness: TranslationReadiness,
 }
 
