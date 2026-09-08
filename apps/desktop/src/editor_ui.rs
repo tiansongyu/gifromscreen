@@ -295,6 +295,8 @@ impl DrawingOverlayDraft {
 #[derive(Debug)]
 pub(crate) struct EditorUiState {
     active_tool: EditorToolTab,
+    /// Session-local preview geometry; never serialized into a project command.
+    pub(crate) canvas: crate::editor_canvas::EditorCanvasState,
     /// One-based frame-number input.
     pub(crate) frame_number_input: String,
     /// Project-relative time input in integer milliseconds.
@@ -389,6 +391,7 @@ impl Default for EditorUiState {
     fn default() -> Self {
         Self {
             active_tool: EditorToolTab::default(),
+            canvas: crate::editor_canvas::EditorCanvasState::default(),
             frame_number_input: "1".into(),
             time_ms_input: "0".into(),
             time_range_start_ms_input: "0".into(),

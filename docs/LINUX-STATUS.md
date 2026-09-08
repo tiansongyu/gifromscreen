@@ -24,6 +24,7 @@ This file is the delivery ledger for the Linux-first implementation. Checked imp
 - [x] Persist stopped recordings as recoverable editable projects instead of flattening them immediately.
 - [x] Edit frame selection, ordering, deletion, and variable delays in a virtualized timeline.
 - [x] Render the current frame preview and export all or selected frames through a cancellable background GIF job.
+- [x] Fit/100%/200% preview, bounded scroll/middle-drag viewport and explicit numeric/direct crop drafts; [native crop, Undo/Redo and reopen/GIF evidence](EDITOR-CANVAS-QA-2026-09-08.md). Exact views reject device/cache limits; arbitrary-size tiled previews and hardware mixed-DPI acceptance remain open.
 - [x] Reopen existing projects with journal-recovery and asset-integrity reporting.
 - [x] Import animated GIF files into editable projects with bounded decoding.
 - [x] Import PNG, JPEG, BMP, and WebP files into editable projects with bounded decoding.

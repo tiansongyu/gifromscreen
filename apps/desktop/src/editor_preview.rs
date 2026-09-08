@@ -9,8 +9,8 @@ use std::{
 use eframe::egui;
 use gif_from_screen_application::{PresentationTransitionStep, transition_step_progress};
 use gif_from_screen_domain::{
-    AssetDescriptor, AssetId, AssetKind, FrameClip, FrameId, FrameRenderStep, OverlayId, ProjectId,
-    ProjectRevision, RasterEncoding, TimeUs, Transition, TransitionId,
+    AssetDescriptor, AssetId, AssetKind, FrameClip, FrameGeometryPlan, FrameId, FrameRenderStep,
+    OverlayId, ProjectId, ProjectRevision, RasterEncoding, TimeUs, Transition, TransitionId,
 };
 use gif_from_screen_project::{ActiveProject, AssetStore, ProjectError};
 use gif_from_screen_render::{
@@ -170,6 +170,16 @@ pub(crate) enum EditorPreviewError {
     PreviewMemoryLimitExceeded { required: usize, limit: usize },
     #[error("could not allocate {requested} bytes for the downsampled preview")]
     PreviewAllocationFailed { requested: usize },
+    #[error(
+        "exact-pixel preview {width}x{height} exceeds the device texture-side limit {limit}; choose Fit"
+    )]
+    NativeTextureLimit {
+        width: u32,
+        height: u32,
+        limit: usize,
+    },
+    #[error("could not plan the rendered dimensions of frame {frame_id}: {reason}")]
+    GeometryPlan { frame_id: FrameId, reason: String },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -179,6 +189,7 @@ struct PreviewCacheKey {
     frame_id: FrameId,
     transition: Option<PresentationTransitionStep>,
     max_size: [u32; 2],
+    native_pixels: bool,
 }
 
 #[derive(Clone)]
@@ -310,6 +321,71 @@ impl EditorPreviewCache {
         context: &egui::Context,
         max_size: [u32; 2],
     ) -> Result<EditorPreview, EditorPreviewError> {
+        self.load_presentation_preview(project, frame_id, transition, context, max_size, false)
+    }
+
+    /// 100% and 200% share one original-resolution texture. Reject excessive
+    /// resources before reading pixels rather than silently downsampling an
+    /// allegedly exact-pixel view. Fit remains available for those images.
+    pub(crate) fn native_presentation_preview(
+        &mut self,
+        project: &ActiveProject,
+        frame_id: FrameId,
+        transition: Option<PresentationTransitionStep>,
+        context: &egui::Context,
+    ) -> Result<EditorPreview, EditorPreviewError> {
+        let key = PreviewCacheKey {
+            project_id: project.manifest().project_id,
+            revision: project.manifest().revision,
+            frame_id,
+            transition,
+            max_size: [u32::MAX; 2],
+            native_pixels: true,
+        };
+        let max_side = context.input(|input| input.max_texture_side);
+        if let Some(preview) = self.cache.get(&key).cloned() {
+            validate_native_extent(preview.rendered_size, max_side, self.cache.max_bytes)?;
+            return Ok(preview);
+        }
+        let frame = project
+            .manifest()
+            .timeline
+            .frames
+            .iter()
+            .find(|frame| frame.id == frame_id)
+            .ok_or(EditorPreviewError::FrameNotFound { frame_id })?;
+        let descriptor = project.manifest().assets.get(&frame.asset_id).ok_or(
+            EditorPreviewError::MissingAssetDescriptor {
+                frame_id,
+                asset_id: frame.asset_id,
+            },
+        )?;
+        let (source_size, _) = preview_raster_shape(
+            &descriptor.kind,
+            PreviewRasterRole::Frame { frame_id },
+            frame.asset_id,
+        )?;
+        let size = FrameGeometryPlan::new(frame, source_size)
+            .map_err(|reason| EditorPreviewError::GeometryPlan { frame_id, reason })?
+            .output_size();
+        validate_native_extent(
+            [size.width.get(), size.height.get()],
+            max_side,
+            self.cache.max_bytes,
+        )?;
+        self.load_presentation_preview(project, frame_id, transition, context, [u32::MAX; 2], true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_presentation_preview(
+        &mut self,
+        project: &ActiveProject,
+        frame_id: FrameId,
+        transition: Option<PresentationTransitionStep>,
+        context: &egui::Context,
+        max_size: [u32; 2],
+        native_pixels: bool,
+    ) -> Result<EditorPreview, EditorPreviewError> {
         validate_preview_bounds(max_size)?;
         let project_id = project.manifest().project_id;
         let revision = project.manifest().revision;
@@ -320,6 +396,7 @@ impl EditorPreviewCache {
             frame_id,
             transition,
             max_size,
+            native_pixels,
         };
         if let Some(preview) = self.cache.get(&key) {
             return Ok(preview.clone());
@@ -359,13 +436,25 @@ impl EditorPreviewCache {
             )?
         };
         let texture_bytes = prepared.rgba.len();
-        let preview = upload_preview(
+        if native_pixels {
+            validate_native_extent(
+                prepared.rendered_size,
+                context.input(|input| input.max_texture_side),
+                self.cache.max_bytes,
+            )?;
+        }
+        let preview = upload_preview_with_options(
             &prepared,
             context,
             format!(
-                "editor-preview-{project_id}-{revision}-{frame_id}-{transition:?}-{}x{}",
+                "editor-preview-{project_id}-{revision}-{frame_id}-{transition:?}-{native_pixels}-{}x{}",
                 max_size[0], max_size[1],
             ),
+            if native_pixels {
+                egui::TextureOptions::NEAREST
+            } else {
+                egui::TextureOptions::LINEAR
+            },
         )?;
         self.cache.insert(key, preview.clone(), texture_bytes);
         Ok(preview)
@@ -460,6 +549,15 @@ pub(crate) fn upload_preview(
     context: &egui::Context,
     name: String,
 ) -> Result<EditorPreview, EditorPreviewError> {
+    upload_preview_with_options(prepared, context, name, egui::TextureOptions::LINEAR)
+}
+
+fn upload_preview_with_options(
+    prepared: &PreparedPreview,
+    context: &egui::Context,
+    name: String,
+    options: egui::TextureOptions,
+) -> Result<EditorPreview, EditorPreviewError> {
     let overflow = || EditorPreviewError::PreviewByteLengthOverflow {
         width: prepared.preview_size[0],
         height: prepared.preview_size[1],
@@ -470,7 +568,7 @@ pub(crate) fn upload_preview(
     ];
     let image = egui::ColorImage::from_rgba_unmultiplied(size, &prepared.rgba);
     Ok(EditorPreview {
-        texture: context.load_texture(name, image, egui::TextureOptions::LINEAR),
+        texture: context.load_texture(name, image, options),
         rendered_size: prepared.rendered_size,
         preview_size: prepared.preview_size,
     })
@@ -971,6 +1069,31 @@ fn validate_preview_bounds(max_size: [u32; 2]) -> Result<(), EditorPreviewError>
     }
 }
 
+fn validate_native_extent(
+    size: [u32; 2],
+    max_side: usize,
+    max_bytes: usize,
+) -> Result<(), EditorPreviewError> {
+    if size
+        .into_iter()
+        .any(|side| usize::try_from(side).map_or(true, |side| side > max_side))
+    {
+        return Err(EditorPreviewError::NativeTextureLimit {
+            width: size[0],
+            height: size[1],
+            limit: max_side,
+        });
+    }
+    let required = checked_rgba_byte_len(size)?;
+    if required > max_bytes {
+        return Err(EditorPreviewError::PreviewMemoryLimitExceeded {
+            required,
+            limit: max_bytes,
+        });
+    }
+    Ok(())
+}
+
 fn fit_preview_dimensions(
     source: [u32; 2],
     max_size: [u32; 2],
@@ -1085,6 +1208,7 @@ mod tests {
             frame_id: FrameId::from_u128(frame),
             transition: None,
             max_size,
+            native_pixels: false,
         }
     }
 
@@ -1196,6 +1320,80 @@ mod tests {
             })
             .unwrap();
         (asset_id, track)
+    }
+
+    #[test]
+    fn native_preview_is_full_resolution_nearest_and_reuses_only_the_exact_texture() {
+        let (_directory, mut project, frame, _) = project_with_frame(
+            &[255, 0, 0, 255, 0, 255, 0, 255],
+            PhysicalSize::new(2, 1).unwrap(),
+            ClipTransform::default(),
+            Vec::new(),
+        );
+        let context = egui::Context::default();
+        let mut cache = EditorPreviewCache::with_limits(4, 1024, 4096);
+        let fit = cache.preview(&project, frame, &context, [1, 1]).unwrap();
+        let native = cache
+            .native_presentation_preview(&project, frame, None, &context)
+            .unwrap();
+        assert_eq!(fit.preview_size, [1, 1]);
+        assert_eq!(native.preview_size, [2, 1]);
+        assert_eq!(native.texture.size(), [2, 1]);
+        assert_ne!(fit.texture.id(), native.texture.id());
+        assert_eq!(
+            context
+                .tex_manager()
+                .read()
+                .meta(native.texture.id())
+                .unwrap()
+                .options,
+            egui::TextureOptions::NEAREST
+        );
+        let repeated = cache
+            .native_presentation_preview(&project, frame, None, &context)
+            .unwrap();
+        assert_eq!(native.texture.id(), repeated.texture.id());
+        project
+            .commit(EditCommand::SetFrameDurations {
+                changes: vec![FrameDurationChange {
+                    frame_id: frame,
+                    duration: DurationUs::new(20_000).unwrap(),
+                }],
+            })
+            .unwrap();
+        let edited = cache
+            .native_presentation_preview(&project, frame, None, &context)
+            .unwrap();
+        assert_ne!(native.texture.id(), edited.texture.id());
+        assert_eq!(cache.cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn native_preview_enforces_byte_and_device_limits_before_reading_assets() {
+        let (_directory, project, frame, asset) = project_with_frame(
+            &[255; 8],
+            PhysicalSize::new(2, 1).unwrap(),
+            ClipTransform::default(),
+            Vec::new(),
+        );
+        // Corrupt the fixture's file: limit errors must take precedence over I/O.
+        fs::write(project.assets().asset_path(asset), []).unwrap();
+        let context = egui::Context::default();
+        let mut cache = EditorPreviewCache::with_limits(4, 4, 4096);
+        assert!(matches!(
+            cache.native_presentation_preview(&project, frame, None, &context),
+            Err(EditorPreviewError::PreviewMemoryLimitExceeded {
+                required: 8,
+                limit: 4
+            })
+        ));
+        context.input_mut(|input| input.max_texture_side = 1);
+        let mut cache = EditorPreviewCache::with_limits(4, 1024, 4096);
+        assert!(matches!(
+            cache.native_presentation_preview(&project, frame, None, &context),
+            Err(EditorPreviewError::NativeTextureLimit { limit: 1, .. })
+        ));
+        assert!(cache.cache.entries.is_empty());
     }
 
     #[test]

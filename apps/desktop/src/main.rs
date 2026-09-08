@@ -17,6 +17,7 @@ mod cinemagraph_draft;
 mod cinemagraph_preview;
 mod countdown;
 mod custom_palette_input;
+mod editor_canvas;
 mod editor_export_presets;
 mod editor_preview;
 mod editor_ui;
@@ -3596,26 +3597,29 @@ fn show_editor_scroll_area<R>(
         .show(ui, contents)
 }
 
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "preview dimensions are capped below 1024 pixels before the egui f32 boundary"
-)]
 fn show_editor_preview_panel(
     ui: &mut egui::Ui,
-    workspace: &EditorWorkspace,
+    workspace: &mut EditorWorkspace,
     cache: &mut EditorPreviewCache,
     state: &mut EditorUiState,
     motion: &mut MotionTools,
     cine_input_enabled: bool,
 ) {
     state.drawing_overlay.reconcile(workspace);
+    state.canvas.reconcile(workspace);
     motion.reconcile_cinemagraph(workspace);
     let cine_reference = motion.cinemagraph_reference();
+    if cine_reference.is_some() || state.drawing_overlay.phase == DrawingDraftPhase::Capturing {
+        state.canvas.crop.cancel();
+    }
     let transition = if cine_reference.is_some() {
         None
     } else {
         state.preview_transition(workspace)
     };
+    if transition.is_some() || state.playback.is_some() {
+        state.canvas.crop.cancel();
+    }
     ui.heading(if cine_reference.is_some() {
         "Cinemagraph reference · frame 1"
     } else if transition.is_some() {
@@ -3623,51 +3627,113 @@ fn show_editor_preview_panel(
     } else {
         "Current frame preview"
     });
-    if !workspace.asset_issues().is_empty() {
-        ui.colored_label(
-            ui.visuals().error_fg_color,
-            format!(
-                "Preview and export are blocked by {} unresolved asset issue(s).",
-                workspace.asset_issues().len()
-            ),
-        );
-        for issue in workspace.asset_issues() {
-            ui.monospace(format!("{issue:?}"));
-        }
+    state.canvas.show_zoom(ui);
+    if show_preview_asset_issues(ui, workspace) {
         return;
     }
     let Some(frame_id) = cine_reference.or_else(|| workspace.selection().current()) else {
         ui.label("Select a frame to preview it.");
         return;
     };
-    match cache.presentation_preview(
-        workspace.active_project(),
-        frame_id,
-        transition,
-        ui.ctx(),
-        EDITOR_PREVIEW_MAX_SIZE,
-    ) {
-        Ok(preview) => {
-            let image_size = editor_preview_extent(preview.preview_size, ui.available_width());
-            let editable = transition.is_none() && state.playback.is_none();
-            let sense = if cine_reference.is_some() && cine_input_enabled {
-                egui::Sense::click_and_drag()
-            } else if editable && state.drawing_overlay.phase == DrawingDraftPhase::Capturing {
-                egui::Sense::drag()
-            } else {
-                egui::Sense::hover()
-            };
-            let response = show_editor_preview_image(ui, &preview.texture, image_size, sense);
-            if cine_reference.is_some() {
+    let preview = if state.canvas.zoom == editor_canvas::PreviewZoom::Fit {
+        cache.presentation_preview(
+            workspace.active_project(),
+            frame_id,
+            transition,
+            ui.ctx(),
+            EDITOR_PREVIEW_MAX_SIZE,
+        )
+    } else {
+        cache.native_presentation_preview(
+            workspace.active_project(),
+            frame_id,
+            transition,
+            ui.ctx(),
+        )
+    };
+    match preview {
+        Ok(preview) => draw_editor_preview(
+            ui,
+            workspace,
+            state,
+            motion,
+            &preview,
+            EditorPreviewTarget {
+                frame_id,
+                transition,
+                cinemagraph: cine_reference.is_some(),
+                input_enabled: cine_input_enabled,
+            },
+        ),
+        Err(error) => {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Could not render preview: {error}"),
+            );
+            if state.canvas.zoom != editor_canvas::PreviewZoom::Fit {
+                ui.label("Exact-pixel views keep the existing texture/cache limits. Choose Fit for a bounded downsampled preview.");
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EditorPreviewTarget {
+    frame_id: FrameId,
+    transition: Option<gif_from_screen_application::PresentationTransitionStep>,
+    cinemagraph: bool,
+    input_enabled: bool,
+}
+
+fn draw_editor_preview(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    motion: &mut MotionTools,
+    preview: &editor_preview::EditorPreview,
+    target: EditorPreviewTarget,
+) {
+    let editable = target.transition.is_none() && state.playback.is_none();
+    let crop = state.canvas.crop.show_controls(
+        ui,
+        workspace,
+        target.frame_id,
+        preview.rendered_size,
+        editable && target.input_enabled && !target.cinemagraph,
+    );
+    if crop.started {
+        state.pause_preview();
+        state.drawing_overlay.cancel();
+    }
+    if crop.applied {
+        state.pause_preview();
+        ui.ctx().request_repaint();
+        return;
+    }
+    let crop_active = state.canvas.crop.active();
+    let sense = if (target.cinemagraph && target.input_enabled) || (crop_active && editable) {
+        egui::Sense::click_and_drag()
+    } else if editable && state.drawing_overlay.phase == DrawingDraftPhase::Capturing {
+        egui::Sense::drag()
+    } else {
+        egui::Sense::hover()
+    };
+    let shown = state.canvas.show_image(
+        ui,
+        preview,
+        sense,
+        editable && target.input_enabled,
+        |ui, response| {
+            if target.cinemagraph {
                 motion.show_cinemagraph_preview(
                     ui,
-                    &response,
+                    response,
                     preview.rendered_size,
-                    cine_input_enabled && editable,
+                    target.input_enabled && editable,
                 );
-            } else if editable && !motion.cinemagraph_editing() {
+            } else if editable && !motion.cinemagraph_editing() && !crop_active {
                 update_drawing_draft_from_preview(
-                    &response,
+                    response,
                     preview.rendered_size,
                     &mut state.drawing_overlay,
                 );
@@ -3678,39 +3744,41 @@ fn show_editor_preview_panel(
                     &state.drawing_overlay,
                 );
             }
-            if let Some(step) = transition {
-                ui.weak(format!(
-                    "Transition step {} · select an original frame to edit",
-                    step.step
-                ));
-            }
-            ui.weak(format!(
-                "Rendered {}×{} · preview {}×{}",
-                preview.rendered_size[0],
-                preview.rendered_size[1],
-                preview.preview_size[0],
-                preview.preview_size[1]
-            ));
-        }
-        Err(error) => {
-            ui.colored_label(
-                ui.visuals().error_fg_color,
-                format!("Could not render preview: {error}"),
-            );
-        }
+        },
+    );
+    if let Err(error) = shown {
+        ui.colored_label(ui.visuals().error_fg_color, error);
     }
+    if let Some(step) = target.transition {
+        ui.weak(format!(
+            "Transition step {} · select an original frame to edit",
+            step.step
+        ));
+    }
+    ui.weak(format!(
+        "Rendered {}×{} · preview {}×{}",
+        preview.rendered_size[0],
+        preview.rendered_size[1],
+        preview.preview_size[0],
+        preview.preview_size[1]
+    ));
 }
 
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "preview dimensions are bounded before UI conversion"
-)]
-fn editor_preview_extent(size: [u32; 2], available_width: f32) -> egui::Vec2 {
-    let natural = egui::vec2(size[0] as f32, size[1] as f32);
-    let scale = (available_width.max(1.0) / natural.x)
-        .min(360.0 / natural.y)
-        .min(3.0);
-    natural * scale
+fn show_preview_asset_issues(ui: &mut egui::Ui, workspace: &EditorWorkspace) -> bool {
+    if workspace.asset_issues().is_empty() {
+        return false;
+    }
+    ui.colored_label(
+        ui.visuals().error_fg_color,
+        format!(
+            "Preview and export are blocked by {} unresolved asset issue(s).",
+            workspace.asset_issues().len()
+        ),
+    );
+    for issue in workspace.asset_issues() {
+        ui.monospace(format!("{issue:?}"));
+    }
+    true
 }
 
 fn show_editor_preview_image(

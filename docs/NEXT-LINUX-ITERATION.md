@@ -88,10 +88,13 @@ these tasks extend them rather than replace their state machines.
    request a new authorized source explicitly, keep the canvas or request a
    compatible crop, and use a new capture clock. Cancelled permission must not
    discard existing frames or include downtime in the GIF.
-5. **Editor viewport and direct crop.** Add Fit/100%/200% and a separate bounded
-   crop draft using the actual painted-image rectangle. Synchronize numeric and
-   drag controls and commit through existing ordered complete-image commands.
-   New interpolation choices must not reinterpret older nearest-neighbor saves.
+5. **Editor viewport and direct crop: connected.** Fit/100%/200%, scrolling and
+   middle-drag share the actual painted-image rectangle with annotation tools.
+   Numeric/drag crop drafts apply through the existing ordered complete-image
+   command, with Undo/Redo and [native reopen/GIF evidence](EDITOR-CANVAS-QA-2026-09-08.md).
+   Exact zoom uses a full-resolution nearest texture, not an enlarged downsample.
+   Device/64 MiB limits explicitly fall back to choosing Fit; tiled exact views,
+   larger-image native panning and mixed-DPI hardware acceptance remain open.
 
 Shortcut implementation constraints: on X11, use exact passive key grabs with
 checked conflicts and rollback/unregistration, not `AnyKey`/`AnyModifier` or a
