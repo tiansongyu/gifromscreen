@@ -12,9 +12,9 @@ Built in Rust, with recording, editing and export performed locally. Inspired by
 
 ## Get and run
 
-**[Download the Linux x86_64 preview](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0-preview.2/gifromscreen-0.1.0-linux-x86_64.tar.gz)** · [SHA-256 file](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0-preview.2/gifromscreen-0.1.0-linux-x86_64.tar.gz.sha256) · [Release notes](https://github.com/tiansongyu/gifromscreen/releases/tag/v0.1.0-preview.2)
+**[Download the Linux x86_64 preview](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0-preview.3/gifromscreen-0.1.0-linux-x86_64.tar.gz)** · [SHA-256 file](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0-preview.3/gifromscreen-0.1.0-linux-x86_64.tar.gz.sha256) · [Release notes](https://github.com/tiansongyu/gifromscreen/releases/tag/v0.1.0-preview.3)
 
-Current version: `v0.1.0-preview.2` (about 26.7 MB), available without sign-in. This is an unsigned development preview, not a stable release. Newer main-branch test builds remain available in [CI Artifacts](https://github.com/tiansongyu/gifromscreen/actions/workflows/portable.yml), which require sign-in and expire after 30 days.
+Current version: `v0.1.0-preview.3` (about 26.8 MB), available without sign-in. This is an unsigned development preview, not a stable release. Newer main-branch test builds remain available in [CI Artifacts](https://github.com/tiansongyu/gifromscreen/actions/workflows/portable.yml), which require sign-in and expire after 30 days.
 
 The portable package is built against Ubuntu 22.04 / glibc 2.35 and includes the desktop app and CLI. Follow the [download checksum and extraction instructions](docs/PACKAGING.md#download-and-run), then run from the extracted directory:
 
@@ -62,9 +62,7 @@ Wayland does not offer a universal transparent desktop frame, automatic controll
 
 ## Interface languages
 
-The app follows the system locale by default and saves an explicit override from **Language**. English and Simplified Chinese cover the launcher, recorder controls, shortcut settings and core Frames/Timing/Transform editor controls. Migrated existing notices update with the language; advanced tools and some forms still need translation.
-
-The main branch additionally [localizes preview, crop and GIF export controls](docs/PREVIEW-EXPORT-LOCALIZATION.md). These newer changes are not included in the Preview 2 download above.
+The app follows the system locale by default and saves an explicit override from **Language**. English and Simplified Chinese cover the launcher, recorder controls, shortcut settings, core Frames/Timing/Transform editor controls, and [preview, crop and GIF export](docs/PREVIEW-EXPORT-LOCALIZATION.md). Migrated existing notices update with the language; advanced tools and some forms still need translation.
 
 The 29 entries are translation targets, not 29 completed catalogs. Unavailable translations visibly fall back to English while preserving the selected preference. See the [localization plan](docs/LOCALIZATION-PLAN.md).
 

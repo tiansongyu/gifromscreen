@@ -5,9 +5,10 @@ selectable/persistent UI languages, default to the machine language, then improv
 the whole project README with real animated demonstrations and convenient Release
 downloads. This plan supplements, not replaces, the Linux feature/release ledger.
 
-Latest downloadable preview: [Preview 2](LINUX-PREVIEW-2-QA.md), built from
-`89021bd`, adds editor/shortcut/live-notice localization and language-layout guards.
-Its public tarball and checksum were independently downloaded and verified.
+Latest downloadable preview: [Preview 3](LINUX-PREVIEW-3-QA.md), built from
+`974dfe8`, adds preview/crop/export localization and ordinary drawing input
+ownership. Its public tarball and checksum were independently downloaded and
+verified; the packaged desktop also passed a real drawing/export check.
 The two existing demonstration GIFs retain their recorded-source provenance;
 they are not relabeled as new captures or as all-language/full-parity evidence.
 
@@ -81,6 +82,7 @@ Before creating a tag/Release:
   inspect the API's resulting asset identities and test the public download links.
   Only then wire the README's quick-download links and badges to those assets.
 
-No Release is claimed by this plan, and a green build alone is not publication.
+This plan alone is not a release claim; the acceptance records identify actual
+published artifacts. A green build alone is not publication.
 After publication, downloading the documented asset and verifying/installing it
 is the final quick-start check. macOS remains deferred until Linux is delivered.

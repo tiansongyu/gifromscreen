@@ -1,8 +1,9 @@
 # Preview, crop and GIF export localization
 
-This main-branch slice continues the [editor localization work](EDITOR-LOCALIZATION.md).
-It is newer than the frozen [Preview 2 download](LINUX-PREVIEW-2-QA.md); it does not
-change that release's binaries or claim complete application/29-language coverage.
+This slice continues the [editor localization work](EDITOR-LOCALIZATION.md) and
+is downloadable in [Preview 3](LINUX-PREVIEW-3-QA.md). The frozen
+[Preview 2 download](LINUX-PREVIEW-2-QA.md) remains unchanged. This is not complete
+application/29-language coverage.
 
 ## Translated controls and outcomes
 
@@ -53,6 +54,8 @@ language round trips, including 4096/4097-byte boundaries and unchanged failed
 loads. Crop tests use real numeric text input and Apply/Undo/reopen operations.
 The [ordinary drawing input tests](DRAWING-PREVIEW-INPUT.md) are part of the same
 desktop run, not a replacement for native acceptance.
+The [native acceptance record](PREVIEW-EXPORT-QA-2026-09-09.md) covers final-build
+drawing, Undo/Redo, system-language negotiation and reopened GIF output.
 
 ## Remaining scope
 

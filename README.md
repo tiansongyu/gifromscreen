@@ -12,9 +12,9 @@
 
 ## 获取与运行
 
-**[下载 Linux x86_64 预览版](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0-preview.2/gifromscreen-0.1.0-linux-x86_64.tar.gz)** · [SHA-256 校验文件](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0-preview.2/gifromscreen-0.1.0-linux-x86_64.tar.gz.sha256) · [版本说明](https://github.com/tiansongyu/gifromscreen/releases/tag/v0.1.0-preview.2)
+**[下载 Linux x86_64 预览版](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0-preview.3/gifromscreen-0.1.0-linux-x86_64.tar.gz)** · [SHA-256 校验文件](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0-preview.3/gifromscreen-0.1.0-linux-x86_64.tar.gz.sha256) · [版本说明](https://github.com/tiansongyu/gifromscreen/releases/tag/v0.1.0-preview.3)
 
-当前版本为 `v0.1.0-preview.2`（约 26.7 MB），可直接下载，不需要登录。它是未签名的开发预览版，不是稳定版。更新的主分支测试包仍可从 [CI Artifacts](https://github.com/tiansongyu/gifromscreen/actions/workflows/portable.yml)获取（需要登录，保留 30 天）。
+当前版本为 `v0.1.0-preview.3`（约 26.8 MB），可直接下载，不需要登录。它是未签名的开发预览版，不是稳定版。更新的主分支测试包仍可从 [CI Artifacts](https://github.com/tiansongyu/gifromscreen/actions/workflows/portable.yml)获取（需要登录，保留 30 天）。
 
 便携包以 Ubuntu 22.04 / glibc 2.35 为构建基线，包含桌面程序和命令行工具。按照[安装说明](docs/PACKAGING.md#download-and-run)校验下载的 SHA-256 并解压，进入解压后的目录运行：
 
@@ -62,9 +62,7 @@ Wayland 不提供通用的全局透明取景框，也不能保证自动排除控
 
 ## 界面语言
 
-默认跟随系统语言，也可在“语言 / Language”中切换并保存选择。目前中英文覆盖首页、录制控制、快捷键设置及编辑器主要帧/计时/变换操作；已有的已迁移提示也能随语言更新。高级工具和部分表单仍在迁移。
-
-主分支还补充了[预览、裁剪和 GIF 导出界面的中英文支持](docs/PREVIEW-EXPORT-LOCALIZATION.md)；这部分新改动尚不包含在上方的 Preview 2 下载中。
+默认跟随系统语言，也可在“语言 / Language”中切换并保存选择。目前中英文覆盖首页、录制控制、快捷键设置、编辑器主要帧/计时/变换操作，以及[预览、裁剪和 GIF 导出](docs/PREVIEW-EXPORT-LOCALIZATION.md)。已迁移的提示也能随语言更新；高级工具和部分表单仍在迁移。
 
 语言列表中的 29 项是覆盖目标，不代表 29 套完整译文。尚未提供的译文会明确回退到英语，原选择仍会保存；详细范围见[本地化计划](docs/LOCALIZATION-PLAN.md)。
 

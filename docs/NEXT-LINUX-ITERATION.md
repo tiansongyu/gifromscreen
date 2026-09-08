@@ -36,6 +36,8 @@ translated configuration, validation, progress and retained preset/result notice
 It does not retroactively change Preview 2 or complete the remaining tool catalogs.
 The same main-branch work adds [ordinary drawing input ownership](DRAWING-PREVIEW-INPUT.md),
 including general mapping-change cancellation and fast native input batches.
+These changes are now downloadable as [Preview 3](LINUX-PREVIEW-3-QA.md), with
+[separate native source-build acceptance](PREVIEW-EXPORT-QA-2026-09-09.md).
 
 ## Playback timing: implemented, bounded native manual acceptance recorded
 
