@@ -26,6 +26,7 @@ pub(crate) fn draw(
     settings: &mut RecordingSettings,
     notice: Option<&str>,
     input_ready: bool,
+    snap: &mut crate::window_snap::WindowSnapUi,
 ) -> RecorderOverlayAction {
     move_from_keyboard(context, geometry, stage);
     let mut action = RecorderOverlayAction::None;
@@ -52,6 +53,7 @@ pub(crate) fn draw(
                     ui.label("Waiting for the recording guide and capture region to be ready.");
                 }
                 ui.separator();
+                snap.show(ui, geometry, stage);
                 show_geometry(ui, geometry, stage);
                 ui.separator();
                 show_timing(ui, settings, stage);
@@ -424,6 +426,7 @@ mod tests {
                     &mut self.settings,
                     Some("Display 1 · waiting for the latest guide acknowledgement. Long status text must not move or cover Stop."),
                     self.ready,
+                    &mut crate::window_snap::WindowSnapUi::default(),
                 );
             });
             (output, action)

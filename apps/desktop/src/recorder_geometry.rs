@@ -47,8 +47,9 @@ impl RecorderGeometry {
         self.size_frozen
     }
 
-    /// Call before capture/countdown begins. Moving remains possible while
-    /// recording or paused; a new recording needs a new unfrozen geometry.
+    /// Call when native recording successfully starts. Countdown disallows
+    /// resizing through its UI stage; a failed start must not freeze the canvas.
+    /// Moving remains possible while recording or paused.
     pub(crate) fn freeze_size(&mut self) -> PhysicalSize {
         self.size_frozen = true;
         self.region.size()
@@ -82,6 +83,16 @@ impl RecorderGeometry {
         self.region = PhysicalRect::new(origin.x, origin.y, size.width(), size.height())
             .expect("PhysicalSize guarantees non-empty dimensions");
         Ok(self.move_to(origin))
+    }
+
+    /// An explicit snap is all-or-nothing. Never clip or shift a chosen window
+    /// to make it fit, and never replace an active recording's canvas.
+    pub(crate) fn snap_to(&mut self, region: PhysicalRect) -> Result<(), String> {
+        if self.size_frozen {
+            return Err("Window snapping is only available before recording.".into());
+        }
+        *self = Self::new(self.source, region)?;
+        Ok(())
     }
 
     fn move_to_wide(&mut self, x: i64, y: i64) -> PhysicalRect {

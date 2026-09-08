@@ -35,7 +35,12 @@ pub use shortcuts::{
 mod wayland;
 #[cfg(all(target_os = "linux", feature = "native-wayland"))]
 mod wayland_pipewire;
+mod window_snap;
 mod x11;
+pub use window_snap::{WindowSnapBounds, query_window_snap};
+
+#[cfg(all(target_os = "linux", feature = "native-x11"))]
+mod x11_window;
 
 #[cfg(all(target_os = "linux", feature = "wayland-portal"))]
 pub use wayland::{

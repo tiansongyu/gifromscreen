@@ -39,6 +39,7 @@ pub(super) struct RecorderOverlay {
     was_minimized: bool,
     last_scale: f32,
     gesture: Option<Gesture>,
+    snap: crate::window_snap::WindowSnapUi,
 }
 
 struct Gesture {
@@ -100,11 +101,13 @@ impl RecorderOverlay {
             was_minimized: false,
             last_scale: scale,
             gesture: None,
+            snap: crate::window_snap::WindowSnapUi::default(),
         }
     }
 
     pub(super) fn ready(&self) -> bool {
         self.initialized
+            && !self.snap.is_pending()
             && (self.guide.is_none() || self.controller_geometry.is_some())
             && self.guide_ready()
             && matches!(
@@ -115,6 +118,28 @@ impl RecorderOverlay {
 
     pub(super) fn failed(&self) -> bool {
         self.failure.is_some()
+    }
+
+    fn cancel_invalid_start(
+        &mut self,
+        context: &egui::Context,
+        now: Instant,
+    ) -> Option<&'static str> {
+        let started = self.pending_live_start?;
+        let notice = if now.saturating_duration_since(started) >= CHANGE_TIMEOUT {
+            "Start expired while preparing the controls. Retry after the recorder is ready."
+        } else if self
+            .settle
+            .as_ref()
+            .is_some_and(|settle| matches!(settle.hide, HidePhase::Acknowledged))
+            && !Self::is_hidden(context)
+        {
+            "Start cancelled because the controls were restored before capture began."
+        } else {
+            return None;
+        };
+        self.cancel_start(context);
+        Some(notice)
     }
 
     fn is_hidden(context: &egui::Context) -> bool {
@@ -497,7 +522,13 @@ impl GifFromScreenApp {
                 std::process::id(),
             )?)
         };
-        self.recorder_overlay = Some(RecorderOverlay::new(geometry, workareas, guide, scale));
+        let mut overlay = RecorderOverlay::new(geometry, workareas, guide, scale);
+        if self.sources[self.selected_source].kind()
+            == gif_from_screen_capture::CaptureSourceKind::Monitor
+        {
+            overlay.snap.set_candidates(&self.sources);
+        }
+        self.recorder_overlay = Some(overlay);
         self.main_window_snapshot = Some(snapshot);
         self.pending_recorder_start = None;
         self.notice = Some("Drag a border to move the region; drag a corner to resize before recording. Controls are independent of the selected pixels.".into());
@@ -528,6 +559,9 @@ impl GifFromScreenApp {
         let now = Instant::now();
         let before = overlay.geometry.region();
         overlay.poll_guide(stage);
+        overlay
+            .snap
+            .poll(&mut overlay.geometry, stage, overlay.gesture.is_some());
         let native = observed_window(context, &overlay);
         let may_place = prepare_change(&mut overlay, self.job.as_mut(), native, now);
         if may_place {
@@ -562,6 +596,9 @@ impl GifFromScreenApp {
         context.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(hide_pixels));
         let action = self.draw_x11_controls(context, &mut overlay, stage, paused, !hide_pixels);
         if overlay.geometry.region() != before {
+            // A manual edit supersedes any still-pending snap, including a
+            // move away and back while the native worker is finishing.
+            overlay.snap.cancel();
             overlay.settle = None;
             if let Some(job) = &self.job {
                 begin_change(&mut overlay, job, now);
@@ -578,27 +615,8 @@ impl GifFromScreenApp {
             }
             overlay.pending_live_start = None;
         }
-        if overlay
-            .pending_live_start
-            .is_some_and(|start| now.saturating_duration_since(start) >= CHANGE_TIMEOUT)
-        {
-            overlay.cancel_start(context);
-            self.notice = Some(
-                "Start expired while preparing the controls. Retry after the recorder is ready."
-                    .into(),
-            );
-        }
-        if overlay.pending_live_start.is_some()
-            && overlay
-                .settle
-                .as_ref()
-                .is_some_and(|settle| matches!(settle.hide, HidePhase::Acknowledged))
-            && !RecorderOverlay::is_hidden(context)
-        {
-            overlay.cancel_start(context);
-            self.notice = Some(
-                "Start cancelled because the controls were restored before capture began.".into(),
-            );
+        if let Some(notice) = overlay.cancel_invalid_start(context, now) {
+            self.notice = Some(notice.into());
         }
         let start = overlay.pending_live_start.is_some() && overlay.settled(context, now, hidden);
         finish_change(
@@ -660,6 +678,7 @@ impl GifFromScreenApp {
                 &mut self.settings,
                 Some(&notice),
                 input_ready,
+                &mut overlay.snap,
             );
             if matches!(
                 overlay.window_state,

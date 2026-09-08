@@ -76,11 +76,14 @@ these tasks extend them rather than replace their state machines.
    Direct numeric movement, 1 px / Shift-10 px buttons and a focusable arrow-key
    movement control are connected; zoom never becomes a selection input. Arrow
    repeat is bounded per update, Escape releases this focus, and text fields and
-   other applications retain their keys. Native DPI/zoom stress remains open. Add
-   pre-record window snapping through `RegionRetargetPlan`. Show the backend's
-   accepted rectangle, coalesce movement while one request is in flight, and
-   retain fixed canvas size during recording. Optional X11 cursor-follow comes
-   after those controls; Wayland source-local movement is not global tracking.
+   other applications retain their keys. Ready-only window selection/snapping
+   now reads fresh client, validated WM frame or native outer bounds, with
+   [native move/snap/record/GIF evidence](WINDOW-SNAP-QA-2026-09-08.md).
+   It changes the unfrozen physical geometry, then uses the existing guide/control
+   acknowledgements before Start; live recording still retains a fixed canvas.
+   A crosshair picker, in-controller window-list refresh, explicit partial-window
+   policy and wider WM/CSD/DPI acceptance remain open. Optional X11 cursor-follow
+   comes after those controls; Wayland source-local movement is not global tracking.
 3. **X11 interaction sampling: desktop-wide mode connected.** One bounded XI2
    feed triggers frames without requiring sensitive metadata persistence, drops
    paused/pending input, coalesces bursts and supplies fixed 500 ms playback by

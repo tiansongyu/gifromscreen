@@ -48,6 +48,7 @@ mod wayland_controller_layout;
 #[path = "wayland_controller_tests.rs"]
 mod wayland_controller_tests;
 mod wayland_prepare_job;
+mod window_snap;
 mod x11_controller_ui;
 mod x11_controller_window;
 mod x11_recorder;

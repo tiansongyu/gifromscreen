@@ -20,6 +20,10 @@ mod cursor_edge_tests;
 #[path = "x11_interaction_tests.rs"]
 mod interaction_tests;
 
+#[cfg(all(test, target_os = "linux", feature = "native-x11"))]
+#[path = "x11_window_snap_tests.rs"]
+mod window_snap_tests;
+
 #[cfg(all(target_os = "linux", feature = "native-x11"))]
 mod native {
     use std::collections::{HashSet, VecDeque};
@@ -1527,7 +1531,7 @@ fn format_window_source_id(screen_index: usize, window: u32) -> String {
 }
 
 #[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
-fn parse_window_source_id(source_id: &str, screen_index: usize) -> Option<u32> {
+pub(crate) fn parse_window_source_id(source_id: &str, screen_index: usize) -> Option<u32> {
     let prefix = format!("x11:screen:{screen_index}:window:0x");
     let xid = source_id.strip_prefix(&prefix)?;
     if xid.len() != 8 || !xid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -1548,7 +1552,7 @@ fn decode_u32_property(format: u8, value: &[u8]) -> Option<Vec<u32>> {
 }
 
 #[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
-fn decode_text_property(format: u8, value: &[u8]) -> Option<String> {
+pub(crate) fn decode_text_property(format: u8, value: &[u8]) -> Option<String> {
     if format != 8 {
         return None;
     }
