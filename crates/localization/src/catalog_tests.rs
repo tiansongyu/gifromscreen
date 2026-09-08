@@ -13,7 +13,7 @@ fn localizer(tag: &str) -> Localizer {
 
 #[test]
 fn initial_key_ids_are_unique_and_both_catalogs_have_every_declared_message() {
-    assert_eq!(ALL_MESSAGES.len(), 76);
+    assert_eq!(ALL_MESSAGES.len(), 283);
     let ids: BTreeSet<_> = ALL_MESSAGES.iter().map(|message| message.id()).collect();
     assert_eq!(ids.len(), ALL_MESSAGES.len());
     for tag in ["en", "zh"] {
@@ -213,4 +213,202 @@ fn template_brace_escaping_is_single_pass_and_invalid_templates_fail() {
             Err(FormatError::InvalidTemplate)
         );
     }
+}
+
+#[test]
+fn recorder_compact_buttons_do_not_change_existing_message_contracts() {
+    let english = localizer("en");
+    let chinese = localizer("zh");
+    for (message, id, text, translated) in [
+        (
+            Message::RecorderStop,
+            "recorder-stop",
+            "Stop and save",
+            "停止并保存",
+        ),
+        (
+            Message::RecorderStopShort,
+            "recorder-stop-short",
+            "Stop",
+            "停止",
+        ),
+        (
+            Message::RecorderDiscard,
+            "recorder-discard",
+            "Discard recording",
+            "丢弃录制",
+        ),
+        (
+            Message::RecorderDiscardShort,
+            "recorder-discard-short",
+            "Discard",
+            "丢弃",
+        ),
+        (Message::RecorderStart, "recorder-start", "Start", "开始"),
+        (Message::RecorderPause, "recorder-pause", "Pause", "暂停"),
+        (Message::RecorderResume, "recorder-resume", "Resume", "继续"),
+        (Message::CancelButton, "cancel-button", "Cancel", "取消"),
+    ] {
+        assert_eq!(message.id(), id);
+        assert!(message.parameters().is_empty());
+        assert_eq!(english.text(message), text);
+        assert_eq!(chinese.text(message), translated);
+    }
+    assert_eq!(Message::RecorderCountdown.parameters(), ["seconds"]);
+    assert_eq!(
+        english.text(Message::RecorderCountdown),
+        "Starting in {seconds}…"
+    );
+    assert_eq!(
+        english.text(Message::RecorderStartsIn),
+        "Recording starts in {seconds}s"
+    );
+    assert_eq!(Message::RecorderStartsIn.parameters(), ["seconds"]);
+}
+
+#[test]
+fn recorder_named_values_keep_signed_coordinates_precision_and_private_data_literal() {
+    let arguments = [
+        ("width", "1"),
+        ("height", "720"),
+        ("x", "-1920"),
+        ("y", "-40"),
+        ("kind", "Window {width} 用户标题"),
+    ];
+    assert_eq!(
+        localizer("en")
+            .format(Message::RecorderSelectedSource, &arguments)
+            .unwrap(),
+        "Selected source: 1×720 at -1920,-40 (Window {width} 用户标题)"
+    );
+    assert_eq!(
+        localizer("zh")
+            .format(Message::RecorderSelectedSource, &arguments)
+            .unwrap(),
+        "所选来源：1×720，位置 -1920,-40（Window {width} 用户标题）"
+    );
+    let path = "/home/用户/{frames}/还原{seconds}.gfsproj";
+    for tag in ["en", "zh"] {
+        let result = localizer(tag)
+            .format(
+                Message::RecorderProjectReady,
+                &[("frames", "0"), ("seconds", "0.125"), ("path", path)],
+            )
+            .unwrap();
+        assert!(result.contains(path));
+        assert!(result.contains("0.125s"));
+        let error = "BadWindow: /private/{error}/密码.gfsproj\nraw OS detail";
+        let result = localizer(tag)
+            .format(Message::SnapDragError, &[("error", error)])
+            .unwrap();
+        assert!(result.contains(error));
+    }
+}
+
+#[test]
+fn recorder_dynamic_contracts_reject_old_positional_or_incorrect_names() {
+    let cases = [
+        (Message::RecorderStartsIn, vec![("remaining", "3")]),
+        (
+            Message::RecorderProgressSummary,
+            vec![("count", "2"), ("seconds", "0.5")],
+        ),
+        (Message::RecorderFixedDelayHint, vec![("ms", "66")]),
+        (
+            Message::RecorderCountdownRange,
+            vec![("MAX_COUNTDOWN_SECONDS", "60")],
+        ),
+        (Message::SnapFound, vec![("windows", "2")]),
+        (Message::SnapFailed, vec![("reason", "raw OS detail")]),
+    ];
+    for tag in ["en", "zh"] {
+        let localizer = localizer(tag);
+        for (message, arguments) in &cases {
+            assert_eq!(
+                localizer.format(*message, arguments),
+                Err(FormatError::UnknownArgument)
+            );
+        }
+        assert_eq!(
+            localizer.format(
+                Message::RecorderProgressTimingHint,
+                &[("source_seconds", "1.234")]
+            ),
+            Err(FormatError::MissingArgument("playback_seconds"))
+        );
+    }
+}
+
+#[test]
+fn typed_phase_and_source_labels_preserve_original_english_without_debug_lookup() {
+    for (message, english) in [
+        (Message::RecorderPhaseStartingCapture, "StartingCapture"),
+        (Message::RecorderPhaseCapturing, "Capturing"),
+        (Message::RecorderPaused, "Paused"),
+        (Message::RecorderPhaseStoppingCapture, "StoppingCapture"),
+        (Message::RecorderPhaseEncoding, "Encoding"),
+        (Message::RecorderPhaseCommitting, "Committing"),
+        (Message::RecorderPhaseComplete, "Complete"),
+        (Message::RecorderSourceMonitor, "Monitor"),
+        (Message::RecorderSourceWindow, "Window"),
+        (Message::RecorderUnknown, "Unknown"),
+    ] {
+        assert_eq!(localizer("en").text(message), english);
+        assert_ne!(localizer("zh").text(message), english);
+        assert!(message.parameters().is_empty());
+    }
+    assert_eq!(
+        localizer("en")
+            .format(Message::RecorderCountdownNotice, &[("seconds", "3")])
+            .unwrap(),
+        "Recording starts in 3 seconds…"
+    );
+    assert_eq!(
+        localizer("zh")
+            .format(Message::RecorderCountdownRange, &[("maximum", "60")])
+            .unwrap(),
+        "倒计时必须在 0 到 60 秒之间。"
+    );
+    assert_eq!(
+        localizer("en")
+            .format(
+                Message::RecorderPreparedNotice,
+                &[("width", "1"), ("height", "1")]
+            )
+            .unwrap(),
+        "Wayland source prepared at 1×1 pixels. The native session is paused and retained by its worker."
+    );
+}
+
+#[test]
+fn source_discovery_keeps_protocol_names_and_raw_diagnostics_literal() {
+    for server in ["X11", "Wayland"] {
+        let arguments = [("count", "0"), ("display_server", server)];
+        assert_eq!(
+            localizer("en")
+                .format(Message::RecorderSourcesFound, &arguments)
+                .unwrap(),
+            format!("Found 0 {server} capture source option(s).")
+        );
+        assert_eq!(
+            localizer("zh")
+                .format(Message::RecorderSourcesFound, &arguments)
+                .unwrap(),
+            format!("找到 0 个 {server} 录制来源选项。")
+        );
+    }
+    let error = "PermissionDenied {display_server}: /run/user/用户/{count}";
+    assert_eq!(
+        localizer("zh")
+            .format(Message::RecorderSourcesFailed, &[("error", error)])
+            .unwrap(),
+        format!("无法加载 Linux 录制来源：{error}")
+    );
+    assert_eq!(
+        localizer("en").format(
+            Message::RecorderSourcesFound,
+            &[("count", "1"), ("displayServer", "X11")]
+        ),
+        Err(FormatError::UnknownArgument)
+    );
 }

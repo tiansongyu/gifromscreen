@@ -360,6 +360,7 @@ fn toolbar_frame(
             true,
             None,
             false,
+            crate::test_localizer(),
         )
         .action;
     });
@@ -778,6 +779,7 @@ fn controller_explains_source_specific_visibility_limits_without_font_dependent_
                 false,
                 None,
                 monitor_source,
+                crate::test_localizer(),
             );
         });
         let mut text = String::new();

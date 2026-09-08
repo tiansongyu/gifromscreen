@@ -3,6 +3,7 @@
 
 use eframe::egui;
 use gif_from_screen_capture::{PhysicalPosition, PhysicalSize};
+use gif_from_screen_localization::{Localizer, Message};
 use gif_from_screen_workflow::WorkflowProgress;
 
 use crate::{
@@ -27,6 +28,7 @@ pub(crate) fn draw(
     notice: Option<&str>,
     input_ready: bool,
     snap: &mut crate::window_snap::WindowSnapUi,
+    localizer: Localizer,
 ) -> RecorderOverlayAction {
     move_from_keyboard(context, geometry, stage);
     let mut action = RecorderOverlayAction::None;
@@ -38,6 +40,7 @@ pub(crate) fn draw(
                 stage,
                 settings.cadence == RecordingCadenceChoice::Manual,
                 input_ready,
+                localizer,
             );
         });
     egui::CentralPanel::default().show(context, |ui| {
@@ -45,7 +48,7 @@ pub(crate) fn draw(
             .id_salt("x11_controller_settings")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                show_status(ui, stage, progress);
+                show_status(ui, stage, progress, localizer);
                 if let Some(notice) = notice {
                     ui.add(egui::Label::new(notice).wrap());
                 }
@@ -54,16 +57,13 @@ pub(crate) fn draw(
                 // inserting it only when busy would move the claimed hit target.
                 ui.add_visible(
                     !input_ready,
-                    egui::Label::new(
-                        "Waiting for the recording guide and capture region to be ready.",
-                    )
-                    .wrap(),
+                    egui::Label::new(localizer.text(Message::RecorderWaitGeometry)).wrap(),
                 );
                 ui.separator();
-                snap.show(ui, geometry, stage);
-                show_geometry(ui, geometry, stage);
+                snap.show(ui, geometry, stage, localizer);
+                show_geometry(ui, geometry, stage, localizer);
                 ui.separator();
-                show_timing(ui, settings, stage);
+                show_timing(ui, settings, stage, localizer);
             });
     });
     if context.input(|input| input.viewport().close_requested()) {
@@ -77,12 +77,15 @@ fn primary_controls(
     stage: RecorderStage,
     manual: bool,
     input_ready: bool,
+    localizer: Localizer,
 ) -> RecorderOverlayAction {
     let mut action = RecorderOverlayAction::None;
     ui.horizontal_wrapped(|ui| {
-        let mut button = |label, enabled, requested| {
+        let mut button = |message, enabled, requested| {
+            // Buttons use sequential auto IDs, not their translated captions.
+            // Keep them direct children so horizontal wrapping sees each button.
             if ui
-                .add_enabled(enabled, egui::Button::new(label).wrap())
+                .add_enabled(enabled, egui::Button::new(localizer.text(message)).wrap())
                 .clicked()
             {
                 action = requested;
@@ -90,73 +93,125 @@ fn primary_controls(
         };
         match stage {
             RecorderStage::Ready => {
-                button("Start", input_ready, RecorderOverlayAction::Start);
-                button("Cancel", true, RecorderOverlayAction::Close);
+                button(
+                    Message::RecorderStart,
+                    input_ready,
+                    RecorderOverlayAction::Start,
+                );
+                button(Message::CancelButton, true, RecorderOverlayAction::Close);
             }
             RecorderStage::Countdown(_) => {
-                button("Cancel", true, RecorderOverlayAction::CancelCountdown);
+                button(
+                    Message::CancelButton,
+                    true,
+                    RecorderOverlayAction::CancelCountdown,
+                );
             }
             RecorderStage::Recording => {
                 if manual {
                     button(
-                        "Take snapshot",
+                        Message::RecorderTakeSnapshot,
                         input_ready,
                         RecorderOverlayAction::Snapshot,
                     );
                 }
-                button("Pause", true, RecorderOverlayAction::Pause);
-                button("Stop", true, RecorderOverlayAction::Stop);
-                button("Discard", true, RecorderOverlayAction::Discard);
+                button(Message::RecorderPause, true, RecorderOverlayAction::Pause);
+                button(
+                    Message::RecorderStopShort,
+                    true,
+                    RecorderOverlayAction::Stop,
+                );
+                button(
+                    Message::RecorderDiscardShort,
+                    true,
+                    RecorderOverlayAction::Discard,
+                );
             }
             RecorderStage::Paused => {
-                button("Resume", input_ready, RecorderOverlayAction::Resume);
-                button("Stop", true, RecorderOverlayAction::Stop);
-                button("Discard", true, RecorderOverlayAction::Discard);
+                button(
+                    Message::RecorderResume,
+                    input_ready,
+                    RecorderOverlayAction::Resume,
+                );
+                button(
+                    Message::RecorderStopShort,
+                    true,
+                    RecorderOverlayAction::Stop,
+                );
+                button(
+                    Message::RecorderDiscardShort,
+                    true,
+                    RecorderOverlayAction::Discard,
+                );
             }
             RecorderStage::Finalizing => {
-                button("Cancel", true, RecorderOverlayAction::Discard);
+                button(Message::CancelButton, true, RecorderOverlayAction::Discard);
             }
         }
     });
     action
 }
 
-fn show_status(ui: &mut egui::Ui, stage: RecorderStage, progress: Option<WorkflowProgress>) {
+fn show_status(
+    ui: &mut egui::Ui,
+    stage: RecorderStage,
+    progress: Option<WorkflowProgress>,
+    localizer: Localizer,
+) {
     match stage {
         RecorderStage::Ready => {
-            ui.strong("Ready to record");
+            ui.strong(localizer.text(Message::RecorderReadyToRecord));
         }
         RecorderStage::Countdown(remaining) => {
-            ui.strong(format!("Recording starts in {remaining}s"));
+            ui.strong(crate::format_message(
+                localizer,
+                Message::RecorderStartsIn,
+                &[("seconds", &remaining.to_string())],
+            ));
         }
         RecorderStage::Recording => {
-            ui.strong("Recording");
+            ui.strong(localizer.text(Message::RecorderRecording));
         }
         RecorderStage::Paused => {
-            ui.strong("Paused");
+            ui.strong(localizer.text(Message::RecorderPaused));
         }
         RecorderStage::Finalizing => {
             ui.spinner();
-            ui.label("Finalizing recoverable project…");
+            ui.label(localizer.text(Message::RecorderFinalizingProject));
         }
     }
     if let Some(progress) = progress {
-        ui.label(format!(
-            "{} frames · GIF {:.1}s",
-            progress.frames_captured,
-            progress.playback_duration.as_secs_f64()
+        ui.label(crate::format_message(
+            localizer,
+            Message::RecorderProgressSummary,
+            &[
+                ("frames", &progress.frames_captured.to_string()),
+                (
+                    "seconds",
+                    &format!("{:.1}", progress.playback_duration.as_secs_f64()),
+                ),
+            ],
         ))
-        .on_hover_text(format!(
-            "Source sample span: {:.3}s. Playback timing does not change the captured input clock.",
-            progress.capture_duration.as_secs_f64()
+        .on_hover_text(crate::format_message(
+            localizer,
+            Message::RecorderSourceSpanHint,
+            &[(
+                "seconds",
+                &format!("{:.3}", progress.capture_duration.as_secs_f64()),
+            )],
         ));
     }
 }
 
-fn show_geometry(ui: &mut egui::Ui, geometry: &mut RecorderGeometry, stage: RecorderStage) {
-    ui.strong("Recording region · physical pixels");
-    ui.label("Global desktop coordinates; negative monitor positions are supported.");
-    show_position_buttons(ui, geometry, stage);
+fn show_geometry(
+    ui: &mut egui::Ui,
+    geometry: &mut RecorderGeometry,
+    stage: RecorderStage,
+    localizer: Localizer,
+) {
+    ui.strong(localizer.text(Message::RecorderPhysicalRegion));
+    ui.label(localizer.text(Message::RecorderGlobalCoordinates));
+    show_position_buttons(ui, geometry, stage, localizer);
 
     let before = geometry.region();
     let mut position = before.origin();
@@ -179,7 +234,7 @@ fn show_geometry(ui: &mut egui::Ui, geometry: &mut RecorderGeometry, stage: Reco
                 egui::DragValue::new(&mut width)
                     .speed(1)
                     .range(1..=geometry.source().size().width())
-                    .prefix("Width: "),
+                    .prefix(localizer.text(Message::RecorderWidthPrefix)),
             )
             .changed();
         changed |= ui
@@ -187,41 +242,69 @@ fn show_geometry(ui: &mut egui::Ui, geometry: &mut RecorderGeometry, stage: Reco
                 egui::DragValue::new(&mut height)
                     .speed(1)
                     .range(1..=geometry.source().size().height())
-                    .prefix("Height: "),
+                    .prefix(localizer.text(Message::RecorderHeightPrefix)),
             )
             .changed();
     });
     if !resizing {
-        ui.label("Canvas size is locked; only the recording position can change.");
+        ui.label(localizer.text(Message::RecorderCanvasPositionOnly));
     }
     if changed {
         let result = PhysicalSize::new(width, height)
-            .map_err(|error| error.to_string())
+            .map_err(|_| Message::RecorderInvalidDimensions)
             .and_then(|size| apply_region_edit(geometry, stage, position, size));
         if let Err(error) = result {
-            ui.colored_label(ui.visuals().error_fg_color, error);
+            ui.colored_label(ui.visuals().error_fg_color, localizer.text(error));
         }
     }
 }
 
-fn show_position_buttons(ui: &mut egui::Ui, geometry: &mut RecorderGeometry, stage: RecorderStage) {
+fn show_position_buttons(
+    ui: &mut egui::Ui,
+    geometry: &mut RecorderGeometry,
+    stage: RecorderStage,
+    localizer: Localizer,
+) {
     let step = if ui.input(|input| input.modifiers.shift) {
         10
     } else {
         1
     };
     ui.add_enabled_ui(stage.allows_moving(), |ui| {
-        let painted = ui.add(egui::Button::new("Move with arrow keys").sense(egui::Sense::hover()));
+        let painted = ui.add(
+            egui::Button::new(localizer.text(Message::RecorderKeyboardMove))
+                .sense(egui::Sense::hover()),
+        );
         let target = ui.interact(painted.rect, keyboard_move_id(), egui::Sense::click());
-        target.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Move with arrow keys"));
-        if target.clicked() { target.request_focus(); }
-        if target.has_focus() {
-            ui.memory_mut(|memory| memory.set_focus_lock_filter(keyboard_move_id(), egui::EventFilter {
-                horizontal_arrows: true, vertical_arrows: true, ..Default::default()
-            }));
-            ui.painter().rect_stroke(target.rect, 3.0, ui.visuals().selection.stroke, egui::StrokeKind::Inside);
+        target.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                ui.is_enabled(),
+                localizer.text(Message::RecorderKeyboardMove),
+            )
+        });
+        if target.clicked() {
+            target.request_focus();
         }
-        target.on_hover_text("Focus this control, then use the arrow keys. Shift moves 10 physical pixels; Escape releases keyboard movement. Text fields keep their own arrow keys.");
+        if target.has_focus() {
+            ui.memory_mut(|memory| {
+                memory.set_focus_lock_filter(
+                    keyboard_move_id(),
+                    egui::EventFilter {
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        ..Default::default()
+                    },
+                );
+            });
+            ui.painter().rect_stroke(
+                target.rect,
+                3.0,
+                ui.visuals().selection.stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        target.on_hover_text(localizer.text(Message::RecorderKeyboardMoveHint));
         ui.horizontal_wrapped(|ui| {
             for (label, dx, dy) in [
                 ("X−", -step, 0),
@@ -235,7 +318,7 @@ fn show_position_buttons(ui: &mut egui::Ui, geometry: &mut RecorderGeometry, sta
             }
         });
     });
-    ui.small("Move 1 px; hold Shift for 10 px. Position is clamped to the source.");
+    ui.small(localizer.text(Message::RecorderMoveStepHint));
 }
 
 fn keyboard_move_id() -> egui::Id {
@@ -309,30 +392,37 @@ fn apply_region_edit(
     stage: RecorderStage,
     position: PhysicalPosition,
     size: PhysicalSize,
-) -> Result<(), String> {
+) -> Result<(), Message> {
     if !stage.allows_moving() {
-        return Err("The recording region cannot change while finalizing".into());
+        return Err(Message::RecorderRegionFinalizing);
     }
     let mut candidate = *geometry;
     if size != candidate.region().size() {
-        if !stage.allows_resizing() {
-            return Err("Recording canvas size is locked".into());
+        if !stage.allows_resizing() || geometry.size_is_frozen() {
+            return Err(Message::RecorderCanvasLocked);
         }
-        candidate.resize(size)?;
+        candidate
+            .resize(size)
+            .map_err(|_| Message::RecorderDimensionsExceed)?;
     }
     candidate.move_to(position);
     *geometry = candidate;
     Ok(())
 }
 
-fn show_timing(ui: &mut egui::Ui, settings: &mut RecordingSettings, stage: RecorderStage) {
+fn show_timing(
+    ui: &mut egui::Ui,
+    settings: &mut RecordingSettings,
+    stage: RecorderStage,
+    localizer: Localizer,
+) {
     let ready = stage == RecorderStage::Ready;
     // Disabled controls must not sanitize or otherwise modify live settings.
     let mut countdown = settings.countdown_seconds;
     let mut duration = settings.duration_ms;
-    ui.strong("Timing");
+    ui.strong(localizer.text(Message::RecorderTiming));
     ui.add_enabled_ui(ready, |ui| {
-        ui.label("Start countdown (seconds)");
+        ui.label(localizer.text(Message::RecorderCountdownSeconds));
         if ui
             .add(
                 egui::DragValue::new(&mut countdown)
@@ -344,7 +434,7 @@ fn show_timing(ui: &mut egui::Ui, settings: &mut RecordingSettings, stage: Recor
         {
             settings.countdown_seconds = countdown;
         }
-        ui.label("Maximum capture duration (ms)");
+        ui.label(localizer.text(Message::RecorderMaximumDurationMs));
         if ui
             .add(
                 egui::DragValue::new(&mut duration)
@@ -356,7 +446,7 @@ fn show_timing(ui: &mut egui::Ui, settings: &mut RecordingSettings, stage: Recor
         {
             settings.duration_ms = duration;
         }
-        ui.small("0 ms means stop manually.");
+        ui.small(localizer.text(Message::RecorderManualStopHint));
     });
 }
 
@@ -374,6 +464,8 @@ mod tests {
         settings: RecordingSettings,
         stage: RecorderStage,
         ready: bool,
+        localizer: Localizer,
+        notice: String,
     }
 
     impl View {
@@ -399,6 +491,10 @@ mod tests {
                 },
                 stage,
                 ready: true,
+                localizer: Localizer::new(
+                    gif_from_screen_localization::find_language("en").unwrap(),
+                ),
+                notice: "Display 1 · waiting for the latest guide acknowledgement. Long status text must not move or cover Stop.".into(),
             }
         }
 
@@ -431,9 +527,10 @@ mod tests {
                         encode: None,
                     }),
                     &mut self.settings,
-                    Some("Display 1 · waiting for the latest guide acknowledgement. Long status text must not move or cover Stop."),
+                    Some(&self.notice),
                     self.ready,
                     &mut crate::window_snap::WindowSnapUi::default(),
+                    self.localizer,
                 );
             });
             (output, action)
@@ -594,6 +691,131 @@ mod tests {
                 assert_eq!(view.geometry, geometry_before);
             }
         }
+    }
+
+    fn chinese() -> Localizer {
+        Localizer::new(gif_from_screen_localization::find_language("zh").unwrap())
+    }
+
+    fn action_message(stage: RecorderStage, action: RecorderOverlayAction) -> Message {
+        match action {
+            RecorderOverlayAction::Start => Message::RecorderStart,
+            RecorderOverlayAction::Pause => Message::RecorderPause,
+            RecorderOverlayAction::Resume => Message::RecorderResume,
+            RecorderOverlayAction::Stop => Message::RecorderStopShort,
+            RecorderOverlayAction::Snapshot => Message::RecorderTakeSnapshot,
+            RecorderOverlayAction::Discard if stage != RecorderStage::Finalizing => {
+                Message::RecorderDiscardShort
+            }
+            RecorderOverlayAction::Discard
+            | RecorderOverlayAction::CancelCountdown
+            | RecorderOverlayAction::Close => Message::CancelButton,
+            RecorderOverlayAction::None => panic!("not a primary controller action"),
+        }
+    }
+
+    #[test]
+    fn chinese_controls_with_real_fonts_zoom_and_long_notices_keep_all_actions_reachable() {
+        for (width, height, scale, zoom) in [
+            (320.0, 240.0, 1.0, 1.0),
+            (240.0, 240.0, 2.0, 1.0),
+            (640.0, 584.0, 1.5, 1.5),
+        ] {
+            for (stage, _, action) in actions() {
+                let mut view = View::new(width, height, scale, stage);
+                crate::preferences::fonts::install(&view.context);
+                view.context.set_zoom_factor(zoom);
+                view.localizer = chinese();
+                view.notice =
+                    "显示器 {source}：原生录制区域尚未完成更新。/tmp/录像 {原始路径} ".repeat(24);
+                let before = view.geometry;
+                let label = view.localizer.text(action_message(stage, action));
+                let output = view.warm();
+                let rect = visible_text(&output, view.viewport, label).unwrap_or_else(|| {
+                    panic!("{label:?} clipped at {width}x{height}, font {scale}, zoom {zoom}")
+                });
+                assert_eq!(view.click(rect.center(), false), action);
+                assert_eq!(view.geometry, before);
+            }
+        }
+    }
+
+    #[test]
+    fn chinese_native_ack_gates_and_scrolling_preserve_stop_and_capture_settings() {
+        for (stage, _, action) in actions() {
+            let mut view = View::new(320.0, 240.0, 2.0, stage);
+            crate::preferences::fonts::install(&view.context);
+            view.localizer = chinese();
+            view.ready = false;
+            let before = view.geometry;
+            let label = view.localizer.text(action_message(stage, action));
+            let rect = visible_text(&view.warm(), view.viewport, label).unwrap();
+            let expected = if matches!(
+                action,
+                RecorderOverlayAction::Start
+                    | RecorderOverlayAction::Resume
+                    | RecorderOverlayAction::Snapshot
+            ) {
+                RecorderOverlayAction::None
+            } else {
+                action
+            };
+            assert_eq!(view.click(rect.center(), false), expected);
+            assert_eq!(view.geometry, before);
+        }
+        let mut view = View::new(320.0, 240.0, 2.0, RecorderStage::Recording);
+        crate::preferences::fonts::install(&view.context);
+        view.localizer = chinese();
+        view.settings.duration_ms = MAX_RECORDING_DURATION_MS + 1;
+        view.settings.countdown_seconds = MAX_COUNTDOWN_SECONDS + 1;
+        let before = view.geometry;
+        let stop = visible_text(
+            &view.warm(),
+            view.viewport,
+            chinese().text(Message::RecorderStopShort),
+        )
+        .unwrap();
+        view.seek(chinese().text(Message::RecorderManualStopHint));
+        assert_eq!(
+            visible_text(
+                &view.warm(),
+                view.viewport,
+                chinese().text(Message::RecorderStopShort)
+            ),
+            Some(stop)
+        );
+        assert_eq!(view.geometry, before);
+        assert_eq!(view.settings.duration_ms, MAX_RECORDING_DURATION_MS + 1);
+        assert_eq!(view.settings.countdown_seconds, MAX_COUNTDOWN_SECONDS + 1);
+    }
+
+    #[test]
+    fn switching_language_preserves_movement_focus_and_numeric_edit_semantics() {
+        let mut view = View::new(420.0, 320.0, 1.0, RecorderStage::Ready);
+        crate::preferences::fonts::install(&view.context);
+        let target = view
+            .seek(view.localizer.text(Message::RecorderKeyboardMove))
+            .center();
+        view.click(target, false);
+        view.warm();
+        let before = view.geometry.region();
+        view.localizer = chinese();
+        view.warm();
+        assert!(
+            view.context
+                .memory(|memory| memory.has_focus(keyboard_move_id()))
+        );
+        view.frame(
+            vec![arrow(egui::Key::ArrowRight, true, false)],
+            egui::Modifiers::SHIFT,
+        );
+        assert_eq!(view.geometry.region().origin().x, before.origin().x + 10);
+        assert_eq!(view.geometry.region().size(), before.size());
+        view.edit_number("3", "6");
+        view.edit_number("0", "1500");
+        assert_eq!(view.settings.countdown_seconds, 6);
+        assert_eq!(view.settings.duration_ms, 1500);
+        assert_eq!(view.geometry.region().size(), before.size());
     }
 
     #[test]

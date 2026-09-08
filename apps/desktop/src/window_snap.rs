@@ -7,6 +7,7 @@ use gif_from_screen_capture_linux::{
     DragPickerButton, DragPickerRequest, DragPickerUpdate, PickedWindow, WindowSnapBounds,
     WindowSnapCatalog, list_snap_windows, pick_snap_window, query_window_snap,
 };
+use gif_from_screen_localization::{Localizer, Message};
 use std::{
     sync::{
         Arc,
@@ -22,7 +23,7 @@ pub(crate) struct WindowSnapUi {
     selected: usize,
     bounds: WindowSnapBounds,
     pending: Option<Pending>,
-    notice: Option<String>,
+    notice: Option<SnapNotice>,
     closing: bool,
     native: Option<NativeDrag>,
     queued_picker: Option<ClickIntent>,
@@ -34,6 +35,61 @@ pub(crate) struct WindowSnapUi {
     pixels_per_point: f32,
     launch_drag: DragLauncher,
     click_picker: ClickPicker,
+}
+
+/// Keep status identity until painting so a language change also translates
+/// completed work. Native diagnostic arguments remain literal user data.
+#[derive(Debug)]
+enum SnapNotice {
+    Message(Message),
+    Count(Message, usize),
+    Error(Message, SnapDiagnostic),
+}
+
+#[derive(Debug)]
+enum SnapDiagnostic {
+    Raw(String),
+    Message(Message),
+}
+
+impl From<Message> for SnapNotice {
+    fn from(message: Message) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl From<Message> for SnapDiagnostic {
+    fn from(message: Message) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl From<String> for SnapDiagnostic {
+    fn from(message: String) -> Self {
+        Self::Raw(message)
+    }
+}
+
+impl SnapNotice {
+    fn error(message: Message, error: impl Into<SnapDiagnostic>) -> Self {
+        Self::Error(message, error.into())
+    }
+
+    fn render(&self, localizer: Localizer) -> String {
+        match self {
+            Self::Message(message) => localizer.text(*message).into(),
+            Self::Count(message, count) => {
+                crate::format_message(localizer, *message, &[("count", &count.to_string())])
+            }
+            Self::Error(message, error) => {
+                let error = match error {
+                    SnapDiagnostic::Raw(error) => error.as_str(),
+                    SnapDiagnostic::Message(message) => localizer.text(*message),
+                };
+                crate::format_message(localizer, *message, &[("error", error)])
+            }
+        }
+    }
 }
 
 impl Default for WindowSnapUi {
@@ -244,7 +300,7 @@ impl WindowSnapUi {
             && context.input(|input| !input.focused || input.key_pressed(egui::Key::Escape))
         {
             self.cancel();
-            self.notice = Some("Window selection cancelled; waiting for native cleanup.".into());
+            self.notice = Some(Message::SnapCancelledCleanup.into());
         }
     }
 
@@ -331,9 +387,7 @@ impl WindowSnapUi {
                 });
             if !valid {
                 self.cancel();
-                self.notice = Some(
-                    "Window selection cancelled because its initiating layout changed.".into(),
-                );
+                self.notice = Some(Message::SnapLayoutChanged.into());
             }
             return;
         }
@@ -370,7 +424,7 @@ impl WindowSnapUi {
         let hit = match physical_hit(layout, parent, self.pixels_per_point) {
             Ok(hit) => hit,
             Err(error) => {
-                self.drag_error(&error);
+                self.drag_error(error);
                 return;
             }
         };
@@ -420,13 +474,13 @@ impl WindowSnapUi {
                     });
                 }
                 Err(error) => {
-                    self.drag_error(&error);
+                    self.drag_error(error);
                     return;
                 }
             }
         }
         let Some(generation) = self.generation.checked_add(1) else {
-            self.drag_error("Drag-handle generations exhausted; reopen the recorder.");
+            self.drag_error(Message::SnapGenerationsExhausted);
             return;
         };
         binding.request.generation = generation;
@@ -444,24 +498,20 @@ impl WindowSnapUi {
                 // and never reinterpret its result as the new layout.
                 if native.handle.is_claimed() || native.handle.is_picking() {
                     native.handle.stop();
-                    self.notice = Some(
-                        "Window selection cancelled because its initiating layout changed.".into(),
-                    );
+                    self.notice = Some(Message::SnapLayoutChanged.into());
                 } else {
-                    self.drag_error(&error);
+                    self.drag_error(error);
                 }
             }
         }
     }
 
-    fn drag_error(&mut self, error: &str) {
+    fn drag_error(&mut self, error: impl Into<SnapDiagnostic>) {
         self.drag_failed = true;
         if let Some(native) = &self.native {
             native.handle.stop();
         }
-        self.notice = Some(format!(
-            "Native drag handle unavailable: {error} Click-to-pick is still available; use Retry drag handle to retry."
-        ));
+        self.notice = Some(SnapNotice::error(Message::SnapDragError, error));
     }
 
     fn poll_native(
@@ -480,7 +530,7 @@ impl WindowSnapUi {
                 .is_some_and(|binding| self.binding_current(binding, *geometry, stage, dragging))
         {
             native.handle.stop();
-            self.notice = Some("Window selection cancelled because its original layout or recording target changed.".into());
+            self.notice = Some(Message::SnapTargetChanged.into());
         }
         let native = self.native.as_mut().expect("native retained until cleanup");
         let update = native.handle.poll();
@@ -500,7 +550,7 @@ impl WindowSnapUi {
             return;
         }
         match result {
-            Err(error) => self.drag_error(&error),
+            Err(error) => self.drag_error(error),
             Ok(None) => {}
             Ok(Some(selection)) => {
                 if native.binding.is_some_and(|binding| {
@@ -509,9 +559,7 @@ impl WindowSnapUi {
                 }) {
                     self.finish_result(geometry, Ok(WorkResult::Picked(selection.picked)));
                 } else {
-                    self.notice = Some(
-                        "Discarded a stale native window selection; current region kept.".into(),
-                    );
+                    self.notice = Some(Message::SnapStaleResult.into());
                 }
             }
         }
@@ -558,9 +606,7 @@ impl WindowSnapUi {
         };
         if pending.geometry != *geometry || stage != RecorderStage::Ready || dragging {
             self.cancel();
-            self.notice = Some(
-                "Window snap cancelled because the recording selection or stage changed.".into(),
-            );
+            self.notice = Some(Message::SnapSelectionChanged.into());
         }
         let pending = self
             .pending
@@ -568,16 +614,21 @@ impl WindowSnapUi {
             .expect("pending retained until completion");
         let result = match pending.receiver.try_recv() {
             Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => {
-                Err("Window snap worker stopped without a result.".into())
-            }
-            Ok(result) => result,
+            Err(TryRecvError::Disconnected) => None,
+            Ok(result) => Some(result),
         };
         let pending = self.pending.take().expect("one pending snap");
         if pending.cancellation.load(Ordering::Acquire) {
             return;
         }
-        self.finish_result(geometry, result);
+        if let Some(result) = result {
+            self.finish_result(geometry, result);
+        } else {
+            self.notice = Some(SnapNotice::error(
+                Message::SnapOperationFailed,
+                Message::SnapWorkerStopped,
+            ));
+        }
     }
 
     fn finish_result(
@@ -586,30 +637,43 @@ impl WindowSnapUi {
         result: Result<WorkResult, String>,
     ) {
         self.notice = Some(match result {
-            Ok(WorkResult::Picked(None)) => "Window selection cancelled; original region kept.".into(),
+            Ok(WorkResult::Picked(None)) => Message::SnapCancelled.into(),
             Ok(WorkResult::Picked(Some(picked))) => match geometry.snap_to(picked.region) {
                 Ok(()) => {
-                    if let Some(index) = self.candidates.iter().position(|source| source.id() == picked.source.id()) {
+                    if let Some(index) = self
+                        .candidates
+                        .iter()
+                        .position(|source| source.id() == picked.source.id())
+                    {
                         self.candidates[index] = picked.source;
                         self.selected = index;
                     } else {
-                        if self.candidates.len() == 256 { self.candidates.pop(); }
+                        if self.candidates.len() == 256 {
+                            self.candidates.pop();
+                        }
                         self.candidates.push(picked.source);
                         self.selected = self.candidates.len() - 1;
                     }
-                    "Selected window; recording region updated. This is one-time positioning, not window tracking.".into()
+                    Message::SnapSelected.into()
                 }
-                Err(error) => format!("Selected window does not fit; original region kept: {error}"),
+                Err(error) => SnapNotice::error(Message::SnapSelectedDoesNotFit, error),
             },
             Ok(WorkResult::Region(region)) => match geometry.snap_to(region) {
-                Ok(()) => "Snapped to the current window bounds. This is a one-time position, not window tracking.".into(),
-                Err(error) => format!("Window snap failed; original selection kept: {error}"),
+                Ok(()) => Message::SnapPositioned.into(),
+                Err(error) => SnapNotice::error(Message::SnapFailed, error),
             },
             Ok(WorkResult::Catalog(catalog)) => {
                 self.set_candidates(&catalog.windows);
-                format!("Found {} windows. Selection geometry is unchanged.{}", self.candidates.len(), if catalog.truncated { " The discovery limit was reached; the list is incomplete." } else { "" })
+                SnapNotice::Count(
+                    if catalog.truncated {
+                        Message::SnapFoundIncomplete
+                    } else {
+                        Message::SnapFound
+                    },
+                    self.candidates.len(),
+                )
             }
-            Err(error) => format!("Window operation failed; selection and previous list kept: {error}"),
+            Err(error) => SnapNotice::error(Message::SnapOperationFailed, error),
         });
     }
 
@@ -618,94 +682,154 @@ impl WindowSnapUi {
         ui: &mut egui::Ui,
         geometry: &RecorderGeometry,
         stage: RecorderStage,
+        localizer: Localizer,
     ) {
         if stage != RecorderStage::Ready || geometry.size_is_frozen() || !self.available {
             return;
         }
-        egui::CollapsingHeader::new("Fit region to a window…").show(ui, |ui| {
-            ui.add_enabled_ui(!self.is_pending() && !self.closing && self.pending.is_none(), |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.selectable_value(&mut self.bounds, WindowSnapBounds::WindowFrame, "Window frame");
-                    ui.selectable_value(&mut self.bounds, WindowSnapBounds::Client, "Client area");
-                    ui.selectable_value(&mut self.bounds, WindowSnapBounds::Outer, "Native bounds");
-                });
-                let picker = ui.button("Pick window on screen…");
-                let hit = picker.rect.intersect(ui.clip_rect());
-                self.drawn.hit = (hit.is_finite() && hit.is_positive()).then_some(hit);
-                self.drawn.enabled = picker.enabled();
-                if picker.clicked()
-                    && let Err(error) = self.start_picker(*geometry) { self.notice = Some(error); }
-                self.show_drag_status(ui);
-                ui.small("Drag this button onto a window and release, or click it then pick a window. Right-click or Escape cancels. Controls hide only while selecting; the target must fit within the selected screen.");
-                if self.drag_failed && ui.button("Retry drag handle").clicked() {
-                    self.drag_failed = false;
-                    self.notice = None;
-                }
-                egui::ComboBox::from_id_salt("snap-window-choice")
-                    .width(ui.available_width())
-                    .truncate()
-                    .selected_text(self.candidates.get(self.selected).map_or("No windows discovered", |source| source.name()))
-                    .show_ui(ui, |ui| {
-                        ui.set_max_width(340.0);
-                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-                        for (index, source) in self.candidates.iter().enumerate() {
-                            ui.selectable_value(&mut self.selected, index, source.name()).on_hover_text(source.name());
+        egui::CollapsingHeader::new(localizer.text(Message::SnapTitle))
+            .id_salt("window-snap")
+            .show(ui, |ui| {
+                ui.add_enabled_ui(
+                    !self.is_pending() && !self.closing && self.pending.is_none(),
+                    |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.selectable_value(
+                                &mut self.bounds,
+                                WindowSnapBounds::WindowFrame,
+                                localizer.text(Message::SnapWindowFrame),
+                            );
+                            ui.selectable_value(
+                                &mut self.bounds,
+                                WindowSnapBounds::Client,
+                                localizer.text(Message::SnapClientArea),
+                            );
+                            ui.selectable_value(
+                                &mut self.bounds,
+                                WindowSnapBounds::Outer,
+                                localizer.text(Message::SnapNativeBounds),
+                            );
+                        });
+                        let picker = ui
+                            .push_id("snap-pick-window", |ui| {
+                                ui.button(localizer.text(Message::SnapPickWindow))
+                            })
+                            .inner;
+                        let hit = picker.rect.intersect(ui.clip_rect());
+                        self.drawn.hit = (hit.is_finite() && hit.is_positive()).then_some(hit);
+                        self.drawn.enabled = picker.enabled();
+                        if picker.clicked()
+                            && let Err(error) = self.start_picker(*geometry)
+                        {
+                            self.notice = Some(error);
                         }
-                    });
-                ui.horizontal_wrapped(|ui| {
-                if ui.button("Refresh windows").clicked()
-                    && let Err(error) = self.start_work(*geometry, |cancel| list_snap_windows(None, cancel).map(WorkResult::Catalog))
-                {
-                    self.notice = Some(error);
-                }
-                if ui.add_enabled(!self.candidates.is_empty(), egui::Button::new("Snap region")).clicked() {
-                    let source = self.candidates[self.selected].clone();
-                    let bounds = self.bounds;
-                    if let Err(error) = self.start(*geometry, move |cancel| query_window_snap(None, &source, bounds, cancel)) {
-                        self.notice = Some(error);
+                        self.show_drag_status(ui, localizer);
+                        ui.small(localizer.text(Message::SnapPickHelp));
+                        if self.drag_failed
+                            && ui.button(localizer.text(Message::SnapRetryDrag)).clicked()
+                        {
+                            self.drag_failed = false;
+                            self.notice = None;
+                        }
+                        self.show_window_choices(ui, *geometry, localizer);
+                    },
+                );
+                if self.is_pending() || self.pending.is_some() {
+                    ui.spinner();
+                    if ui
+                        .button(localizer.text(Message::SnapCancelOperation))
+                        .clicked()
+                    {
+                        self.cancel();
+                        self.notice = Some(Message::SnapCancelledUnchanged.into());
                     }
                 }
-                });
+                ui.small(localizer.text(Message::SnapBoundsHelp));
+                if let Some(notice) = &self.notice {
+                    ui.label(notice.render(localizer));
+                }
             });
-            if self.is_pending() || self.pending.is_some() {
-                ui.spinner();
-                if ui.button("Cancel window operation").clicked() {
-                    self.cancel();
-                    self.notice = Some("Window snap cancelled; selection unchanged.".into());
+    }
+
+    fn show_window_choices(
+        &mut self,
+        ui: &mut egui::Ui,
+        geometry: RecorderGeometry,
+        localizer: Localizer,
+    ) {
+        egui::ComboBox::from_id_salt("snap-window-choice")
+            .width(ui.available_width())
+            .truncate()
+            .selected_text(
+                self.candidates
+                    .get(self.selected)
+                    .map_or(localizer.text(Message::SnapNoWindows), |source| {
+                        source.name()
+                    }),
+            )
+            .show_ui(ui, |ui| {
+                ui.set_max_width(340.0);
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                for (index, source) in self.candidates.iter().enumerate() {
+                    ui.push_id(source.id().as_str(), |ui| {
+                        ui.selectable_value(&mut self.selected, index, source.name())
+                            .on_hover_text(source.name());
+                    });
+                }
+            });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button(localizer.text(Message::SnapRefresh)).clicked()
+                && let Err(error) = self.start_work(geometry, |cancel| {
+                    list_snap_windows(None, cancel).map(WorkResult::Catalog)
+                })
+            {
+                self.notice = Some(error);
+            }
+            if ui
+                .add_enabled(
+                    !self.candidates.is_empty(),
+                    egui::Button::new(localizer.text(Message::SnapApply)),
+                )
+                .clicked()
+            {
+                let source = self.candidates[self.selected].clone();
+                let bounds = self.bounds;
+                if let Err(error) = self.start(geometry, move |cancel| {
+                    query_window_snap(None, &source, bounds, cancel)
+                }) {
+                    self.notice = Some(error);
                 }
             }
-            ui.small("Window frame uses validated WM borders or client-side shadow hints. Native bounds may include invisible margins. Refresh discovers new or renamed windows without closing this controller.");
-            if let Some(notice) = &self.notice { ui.label(notice); }
         });
     }
 
-    fn show_drag_status(&self, ui: &mut egui::Ui) {
+    fn show_drag_status(&self, ui: &mut egui::Ui, localizer: Localizer) {
         let status = if self.drag_failed {
-            "Drag unavailable; click-to-pick available."
+            Message::SnapDragUnavailable
         } else if self.drag_ready() {
-            "Drag ready; or click to pick."
+            Message::SnapDragReady
         } else {
-            "Preparing drag; click-to-pick available."
+            Message::SnapDragPreparing
         };
         // One reserved line below the fixed caption: ready changes must not
         // move its input rectangle and thereby invalidate their own generation.
-        ui.add(egui::Label::new(egui::RichText::new(status).small()).truncate())
-            .on_hover_text(status);
+        ui.add(egui::Label::new(egui::RichText::new(localizer.text(status)).small()).truncate())
+            .on_hover_text(localizer.text(status));
     }
 
     fn start(
         &mut self,
         geometry: RecorderGeometry,
         loader: impl FnOnce(&AtomicBool) -> Result<PhysicalRect, String> + Send + 'static,
-    ) -> Result<(), String> {
+    ) -> Result<(), SnapNotice> {
         self.start_work(geometry, move |cancel| {
             loader(cancel).map(WorkResult::Region)
         })
     }
 
-    fn start_picker(&mut self, geometry: RecorderGeometry) -> Result<(), String> {
+    fn start_picker(&mut self, geometry: RecorderGeometry) -> Result<(), SnapNotice> {
         if self.is_picking() || self.native_claimed() || self.pending.is_some() {
-            return Err("A window selection is already finishing.".into());
+            return Err(Message::SnapAlreadyFinishing.into());
         }
         if let Some(native) = &self.native {
             native.handle.stop();
@@ -714,9 +838,7 @@ impl WindowSnapUi {
                 bounds: self.bounds,
                 cancelled: false,
             });
-            self.notice = Some(
-                "Preparing click-to-pick; waiting for the native drag handle to close.".into(),
-            );
+            self.notice = Some(Message::SnapPreparingClick.into());
             return Ok(());
         }
         self.start_click_picker(geometry, self.bounds)
@@ -726,7 +848,7 @@ impl WindowSnapUi {
         &mut self,
         geometry: RecorderGeometry,
         bounds: WindowSnapBounds,
-    ) -> Result<(), String> {
+    ) -> Result<(), SnapNotice> {
         let picker = self.click_picker;
         self.start_work(geometry, move |cancel| {
             picker(bounds, cancel).map(WorkResult::Picked)
@@ -739,9 +861,9 @@ impl WindowSnapUi {
         &mut self,
         geometry: RecorderGeometry,
         loader: impl FnOnce(&AtomicBool) -> Result<WorkResult, String> + Send + 'static,
-    ) -> Result<(), String> {
+    ) -> Result<(), SnapNotice> {
         if self.pending.is_some() || self.is_picking() || self.native_claimed() || self.closing {
-            return Err("A window snap is still finishing.".into());
+            return Err(Message::SnapStillFinishing.into());
         }
         let cancellation = Arc::new(AtomicBool::new(false));
         let cancel = Arc::clone(&cancellation);
@@ -751,14 +873,14 @@ impl WindowSnapUi {
             .spawn(move || {
                 let _ = send.send(loader(&cancel));
             })
-            .map_err(|error| format!("Could not start window snap: {error}"))?;
+            .map_err(|error| SnapNotice::error(Message::SnapStartFailed, error.to_string()))?;
         self.pending = Some(Pending {
             geometry,
             cancellation,
             receiver,
             picking: false,
         });
-        self.notice = Some("Reading windows…".into());
+        self.notice = Some(Message::SnapReading.into());
         Ok(())
     }
 }
@@ -768,9 +890,9 @@ fn physical_hit(
     layout: Option<egui::Rect>,
     parent: DragParent,
     ppp: f32,
-) -> Result<Option<PhysicalRect>, String> {
+) -> Result<Option<PhysicalRect>, Message> {
     if !ppp.is_finite() || ppp <= 0.0 {
-        return Err("Invalid UI pixel scale.".into());
+        return Err(Message::SnapInvalidScale);
     }
     let Some(rect) = layout else {
         return Ok(None);
@@ -798,7 +920,7 @@ fn physical_hit(
         || right - left > f64::from(u16::MAX)
         || bottom - top > f64::from(u16::MAX)
     {
-        return Err("Visible drag button exceeds the native input-child coordinate limit.".into());
+        return Err(Message::SnapHitLimit);
     }
     PhysicalRect::new(
         left as i32,
@@ -807,7 +929,7 @@ fn physical_hit(
         (bottom - top) as u32,
     )
     .map(Some)
-    .map_err(|error| error.to_string())
+    .map_err(|_| Message::SnapHitLimit)
 }
 
 #[cfg(test)]
@@ -817,6 +939,14 @@ mod tests {
         sync::Mutex,
         time::{Duration, Instant},
     };
+
+    fn english() -> Localizer {
+        Localizer::new(gif_from_screen_localization::find_language("en").unwrap())
+    }
+
+    fn chinese() -> Localizer {
+        Localizer::new(gif_from_screen_localization::find_language("zh").unwrap())
+    }
 
     fn geometry() -> RecorderGeometry {
         RecorderGeometry::new(
@@ -939,7 +1069,13 @@ mod tests {
         complete(&mut ui, &mut geometry, RecorderStage::Ready);
         assert_eq!(geometry, before);
         assert_eq!(ui.candidates, candidates);
-        assert!(ui.notice.as_ref().unwrap().contains("does not fit"));
+        assert!(
+            ui.notice
+                .as_ref()
+                .unwrap()
+                .render(english())
+                .contains("does not fit")
+        );
     }
 
     #[test]
@@ -972,7 +1108,13 @@ mod tests {
         complete(&mut ui, &mut geometry, RecorderStage::Ready);
         assert_eq!(geometry, before);
         assert_eq!(ui.candidates[0].name(), "Discovered later");
-        assert!(ui.notice.as_ref().unwrap().contains("incomplete"));
+        assert!(
+            ui.notice
+                .as_ref()
+                .unwrap()
+                .render(english())
+                .contains("incomplete")
+        );
     }
 
     #[test]
@@ -997,6 +1139,7 @@ mod tests {
                 ui.notice
                     .as_ref()
                     .unwrap()
+                    .render(english())
                     .contains("original selection kept")
             );
         }
@@ -1397,7 +1540,15 @@ mod tests {
         ui.set_candidates(&[]);
         let context = egui::Context::default();
         publish(&mut ui, &context, geometry(), Some(caption()), true);
-        assert!(ui.drag_failed && ui.notice.as_ref().unwrap().contains("Click-to-pick"));
+        assert!(
+            ui.drag_failed
+                && ui
+                    .notice
+                    .as_ref()
+                    .unwrap()
+                    .render(english())
+                    .contains("Click-to-pick")
+        );
         ui.launch_drag = forbidden_drag_start;
         publish(&mut ui, &context, geometry(), Some(caption()), true);
         publish(&mut ui, &context, geometry(), None, true);
@@ -1409,6 +1560,7 @@ mod tests {
             ui.notice
                 .as_ref()
                 .unwrap()
+                .render(english())
                 .contains("explicit retry attempted")
         );
     }
@@ -1687,6 +1839,179 @@ mod tests {
         assert_eq!(shared.lock().unwrap().requests.len(), count);
     }
 
+    #[test]
+    fn completed_notices_translate_at_paint_time_without_changing_window_names_or_raw_errors() {
+        let mut snap = WindowSnapUi::default();
+        let mut geometry = geometry();
+        let before = geometry;
+        let name = "/tmp/窗口 {count} — Screen {error}";
+        snap.finish_result(
+            &mut geometry,
+            Ok(WorkResult::Catalog(WindowSnapCatalog {
+                windows: vec![source("native:1", name)],
+                truncated: true,
+            })),
+        );
+        let notice = snap.notice.as_ref().unwrap();
+        for localizer in [english(), chinese()] {
+            assert_eq!(
+                notice.render(localizer),
+                localizer
+                    .format(Message::SnapFoundIncomplete, &[("count", "1")])
+                    .unwrap()
+            );
+            assert_eq!(snap.candidates[0].name(), name);
+        }
+        let raw = "OS failure: /tmp/原始 {error} {count} ".repeat(20);
+        snap.finish_result(&mut geometry, Err(raw.clone()));
+        assert_eq!(
+            snap.notice.as_ref().unwrap().render(chinese()),
+            chinese()
+                .format(Message::SnapOperationFailed, &[("error", &raw)])
+                .unwrap()
+        );
+        assert_eq!(geometry, before);
+        snap.drag_error(Message::SnapInvalidScale);
+        assert_eq!(
+            snap.notice.as_ref().unwrap().render(chinese()),
+            chinese()
+                .format(
+                    Message::SnapDragError,
+                    &[("error", chinese().text(Message::SnapInvalidScale))]
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn disconnected_worker_notice_remains_localizable_after_native_cleanup() {
+        let mut snap = WindowSnapUi::default();
+        let mut geometry = geometry();
+        let before = geometry;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(sender);
+        snap.pending = Some(Pending {
+            geometry,
+            cancellation: Arc::new(AtomicBool::new(false)),
+            receiver,
+            picking: true,
+        });
+        snap.poll(&mut geometry, RecorderStage::Ready, false);
+        assert!(!snap.is_pending() && !snap.is_picking());
+        assert_eq!(geometry, before);
+        assert_eq!(
+            snap.notice.as_ref().unwrap().render(chinese()),
+            chinese()
+                .format(
+                    Message::SnapOperationFailed,
+                    &[("error", chinese().text(Message::SnapWorkerStopped))]
+                )
+                .unwrap()
+        );
+    }
+
+    fn text_center(output: &egui::FullOutput, caption: &str) -> egui::Pos2 {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape
+                    && text.galley.text() == caption
+                {
+                    Some(text.pos + text.galley.size() * 0.5)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("missing caption {caption:?}"))
+    }
+
+    fn open_localized_snap(context: &egui::Context, snap: &mut WindowSnapUi, localizer: Localizer) {
+        let first = widget_frame_localized(context, snap, Vec::new(), localizer);
+        let position = text_center(&first, localizer.text(Message::SnapTitle));
+        for pressed in [true, false] {
+            widget_frame_localized(
+                context,
+                snap,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                localizer,
+            );
+        }
+        widget_frame_localized(context, snap, Vec::new(), localizer);
+    }
+
+    #[test]
+    fn chinese_ready_and_claimed_status_keep_native_hit_stable_at_fractional_scale() {
+        for scale in [1.0, 1.25] {
+            let context = egui::Context::default();
+            crate::preferences::fonts::install(&context);
+            context.style_mut(|style| style.animation_time = 0.0);
+            context.set_zoom_factor(scale);
+            let (mut snap, shared) = fake_drag();
+            open_localized_snap(&context, &mut snap, chinese());
+            let hit = snap
+                .drawn
+                .hit
+                .expect("Chinese native drag target is visible");
+            let request = *shared.lock().unwrap().requests.last().unwrap();
+            assert_eq!(
+                request.rect,
+                physical_hit(Some(hit), parent(), context.pixels_per_point()).unwrap()
+            );
+            let count = shared.lock().unwrap().requests.len();
+            snap.poll(&mut geometry(), RecorderStage::Ready, false);
+            assert!(snap.drag_ready());
+            widget_frame_localized(&context, &mut snap, Vec::new(), chinese());
+            assert_eq!(snap.drawn.hit, Some(hit));
+            shared.lock().unwrap().claimed = Some(request.generation);
+            widget_frame_localized(&context, &mut snap, Vec::new(), chinese());
+            assert_eq!(snap.drawn.hit, Some(hit));
+            assert!(!snap.drawn.enabled);
+            assert!(!shared.lock().unwrap().cancelled);
+            assert_eq!(shared.lock().unwrap().requests.len(), count);
+        }
+    }
+
+    #[test]
+    fn language_switch_preserves_open_header_but_cancels_stale_claimed_hit_and_result() {
+        let context = egui::Context::default();
+        crate::preferences::fonts::install(&context);
+        context.style_mut(|style| style.animation_time = 0.0);
+        let (mut snap, shared) = fake_drag();
+        open_localized_snap(&context, &mut snap, english());
+        let hit = snap.drawn.hit.unwrap();
+        let generation = shared.lock().unwrap().requests.last().unwrap().generation;
+        let requests = shared.lock().unwrap().requests.len();
+        shared.lock().unwrap().claimed = Some(generation);
+        widget_frame_localized(&context, &mut snap, Vec::new(), chinese());
+        assert!(snap.drawn.hit.is_some(), "translated header must stay open");
+        assert_ne!(
+            snap.drawn.hit,
+            Some(hit),
+            "translated caption changes this fixture's layout"
+        );
+        assert!(shared.lock().unwrap().cancelled);
+        assert_eq!(shared.lock().unwrap().requests.len(), requests);
+        let mut geometry = geometry();
+        let before = geometry;
+        shared.lock().unwrap().terminal = Some(Ok(Some(picked(generation))));
+        snap.poll(&mut geometry, RecorderStage::Ready, false);
+        assert_eq!(geometry, before);
+        assert!(snap.candidates.is_empty());
+        assert_eq!(
+            snap.notice.as_ref().unwrap().render(chinese()),
+            chinese().text(Message::SnapLayoutChanged)
+        );
+    }
+
     fn controller_frame(
         context: &egui::Context,
         snap: &mut WindowSnapUi,
@@ -1718,6 +2043,7 @@ mod tests {
                     None,
                     input_ready,
                     snap,
+                    english(),
                 );
                 snap.publish_drag_button(*geometry, RecorderStage::Ready, true, context);
             },
@@ -1728,6 +2054,15 @@ mod tests {
         context: &egui::Context,
         snap: &mut WindowSnapUi,
         events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        widget_frame_localized(context, snap, events, english())
+    }
+
+    fn widget_frame_localized(
+        context: &egui::Context,
+        snap: &mut WindowSnapUi,
+        events: Vec<egui::Event>,
+        localizer: Localizer,
     ) -> egui::FullOutput {
         context.run(
             egui::RawInput {
@@ -1746,7 +2081,7 @@ mod tests {
                         egui::Pos2::ZERO,
                         egui::pos2(180.0, 120.0),
                     )));
-                    snap.show(ui, &geometry(), RecorderStage::Ready);
+                    snap.show(ui, &geometry(), RecorderStage::Ready, localizer);
                 });
                 snap.publish_drag_button(geometry(), RecorderStage::Ready, true, context);
             },

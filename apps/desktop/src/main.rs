@@ -53,7 +53,7 @@ mod window_snap;
 mod x11_controller_ui;
 mod x11_controller_window;
 mod x11_recorder;
-use gif_from_screen_localization::Message;
+use gif_from_screen_localization::{Localizer, Message};
 use x11_recorder::RecorderOverlay;
 
 use std::{
@@ -148,6 +148,24 @@ use wayland_prepare_job::{
 };
 
 const APP_NAME: &str = "GifFromScreen";
+
+pub(crate) fn format_message(
+    localizer: Localizer,
+    message: Message,
+    values: &[(&str, &str)],
+) -> String {
+    localizer
+        .format(message, values)
+        .unwrap_or_else(|error| error.to_string())
+}
+
+#[cfg(test)]
+fn test_localizer() -> Localizer {
+    Localizer::new(gif_from_screen_localization::find_language("en").unwrap())
+}
+
+#[cfg(test)]
+mod recorder_localization_tests;
 const MAX_RECORDING_DURATION_MS: u64 = 3_600_000;
 const EDITOR_HISTORY_LIMIT: usize = 100;
 const EDITOR_PREVIEW_MAX_SIZE: [u32; 2] = [960, 540];
@@ -773,6 +791,7 @@ struct RecorderOverlayFrame {
 
 struct GifFromScreenApp {
     language_settings: preferences::LanguageSettings,
+    recorder_ui_language: &'static str,
     x11_window_id: Option<u32>,
     pending_recorder_start: Option<Instant>,
     shortcut_tool: shortcut_ui::ShortcutTool,
@@ -834,6 +853,7 @@ impl Default for GifFromScreenApp {
     fn default() -> Self {
         Self {
             language_settings: preferences::LanguageSettings::default(),
+            recorder_ui_language: "en",
             pending_recorder_start: None,
             x11_window_id: None,
             shortcut_tool: shortcut_ui::ShortcutTool::default(),
@@ -917,6 +937,7 @@ impl eframe::App for GifFromScreenApp {
         }
         self.receive_background_messages(context);
         self.language_settings.poll(context);
+        self.sync_recorder_language(self.language_settings.localizer());
         if !closing_controller {
             self.handle_worker_shutdown(context);
         }
@@ -1016,6 +1037,31 @@ impl eframe::App for GifFromScreenApp {
 }
 
 impl GifFromScreenApp {
+    fn sync_recorder_language(&mut self, localizer: Localizer) {
+        let language = localizer.resolve(Message::RecorderStart).language_tag;
+        if self.recorder_ui_language == language {
+            return;
+        }
+        self.recorder_ui_language = language;
+        // A translation can change the preview's position within the window.
+        // Discard only unfinished screen-space gestures, not confirmed source
+        // rectangles or capture settings. Native X11 guide geometry is separate.
+        if let Some(picker) = &mut self.region_picker {
+            picker.drag_start = None;
+            picker.drag_current = None;
+        }
+        if let Some(preview) = &mut self.wayland_frozen_preview {
+            preview.drag_start = None;
+            preview.drag_current = None;
+            preview.drag_initial_region = None;
+        }
+        if let Some(controller) = &mut self.wayland_crop_controller {
+            controller.drag_start = None;
+            controller.drag_current = None;
+            controller.drag_initial_region = None;
+        }
+    }
+
     fn restore_main_window_if_requested(&mut self, context: &egui::Context) {
         if let Some(snapshot) = &mut self.main_window_snapshot
             && let MainWindowRestore::Wayland {
@@ -1905,17 +1951,18 @@ impl GifFromScreenApp {
     }
 
     fn show_screen_recorder(&mut self, ui: &mut egui::Ui) {
+        let localizer = self.language_settings.localizer();
         self.ensure_capture_source_catalog();
         if self.region_picker.is_some() {
             self.show_region_picker(ui);
             return;
         }
         ui.heading(match self.display_server {
-            Some(LinuxDisplayServer::Wayland) => "Wayland screen recorder",
-            Some(LinuxDisplayServer::X11) => "X11 screen recorder",
-            Some(_) | None => "Linux screen recorder",
+            Some(LinuxDisplayServer::Wayland) => localizer.text(Message::RecorderWaylandTitle),
+            Some(LinuxDisplayServer::X11) => localizer.text(Message::RecorderX11Title),
+            Some(_) | None => localizer.text(Message::RecorderLinuxTitle),
         });
-        ui.label("Capture and durable project creation run on a background worker.");
+        ui.label(localizer.text(Message::RecorderBackgroundWork));
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui
@@ -1924,7 +1971,7 @@ impl GifFromScreenApp {
                         && self.recorder_overlay.is_none()
                         && !self.sources.is_empty()
                         && self.source_catalog_job.state() != CaptureSourceJobState::Loading,
-                    egui::Button::new("Open recorder frame"),
+                    egui::Button::new(localizer.text(Message::RecorderOpenFrame)),
                 )
                 .clicked()
                 && let Err(error) = self.open_recorder_overlay(ui.ctx())
@@ -1951,19 +1998,29 @@ impl GifFromScreenApp {
     }
 
     fn show_screen_recorder_options(&mut self, ui: &mut egui::Ui) {
+        let localizer = self.language_settings.localizer();
         self.show_recording_settings(ui);
         ui.separator();
-        egui::CollapsingHeader::new("Global recorder shortcuts")
+        egui::CollapsingHeader::new(localizer.text(Message::RecorderGlobalShortcuts))
             .id_salt("global-recorder-shortcuts")
             .show(ui, |ui| self.shortcut_tool.show(ui, self.display_server));
         if let Some(progress) = self.progress {
             ui.add_space(12.0);
-            ui.label(format!(
-                "{:?}: {} captured frames · source span {:.2}s · GIF {:.2}s",
-                progress.phase,
-                progress.frames_captured,
-                progress.capture_duration.as_secs_f32(),
-                progress.playback_duration.as_secs_f32()
+            ui.label(format_message(
+                localizer,
+                Message::RecorderWorkflowProgress,
+                &[
+                    ("phase", recording_phase_label(progress.phase, localizer)),
+                    ("count", &progress.frames_captured.to_string()),
+                    (
+                        "source_seconds",
+                        &format!("{:.2}", progress.capture_duration.as_secs_f32()),
+                    ),
+                    (
+                        "playback_seconds",
+                        &format!("{:.2}", progress.playback_duration.as_secs_f32()),
+                    ),
+                ],
             ));
         }
     }
@@ -2153,14 +2210,15 @@ impl GifFromScreenApp {
     }
 
     fn show_recording_settings(&mut self, ui: &mut egui::Ui) {
+        let localizer = self.language_settings.localizer();
         egui::Grid::new("recording_settings")
             .num_columns(2)
             .spacing([16.0, 8.0])
             .show(ui, |ui| {
-                ui.label("Capture source");
+                ui.label(localizer.text(Message::RecorderCaptureSource));
                 ui.horizontal(|ui| {
                     let selected_name = self.sources.get(self.selected_source).map_or_else(
-                        || "No capture source".to_owned(),
+                        || localizer.text(Message::RecorderNoCaptureSource).to_owned(),
                         |source| source.name().into(),
                     );
                     egui::ComboBox::from_id_salt("capture_source")
@@ -2174,7 +2232,7 @@ impl GifFromScreenApp {
                                 );
                             }
                         });
-                    if ui.button("Refresh").clicked() {
+                    if ui.button(localizer.text(Message::RecentRefresh)).clicked() {
                         self.refresh_sources();
                     }
                     if self.source_catalog_job.state() == CaptureSourceJobState::Loading {
@@ -2183,10 +2241,10 @@ impl GifFromScreenApp {
                 });
                 ui.end_row();
 
-                ui.label("Output GIF");
+                ui.label(localizer.text(Message::RecorderOutputGif));
                 ui.text_edit_singleline(&mut self.settings.output);
                 ui.end_row();
-                ui.label("Maximum capture duration (ms, 0 = manual stop)");
+                ui.label(localizer.text(Message::RecorderMaximumDurationManualStopMs));
                 ui.add(
                     egui::DragValue::new(&mut self.settings.duration_ms)
                         .range(0..=MAX_RECORDING_DURATION_MS),
@@ -2196,23 +2254,25 @@ impl GifFromScreenApp {
                     ui,
                     &mut self.settings,
                     self.display_server == Some(LinuxDisplayServer::X11),
+                    localizer,
                 );
-                show_frame_retention_setting(ui, &mut self.settings);
+                show_frame_retention_setting(ui, &mut self.settings, localizer);
                 show_recording_annotations_setting(
                     ui,
                     &mut self.settings,
                     self.display_server == Some(LinuxDisplayServer::X11),
+                    localizer,
                 );
-                ui.label("Start countdown (seconds)");
+                ui.label(localizer.text(Message::RecorderCountdownSeconds));
                 ui.add(
                     egui::DragValue::new(&mut self.settings.countdown_seconds)
                         .range(0..=MAX_COUNTDOWN_SECONDS),
                 );
                 ui.end_row();
-                ui.label("Capture a region");
+                ui.label(localizer.text(Message::RecorderCaptureRegion));
                 ui.checkbox(
                     &mut self.settings.region_enabled,
-                    "Use physical-pixel rectangle",
+                    localizer.text(Message::RecorderPhysicalRectangle),
                 );
                 ui.end_row();
             });
@@ -2224,45 +2284,56 @@ impl GifFromScreenApp {
                 ui.add(egui::DragValue::new(&mut self.settings.region_x));
                 ui.label("Y");
                 ui.add(egui::DragValue::new(&mut self.settings.region_y));
-                ui.label("Width");
+                ui.label(localizer.text(Message::RecorderWidth));
                 ui.add(egui::DragValue::new(&mut self.settings.region_width).range(1..=65_535));
-                ui.label("Height");
+                ui.label(localizer.text(Message::RecorderHeight));
                 ui.add(egui::DragValue::new(&mut self.settings.region_height).range(1..=65_535));
             });
-            if ui.button("Select region visually").clicked()
+            if ui
+                .button(localizer.text(Message::RecorderSelectRegion))
+                .clicked()
                 && let Err(error) = self.begin_region_picker(ui.ctx())
             {
                 self.notice = Some(error);
             }
         }
+        self.show_recording_source_description(ui, localizer);
+    }
+
+    fn show_recording_source_description(&self, ui: &mut egui::Ui, localizer: Localizer) {
         if let Some(source) = self.sources.get(self.selected_source)
             && let Some(rect) = source.geometry()
         {
-            ui.weak(format!(
-                "Selected source: {}×{} at {},{} ({:?})",
-                rect.size().width(),
-                rect.size().height(),
-                rect.origin().x,
-                rect.origin().y,
-                source.kind()
+            ui.weak(format_message(
+                localizer,
+                Message::RecorderSelectedSource,
+                &[
+                    ("width", &rect.size().width().to_string()),
+                    ("height", &rect.size().height().to_string()),
+                    ("x", &rect.origin().x.to_string()),
+                    ("y", &rect.origin().y.to_string()),
+                    (
+                        "kind",
+                        recording_source_kind_label(source.kind(), localizer),
+                    ),
+                ],
             ));
         } else if self.display_server == Some(LinuxDisplayServer::Wayland)
             && self.sources.get(self.selected_source).is_some()
         {
-            ui.weak(
-                "Wayland keeps source geometry private. The system chooser will open in the background, then the first PipeWire frame will provide a frozen preview.",
-            );
+            ui.weak(localizer.text(Message::RecorderWaylandPrivateGeometry));
         }
     }
 
     fn begin_region_picker(&mut self, context: &egui::Context) -> Result<(), String> {
+        let localizer = self.language_settings.localizer();
         if self.display_server == Some(LinuxDisplayServer::Wayland) {
             return self.begin_wayland_preparation();
         }
         let source = self
             .sources
             .get(self.selected_source)
-            .ok_or_else(|| "No X11 capture source is selected.".to_owned())?;
+            .ok_or_else(|| localizer.text(Message::RecorderNoX11Source).to_owned())?;
         let target = match source.kind() {
             CaptureSourceKind::Monitor => CaptureTarget::Monitor(source.id().clone()),
             CaptureSourceKind::Window => CaptureTarget::Window(source.id().clone()),
@@ -2295,6 +2366,7 @@ impl GifFromScreenApp {
     // picker converts back against the source dimensions before committing.
     #[allow(clippy::cast_precision_loss)]
     fn show_region_picker(&mut self, ui: &mut egui::Ui) {
+        let localizer = self.language_settings.localizer();
         let mut apply = None;
         let mut cancel = false;
         let picker = self
@@ -2302,8 +2374,8 @@ impl GifFromScreenApp {
             .as_mut()
             .expect("caller checked region picker presence");
 
-        ui.heading("Select capture region");
-        ui.label("Drag over the preview, then apply the physical-pixel rectangle.");
+        ui.heading(localizer.text(Message::RecorderSelectRegionTitle));
+        ui.label(localizer.text(Message::RecorderSelectRegionHint));
         ui.add_space(8.0);
         let available = ui.available_size();
         let maximum = egui::vec2(available.x.max(1.0), (available.y - 90.0).max(1.0));
@@ -2350,23 +2422,24 @@ impl GifFromScreenApp {
 
         ui.horizontal(|ui| {
             if let Some(selection) = picker.selection {
-                ui.label(format!(
-                    "{}×{} at {},{}",
-                    selection.size().width(),
-                    selection.size().height(),
-                    selection.origin().x,
-                    selection.origin().y
+                ui.label(format_recording_region(
+                    localizer,
+                    Message::RecorderRegionSummary,
+                    selection,
                 ));
             } else {
-                ui.weak("No region selected");
+                ui.weak(localizer.text(Message::RecorderNoRegionSelected));
             }
             if ui
-                .add_enabled(picker.selection.is_some(), egui::Button::new("Apply"))
+                .add_enabled(
+                    picker.selection.is_some(),
+                    egui::Button::new(localizer.text(Message::ApplyButton)),
+                )
                 .clicked()
             {
                 apply = picker.selection;
             }
-            if ui.button("Cancel").clicked() {
+            if ui.button(localizer.text(Message::CancelButton)).clicked() {
                 cancel = true;
             }
         });
@@ -2377,7 +2450,7 @@ impl GifFromScreenApp {
             self.settings.region_y = selection.origin().y;
             self.settings.region_width = selection.size().width();
             self.settings.region_height = selection.size().height();
-            self.notice = Some("Capture region updated from preview.".into());
+            self.notice = Some(localizer.text(Message::RecorderRegionUpdated).into());
             self.region_picker = None;
         } else if cancel {
             self.region_picker = None;
@@ -2418,6 +2491,7 @@ impl GifFromScreenApp {
         context: &egui::Context,
         action: RecorderOverlayAction,
     ) {
+        let localizer = self.language_settings.localizer();
         match action {
             RecorderOverlayAction::None => {}
             RecorderOverlayAction::Start => {
@@ -2436,7 +2510,7 @@ impl GifFromScreenApp {
                     overlay.cancel_start(context);
                 }
                 if self.recording_countdown.cancel() {
-                    self.notice = Some("Recording countdown cancelled.".into());
+                    self.notice = Some(localizer.text(Message::RecorderCountdownCancelled).into());
                     context.request_repaint();
                 }
             }
@@ -2444,20 +2518,24 @@ impl GifFromScreenApp {
                 if let Some(job) = &mut self.job
                     && job.request_pause(true)
                 {
-                    self.notice = Some("Pause requested. Wait for the paused state before typing sensitive information.".to_owned());
+                    self.notice = Some(localizer.text(Message::RecorderPauseRequested).to_owned());
                 }
             }
             RecorderOverlayAction::Resume => {
                 if let Some(job) = &mut self.job
                     && job.request_pause(false)
                 {
-                    self.notice = Some("Resume requested.".to_owned());
+                    self.notice = Some(localizer.text(Message::RecorderResumeRequested).to_owned());
                 }
             }
             RecorderOverlayAction::Snapshot => {
                 if let Some(job) = &mut self.job {
                     job.trigger_snapshot();
-                    self.notice = Some("Manual snapshot requested…".to_owned());
+                    self.notice = Some(
+                        localizer
+                            .text(Message::RecorderSnapshotRequested)
+                            .to_owned(),
+                    );
                     context.request_repaint();
                 }
             }
@@ -2465,7 +2543,7 @@ impl GifFromScreenApp {
                 if let Some(job) = &mut self.job {
                     job.stop_retargeting();
                     let _ = job.controller.stop();
-                    self.notice = Some("Stopping and finalizing recoverable project…".into());
+                    self.notice = Some(localizer.text(Message::RecorderStoppingProject).into());
                 }
             }
             RecorderOverlayAction::Discard => {
@@ -2473,7 +2551,7 @@ impl GifFromScreenApp {
                     job.stop_retargeting();
                     let _ = job.controller.discard();
                     job.cancellation.cancel();
-                    self.notice = Some("Discarding recording…".into());
+                    self.notice = Some(localizer.text(Message::RecorderDiscarding).into());
                 } else {
                     self.close_recorder_overlay();
                 }
@@ -2486,10 +2564,8 @@ impl GifFromScreenApp {
                     );
                     job.stop_retargeting();
                     let _ = job.controller.stop();
-                    self.notice = Some(
-                        "Closing the recorder: stopping and saving the captured project…"
-                            .to_owned(),
-                    );
+                    self.notice =
+                        Some(localizer.text(Message::RecorderClosingAndSaving).to_owned());
                 } else {
                     self.close_recorder_overlay();
                 }
@@ -2498,13 +2574,14 @@ impl GifFromScreenApp {
     }
 
     fn begin_recording(&mut self, context: &egui::Context) -> Result<(), String> {
+        let localizer = self.language_settings.localizer();
         validate_settings(&self.settings)?;
         if self
             .recorder_overlay
             .as_ref()
             .is_some_and(|overlay| !overlay.ready())
         {
-            return Err("Wait for the current input hole and keep the recorder inside its source before starting.".into());
+            return Err(localizer.text(Message::RecorderWaitInputHole).into());
         }
         if self.job.is_some() {
             return Ok(());
@@ -2515,16 +2592,22 @@ impl GifFromScreenApp {
         {
             CountdownStart::Immediate => self.prepare_live_recording(),
             CountdownStart::Started => {
-                self.notice = Some(format!(
-                    "Recording starts in {} seconds…",
-                    self.settings.countdown_seconds
+                self.notice = Some(format_message(
+                    localizer,
+                    Message::RecorderCountdownNotice,
+                    &[(
+                        localizer.text(Message::RecorderIntervalSeconds),
+                        &self.settings.countdown_seconds.to_string(),
+                    )],
                 ));
                 context.request_repaint();
                 Ok(())
             }
             CountdownStart::AlreadyRunning => Ok(()),
-            CountdownStart::OutOfRange => Err(format!(
-                "Countdown must be between 0 and {MAX_COUNTDOWN_SECONDS} seconds."
+            CountdownStart::OutOfRange => Err(format_message(
+                localizer,
+                Message::RecorderCountdownRange,
+                &[("maximum", &MAX_COUNTDOWN_SECONDS.to_string())],
             )),
         }
     }
@@ -2557,6 +2640,7 @@ impl GifFromScreenApp {
     }
 
     fn start_recording(&mut self) -> Result<(), String> {
+        let localizer = self.language_settings.localizer();
         if self.wayland_crop_controller.is_some() {
             return self.start_wayland_recording();
         }
@@ -2564,7 +2648,7 @@ impl GifFromScreenApp {
         let selected = self
             .sources
             .get(self.selected_source)
-            .ok_or_else(|| "No X11 capture source is selected.".to_owned())?;
+            .ok_or_else(|| localizer.text(Message::RecorderNoX11Source).to_owned())?;
         let settings = self.settings.clone();
         let source_id = selected.id().clone();
         let source_kind = selected.kind();
@@ -2620,7 +2704,7 @@ impl GifFromScreenApp {
             })
             .map_err(|error| format!("could not start recording worker: {error}"))?;
 
-        self.notice = Some("Recording started…".into());
+        self.notice = Some(localizer.text(Message::RecorderStarted).into());
         self.progress = None;
         self.job = Some(RecordingJob {
             shortcut_state: recorder_shortcuts::LiveShortcutState::default(),
@@ -2638,6 +2722,7 @@ impl GifFromScreenApp {
     }
 
     fn start_wayland_recording(&mut self) -> Result<(), String> {
+        let localizer = self.language_settings.localizer();
         validate_settings(&self.settings)?;
         if self.settings.input_events || self.settings.cursor == RecordingCursor::Editable {
             return Err("Wayland supports hidden or embedded cursors, not editable cursor metadata or global input events. Disable X11-only options first.".to_owned());
@@ -2656,7 +2741,7 @@ impl GifFromScreenApp {
         let selected = self
             .sources
             .get(self.selected_source)
-            .ok_or_else(|| "No Wayland portal source is selected.".to_owned())?;
+            .ok_or_else(|| localizer.text(Message::RecorderNoWaylandSource).to_owned())?;
         let mut settings = self.settings.clone();
         apply_wayland_region_to_settings(&mut settings, region);
         let worker = RecordingWorkerRequest {
@@ -2676,27 +2761,31 @@ impl GifFromScreenApp {
         self.job = Some(job);
         self.attach_recording_shortcuts();
         self.progress = None;
-        self.notice = Some("Wayland recording started from the prepared session…".to_owned());
+        self.notice = Some(localizer.text(Message::RecorderWaylandStarted).to_owned());
         Ok(())
     }
 
     fn ensure_capture_source_catalog(&mut self) {
+        let localizer = self.language_settings.localizer();
         if self.source_catalog_attempted {
             return;
         }
         self.source_catalog_attempted = true;
         match self.source_catalog_job.start() {
-            Ok(()) => self.notice = Some("Loading Linux capture sources…".to_owned()),
+            Ok(()) => {
+                self.notice = Some(localizer.text(Message::RecorderSourcesLoading).to_owned());
+            }
             Err(error) => self.notice = Some(error.to_string()),
         }
     }
 
     fn receive_capture_source_result(&mut self) {
+        let localizer = self.language_settings.localizer();
         if !self.source_catalog_job.drain() {
             return;
         }
         let Some(result) = self.source_catalog_job.take_result() else {
-            self.notice = Some("Capture-source worker returned no result.".to_owned());
+            self.notice = Some(localizer.text(Message::RecorderSourcesNoResult).to_owned());
             return;
         };
         match result {
@@ -2710,27 +2799,44 @@ impl GifFromScreenApp {
                 self.display_server = Some(display_server);
                 self.sources = sources;
                 self.selected_source = selected_source;
-                self.notice = Some(format!(
-                    "Found {} {:?} capture source option(s).",
-                    self.sources.len(),
-                    display_server
+                let display_name = match display_server {
+                    LinuxDisplayServer::X11 => "X11",
+                    LinuxDisplayServer::Wayland => "Wayland",
+                    _ => localizer.text(Message::RecorderUnknown),
+                };
+                self.notice = Some(format_message(
+                    localizer,
+                    Message::RecorderSourcesFound,
+                    &[
+                        ("count", &self.sources.len().to_string()),
+                        ("display_server", display_name),
+                    ],
                 ));
             }
             Err(error) => {
                 self.display_server = None;
                 self.sources.clear();
                 self.selected_source = 0;
-                self.notice = Some(format!("Could not load Linux capture sources: {error}"));
+                self.notice = Some(format_message(
+                    localizer,
+                    Message::RecorderSourcesFailed,
+                    &[("error", &error.to_string())],
+                ));
             }
         }
     }
 
     fn begin_wayland_preparation(&mut self) -> Result<(), String> {
+        let localizer = self.language_settings.localizer();
         if self.settings.cadence == RecordingCadenceChoice::Interaction {
-            return Err("Interaction snapshots require X11. Choose continuous, periodic or manual capture on Wayland.".into());
+            return Err(localizer
+                .text(Message::RecorderInteractionRequiresX11)
+                .into());
         }
         if self.settings.input_events || self.settings.cursor == RecordingCursor::Editable {
-            return Err("Choose a hidden/embedded cursor and disable X11 input events before opening the Wayland source chooser.".to_owned());
+            return Err(localizer
+                .text(Message::RecorderWaylandInputGuard)
+                .to_owned());
         }
         if self.wayland_prepare_job.is_active() {
             return Ok(());
@@ -2739,24 +2845,26 @@ impl GifFromScreenApp {
             .sources
             .get(self.selected_source)
             .cloned()
-            .ok_or_else(|| "No Wayland portal source is selected.".to_owned())?;
+            .ok_or_else(|| localizer.text(Message::RecorderNoWaylandSource).to_owned())?;
         self.wayland_frozen_preview = None;
         let cadence = recording_cadence(&self.settings)?;
         self.wayland_prepare_job
             .start(source, cadence, self.settings.cursor.capture_mode())
             .map_err(|error| error.to_string())?;
         self.notice = Some(
-            "Opening the Wayland system chooser in the background. Select a screen or window to prepare its frozen preview."
+            localizer
+                .text(Message::RecorderWaylandOpeningChooser)
                 .to_owned(),
         );
         Ok(())
     }
 
     fn receive_wayland_prepare_messages(&mut self, context: &egui::Context) {
+        let localizer = self.language_settings.localizer();
         for event in self.wayland_prepare_job.drain() {
             match event {
                 WaylandPrepareJobEvent::StateChanged(state) => {
-                    self.notice = Some(wayland_prepare_state_notice(state).to_owned());
+                    self.notice = Some(wayland_prepare_state_notice(state, localizer).to_owned());
                 }
                 WaylandPrepareJobEvent::PreviewReady(preview) => {
                     match frozen_preview_image(&preview) {
@@ -2777,10 +2885,13 @@ impl GifFromScreenApp {
                                 drag_current: None,
                                 drag_initial_region: None,
                             });
-                            self.notice = Some(format!(
-                                "Wayland source prepared at {}×{} pixels. The native session is paused and retained by its worker.",
-                                source_size.width(),
-                                source_size.height()
+                            self.notice = Some(format_message(
+                                localizer,
+                                Message::RecorderPreparedNotice,
+                                &[
+                                    ("width", &source_size.width().to_string()),
+                                    ("height", &source_size.height().to_string()),
+                                ],
                             ));
                         }
                         Err(error) => {
@@ -2797,14 +2908,17 @@ impl GifFromScreenApp {
                         self.restore_main_window = true;
                     }
                     self.notice = Some(match self.wayland_prepare_job.take_result() {
-                        Some(Ok(WaylandPrepareOutcome::Cancelled)) => {
-                            "Wayland source preparation cancelled and its portal session closed."
-                                .to_owned()
-                        }
-                        Some(Err(error)) => {
-                            format!("Could not prepare Wayland source: {error}")
-                        }
-                        None => "Wayland preparation ended without a result.".to_owned(),
+                        Some(Ok(WaylandPrepareOutcome::Cancelled)) => localizer
+                            .text(Message::RecorderPreparationCancelled)
+                            .to_owned(),
+                        Some(Err(error)) => format_message(
+                            localizer,
+                            Message::RecorderPreparationFailed,
+                            &[("error", &error.to_string())],
+                        ),
+                        None => localizer
+                            .text(Message::RecorderPreparationNoResult)
+                            .to_owned(),
                     });
                 }
             }
@@ -2813,7 +2927,8 @@ impl GifFromScreenApp {
 
     #[allow(clippy::cast_precision_loss)]
     fn show_wayland_preparation(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Wayland source preparation");
+        let localizer = self.language_settings.localizer();
+        ui.heading(localizer.text(Message::RecorderWaylandPreparation));
         let mut selected_from_drag = None;
         let mut apply_exact = false;
         let cancelling = self.wayland_prepare_job.state() == WaylandPrepareJobState::Cancelling;
@@ -2821,6 +2936,7 @@ impl GifFromScreenApp {
             ui,
             self.wayland_frozen_preview.is_some(),
             cancelling,
+            localizer,
         );
         ui.separator();
         egui::ScrollArea::vertical()
@@ -2828,29 +2944,41 @@ impl GifFromScreenApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if let Some(preview) = &mut self.wayland_frozen_preview {
-                    apply_exact = Self::show_wayland_preparation_coordinates(ui, &mut self.settings);
-                    ui.label(format!(
-                        "Selected {}×{} at {},{}",
-                        preview.selection.size().width(),
-                        preview.selection.size().height(),
-                        preview.selection.origin().x,
-                        preview.selection.origin().y
+                    apply_exact = Self::show_wayland_preparation_coordinates(
+                        ui,
+                        &mut self.settings,
+                        localizer,
+                    );
+                    ui.label(format_recording_region(
+                        localizer,
+                        Message::RecorderSelectedRegion,
+                        preview.selection,
                     ));
-                    ui.label(format!(
-                        "Frozen {}×{} PipeWire frame",
-                        preview.source_size.width(),
-                        preview.source_size.height()
+                    ui.label(format_message(
+                        localizer,
+                        Message::RecorderFrozenFrame,
+                        &[
+                            ("width", &preview.source_size.width().to_string()),
+                            ("height", &preview.source_size.height().to_string()),
+                        ],
                     ));
-                    ui.weak("This is a source-local preview, not a window positioned over global desktop coordinates.");
-                    if let Some(notice) = &self.notice { ui.label(notice); }
+                    ui.weak(localizer.text(Message::RecorderSourceLocalHint));
+                    if let Some(notice) = &self.notice {
+                        ui.label(notice);
+                    }
                     ui.add_space(8.0);
                     selected_from_drag = draw_wayland_region_selector(ui, preview, true);
                 } else {
                     ui.horizontal_wrapped(|ui| {
                         ui.spinner();
-                        ui.label(wayland_prepare_state_notice(self.wayland_prepare_job.state()));
+                        ui.label(wayland_prepare_state_notice(
+                            self.wayland_prepare_job.state(),
+                            localizer,
+                        ));
                     });
-                    if let Some(notice) = &self.notice { ui.label(notice); }
+                    if let Some(notice) = &self.notice {
+                        ui.label(notice);
+                    }
                 }
             });
         if let Some(region) = selected_from_drag {
@@ -2860,35 +2988,7 @@ impl GifFromScreenApp {
             apply_wayland_region_to_settings(&mut self.settings, region);
         }
         if apply_exact {
-            let result = PhysicalRect::new(
-                self.settings.region_x,
-                self.settings.region_y,
-                self.settings.region_width,
-                self.settings.region_height,
-            )
-            .map_err(|error| error.to_string())
-            .and_then(|region| {
-                let source_size = self
-                    .wayland_frozen_preview
-                    .as_ref()
-                    .map(|preview| preview.source_size)
-                    .ok_or_else(|| "Wayland preview is no longer available.".to_owned())?;
-                region
-                    .fits_within(source_size)
-                    .then_some(region)
-                    .ok_or_else(|| {
-                        "The exact region must stay inside the frozen source frame.".to_owned()
-                    })
-            });
-            match result {
-                Ok(region) => {
-                    if let Some(preview) = &mut self.wayland_frozen_preview {
-                        preview.selection = region;
-                    }
-                    self.notice = Some("Exact Wayland source-local region applied.".to_owned());
-                }
-                Err(error) => self.notice = Some(error),
-            }
+            self.apply_exact_wayland_region(localizer);
         }
         if open.clicked()
             && let Err(error) = self.open_wayland_crop_controller(ui.ctx())
@@ -2898,9 +2998,52 @@ impl GifFromScreenApp {
         if cancel.clicked() && self.wayland_prepare_job.cancel() {
             self.shortcut_tool.reset_recording_scope();
             self.notice = Some(
-                "Cancellation requested. Closing the source request and its portal session in the background."
+                localizer
+                    .text(Message::RecorderPreparationCancellationRequested)
                     .to_owned(),
             );
+        }
+    }
+
+    fn apply_exact_wayland_region(&mut self, localizer: Localizer) {
+        let result = PhysicalRect::new(
+            self.settings.region_x,
+            self.settings.region_y,
+            self.settings.region_width,
+            self.settings.region_height,
+        )
+        .map_err(|error| error.to_string())
+        .and_then(|region| {
+            let source_size = self
+                .wayland_frozen_preview
+                .as_ref()
+                .map(|preview| preview.source_size)
+                .ok_or_else(|| {
+                    localizer
+                        .text(Message::RecorderWaylandPreviewUnavailable)
+                        .to_owned()
+                })?;
+            region
+                .fits_within(source_size)
+                .then_some(region)
+                .ok_or_else(|| {
+                    localizer
+                        .text(Message::RecorderExactRegionOutside)
+                        .to_owned()
+                })
+        });
+        match result {
+            Ok(region) => {
+                if let Some(preview) = &mut self.wayland_frozen_preview {
+                    preview.selection = region;
+                }
+                self.notice = Some(
+                    localizer
+                        .text(Message::RecorderWaylandRegionApplied)
+                        .to_owned(),
+                );
+            }
+            Err(error) => self.notice = Some(error),
         }
     }
 
@@ -2908,14 +3051,17 @@ impl GifFromScreenApp {
         ui: &mut egui::Ui,
         ready: bool,
         cancelling: bool,
+        localizer: Localizer,
     ) -> (egui::Response, egui::Response) {
         ui.horizontal_wrapped(|ui| {
             let open = ui.add_enabled(
                 ready,
-                egui::Button::new("Open source-local recorder controller").wrap(),
+                egui::Button::new(localizer.text(Message::RecorderOpenSourceController)).wrap(),
             );
-            let cancel =
-                ui.add_enabled(!cancelling, egui::Button::new("Cancel preparation").wrap());
+            let cancel = ui.add_enabled(
+                !cancelling,
+                egui::Button::new(localizer.text(Message::RecorderCancelPreparation)).wrap(),
+            );
             (open, cancel)
         })
         .inner
@@ -2924,35 +3070,42 @@ impl GifFromScreenApp {
     fn show_wayland_preparation_coordinates(
         ui: &mut egui::Ui,
         settings: &mut RecordingSettings,
+        localizer: Localizer,
     ) -> bool {
         ui.horizontal_wrapped(|ui| {
             ui.label("X");
             ui.add(egui::DragValue::new(&mut settings.region_x));
             ui.label("Y");
             ui.add(egui::DragValue::new(&mut settings.region_y));
-            ui.label("Width");
+            ui.label(localizer.text(Message::RecorderWidth));
             ui.add(egui::DragValue::new(&mut settings.region_width).range(1..=65_535));
-            ui.label("Height");
+            ui.label(localizer.text(Message::RecorderHeight));
             ui.add(egui::DragValue::new(&mut settings.region_height).range(1..=65_535));
-            ui.button("Apply exact region").clicked()
+            ui.button(localizer.text(Message::RecorderApplyExactRegion))
+                .clicked()
         })
         .inner
     }
 
     fn open_wayland_crop_controller(&mut self, context: &egui::Context) -> Result<(), String> {
+        let localizer = self.language_settings.localizer();
         trace_wayland_controller("open entered");
         if self.wayland_prepare_job.state() != WaylandPrepareJobState::Prepared {
-            return Err("The Wayland source is not ready yet.".to_owned());
+            return Err(localizer
+                .text(Message::RecorderWaylandSourceNotReady)
+                .to_owned());
         }
         self.enter_wayland_crop_controller(context)
     }
 
     fn enter_wayland_crop_controller(&mut self, context: &egui::Context) -> Result<(), String> {
+        let localizer = self.language_settings.localizer();
         let mut snapshot = wayland_window_snapshot(context);
-        let preview = self
-            .wayland_frozen_preview
-            .take()
-            .ok_or_else(|| "The frozen Wayland preview is no longer available.".to_owned())?;
+        let preview = self.wayland_frozen_preview.take().ok_or_else(|| {
+            localizer
+                .text(Message::RecorderFrozenPreviewUnavailable)
+                .to_owned()
+        })?;
         if let Some(previous) = self.main_window_snapshot
             && let MainWindowRestore::Wayland {
                 restoring: true,
@@ -2978,13 +3131,14 @@ impl GifFromScreenApp {
         self.restore_main_window = false;
         trace_wayland_controller("controller state installed");
         self.notice = Some(
-            "Recorder controls are active in this window; other pages are hidden. The preview rectangle controls source-local cropping, not a physical desktop frame."
+            localizer
+                .text(Message::RecorderSourceControllerActive)
                 .to_owned(),
         );
         // Wayland cannot hide/unhide a toplevel. Reuse this surface and render
         // only recorder controls, retaining the launcher/editor state in memory.
         context.send_viewport_cmd(egui::ViewportCommand::Title(
-            "GifFromScreen — Recorder".to_owned(),
+            localizer.text(Message::RecorderWindowTitle).to_owned(),
         ));
         self.restore_main_window_if_requested(context);
         context.request_repaint();
@@ -2992,6 +3146,7 @@ impl GifFromScreenApp {
     }
 
     fn show_wayland_crop_controller(&mut self, context: &egui::Context) {
+        let localizer = self.language_settings.localizer();
         trace_wayland_controller("controller draw entered");
         let stage = self.recorder_stage();
         if stage == RecorderStage::Finalizing
@@ -3028,6 +3183,7 @@ impl GifFromScreenApp {
             self.sources
                 .get(self.selected_source)
                 .is_some_and(|source| source.kind() == CaptureSourceKind::Monitor),
+            localizer,
         );
         let region = frame.region.unwrap_or(controller.region);
         controller.region = region;
@@ -3047,6 +3203,7 @@ impl GifFromScreenApp {
         context: &egui::Context,
         action: RecorderOverlayAction,
     ) {
+        let localizer = self.language_settings.localizer();
         match action {
             RecorderOverlayAction::None => {}
             RecorderOverlayAction::Start => {
@@ -3056,27 +3213,35 @@ impl GifFromScreenApp {
             }
             RecorderOverlayAction::CancelCountdown => {
                 if self.recording_countdown.cancel() {
-                    self.notice = Some("Recording countdown cancelled.".to_owned());
+                    self.notice = Some(
+                        localizer
+                            .text(Message::RecorderCountdownCancelled)
+                            .to_owned(),
+                    );
                 }
             }
             RecorderOverlayAction::Pause => {
                 if let Some(job) = &mut self.job
                     && job.request_pause(true)
                 {
-                    self.notice = Some("Pause requested. Wait for the paused state before typing sensitive information.".to_owned());
+                    self.notice = Some(localizer.text(Message::RecorderPauseRequested).to_owned());
                 }
             }
             RecorderOverlayAction::Resume => {
                 if let Some(job) = &mut self.job
                     && job.request_pause(false)
                 {
-                    self.notice = Some("Resume requested.".to_owned());
+                    self.notice = Some(localizer.text(Message::RecorderResumeRequested).to_owned());
                 }
             }
             RecorderOverlayAction::Snapshot => {
                 if let Some(job) = &mut self.job {
                     job.trigger_snapshot();
-                    self.notice = Some("Manual snapshot requested…".to_owned());
+                    self.notice = Some(
+                        localizer
+                            .text(Message::RecorderSnapshotRequested)
+                            .to_owned(),
+                    );
                     context.request_repaint();
                 }
             }
@@ -3084,7 +3249,7 @@ impl GifFromScreenApp {
                 if let Some(job) = &mut self.job {
                     job.stop_retargeting();
                     let _ = job.controller.stop();
-                    self.notice = Some("Stopping and finalizing recoverable project…".to_owned());
+                    self.notice = Some(localizer.text(Message::RecorderStoppingProject).to_owned());
                 }
             }
             RecorderOverlayAction::Discard => {
@@ -3092,7 +3257,7 @@ impl GifFromScreenApp {
                     job.stop_retargeting();
                     let _ = job.controller.discard();
                     job.cancellation.cancel();
-                    self.notice = Some("Discarding recording…".to_owned());
+                    self.notice = Some(localizer.text(Message::RecorderDiscarding).to_owned());
                 } else {
                     self.close_wayland_crop_controller();
                 }
@@ -3101,10 +3266,8 @@ impl GifFromScreenApp {
                 if let Some(job) = &mut self.job {
                     job.stop_retargeting();
                     let _ = job.controller.stop();
-                    self.notice = Some(
-                        "Closing the recorder: stopping and saving the captured project…"
-                            .to_owned(),
-                    );
+                    self.notice =
+                        Some(localizer.text(Message::RecorderClosingAndSaving).to_owned());
                 } else {
                     self.close_wayland_crop_controller();
                 }
@@ -3122,8 +3285,13 @@ impl GifFromScreenApp {
     }
 
     fn refresh_sources(&mut self) {
+        let localizer = self.language_settings.localizer();
         if self.source_catalog_job.state() == CaptureSourceJobState::Loading {
-            self.notice = Some("Capture-source refresh is already running.".to_owned());
+            self.notice = Some(
+                localizer
+                    .text(Message::RecorderRefreshAlreadyRunning)
+                    .to_owned(),
+            );
             return;
         }
         if self.wayland_prepare_job.is_active() {
@@ -3133,12 +3301,19 @@ impl GifFromScreenApp {
         }
         self.source_catalog_attempted = true;
         match self.source_catalog_job.start() {
-            Ok(()) => self.notice = Some("Refreshing Linux capture sources…".to_owned()),
+            Ok(()) => {
+                self.notice = Some(
+                    localizer
+                        .text(Message::RecorderRefreshingSources)
+                        .to_owned(),
+                );
+            }
             Err(error) => self.notice = Some(error.to_string()),
         }
     }
 
     fn receive_job_messages(&mut self) {
+        let localizer = self.language_settings.localizer();
         let Some(job) = &self.job else {
             return;
         };
@@ -3158,7 +3333,11 @@ impl GifFromScreenApp {
                     if let Some(job) = &mut self.job {
                         job.stop_retargeting();
                     }
-                    self.notice = Some("Finalizing recoverable project…".to_owned());
+                    self.notice = Some(
+                        localizer
+                            .text(Message::RecorderFinalizingProject)
+                            .to_owned(),
+                    );
                 }
                 JobMessage::Finished(RecordingCompletion::Completed(project)) => {
                     let discarded = self
@@ -3167,8 +3346,12 @@ impl GifFromScreenApp {
                         .is_some_and(|job| job.cancellation.is_cancelled());
                     if discarded {
                         self.notice = Some(match remove_completed_project(*project) {
-                            Ok(()) => "Recording discarded.".to_owned(),
-                            Err(error) => format!("Recording was discarded, but {error}"),
+                            Ok(()) => localizer.text(Message::RecorderDiscarded).to_owned(),
+                            Err(error) => format_message(
+                                localizer,
+                                Message::RecorderDiscardCleanupFailed,
+                                &[("error", &error)],
+                            ),
                         });
                     } else {
                         self.notice = Some(
@@ -3182,11 +3365,21 @@ impl GifFromScreenApp {
                                     self.editor_ui_state = EditorUiState::default();
                                     self.editor_preview_cache = EditorPreviewCache::new();
                                     self.editor_export_settings = EditorExportSettings::default();
-                                    format!(
-                                        "Project ready: {} frames, {:.3}s at {}",
-                                        summary.frames,
-                                        Duration::from_micros(summary.duration_us).as_secs_f64(),
-                                        summary.project_path.display()
+                                    format_message(
+                                        localizer,
+                                        Message::RecorderProjectReady,
+                                        &[
+                                            ("frames", &summary.frames.to_string()),
+                                            (
+                                                "seconds",
+                                                &format!(
+                                                    "{:.3}",
+                                                    Duration::from_micros(summary.duration_us)
+                                                        .as_secs_f64()
+                                                ),
+                                            ),
+                                            ("path", &summary.project_path.display().to_string()),
+                                        ],
                                     )
                                 }
                                 Err(error) => format!("Could not open recorded project: {error}"),
@@ -4244,6 +4437,7 @@ const fn export_dither_label(choice: ExportDitherChoice) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_wayland_crop_controller(
     context: &egui::Context,
     stage: RecorderStage,
@@ -4252,25 +4446,32 @@ fn draw_wayland_crop_controller(
     manual_snapshots: bool,
     notice: Option<&str>,
     monitor_source: bool,
+    localizer: Localizer,
 ) -> RecorderOverlayFrame {
     trace_wayland_controller("controller panels draw");
-    let mut action =
-        draw_wayland_controller_toolbar(context, stage, progress, controller, manual_snapshots);
+    let mut action = draw_wayland_controller_toolbar(
+        context,
+        stage,
+        progress,
+        controller,
+        manual_snapshots,
+        localizer,
+    );
     let region = egui::CentralPanel::default()
         .frame(egui::Frame::new().fill(egui::Color32::from_rgb(16, 18, 22)))
         .show(context, |ui| {
-            ui.label(
-                "Frozen source-local preview — this controller window is not a physical desktop frame.",
-            );
+            ui.label(localizer.text(Message::RecorderFrozenControllerHint));
             if monitor_source {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
-                    "Monitor capture includes this controller if it overlaps the crop. Move it outside the recorded area before Start, or choose a window source. This app cannot exclude itself from monitor capture.",
+                    localizer.text(Message::RecorderMonitorIncludesController),
                 );
             } else {
-                ui.weak("Keep the selected window visible. Some applications stop redrawing when fully covered or minimized; new capture timestamps do not guarantee updated source pixels.");
+                ui.weak(localizer.text(Message::RecorderKeepWindowVisible));
             }
-            if let Some(notice) = notice { ui.label(notice); }
+            if let Some(notice) = notice {
+                ui.label(notice);
+            }
             draw_source_region_selector(
                 ui,
                 &controller.texture,
@@ -4328,6 +4529,7 @@ fn draw_wayland_controller_toolbar(
     progress: Option<WorkflowProgress>,
     controller: &mut WaylandCropController,
     manual_snapshots: bool,
+    localizer: Localizer,
 ) -> RecorderOverlayAction {
     let available = context.available_rect().size();
     let margin = 16.0;
@@ -4352,6 +4554,7 @@ fn draw_wayland_controller_toolbar(
         progress,
         controller,
         manual_snapshots,
+        localizer,
     );
     let height = (measuring.min_size().y + margin).min((available.y - 32.0).max(1.0));
     let mut action = RecorderOverlayAction::None;
@@ -4374,6 +4577,7 @@ fn draw_wayland_controller_toolbar(
                         progress,
                         controller,
                         manual_snapshots,
+                        localizer,
                     );
                 });
         });
@@ -4386,85 +4590,115 @@ fn draw_wayland_toolbar_contents(
     progress: Option<WorkflowProgress>,
     controller: &mut WaylandCropController,
     manual_snapshots: bool,
+    localizer: Localizer,
 ) -> RecorderOverlayAction {
     let mut action = RecorderOverlayAction::None;
     ui.horizontal_wrapped(|ui| match stage {
         RecorderStage::Ready => {
-            if ui.button("Start").clicked() {
+            if ui.button(localizer.text(Message::RecorderStart)).clicked() {
                 action = RecorderOverlayAction::Start;
             }
-            if ui.button("Cancel").clicked() {
+            if ui.button(localizer.text(Message::CancelButton)).clicked() {
                 action = RecorderOverlayAction::Close;
             }
         }
         RecorderStage::Countdown(remaining) => {
-            if ui.button("Cancel countdown").clicked() {
+            if ui
+                .button(localizer.text(Message::RecorderCancelCountdown))
+                .clicked()
+            {
                 action = RecorderOverlayAction::CancelCountdown;
             }
-            ui.strong(format!("Recording starts in {remaining}s"));
+            ui.strong(format_message(
+                localizer,
+                Message::RecorderStartsIn,
+                &[("seconds", &remaining.to_string())],
+            ));
         }
         RecorderStage::Recording => {
-            if manual_snapshots && ui.button("Take snapshot").clicked() {
+            if manual_snapshots
+                && ui
+                    .button(localizer.text(Message::RecorderTakeSnapshot))
+                    .clicked()
+            {
                 action = RecorderOverlayAction::Snapshot;
             }
-            if ui.button("Pause").clicked() {
+            if ui.button(localizer.text(Message::RecorderPause)).clicked() {
                 action = RecorderOverlayAction::Pause;
             }
-            if ui.button("Stop").clicked() {
+            if ui
+                .button(localizer.text(Message::RecorderStopShort))
+                .clicked()
+            {
                 action = RecorderOverlayAction::Stop;
             }
-            if ui.button("Discard").clicked() {
+            if ui
+                .button(localizer.text(Message::RecorderDiscardShort))
+                .clicked()
+            {
                 action = RecorderOverlayAction::Discard;
             }
         }
         RecorderStage::Paused => {
-            if ui.button("Resume").clicked() {
+            if ui.button(localizer.text(Message::RecorderResume)).clicked() {
                 action = RecorderOverlayAction::Resume;
             }
-            if ui.button("Stop").clicked() {
+            if ui
+                .button(localizer.text(Message::RecorderStopShort))
+                .clicked()
+            {
                 action = RecorderOverlayAction::Stop;
             }
-            if ui.button("Discard").clicked() {
+            if ui
+                .button(localizer.text(Message::RecorderDiscardShort))
+                .clicked()
+            {
                 action = RecorderOverlayAction::Discard;
             }
         }
         RecorderStage::Finalizing => {
-            if ui.button("Cancel").clicked() {
+            if ui.button(localizer.text(Message::CancelButton)).clicked() {
                 action = RecorderOverlayAction::Discard;
             }
             ui.spinner();
-            ui.label("Finalizing recoverable project…");
+            ui.label(localizer.text(Message::RecorderFinalizingProject));
         }
     });
     match stage {
         RecorderStage::Ready => {
-            ui.weak("Drag the preview to resize before recording.");
+            ui.weak(localizer.text(Message::RecorderPreviewResizeHint));
         }
-        RecorderStage::Recording => show_overlay_progress(ui, progress),
+        RecorderStage::Recording => show_overlay_progress(ui, progress, localizer),
         RecorderStage::Paused => {
-            ui.label("Paused");
+            ui.label(localizer.text(Message::RecorderPaused));
         }
         RecorderStage::Countdown(_) | RecorderStage::Finalizing => {}
     }
     ui.horizontal_wrapped(|ui| {
-        ui.strong(format!(
-            "Crop {}×{} at {},{}",
-            controller.region.size().width(),
-            controller.region.size().height(),
-            controller.region.origin().x,
-            controller.region.origin().y
+        ui.strong(format_recording_region(
+            localizer,
+            Message::RecorderCropSummary,
+            controller.region,
         ));
-        show_wayland_crop_nudges(ui, controller);
+        show_wayland_crop_nudges(ui, controller, localizer);
     });
     action
 }
 
-fn show_wayland_crop_nudges(ui: &mut egui::Ui, controller: &mut WaylandCropController) {
+fn show_wayland_crop_nudges(
+    ui: &mut egui::Ui,
+    controller: &mut WaylandCropController,
+    localizer: Localizer,
+) {
     for (label, dx, dy) in [
-        ("Move left 10 source pixels", -10_i16, 0_i16),
-        ("Move right 10 source pixels", 10, 0),
-        ("Move up 10 source pixels", 0, -10),
-        ("Move down 10 source pixels", 0, 10),
+        (
+            localizer.text(Message::RecorderMoveSourceLeft),
+            -10_i16,
+            0_i16,
+        ),
+        (localizer.text(Message::RecorderMoveSourceRight), 10, 0),
+        (localizer.text(Message::RecorderMoveSourceUp), 0, -10),
+        (localizer.text(Message::RecorderMoveSourceDown), 0, 10),
     ] {
         let response = ui
             .add(egui::Button::new("").min_size(egui::vec2(26.0, 24.0)))
@@ -4487,7 +4721,7 @@ fn show_wayland_crop_nudges(ui: &mut egui::Ui, controller: &mut WaylandCropContr
             );
         }
     }
-    ui.weak("10 px source-local");
+    ui.weak(localizer.text(Message::RecorderSourceLocalStep));
 }
 
 fn draw_wayland_region_selector(
@@ -4644,40 +4878,98 @@ fn translate_source_region(
     .unwrap_or(region)
 }
 
-fn show_overlay_progress(ui: &mut egui::Ui, progress: Option<WorkflowProgress>) {
+fn format_recording_region(localizer: Localizer, message: Message, region: PhysicalRect) -> String {
+    format_message(
+        localizer,
+        message,
+        &[
+            ("width", &region.size().width().to_string()),
+            ("height", &region.size().height().to_string()),
+            ("x", &region.origin().x.to_string()),
+            ("y", &region.origin().y.to_string()),
+        ],
+    )
+}
+
+fn recording_source_kind_label(kind: CaptureSourceKind, localizer: Localizer) -> &'static str {
+    localizer.text(match kind {
+        CaptureSourceKind::Monitor => Message::RecorderSourceMonitor,
+        CaptureSourceKind::Window => Message::RecorderSourceWindow,
+        _ => Message::RecorderUnknown,
+    })
+}
+
+fn recording_phase_label(
+    phase: gif_from_screen_workflow::WorkflowPhase,
+    localizer: Localizer,
+) -> &'static str {
+    use gif_from_screen_workflow::WorkflowPhase;
+    localizer.text(match phase {
+        WorkflowPhase::StartingCapture => Message::RecorderPhaseStartingCapture,
+        WorkflowPhase::Capturing => Message::RecorderPhaseCapturing,
+        WorkflowPhase::Paused => Message::RecorderPaused,
+        WorkflowPhase::StoppingCapture => Message::RecorderPhaseStoppingCapture,
+        WorkflowPhase::Encoding => Message::RecorderPhaseEncoding,
+        WorkflowPhase::Committing => Message::RecorderPhaseCommitting,
+        WorkflowPhase::Complete => Message::RecorderPhaseComplete,
+        _ => Message::RecorderUnknown,
+    })
+}
+
+fn show_overlay_progress(
+    ui: &mut egui::Ui,
+    progress: Option<WorkflowProgress>,
+    localizer: Localizer,
+) {
     if let Some(progress) = progress {
-        ui.label(format!(
-            "{} frames · GIF {:.1}s",
-            progress.frames_captured,
-            progress.playback_duration.as_secs_f32()
-        )).on_hover_text(format!(
-            "Source sample span: {:.3}s. GIF playback duration: {:.3}s. Fixed playback delay does not change the captured input clock.",
-            progress.capture_duration.as_secs_f64(), progress.playback_duration.as_secs_f64()
+        ui.label(format_message(
+            localizer,
+            Message::RecorderProgressSummary,
+            &[
+                ("frames", &progress.frames_captured.to_string()),
+                (
+                    "seconds",
+                    &format!("{:.1}", progress.playback_duration.as_secs_f32()),
+                ),
+            ],
+        ))
+        .on_hover_text(format_message(
+            localizer,
+            Message::RecorderProgressTimingHint,
+            &[
+                (
+                    "source_seconds",
+                    &format!("{:.3}", progress.capture_duration.as_secs_f64()),
+                ),
+                (
+                    "playback_seconds",
+                    &format!("{:.3}", progress.playback_duration.as_secs_f64()),
+                ),
+            ],
         ));
     } else {
-        ui.label("Starting…");
+        ui.label(localizer.text(Message::RecorderStarting));
     }
 }
 
-const fn wayland_prepare_state_notice(state: WaylandPrepareJobState) -> &'static str {
+fn wayland_prepare_state_notice(
+    state: WaylandPrepareJobState,
+    localizer: Localizer,
+) -> &'static str {
     match state {
-        WaylandPrepareJobState::Idle => "Wayland source preparation is idle.",
+        WaylandPrepareJobState::Idle => localizer.text(Message::RecorderPreparationIdle),
         WaylandPrepareJobState::Connecting => {
-            "Connecting to the Wayland ScreenCast portal in the background…"
+            localizer.text(Message::RecorderPreparationConnecting)
         }
-        WaylandPrepareJobState::Choosing => {
-            "Choose a screen or window in the trusted system dialog…"
-        }
+        WaylandPrepareJobState::Choosing => localizer.text(Message::RecorderPreparationChoosing),
         WaylandPrepareJobState::WaitingForFrame => {
-            "The portal selection is ready; waiting for the first mapped PipeWire frame…"
+            localizer.text(Message::RecorderPreparationWaiting)
         }
-        WaylandPrepareJobState::Prepared => {
-            "The frozen preview is ready and its native session is paused."
-        }
+        WaylandPrepareJobState::Prepared => localizer.text(Message::RecorderPreparationReady),
         WaylandPrepareJobState::Cancelling => {
-            "Cancellation requested. If the trusted chooser is still open, close it to finish portal teardown."
+            localizer.text(Message::RecorderPreparationCancelling)
         }
-        WaylandPrepareJobState::Finished => "Wayland source preparation finished.",
+        WaylandPrepareJobState::Finished => localizer.text(Message::RecorderPreparationFinished),
     }
 }
 
@@ -5469,27 +5761,37 @@ fn validate_settings(settings: &RecordingSettings) -> Result<(), String> {
     Ok(())
 }
 
-const fn recording_cadence_label(choice: RecordingCadenceChoice) -> &'static str {
+fn recording_cadence_label(choice: RecordingCadenceChoice, localizer: Localizer) -> &'static str {
     match choice {
-        RecordingCadenceChoice::FixedFps => "Continuous FPS",
-        RecordingCadenceChoice::Periodic => "Periodic snapshots",
-        RecordingCadenceChoice::Manual => "Manual snapshots",
-        RecordingCadenceChoice::Interaction => "Desktop interaction snapshots (X11)",
+        RecordingCadenceChoice::FixedFps => localizer.text(Message::RecorderContinuousFps),
+        RecordingCadenceChoice::Periodic => localizer.text(Message::RecorderPeriodicSnapshots),
+        RecordingCadenceChoice::Manual => localizer.text(Message::RecorderManualSnapshots),
+        RecordingCadenceChoice::Interaction => {
+            localizer.text(Message::RecorderInteractionSnapshots)
+        }
     }
 }
 
-const fn recording_interval_unit_label(unit: RecordingIntervalUnit) -> &'static str {
+fn recording_interval_unit_label(
+    unit: RecordingIntervalUnit,
+    localizer: Localizer,
+) -> &'static str {
     match unit {
-        RecordingIntervalUnit::Seconds => "seconds",
-        RecordingIntervalUnit::Minutes => "minutes",
-        RecordingIntervalUnit::Hours => "hours",
+        RecordingIntervalUnit::Seconds => localizer.text(Message::RecorderIntervalSeconds),
+        RecordingIntervalUnit::Minutes => localizer.text(Message::RecorderIntervalMinutes),
+        RecordingIntervalUnit::Hours => localizer.text(Message::RecorderIntervalHours),
     }
 }
 
-fn show_recording_cadence_settings(ui: &mut egui::Ui, settings: &mut RecordingSettings, x11: bool) {
-    ui.label("Capture frequency");
+fn show_recording_cadence_settings(
+    ui: &mut egui::Ui,
+    settings: &mut RecordingSettings,
+    x11: bool,
+    localizer: Localizer,
+) {
+    ui.label(localizer.text(Message::RecorderCaptureFrequency));
     egui::ComboBox::from_id_salt("recording_cadence")
-        .selected_text(recording_cadence_label(settings.cadence))
+        .selected_text(recording_cadence_label(settings.cadence, localizer))
         .show_ui(ui, |ui| {
             for choice in [
                 RecordingCadenceChoice::FixedFps,
@@ -5499,30 +5801,33 @@ fn show_recording_cadence_settings(ui: &mut egui::Ui, settings: &mut RecordingSe
                 ui.selectable_value(
                     &mut settings.cadence,
                     choice,
-                    recording_cadence_label(choice),
+                    recording_cadence_label(choice, localizer),
                 );
             }
             ui.add_enabled_ui(x11, |ui| {
                 ui.selectable_value(
                     &mut settings.cadence,
                     RecordingCadenceChoice::Interaction,
-                    recording_cadence_label(RecordingCadenceChoice::Interaction),
+                    recording_cadence_label(RecordingCadenceChoice::Interaction, localizer),
                 );
             });
         });
     ui.end_row();
     match settings.cadence {
         RecordingCadenceChoice::FixedFps => {
-            ui.label("Frames per second");
+            ui.label(localizer.text(Message::RecorderFramesPerSecond));
             ui.add(egui::DragValue::new(&mut settings.fps).range(1..=60));
             ui.end_row();
         }
         RecordingCadenceChoice::Periodic => {
-            ui.label("Periodic snapshot interval");
+            ui.label(localizer.text(Message::RecorderPeriodicInterval));
             ui.horizontal(|ui| {
                 ui.add(egui::DragValue::new(&mut settings.interval_count).range(1..=10_000));
                 egui::ComboBox::from_id_salt("recording_interval_unit")
-                    .selected_text(recording_interval_unit_label(settings.interval_unit))
+                    .selected_text(recording_interval_unit_label(
+                        settings.interval_unit,
+                        localizer,
+                    ))
                     .show_ui(ui, |ui| {
                         for unit in [
                             RecordingIntervalUnit::Seconds,
@@ -5532,7 +5837,7 @@ fn show_recording_cadence_settings(ui: &mut egui::Ui, settings: &mut RecordingSe
                             ui.selectable_value(
                                 &mut settings.interval_unit,
                                 unit,
-                                recording_interval_unit_label(unit),
+                                recording_interval_unit_label(unit, localizer),
                             );
                         }
                     });
@@ -5541,54 +5846,90 @@ fn show_recording_cadence_settings(ui: &mut egui::Ui, settings: &mut RecordingSe
         }
         RecordingCadenceChoice::Manual => {}
         RecordingCadenceChoice::Interaction => {
-            ui.label("Interaction scope");
+            ui.label(localizer.text(Message::RecorderInteractionScope));
             ui.vertical(|ui| {
-                ui.label("Key presses, mouse-button presses and wheel events anywhere on this X11 desktop, including recorder controls. Motion and releases do not trigger snapshots.");
-                ui.weak("Only while recording; paused input is discarded. Bursts coalesce while capture is busy. Key values and click coordinates are not saved unless input annotations are enabled separately.");
+                ui.label(localizer.text(Message::RecorderInteractionScopeHint));
+                ui.weak(localizer.text(Message::RecorderInteractionPrivacyHint));
             });
             ui.end_row();
         }
     }
-    show_recording_playback_settings(ui, settings);
+    show_recording_playback_settings(ui, settings, localizer);
 }
 
-fn show_recording_playback_settings(ui: &mut egui::Ui, settings: &mut RecordingSettings) {
-    ui.label("GIF playback timing");
+fn show_recording_playback_settings(
+    ui: &mut egui::Ui,
+    settings: &mut RecordingSettings,
+    localizer: Localizer,
+) {
+    ui.label(localizer.text(Message::RecorderPlaybackTiming));
     ui.horizontal_wrapped(|ui| match settings.cadence {
         RecordingCadenceChoice::FixedFps => {
-            ui.checkbox(&mut settings.playback.fixed_frame_rate, "Fixed playback rate");
+            ui.checkbox(
+                &mut settings.playback.fixed_frame_rate,
+                localizer.text(Message::RecorderFixedPlaybackRate),
+            );
             if settings.playback.fixed_frame_rate {
-                ui.weak(format!("{} ms per retained frame, independent of capture delays.", 1000 / settings.fps.max(1)));
+                ui.weak(format_message(
+                    localizer,
+                    Message::RecorderFixedDelayHint,
+                    &[("milliseconds", &(1000 / settings.fps.max(1)).to_string())],
+                ));
             } else {
-                ui.weak("Follow the active time between captured samples.");
+                ui.weak(localizer.text(Message::RecorderMeasuredTimingHint));
             }
         }
         RecordingCadenceChoice::Periodic => {
-            ui.checkbox(&mut settings.playback.periodic_fixed, "Fixed frame delay");
+            ui.checkbox(
+                &mut settings.playback.periodic_fixed,
+                localizer.text(Message::RecorderFixedFrameDelay),
+            );
             if settings.playback.periodic_fixed {
-                ui.add(egui::DragValue::new(&mut settings.playback.periodic_frame_delay_ms).range(1..=MAX_RECORDING_DURATION_MS).suffix(" ms per frame"));
-                ui.weak("Sampling interval and GIF playback speed are independent.");
+                ui.add(
+                    egui::DragValue::new(&mut settings.playback.periodic_frame_delay_ms)
+                        .range(1..=MAX_RECORDING_DURATION_MS)
+                        .suffix(localizer.text(Message::RecorderPerFrameMsSuffix)),
+                );
+                ui.weak(localizer.text(Message::RecorderIndependentTimingHint));
             } else {
-                ui.weak("Follow source timing; the final frame uses the sampling interval.");
+                ui.weak(localizer.text(Message::RecorderPeriodicMeasuredHint));
             }
         }
         RecordingCadenceChoice::Manual => {
-            ui.checkbox(&mut settings.playback.manual_fixed, "Fixed frame delay");
-            ui.add(egui::DragValue::new(&mut settings.manual_frame_duration_ms)
-                .range(1..=MAX_RECORDING_DURATION_MS)
-                .suffix(if settings.playback.manual_fixed { " ms per frame" } else { " ms final frame" }));
+            ui.checkbox(
+                &mut settings.playback.manual_fixed,
+                localizer.text(Message::RecorderFixedFrameDelay),
+            );
+            ui.add(
+                egui::DragValue::new(&mut settings.manual_frame_duration_ms)
+                    .range(1..=MAX_RECORDING_DURATION_MS)
+                    .suffix(if settings.playback.manual_fixed {
+                        localizer.text(Message::RecorderPerFrameMsSuffix)
+                    } else {
+                        localizer.text(Message::RecorderFinalFrameMsSuffix)
+                    }),
+            );
             if settings.playback.manual_fixed {
-                ui.weak("Every snapshot gets this playback delay, regardless of time between clicks.");
+                ui.weak(localizer.text(Message::RecorderManualFixedHint));
             } else {
-                ui.weak("Earlier frames follow active time between clicks; this is only the final frame's delay.");
+                ui.weak(localizer.text(Message::RecorderManualMeasuredHint));
             }
         }
         RecordingCadenceChoice::Interaction => {
-            ui.checkbox(&mut settings.playback.interaction_fixed, "Fixed frame delay");
-            ui.add(egui::DragValue::new(&mut settings.playback.interaction_frame_delay_ms)
-                .range(1..=MAX_RECORDING_DURATION_MS)
-                .suffix(if settings.playback.interaction_fixed { " ms per frame" } else { " ms final frame" }));
-            ui.weak("GIF playback delay is independent of time between input events. Captures have no added trigger delay.");
+            ui.checkbox(
+                &mut settings.playback.interaction_fixed,
+                localizer.text(Message::RecorderFixedFrameDelay),
+            );
+            ui.add(
+                egui::DragValue::new(&mut settings.playback.interaction_frame_delay_ms)
+                    .range(1..=MAX_RECORDING_DURATION_MS)
+                    .suffix(if settings.playback.interaction_fixed {
+                        localizer.text(Message::RecorderPerFrameMsSuffix)
+                    } else {
+                        localizer.text(Message::RecorderFinalFrameMsSuffix)
+                    }),
+            );
+            ui.weak(localizer.text(Message::RecorderInteractionPlaybackHint));
         }
     });
     ui.end_row();
@@ -5598,49 +5939,77 @@ fn show_recording_annotations_setting(
     ui: &mut egui::Ui,
     settings: &mut RecordingSettings,
     x11: bool,
+    localizer: Localizer,
 ) {
-    ui.label("Cursor and input annotations");
+    ui.label(localizer.text(Message::RecorderAnnotations));
     ui.vertical(|ui| {
-        egui::ComboBox::from_id_salt("recording-cursor-mode").selected_text(match settings.cursor {
-            RecordingCursor::Embedded => "Cursor in recording pixels",
-            RecordingCursor::Hidden => "Hide cursor", RecordingCursor::Editable => "Editable cursor metadata",
-        }).show_ui(ui, |ui| {
-            ui.selectable_value(&mut settings.cursor, RecordingCursor::Embedded, "Cursor in recording pixels");
-            ui.selectable_value(&mut settings.cursor, RecordingCursor::Hidden, "Hide cursor");
-            ui.add_enabled_ui(x11, |ui| {
-                ui.selectable_value(&mut settings.cursor, RecordingCursor::Editable, "Editable cursor metadata");
+        egui::ComboBox::from_id_salt("recording-cursor-mode")
+            .selected_text(match settings.cursor {
+                RecordingCursor::Embedded => localizer.text(Message::RecorderCursorEmbedded),
+                RecordingCursor::Hidden => localizer.text(Message::RecorderCursorHidden),
+                RecordingCursor::Editable => localizer.text(Message::RecorderCursorEditable),
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut settings.cursor,
+                    RecordingCursor::Embedded,
+                    localizer.text(Message::RecorderCursorEmbedded),
+                );
+                ui.selectable_value(
+                    &mut settings.cursor,
+                    RecordingCursor::Hidden,
+                    localizer.text(Message::RecorderCursorHidden),
+                );
+                ui.add_enabled_ui(x11, |ui| {
+                    ui.selectable_value(
+                        &mut settings.cursor,
+                        RecordingCursor::Editable,
+                        localizer.text(Message::RecorderCursorEditable),
+                    );
+                });
             });
-        });
         ui.add_enabled_ui(x11 || settings.input_events, |ui| {
-            ui.checkbox(&mut settings.input_events, "Record key and mouse-button events (X11)");
+            ui.checkbox(
+                &mut settings.input_events,
+                localizer.text(Message::RecorderRecordInput),
+            );
         });
         if settings.input_events {
-            ui.colored_label(ui.visuals().warn_fg_color, "Keys can include passwords or private messages. Enabled only while recording; pause before typing sensitive information.");
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                localizer.text(Message::RecorderInputPrivacyWarning),
+            );
         }
-        if !x11 { ui.weak("Wayland cannot record global key/click events; manual annotations remain available. Cursor mode is chosen before portal preparation."); }
-        ui.weak("Editable mode leaves the cursor out of pixels; add its captured cursor annotation in the editor. Physical key transitions are captured, not IME text or server-generated auto-repeat.");
+        if !x11 {
+            ui.weak(localizer.text(Message::RecorderWaylandAnnotationsHint));
+        }
+        ui.weak(localizer.text(Message::RecorderEditableCursorHint));
     });
     ui.end_row();
 }
 
-fn show_frame_retention_setting(ui: &mut egui::Ui, settings: &mut RecordingSettings) {
-    ui.label("Frame retention");
+fn show_frame_retention_setting(
+    ui: &mut egui::Ui,
+    settings: &mut RecordingSettings,
+    localizer: Localizer,
+) {
+    ui.label(localizer.text(Message::RecorderFrameRetention));
     ui.horizontal_wrapped(|ui| {
         ui.add_enabled_ui(settings.cadence != RecordingCadenceChoice::Manual, |ui| {
             ui.checkbox(
                 &mut settings.changes_only,
-                "Store only changed pixels, cursor or input",
+                localizer.text(Message::RecorderChangedOnly),
             );
         });
         if settings.cadence == RecordingCadenceChoice::Manual {
-            ui.weak("Every manual trigger is retained, including identical pixels.");
+            ui.weak(localizer.text(Message::RecorderManualRetainedHint));
         } else if settings.changes_only
             && matches!(
                 recording_playback_timing(settings),
                 Ok(gif_from_screen_workflow::PlaybackTiming::Fixed(_))
             )
         {
-            ui.weak("Skipped samples add no GIF playback time in fixed-delay mode.");
+            ui.weak(localizer.text(Message::RecorderSkippedFixedHint));
         }
     });
     ui.end_row();

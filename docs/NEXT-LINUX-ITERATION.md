@@ -20,6 +20,10 @@ explicit for other choices. The bilingual README now contains real GIF demos and
 an independently re-downloaded [Linux Preview 1](LINUX-PREVIEW-1-QA.md) tarball.
 Next: migrate the remaining recorder/editor/tool strings, complete and verify the
 other catalogs, and solve complex-script/RTL input before claiming all languages.
+The next main-branch slice connects [recorder controls and settings](RECORDER-LOCALIZATION.md)
+to en/zh, preserves source geometry and control identities, and cancels unfinished
+preview gestures when text layout changes. This is newer than Preview 1 and does
+not relabel that frozen release as containing later code.
 
 ## Playback timing: implemented, bounded native manual acceptance recorded
 

@@ -1,14 +1,18 @@
 # Localization implementation and acceptance plan
 
-Status: first desktop language slice implemented, 2026-09-08. The
+Status: launcher and recorder language slices implemented on main, 2026-09-08. The
 `gif-from-screen-localization` crate provides the registry, validated preference
 wire format, injected-system-locale negotiation and an initial English/Simplified
 Chinese message catalog. The desktop now offers System plus 29 saved choices,
 asynchronous private preference storage, immediate launcher/navigation switching
 and an embedded licensed CJK fallback. Other catalogs explicitly fall back to
-English; recorder/editor/tool interfaces still require migration.
+English. The recording form, source-local Wayland controls and compact X11
+controls/window snapping now use explicit localizers. Shortcut settings, remaining
+recorder notices and the editor/import/tool interfaces still require migration.
 The target includes the entire application-owned UI, not merely language selection.
 See [the first desktop acceptance record](LOCALIZATION-QA-2026-09-08.md).
+The [recorder integration contract](RECORDER-LOCALIZATION.md) separates automated
+geometry/control tests from native acceptance and records the remaining text scope.
 
 ## Target languages and reference
 

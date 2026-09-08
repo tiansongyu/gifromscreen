@@ -10,6 +10,7 @@ use gif_from_screen_capture::{PhysicalPosition, PhysicalRect, PhysicalSize};
 use gif_from_screen_capture_linux::{
     GuideEdge, GuidePointerEvent, GuideRequest, GuideStatus, RecorderGuide,
 };
+use gif_from_screen_localization::Message;
 
 use crate::{
     GifFromScreenApp, MainWindowRestore, MainWindowSnapshot, RecorderOverlayAction, RecorderStage,
@@ -484,6 +485,7 @@ fn finish_snap_frame(
 
 impl GifFromScreenApp {
     pub(super) fn open_recorder_overlay(&mut self, context: &egui::Context) -> Result<(), String> {
+        let localizer = self.language_settings.localizer();
         crate::validate_settings(&self.settings)?;
         if self.display_server == Some(gif_from_screen_capture_linux::LinuxDisplayServer::Wayland) {
             return self.begin_wayland_preparation();
@@ -565,13 +567,13 @@ impl GifFromScreenApp {
         self.recorder_overlay = Some(overlay);
         self.main_window_snapshot = Some(snapshot);
         self.pending_recorder_start = None;
-        self.notice = Some("Drag a border to move the region; drag a corner to resize before recording. Controls are independent of the selected pixels.".into());
+        self.notice = Some(localizer.text(Message::RecorderBorderDragHint).into());
         context.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
         context.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
             egui::WindowLevel::AlwaysOnTop,
         ));
         context.send_viewport_cmd(egui::ViewportCommand::Title(
-            "GifFromScreen recorder".into(),
+            localizer.text(Message::RecorderX11WindowTitle).into(),
         ));
         context.request_repaint();
         Ok(())
@@ -733,6 +735,7 @@ impl GifFromScreenApp {
         paused: bool,
         visible: bool,
     ) -> RecorderOverlayAction {
+        let localizer = self.language_settings.localizer();
         let mut action = RecorderOverlayAction::None;
         if visible {
             let notice = self.controller_notice(overlay);
@@ -749,19 +752,24 @@ impl GifFromScreenApp {
                 Some(&notice),
                 input_ready,
                 &mut overlay.snap,
+                self.language_settings.localizer(),
             );
             if matches!(
                 overlay.window_state,
                 WindowState::TimedOut | WindowState::Invalid(_)
             ) {
-                egui::Window::new("Recorder placement")
+                egui::Window::new(localizer.text(Message::RecorderPlacement))
+                    .id(egui::Id::new("recorder-placement"))
                     .collapsible(false)
                     .show(context, |ui| {
-                        ui.label("The window manager did not confirm a safe control position.");
-                        if ui.button("Retry placement").clicked() {
+                        ui.label(localizer.text(Message::RecorderPlacementUnsafe));
+                        if ui
+                            .button(localizer.text(Message::RecorderRetryPlacement))
+                            .clicked()
+                        {
                             overlay.window.retry();
                         }
-                        if ui.button("Close recorder").clicked() {
+                        if ui.button(localizer.text(Message::RecorderClose)).clicked() {
                             action = RecorderOverlayAction::Close;
                         }
                     });
@@ -774,15 +782,16 @@ impl GifFromScreenApp {
     }
 
     fn controller_notice(&self, overlay: &RecorderOverlay) -> String {
+        let localizer = self.language_settings.localizer();
         let status = self.shortcut_tool.status_summary().unwrap_or_default();
         let notice = if let Some(error) = &overlay.failure {
             error.as_str()
         } else if overlay.recovering {
-            "Capture is pausing before showing the recovered controls. Resume hides them again when no safe screen space remains."
+            localizer.text(Message::RecorderRecoveringControls)
         } else if overlay.change.is_some() {
-            "Updating the recording position while sampling is paused; waiting for native acknowledgements."
+            localizer.text(Message::RecorderUpdatingPosition)
         } else if matches!(overlay.window_state, WindowState::Hidden) {
-            "No space remains outside the selection. Start will hide/minimize these controls. Restore this window to pause and recover them; global shortcuts and timed stop remain available."
+            localizer.text(Message::RecorderNoControlSpace)
         } else {
             ""
         };
