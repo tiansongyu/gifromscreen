@@ -25,9 +25,11 @@ use gif_from_screen_editor::{
     MAX_FRAME_EFFECT_BLUR_RADIUS, ReduceDelayMode, VirtualFilmstripError, VirtualFilmstripLayout,
     YoyoScope, parse_frame_expression,
 };
+use gif_from_screen_localization::{Localizer, Message};
 
 use crate::editor_workspace::{EditorWorkspace, EditorWorkspaceError, OverlaySelectionAnchor};
 use crate::thumbnail_cache::ThumbnailCache;
+use crate::ui_notice::Notice;
 
 const FILMSTRIP_ITEM_WIDTH: f64 = 112.0;
 const FILMSTRIP_ITEM_GAP: f64 = 8.0;
@@ -91,15 +93,15 @@ impl EditorToolTab {
         Self::Project,
     ];
 
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Frames => "Frames",
-            Self::Timing => "Timing",
-            Self::Transform => "Transform",
-            Self::Effects => "Effects",
-            Self::Overlays => "Overlays",
-            Self::Project => "Project",
-        }
+    fn label(self, localizer: Localizer) -> &'static str {
+        localizer.text(match self {
+            Self::Frames => Message::EditorFramesTab,
+            Self::Timing => Message::EditorTimingTab,
+            Self::Transform => Message::EditorTransformTab,
+            Self::Effects => Message::EditorEffectsTab,
+            Self::Overlays => Message::EditorOverlaysTab,
+            Self::Project => Message::EditorProjectTab,
+        })
     }
 }
 
@@ -458,6 +460,15 @@ impl Default for EditorUiState {
 }
 
 impl EditorUiState {
+    /// Cancel only unfinished layout-sensitive gestures. Completed drawing and
+    /// crop drafts, their settings and all project state remain available.
+    pub(crate) fn cancel_layout_gestures(&mut self) {
+        self.canvas.cancel_layout_gestures();
+        if self.drawing_overlay.phase == DrawingDraftPhase::Capturing {
+            self.drawing_overlay.cancel();
+        }
+    }
+
     /// Leaving the editor must not let its playback clock run behind another page.
     pub(crate) fn pause_preview(&mut self) {
         if let Some(clock) = self.playback.take() {
@@ -648,7 +659,7 @@ pub(crate) enum EditorUiAction {
     },
     Notice {
         operation: EditorUiOperation,
-        message: String,
+        message: Notice,
     },
 }
 
@@ -667,9 +678,10 @@ pub(crate) fn show_editor_ui(
     ui: &mut egui::Ui,
     workspace: &mut EditorWorkspace,
     state: &mut EditorUiState,
+    localizer: Localizer,
 ) -> Vec<EditorUiResult> {
-    let mut results = show_editor_chrome(ui, workspace, state);
-    results.extend(show_editor_tool_panel(ui, workspace, state));
+    let mut results = show_editor_chrome(ui, workspace, state, localizer);
+    results.extend(show_editor_tool_panel(ui, workspace, state, localizer));
     results
 }
 
@@ -679,21 +691,22 @@ pub(crate) fn show_editor_chrome(
     ui: &mut egui::Ui,
     workspace: &mut EditorWorkspace,
     state: &mut EditorUiState,
+    localizer: Localizer,
 ) -> Vec<EditorUiResult> {
     let now = Instant::now();
     let mut results = Vec::new();
     advance_playback(ui.ctx(), workspace, state, now, &mut results);
 
-    show_editor_summary(ui, workspace);
-    show_navigation_toolbar(ui, workspace, state, now, &mut results);
-    show_virtual_filmstrip(ui, workspace, state, now, &mut results);
+    show_editor_summary(ui, workspace, localizer);
+    show_navigation_toolbar(ui, workspace, state, now, &mut results, localizer);
+    show_virtual_filmstrip(ui, workspace, state, now, &mut results, localizer);
     ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
         for tool in EditorToolTab::ALL {
-            ui.selectable_value(&mut state.active_tool, tool, tool.label());
+            ui.selectable_value(&mut state.active_tool, tool, tool.label(localizer));
         }
         ui.separator();
-        show_history_buttons(ui, workspace, state, now, &mut results);
+        show_history_buttons(ui, workspace, state, now, &mut results, localizer);
     });
     ui.separator();
     schedule_playback_repaint(ui.ctx(), state, now);
@@ -705,10 +718,11 @@ pub(crate) fn show_editor_tool_panel(
     ui: &mut egui::Ui,
     workspace: &mut EditorWorkspace,
     state: &mut EditorUiState,
+    localizer: Localizer,
 ) -> Vec<EditorUiResult> {
     let now = Instant::now();
     let mut results = Vec::new();
-    show_active_tool(ui, workspace, state, now, &mut results);
+    show_active_tool(ui, workspace, state, now, &mut results, localizer);
     schedule_playback_repaint(ui.ctx(), state, now);
     results
 }
@@ -719,20 +733,23 @@ fn show_active_tool(
     state: &mut EditorUiState,
     now: Instant,
     results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
 ) {
     match state.active_tool {
         EditorToolTab::Frames => {
-            show_selection_toolbar(ui, workspace, state, now, results);
-            show_edit_toolbar(ui, workspace, state, now, results);
-            show_clipboard_history(ui, workspace, results);
+            show_selection_toolbar(ui, workspace, state, now, results, localizer);
+            show_edit_toolbar(ui, workspace, state, now, results, localizer);
+            show_clipboard_history(ui, workspace, results, localizer);
         }
         EditorToolTab::Timing => {
-            show_delay_toolbar(ui, workspace, state, now, results);
-            show_time_range_toolbar(ui, workspace, state, now, results);
-            show_advanced_timing_toolbar(ui, workspace, state, now, results);
-            show_transition_toolbar(ui, workspace, state, now, results);
+            show_delay_toolbar(ui, workspace, state, now, results, localizer);
+            show_time_range_toolbar(ui, workspace, state, now, results, localizer);
+            show_advanced_timing_toolbar(ui, workspace, state, now, results, localizer);
+            show_transition_toolbar(ui, workspace, state, now, results, localizer);
         }
-        EditorToolTab::Transform => show_transform_toolbar(ui, workspace, state, now, results),
+        EditorToolTab::Transform => {
+            show_transform_toolbar(ui, workspace, state, now, results, localizer);
+        }
         EditorToolTab::Effects => show_effect_toolbar(ui, workspace, state, now, results),
         EditorToolTab::Overlays => {
             ui.horizontal_wrapped(|ui| {
@@ -764,26 +781,41 @@ fn show_active_tool(
     }
 }
 
-fn show_editor_summary(ui: &mut egui::Ui, workspace: &EditorWorkspace) {
+fn show_editor_summary(ui: &mut egui::Ui, workspace: &EditorWorkspace, localizer: Localizer) {
     ui.horizontal_wrapped(|ui| {
-        ui.heading("Editor");
-        ui.label(format!(
-            "{} frames",
-            workspace.manifest().timeline.frames.len()
+        ui.heading(localizer.text(Message::EditorTitle));
+        ui.label(crate::format_message(
+            localizer,
+            Message::EditorFrameCount,
+            &[(
+                "count",
+                &workspace.manifest().timeline.frames.len().to_string(),
+            )],
         ));
-        ui.label(format!("{} selected", workspace.selection().len()));
-        ui.label(format!(
-            "Clipboard: {} frame(s) in {} snapshot(s)",
-            workspace.clipboard_len(),
-            workspace.clipboard_history_len()
+        ui.label(crate::format_message(
+            localizer,
+            Message::EditorSelectedCount,
+            &[("count", &workspace.selection().len().to_string())],
+        ));
+        ui.label(crate::format_message(
+            localizer,
+            Message::EditorClipboardSummary,
+            &[
+                ("frames", &workspace.clipboard_len().to_string()),
+                ("snapshots", &workspace.clipboard_history_len().to_string()),
+            ],
         ));
         if workspace.is_dirty() {
-            ui.strong("Journaled · checkpoint pending");
+            ui.strong(localizer.text(Message::EditorCheckpointPending));
         }
         if !workspace.asset_issues().is_empty() {
             ui.colored_label(
                 ui.visuals().warn_fg_color,
-                format!("{} asset issue(s)", workspace.asset_issues().len()),
+                crate::format_message(
+                    localizer,
+                    Message::EditorAssetIssues,
+                    &[("count", &workspace.asset_issues().len().to_string())],
+                ),
             );
         }
     });
@@ -800,86 +832,107 @@ fn show_clipboard_history(
     ui: &mut egui::Ui,
     workspace: &mut EditorWorkspace,
     results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
 ) {
     let entry_count = workspace.clipboard_history_len();
-    egui::CollapsingHeader::new(format!("Clipboard history ({entry_count})"))
-        .id_salt("editor-clipboard-history")
-        .show(ui, |ui| {
-            if entry_count == 0 {
-                ui.weak("Copy or cut frames to create a session-local snapshot.");
-                return;
-            }
+    egui::CollapsingHeader::new(crate::format_message(
+        localizer,
+        Message::EditorClipboardHistory,
+        &[("count", &entry_count.to_string())],
+    ))
+    .id_salt("editor-clipboard-history")
+    .show(ui, |ui| {
+        if entry_count == 0 {
+            ui.weak(localizer.text(Message::EditorClipboardEmpty));
+            return;
+        }
 
-            let selected = workspace.selected_clipboard_id();
-            let entries = workspace
-                .clipboard_history_entries()
-                .rev()
-                .map(|entry| (entry.id(), entry.frame_count(), entry.total_duration_us()))
-                .collect::<Vec<_>>();
-            let mut action = None;
-            for (id, frames, duration_us) in entries {
-                ui.horizontal(|ui| {
-                    let duration = duration_us
-                        .map_or_else(|| "duration overflow".to_owned(), format_duration_us);
-                    if ui
-                        .selectable_label(
-                            selected == Some(id),
-                            format!("#{} · {frames} frame(s) · {duration}", id.get()),
-                        )
-                        .on_hover_text("Use this snapshot for Paste")
-                        .clicked()
-                    {
-                        action = Some(ClipboardHistoryUiAction::Select(id));
-                    }
-                    if ui.small_button("Remove").clicked() {
-                        action = Some(ClipboardHistoryUiAction::Remove(id));
-                    }
-                });
-            }
-            if ui.button("Clear clipboard history").clicked() {
-                action = Some(ClipboardHistoryUiAction::Clear);
-            }
-
-            match action {
-                Some(ClipboardHistoryUiAction::Select(id)) => {
-                    if workspace.select_clipboard_entry(id) {
-                        let frames = workspace.clipboard_len();
-                        results.push(Ok(EditorUiAction::Clipboard {
-                            operation: EditorUiOperation::SelectClipboardEntry,
-                            frames,
-                        }));
-                    } else {
-                        push_failure(
-                            results,
-                            EditorUiOperation::SelectClipboardEntry,
-                            "Clipboard history changed before the entry could be selected.",
-                        );
-                    }
-                }
-                Some(ClipboardHistoryUiAction::Remove(id)) => {
-                    match workspace.remove_clipboard_entry(id) {
-                        Some(frames) => results.push(Ok(EditorUiAction::Clipboard {
-                            operation: EditorUiOperation::RemoveClipboardEntry,
-                            frames,
-                        })),
-                        None => push_failure(
-                            results,
-                            EditorUiOperation::RemoveClipboardEntry,
-                            "Clipboard history changed before the entry could be removed.",
+        let selected = workspace.selected_clipboard_id();
+        let entries = workspace
+            .clipboard_history_entries()
+            .rev()
+            .map(|entry| (entry.id(), entry.frame_count(), entry.total_duration_us()))
+            .collect::<Vec<_>>();
+        let mut action = None;
+        for (id, frames, duration_us) in entries {
+            ui.horizontal(|ui| {
+                let duration = duration_us.map_or_else(
+                    || localizer.text(Message::EditorDurationOverflow).to_owned(),
+                    format_duration_us,
+                );
+                if ui
+                    .selectable_label(
+                        selected == Some(id),
+                        crate::format_message(
+                            localizer,
+                            Message::EditorClipboardEntry,
+                            &[
+                                ("id", &id.get().to_string()),
+                                ("frames", &frames.to_string()),
+                                ("duration", &duration),
+                            ],
                         ),
-                    }
+                    )
+                    .on_hover_text(localizer.text(Message::EditorUseClipboardSnapshot))
+                    .clicked()
+                {
+                    action = Some(ClipboardHistoryUiAction::Select(id));
                 }
-                Some(ClipboardHistoryUiAction::Clear) => {
-                    workspace.clear_clipboard_history();
-                    push_notice(
+                if ui
+                    .small_button(localizer.text(Message::EditorRemoveClipboardEntry))
+                    .clicked()
+                {
+                    action = Some(ClipboardHistoryUiAction::Remove(id));
+                }
+            });
+        }
+        if ui
+            .button(localizer.text(Message::EditorClearClipboardHistory))
+            .clicked()
+        {
+            action = Some(ClipboardHistoryUiAction::Clear);
+        }
+
+        match action {
+            Some(ClipboardHistoryUiAction::Select(id)) => {
+                if workspace.select_clipboard_entry(id) {
+                    let frames = workspace.clipboard_len();
+                    results.push(Ok(EditorUiAction::Clipboard {
+                        operation: EditorUiOperation::SelectClipboardEntry,
+                        frames,
+                    }));
+                } else {
+                    push_failure(
                         results,
-                        EditorUiOperation::ClearClipboardHistory,
-                        "Clipboard history cleared.",
+                        EditorUiOperation::SelectClipboardEntry,
+                        localizer.text(Message::EditorClipboardSelectChanged),
                     );
                 }
-                None => {}
             }
-        });
+            Some(ClipboardHistoryUiAction::Remove(id)) => {
+                match workspace.remove_clipboard_entry(id) {
+                    Some(frames) => results.push(Ok(EditorUiAction::Clipboard {
+                        operation: EditorUiOperation::RemoveClipboardEntry,
+                        frames,
+                    })),
+                    None => push_failure(
+                        results,
+                        EditorUiOperation::RemoveClipboardEntry,
+                        localizer.text(Message::EditorClipboardRemoveChanged),
+                    ),
+                }
+            }
+            Some(ClipboardHistoryUiAction::Clear) => {
+                workspace.clear_clipboard_history();
+                push_notice(
+                    results,
+                    EditorUiOperation::ClearClipboardHistory,
+                    Notice::localized(localizer, Message::EditorClipboardHistoryCleared, &[]),
+                );
+            }
+            None => {}
+        }
+    });
 }
 
 fn show_project_storage_toolbar(
@@ -1040,12 +1093,16 @@ fn show_navigation_toolbar(
     state: &mut EditorUiState,
     now: Instant,
     results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
 ) {
     let has_frames = !workspace.manifest().timeline.frames.is_empty();
     ui.horizontal_wrapped(|ui| {
-        ui.label("Navigate");
+        ui.label(localizer.text(Message::EditorNavigate));
         if ui
-            .add_enabled(has_frames, egui::Button::new("First"))
+            .add_enabled(
+                has_frames,
+                egui::Button::new(localizer.text(Message::EditorFirst)),
+            )
             .clicked()
         {
             let result = workspace.select_first();
@@ -1059,7 +1116,10 @@ fn show_navigation_toolbar(
             );
         }
         if ui
-            .add_enabled(has_frames, egui::Button::new("Previous"))
+            .add_enabled(
+                has_frames,
+                egui::Button::new(localizer.text(Message::EditorPrevious)),
+            )
             .clicked()
         {
             let result = workspace.select_previous();
@@ -1073,9 +1133,9 @@ fn show_navigation_toolbar(
             );
         }
         let play_label = if state.playback.is_some() {
-            "Pause"
+            localizer.text(Message::EditorPause)
         } else {
-            "Play"
+            localizer.text(Message::EditorPlay)
         };
         if ui
             .add_enabled(has_frames, egui::Button::new(play_label))
@@ -1084,7 +1144,10 @@ fn show_navigation_toolbar(
             toggle_playback(ui.ctx(), workspace, state, now, results);
         }
         if ui
-            .add_enabled(has_frames, egui::Button::new("Next"))
+            .add_enabled(
+                has_frames,
+                egui::Button::new(localizer.text(Message::EditorNext)),
+            )
             .clicked()
         {
             let result = workspace.select_next();
@@ -1098,7 +1161,10 @@ fn show_navigation_toolbar(
             );
         }
         if ui
-            .add_enabled(has_frames, egui::Button::new("Last"))
+            .add_enabled(
+                has_frames,
+                egui::Button::new(localizer.text(Message::EditorLast)),
+            )
             .clicked()
         {
             let result = workspace.select_last();
@@ -1111,15 +1177,16 @@ fn show_navigation_toolbar(
                 result,
             );
         }
-        ui.checkbox(&mut state.loop_preview, "Loop preview")
-            .on_hover_text(
-                "Repeat editor playback. GIF export repetition is configured separately.",
-            );
+        ui.checkbox(
+            &mut state.loop_preview,
+            localizer.text(Message::EditorLoopPreview),
+        )
+        .on_hover_text(localizer.text(Message::EditorLoopPreviewHint));
 
         ui.separator();
-        ui.label("Frame");
+        ui.label(localizer.text(Message::EditorFrame));
         ui.add(egui::TextEdit::singleline(&mut state.frame_number_input).desired_width(54.0));
-        if ui.button("Go").clicked() {
+        if ui.button(localizer.text(Message::EditorGo)).clicked() {
             match parse_input::<usize>(&state.frame_number_input, "frame number") {
                 Ok(frame_number) => {
                     let result = workspace.select_frame_number(frame_number);
@@ -1135,9 +1202,9 @@ fn show_navigation_toolbar(
                 Err(message) => push_failure(results, EditorUiOperation::JumpToFrame, message),
             }
         }
-        ui.label("Time ms");
+        ui.label(localizer.text(Message::EditorTimeMs));
         ui.add(egui::TextEdit::singleline(&mut state.time_ms_input).desired_width(72.0));
-        if ui.button("Go to time").clicked() {
+        if ui.button(localizer.text(Message::EditorGoToTime)).clicked() {
             match parse_time_ms(&state.time_ms_input) {
                 Ok(time) => {
                     let result = workspace.select_time(time);
@@ -1162,14 +1229,21 @@ fn show_selection_toolbar(
     state: &mut EditorUiState,
     now: Instant,
     results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
 ) {
     ui.horizontal_wrapped(|ui| {
-        ui.label("Select");
-        if ui.button("All").clicked() {
+        ui.label(localizer.text(Message::EditorSelect));
+        if ui
+            .button(localizer.text(Message::EditorSelectAll))
+            .clicked()
+        {
             workspace.select_all();
             selection_succeeded(workspace, state, now, results, EditorUiOperation::SelectAll);
         }
-        if ui.button("Invert").clicked() {
+        if ui
+            .button(localizer.text(Message::EditorInvertSelection))
+            .clicked()
+        {
             workspace.invert_selection();
             selection_succeeded(
                 workspace,
@@ -1179,7 +1253,10 @@ fn show_selection_toolbar(
                 EditorUiOperation::InvertSelection,
             );
         }
-        if ui.button("Clear").clicked() {
+        if ui
+            .button(localizer.text(Message::EditorClearSelection))
+            .clicked()
+        {
             workspace.clear_selection();
             selection_succeeded(
                 workspace,
@@ -1190,9 +1267,12 @@ fn show_selection_toolbar(
             );
         }
         ui.separator();
-        ui.label("Expression");
+        ui.label(localizer.text(Message::EditorExpression));
         ui.add(egui::TextEdit::singleline(&mut state.frame_expression).desired_width(180.0));
-        if ui.button("Apply selection").clicked() {
+        if ui
+            .button(localizer.text(Message::EditorApplySelection))
+            .clicked()
+        {
             apply_frame_expression(workspace, state, now, results);
         }
     });
@@ -1204,20 +1284,24 @@ fn show_time_range_toolbar(
     state: &mut EditorUiState,
     now: Instant,
     results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
 ) {
     ui.group(|ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.strong("Time range [start, end) ms");
-            ui.label("Start");
+            ui.strong(localizer.text(Message::EditorTimeRange));
+            ui.label(localizer.text(Message::EditorRangeStart));
             ui.add(
                 egui::TextEdit::singleline(&mut state.time_range_start_ms_input)
                     .desired_width(84.0),
             );
-            ui.label("End");
+            ui.label(localizer.text(Message::EditorRangeEnd));
             ui.add(
                 egui::TextEdit::singleline(&mut state.time_range_end_ms_input).desired_width(84.0),
             );
-            if ui.button("Select range").clicked() {
+            if ui
+                .button(localizer.text(Message::EditorSelectRange))
+                .clicked()
+            {
                 match parse_time_range(state) {
                     Ok((start, end)) => {
                         let result = workspace.select_time_range(start, end);
@@ -1235,7 +1319,10 @@ fn show_time_range_toolbar(
                     }
                 }
             }
-            if ui.button("Keep range").clicked() {
+            if ui
+                .button(localizer.text(Message::EditorKeepRange))
+                .clicked()
+            {
                 match parse_time_range(state) {
                     Ok((start, end)) => {
                         let result = workspace.keep_time_range(start, end);
@@ -1253,7 +1340,10 @@ fn show_time_range_toolbar(
                     }
                 }
             }
-            if ui.button("Delete range").clicked() {
+            if ui
+                .button(localizer.text(Message::EditorDeleteRange))
+                .clicked()
+            {
                 match parse_time_range(state) {
                     Ok((start, end)) => {
                         let result = workspace.delete_time_range(start, end);
@@ -1281,9 +1371,13 @@ fn show_history_buttons(
     state: &mut EditorUiState,
     now: Instant,
     results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
 ) {
     if ui
-        .add_enabled(workspace.can_undo(), egui::Button::new("Undo"))
+        .add_enabled(
+            workspace.can_undo(),
+            egui::Button::new(localizer.text(Message::EditorUndo)),
+        )
         .clicked()
     {
         record_history_result(
@@ -1296,7 +1390,10 @@ fn show_history_buttons(
         );
     }
     if ui
-        .add_enabled(workspace.can_redo(), egui::Button::new("Redo"))
+        .add_enabled(
+            workspace.can_redo(),
+            egui::Button::new(localizer.text(Message::EditorRedo)),
+        )
         .clicked()
     {
         record_history_result(
@@ -1316,40 +1413,11 @@ fn show_edit_toolbar(
     state: &mut EditorUiState,
     now: Instant,
     results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
 ) {
     ui.horizontal_wrapped(|ui| {
-        if ui.button("Cut").clicked() {
-            let result = workspace.cut_selection().map(|_| ());
-            record_project_result(
-                workspace,
-                state,
-                now,
-                results,
-                EditorUiOperation::Cut,
-                result,
-            );
-        }
-        if ui.button("Copy").clicked() {
-            match workspace.copy_selection() {
-                Ok(frames) => results.push(Ok(EditorUiAction::Clipboard {
-                    operation: EditorUiOperation::Copy,
-                    frames,
-                })),
-                Err(error) => push_failure(results, EditorUiOperation::Copy, error),
-            }
-        }
-        if ui.button("Paste").clicked() {
-            let result = workspace.paste_after_current().map(|_| ());
-            record_project_result(
-                workspace,
-                state,
-                now,
-                results,
-                EditorUiOperation::Paste,
-                result,
-            );
-        }
-        if ui.button("Delete").clicked() {
+        show_clipboard_edit_buttons(ui, workspace, state, now, results, localizer);
+        if ui.button(localizer.text(Message::EditorDelete)).clicked() {
             let result = workspace.delete_selection();
             record_project_result(
                 workspace,
@@ -1360,7 +1428,10 @@ fn show_edit_toolbar(
                 result,
             );
         }
-        if ui.button("Delete before").clicked() {
+        if ui
+            .button(localizer.text(Message::EditorDeleteBefore))
+            .clicked()
+        {
             let result = workspace.delete_before_selection();
             record_project_result(
                 workspace,
@@ -1371,7 +1442,10 @@ fn show_edit_toolbar(
                 result,
             );
         }
-        if ui.button("Delete after").clicked() {
+        if ui
+            .button(localizer.text(Message::EditorDeleteAfter))
+            .clicked()
+        {
             let result = workspace.delete_after_selection();
             record_project_result(
                 workspace,
@@ -1382,7 +1456,7 @@ fn show_edit_toolbar(
                 result,
             );
         }
-        if ui.button("Move left").clicked() {
+        if ui.button(localizer.text(Message::EditorMoveLeft)).clicked() {
             let result = workspace.move_selection_left();
             record_project_result(
                 workspace,
@@ -1393,7 +1467,10 @@ fn show_edit_toolbar(
                 result,
             );
         }
-        if ui.button("Move right").clicked() {
+        if ui
+            .button(localizer.text(Message::EditorMoveRight))
+            .clicked()
+        {
             let result = workspace.move_selection_right();
             record_project_result(
                 workspace,
@@ -1404,7 +1481,7 @@ fn show_edit_toolbar(
                 result,
             );
         }
-        if ui.button("Reverse").clicked() {
+        if ui.button(localizer.text(Message::EditorReverse)).clicked() {
             let result = workspace.reverse_selection();
             record_project_result(
                 workspace,
@@ -1418,17 +1495,62 @@ fn show_edit_toolbar(
     });
 }
 
+fn show_clipboard_edit_buttons(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    now: Instant,
+    results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
+) {
+    if ui.button(localizer.text(Message::EditorCut)).clicked() {
+        let result = workspace.cut_selection().map(|_| ());
+        record_project_result(
+            workspace,
+            state,
+            now,
+            results,
+            EditorUiOperation::Cut,
+            result,
+        );
+    }
+    if ui.button(localizer.text(Message::EditorCopy)).clicked() {
+        match workspace.copy_selection() {
+            Ok(frames) => results.push(Ok(EditorUiAction::Clipboard {
+                operation: EditorUiOperation::Copy,
+                frames,
+            })),
+            Err(error) => push_failure(results, EditorUiOperation::Copy, error),
+        }
+    }
+    if ui.button(localizer.text(Message::EditorPaste)).clicked() {
+        let result = workspace.paste_after_current().map(|_| ());
+        record_project_result(
+            workspace,
+            state,
+            now,
+            results,
+            EditorUiOperation::Paste,
+            result,
+        );
+    }
+}
+
 fn show_delay_toolbar(
     ui: &mut egui::Ui,
     workspace: &mut EditorWorkspace,
     state: &mut EditorUiState,
     now: Instant,
     results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
 ) {
     ui.horizontal_wrapped(|ui| {
-        ui.label("Delay µs");
+        ui.label(localizer.text(Message::EditorDelayUs));
         ui.add(egui::TextEdit::singleline(&mut state.duration_us_input).desired_width(92.0));
-        if ui.button("Override").clicked() {
+        if ui
+            .button(localizer.text(Message::EditorOverrideDelay))
+            .clicked()
+        {
             match parse_duration_us(&state.duration_us_input) {
                 Ok(duration) => {
                     let result = workspace.override_selection_duration(duration);
@@ -1446,7 +1568,10 @@ fn show_delay_toolbar(
                 }
             }
         }
-        if ui.button("Adjust signed").clicked() {
+        if ui
+            .button(localizer.text(Message::EditorAdjustSignedDelay))
+            .clicked()
+        {
             match parse_input::<i64>(&state.duration_us_input, "delay adjustment") {
                 Ok(delta) => {
                     let result = workspace.adjust_selection_duration(delta);
@@ -1465,9 +1590,12 @@ fn show_delay_toolbar(
             }
         }
         ui.separator();
-        ui.label("Percent");
+        ui.label(localizer.text(Message::EditorPercent));
         ui.add(egui::TextEdit::singleline(&mut state.percentage_input).desired_width(60.0));
-        if ui.button("Scale").clicked() {
+        if ui
+            .button(localizer.text(Message::EditorScaleDelay))
+            .clicked()
+        {
             match parse_input::<u32>(&state.percentage_input, "duration percentage") {
                 Ok(percent) => {
                     let result = workspace.scale_selection_duration(percent);
@@ -1494,16 +1622,17 @@ fn show_advanced_timing_toolbar(
     state: &mut EditorUiState,
     now: Instant,
     results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
 ) {
     ui.group(|ui| {
-        ui.strong("Advanced timing");
+        ui.strong(localizer.text(Message::EditorAdvancedTiming));
         ui.horizontal_wrapped(|ui| {
-            ui.label("Reduce: keep every");
+            ui.label(localizer.text(Message::EditorReduceKeepEvery));
             ui.add(
                 egui::TextEdit::singleline(&mut state.reduce_keep_every_input).desired_width(54.0),
             );
             egui::ComboBox::from_id_salt("reduce_delay_mode")
-                .selected_text(reduce_delay_label(state.reduce_delay_mode))
+                .selected_text(reduce_delay_label(state.reduce_delay_mode, localizer))
                 .show_ui(ui, |ui| {
                     for mode in [
                         ReduceDelayMode::DontAdjust,
@@ -1513,11 +1642,14 @@ fn show_advanced_timing_toolbar(
                         ui.selectable_value(
                             &mut state.reduce_delay_mode,
                             mode,
-                            reduce_delay_label(mode),
+                            reduce_delay_label(mode, localizer),
                         );
                     }
                 });
-            if ui.button("Reduce frames").clicked() {
+            if ui
+                .button(localizer.text(Message::EditorReduceFrames))
+                .clicked()
+            {
                 match parse_keep_every(&state.reduce_keep_every_input) {
                     Ok(keep_every) => {
                         let result =
@@ -1539,16 +1671,26 @@ fn show_advanced_timing_toolbar(
         });
 
         ui.horizontal_wrapped(|ui| {
-            ui.label("Yoyo source");
+            ui.label(localizer.text(Message::EditorYoyoSource));
             egui::ComboBox::from_id_salt("yoyo_scope")
-                .selected_text(yoyo_scope_label(state.yoyo_scope))
+                .selected_text(yoyo_scope_label(state.yoyo_scope, localizer))
                 .show_ui(ui, |ui| {
                     for scope in [YoyoScope::Selection, YoyoScope::EntireTimeline] {
-                        ui.selectable_value(&mut state.yoyo_scope, scope, yoyo_scope_label(scope));
+                        ui.selectable_value(
+                            &mut state.yoyo_scope,
+                            scope,
+                            yoyo_scope_label(scope, localizer),
+                        );
                     }
                 });
-            ui.checkbox(&mut state.yoyo_repeat_endpoints, "Repeat endpoints");
-            if ui.button("Create Yoyo").clicked() {
+            ui.checkbox(
+                &mut state.yoyo_repeat_endpoints,
+                localizer.text(Message::EditorRepeatEndpoints),
+            );
+            if ui
+                .button(localizer.text(Message::EditorCreateYoyo))
+                .clicked()
+            {
                 let result = workspace.yoyo(state.yoyo_scope, state.yoyo_repeat_endpoints);
                 record_project_result(
                     workspace,
@@ -1560,7 +1702,7 @@ fn show_advanced_timing_toolbar(
                 );
             }
         });
-        show_duplicate_controls(ui, workspace, state, now, results);
+        show_duplicate_controls(ui, workspace, state, now, results, localizer);
     });
 }
 
@@ -1570,15 +1712,19 @@ fn show_duplicate_controls(
     state: &mut EditorUiState,
     now: Instant,
     results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
 ) {
     ui.horizontal_wrapped(|ui| {
-        ui.label("Rendered duplicates ≥");
+        ui.label(localizer.text(Message::EditorRenderedDuplicates));
         ui.add(
             egui::TextEdit::singleline(&mut state.duplicate_threshold_input).desired_width(48.0),
         );
         ui.label("%");
         egui::ComboBox::from_id_salt("duplicate_retention")
-            .selected_text(duplicate_retention_label(state.duplicate_retention))
+            .selected_text(duplicate_retention_label(
+                state.duplicate_retention,
+                localizer,
+            ))
             .show_ui(ui, |ui| {
                 for retention in [
                     DuplicateFrameRetention::First,
@@ -1587,12 +1733,12 @@ fn show_duplicate_controls(
                     ui.selectable_value(
                         &mut state.duplicate_retention,
                         retention,
-                        duplicate_retention_label(retention),
+                        duplicate_retention_label(retention, localizer),
                     );
                 }
             });
         egui::ComboBox::from_id_salt("duplicate_delay_mode")
-            .selected_text(duplicate_delay_label(state.duplicate_delay_mode))
+            .selected_text(duplicate_delay_label(state.duplicate_delay_mode, localizer))
             .show_ui(ui, |ui| {
                 for mode in [
                     DuplicateDelayMode::Keep,
@@ -1602,11 +1748,14 @@ fn show_duplicate_controls(
                     ui.selectable_value(
                         &mut state.duplicate_delay_mode,
                         mode,
-                        duplicate_delay_label(mode),
+                        duplicate_delay_label(mode, localizer),
                     );
                 }
             });
-        if ui.button("Remove duplicates").clicked() {
+        if ui
+            .button(localizer.text(Message::EditorRemoveDuplicates))
+            .clicked()
+        {
             match parse_similarity_threshold(&state.duplicate_threshold_input) {
                 Ok(threshold) => {
                     let result = workspace.remove_duplicate_selection(
@@ -1629,22 +1778,22 @@ fn show_duplicate_controls(
             }
         }
     });
-    ui.weak("Synchronous scan is limited to 256 selected frames and bounded render surfaces.");
+    ui.weak(localizer.text(Message::EditorDuplicateScanLimit));
 }
 
-const fn reduce_delay_label(mode: ReduceDelayMode) -> &'static str {
-    match mode {
-        ReduceDelayMode::DontAdjust => "Shorten timing",
-        ReduceDelayMode::Previous => "Add delay to previous",
-        ReduceDelayMode::Evenly => "Distribute delay evenly",
-    }
+fn reduce_delay_label(mode: ReduceDelayMode, localizer: Localizer) -> &'static str {
+    localizer.text(match mode {
+        ReduceDelayMode::DontAdjust => Message::EditorShortenTiming,
+        ReduceDelayMode::Previous => Message::EditorDelayToPrevious,
+        ReduceDelayMode::Evenly => Message::EditorDistributeDelay,
+    })
 }
 
-const fn yoyo_scope_label(scope: YoyoScope) -> &'static str {
-    match scope {
-        YoyoScope::Selection => "Selection",
-        YoyoScope::EntireTimeline => "Entire timeline",
-    }
+fn yoyo_scope_label(scope: YoyoScope, localizer: Localizer) -> &'static str {
+    localizer.text(match scope {
+        YoyoScope::Selection => Message::EditorSelectionScope,
+        YoyoScope::EntireTimeline => Message::EditorEntireTimeline,
+    })
 }
 
 fn parse_keep_every(input: &str) -> Result<usize, String> {
@@ -1655,19 +1804,22 @@ fn parse_keep_every(input: &str) -> Result<usize, String> {
     Ok(keep_every)
 }
 
-const fn duplicate_retention_label(retention: DuplicateFrameRetention) -> &'static str {
-    match retention {
-        DuplicateFrameRetention::First => "Keep first",
-        DuplicateFrameRetention::Last => "Keep last",
-    }
+fn duplicate_retention_label(
+    retention: DuplicateFrameRetention,
+    localizer: Localizer,
+) -> &'static str {
+    localizer.text(match retention {
+        DuplicateFrameRetention::First => Message::EditorKeepFirstDuplicate,
+        DuplicateFrameRetention::Last => Message::EditorKeepLastDuplicate,
+    })
 }
 
-const fn duplicate_delay_label(mode: DuplicateDelayMode) -> &'static str {
-    match mode {
-        DuplicateDelayMode::Keep => "Keep delay",
-        DuplicateDelayMode::Sum => "Sum delay",
-        DuplicateDelayMode::Average => "Average delay",
-    }
+fn duplicate_delay_label(mode: DuplicateDelayMode, localizer: Localizer) -> &'static str {
+    localizer.text(match mode {
+        DuplicateDelayMode::Keep => Message::EditorKeepDuplicateDelay,
+        DuplicateDelayMode::Sum => Message::EditorSumDuplicateDelay,
+        DuplicateDelayMode::Average => Message::EditorAverageDuplicateDelay,
+    })
 }
 
 fn parse_similarity_threshold(input: &str) -> Result<u8, String> {
@@ -1684,18 +1836,23 @@ fn show_transition_toolbar(
     state: &mut EditorUiState,
     now: Instant,
     results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
 ) {
-    egui::CollapsingHeader::new("Transitions")
+    egui::CollapsingHeader::new(localizer.text(Message::EditorTransitions))
+        .id_salt("editor-transitions")
         .default_open(false)
         .show(ui, |ui| {
             if let Some(transition) = workspace.current_transition() {
-                ui.label(format_transition_summary(transition));
+                ui.label(format_transition_summary(transition, localizer));
             } else {
-                ui.weak("The current frame has no outgoing transition.");
+                ui.weak(localizer.text(Message::EditorNoTransition));
             }
-            show_transition_inputs(ui, state);
+            show_transition_inputs(ui, state, localizer);
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Create / replace").clicked() {
+                if ui
+                    .button(localizer.text(Message::EditorCreateReplaceTransition))
+                    .clicked()
+                {
                     match build_transition_settings(state) {
                         Ok(settings) => {
                             let result = workspace.set_current_transition(settings);
@@ -1713,7 +1870,10 @@ fn show_transition_toolbar(
                         }
                     }
                 }
-                if ui.button("Delete current pair transition").clicked() {
+                if ui
+                    .button(localizer.text(Message::EditorDeletePairTransition))
+                    .clicked()
+                {
                     let result = workspace.remove_current_transition();
                     record_project_result(
                         workspace,
@@ -1725,17 +1885,19 @@ fn show_transition_toolbar(
                     );
                 }
             });
-            ui.weak(format!(
-                "Duration is added to the timeline; steps must be 1..={MAX_TRANSITION_STEPS}."
+            ui.weak(crate::format_message(
+                localizer,
+                Message::EditorTransitionDurationHint,
+                &[("maximum", &MAX_TRANSITION_STEPS.to_string())],
             ));
         });
 }
 
-fn show_transition_inputs(ui: &mut egui::Ui, state: &mut EditorUiState) {
+fn show_transition_inputs(ui: &mut egui::Ui, state: &mut EditorUiState, localizer: Localizer) {
     ui.horizontal_wrapped(|ui| {
-        ui.label("Type");
+        ui.label(localizer.text(Message::EditorTransitionType));
         egui::ComboBox::from_id_salt("current_frame_transition_kind")
-            .selected_text(transition_choice_label(state.transition_choice))
+            .selected_text(transition_choice_label(state.transition_choice, localizer))
             .show_ui(ui, |ui| {
                 for choice in [
                     TransitionChoice::FadeToNext,
@@ -1748,20 +1910,20 @@ fn show_transition_inputs(ui: &mut egui::Ui, state: &mut EditorUiState) {
                     ui.selectable_value(
                         &mut state.transition_choice,
                         choice,
-                        transition_choice_label(choice),
+                        transition_choice_label(choice, localizer),
                     );
                 }
             });
-        ui.label("Total µs");
+        ui.label(localizer.text(Message::EditorTransitionTotalUs));
         ui.add(
             egui::TextEdit::singleline(&mut state.transition_duration_us_input).desired_width(92.0),
         );
-        ui.label("Steps");
+        ui.label(localizer.text(Message::EditorTransitionSteps));
         compact_input(ui, &mut state.transition_steps_input);
     });
     if state.transition_choice == TransitionChoice::FadeToColor {
         ui.horizontal_wrapped(|ui| {
-            ui.label("Fade RGBA");
+            ui.label(localizer.text(Message::EditorFadeRgba));
             compact_input(ui, &mut state.transition_color_red_input);
             compact_input(ui, &mut state.transition_color_green_input);
             compact_input(ui, &mut state.transition_color_blue_input);
@@ -1820,38 +1982,42 @@ fn parse_transition_color(state: &EditorUiState) -> Result<Rgba, String> {
     })
 }
 
-const fn transition_choice_label(choice: TransitionChoice) -> &'static str {
-    match choice {
-        TransitionChoice::FadeToNext => "Fade to next",
-        TransitionChoice::FadeToColor => "Fade to RGBA",
-        TransitionChoice::SlideLeft => "Slide left",
-        TransitionChoice::SlideRight => "Slide right",
-        TransitionChoice::SlideUp => "Slide up",
-        TransitionChoice::SlideDown => "Slide down",
-    }
+fn transition_choice_label(choice: TransitionChoice, localizer: Localizer) -> &'static str {
+    localizer.text(match choice {
+        TransitionChoice::FadeToNext => Message::EditorFadeToNext,
+        TransitionChoice::FadeToColor => Message::EditorFadeToRgba,
+        TransitionChoice::SlideLeft => Message::EditorSlideLeft,
+        TransitionChoice::SlideRight => Message::EditorSlideRight,
+        TransitionChoice::SlideUp => Message::EditorSlideUp,
+        TransitionChoice::SlideDown => Message::EditorSlideDown,
+    })
 }
 
-fn format_transition_summary(transition: &Transition) -> String {
-    format!(
-        "Current outgoing: {} · {} step(s) · {} µs added",
-        match &transition.kind {
-            TransitionKind::FadeToNext => "Fade to next",
-            TransitionKind::FadeToColor { .. } => "Fade to RGBA",
-            TransitionKind::Slide {
-                direction: SlideDirection::Left,
-            } => "Slide left",
-            TransitionKind::Slide {
-                direction: SlideDirection::Right,
-            } => "Slide right",
-            TransitionKind::Slide {
-                direction: SlideDirection::Up,
-            } => "Slide up",
-            TransitionKind::Slide {
-                direction: SlideDirection::Down,
-            } => "Slide down",
-        },
-        transition.steps,
-        transition.duration.get()
+fn format_transition_summary(transition: &Transition, localizer: Localizer) -> String {
+    let kind = localizer.text(match &transition.kind {
+        TransitionKind::FadeToNext => Message::EditorFadeToNext,
+        TransitionKind::FadeToColor { .. } => Message::EditorFadeToRgba,
+        TransitionKind::Slide {
+            direction: SlideDirection::Left,
+        } => Message::EditorSlideLeft,
+        TransitionKind::Slide {
+            direction: SlideDirection::Right,
+        } => Message::EditorSlideRight,
+        TransitionKind::Slide {
+            direction: SlideDirection::Up,
+        } => Message::EditorSlideUp,
+        TransitionKind::Slide {
+            direction: SlideDirection::Down,
+        } => Message::EditorSlideDown,
+    });
+    crate::format_message(
+        localizer,
+        Message::EditorTransitionSummary,
+        &[
+            ("kind", kind),
+            ("steps", &transition.steps.to_string()),
+            ("duration", &transition.duration.get().to_string()),
+        ],
     )
 }
 
@@ -1861,11 +2027,12 @@ fn show_transform_toolbar(
     state: &mut EditorUiState,
     now: Instant,
     results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
 ) {
     ui.group(|ui| {
-        ui.strong("Image geometry");
-        show_crop_resize_controls(ui, workspace, state, now, results);
-        show_orientation_controls(ui, workspace, state, now, results);
+        ui.strong(localizer.text(Message::EditorImageGeometry));
+        show_crop_resize_controls(ui, workspace, state, now, results, localizer);
+        show_orientation_controls(ui, workspace, state, now, results, localizer);
     });
 }
 
@@ -1875,11 +2042,12 @@ fn show_crop_resize_controls(
     state: &mut EditorUiState,
     now: Instant,
     results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
 ) {
-    ui.label("Crop, resize and rotation affect all frames and their existing artwork.");
-    ui.small("Coordinates refer to the current image. Flip and effects use the selected frames.");
+    ui.label(localizer.text(Message::EditorWholeImageGeometryHint));
+    ui.small(localizer.text(Message::EditorGeometryCoordinatesHint));
     ui.horizontal_wrapped(|ui| {
-        ui.label("Crop");
+        ui.label(localizer.text(Message::EditorCrop));
         ui.label("X");
         compact_input(ui, &mut state.crop_x_input);
         ui.label("Y");
@@ -1888,7 +2056,10 @@ fn show_crop_resize_controls(
         compact_input(ui, &mut state.crop_width_input);
         ui.label("H");
         compact_input(ui, &mut state.crop_height_input);
-        if ui.button("Apply crop").clicked() {
+        if ui
+            .button(localizer.text(Message::EditorApplyCrop))
+            .clicked()
+        {
             match parse_crop(state) {
                 Ok(crop) => {
                     let result = workspace.set_selection_crop(crop);
@@ -1904,7 +2075,11 @@ fn show_crop_resize_controls(
                 Err(message) => push_failure(results, EditorUiOperation::ApplyCrop, message),
             }
         }
-        if ui.button("Remove last crop").on_hover_text("Removes the most recent crop on all frames. Later layers keep their stage coordinates; a later crop or effect that no longer fits prevents the edit. Use Undo to restore the exact previous layout.").clicked() {
+        if ui
+            .button(localizer.text(Message::EditorRemoveLastCrop))
+            .on_hover_text(localizer.text(Message::EditorRemoveLastCropHint))
+            .clicked()
+        {
             let result = workspace.clear_selection_crop();
             record_project_result(
                 workspace,
@@ -1918,12 +2093,12 @@ fn show_crop_resize_controls(
     });
 
     ui.horizontal_wrapped(|ui| {
-        ui.label("Resize current image");
+        ui.label(localizer.text(Message::EditorResizeCurrentImage));
         ui.label("W");
         compact_input(ui, &mut state.resize_width_input);
         ui.label("H");
         compact_input(ui, &mut state.resize_height_input);
-        if ui.button("Resize").clicked() {
+        if ui.button(localizer.text(Message::EditorResize)).clicked() {
             match parse_output_size(state) {
                 Ok(size) => {
                     let result = workspace.set_selection_output_size(size);
@@ -1939,7 +2114,11 @@ fn show_crop_resize_controls(
                 Err(message) => push_failure(results, EditorUiOperation::Resize, message),
             }
         }
-        if ui.button("Remove last resize").on_hover_text("Removes the most recent resize on all frames. Later layers retain their own stage coordinates; re-author an input group to recalculate its source-coordinate mapping.").clicked() {
+        if ui
+            .button(localizer.text(Message::EditorRemoveLastResize))
+            .on_hover_text(localizer.text(Message::EditorRemoveLastResizeHint))
+            .clicked()
+        {
             let result = workspace.clear_selection_output_size();
             record_project_result(
                 workspace,
@@ -1959,15 +2138,22 @@ fn show_orientation_controls(
     state: &mut EditorUiState,
     now: Instant,
     results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
 ) {
     ui.horizontal_wrapped(|ui| {
-        for (label, control) in [
-            ("Rotate left", OrientationControl::RotateLeft),
-            ("Rotate right", OrientationControl::RotateRight),
-            ("Flip H", OrientationControl::FlipHorizontal),
-            ("Flip V", OrientationControl::FlipVertical),
+        for (message, control) in [
+            (Message::EditorRotateLeft, OrientationControl::RotateLeft),
+            (Message::EditorRotateRight, OrientationControl::RotateRight),
+            (
+                Message::EditorFlipHorizontal,
+                OrientationControl::FlipHorizontal,
+            ),
+            (
+                Message::EditorFlipVertical,
+                OrientationControl::FlipVertical,
+            ),
         ] {
-            if ui.button(label).clicked() {
+            if ui.button(localizer.text(message)).clicked() {
                 let operation = orientation_operation(control);
                 let result = apply_orientation_control(workspace, control);
                 record_project_result(workspace, state, now, results, operation, result);
@@ -2779,6 +2965,7 @@ fn show_virtual_filmstrip(
     state: &mut EditorUiState,
     now: Instant,
     results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
 ) {
     let frame_count = workspace.manifest().timeline.frames.len();
     let layout = match filmstrip_layout(frame_count) {
@@ -2865,7 +3052,14 @@ fn show_virtual_filmstrip(
                 };
                 let is_selected = workspace.selection().contains(frame_id);
                 let is_current = workspace.selection().current() == Some(frame_id);
-                let label = format!("Frame {} · {} µs", index + 1, duration_us);
+                let label = crate::format_message(
+                    localizer,
+                    Message::EditorFilmstripFrame,
+                    &[
+                        ("number", &(index + 1).to_string()),
+                        ("duration", &duration_us.to_string()),
+                    ],
+                );
                 let mut button = egui::Button::new("")
                     .min_size(egui::vec2(item_width, FILMSTRIP_ITEM_HEIGHT))
                     .selected(is_selected);
@@ -2919,15 +3113,27 @@ fn show_virtual_filmstrip(
                         response = response.on_hover_text(&label);
                     }
                     Some(Err(error)) => {
-                        paint_thumbnail_placeholder(ui, image_bounds, "Unavailable");
+                        paint_thumbnail_placeholder(
+                            ui,
+                            image_bounds,
+                            localizer.text(Message::EditorThumbnailUnavailable),
+                        );
                         response = response.on_hover_text(format!("{label}\n{error}"));
                     }
-                    None => paint_thumbnail_placeholder(ui, image_bounds, "Loading…"),
+                    None => paint_thumbnail_placeholder(
+                        ui,
+                        image_bounds,
+                        localizer.text(Message::EditorThumbnailLoading),
+                    ),
                 }
                 ui.painter().text(
                     egui::pos2(rect.center().x, rect.top() + 53.0),
                     egui::Align2::CENTER_CENTER,
-                    format!("Frame {}", index + 1),
+                    crate::format_message(
+                        localizer,
+                        Message::EditorFrameNumber,
+                        &[("number", &(index + 1).to_string())],
+                    ),
                     egui::FontId::proportional(11.0),
                     ui.visuals().text_color(),
                 );
@@ -3165,7 +3371,7 @@ fn push_failure(
 fn push_notice(
     results: &mut Vec<EditorUiResult>,
     operation: EditorUiOperation,
-    message: impl Into<String>,
+    message: impl Into<Notice>,
 ) {
     results.push(Ok(EditorUiAction::Notice {
         operation,
@@ -3374,6 +3580,10 @@ fn schedule_playback_repaint(context: &egui::Context, state: &EditorUiState, now
 #[cfg(test)]
 #[path = "editor_layer_conversion_ui_tests.rs"]
 mod layer_conversion_tests;
+
+#[cfg(test)]
+#[path = "editor_ui/localization_tests.rs"]
+mod localization_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3636,10 +3846,10 @@ mod tests {
             ReduceDelayMode::Previous,
             ReduceDelayMode::Evenly,
         ] {
-            assert!(!reduce_delay_label(mode).is_empty());
+            assert!(!reduce_delay_label(mode, crate::test_localizer()).is_empty());
         }
         for scope in [YoyoScope::Selection, YoyoScope::EntireTimeline] {
-            assert!(!yoyo_scope_label(scope).is_empty());
+            assert!(!yoyo_scope_label(scope, crate::test_localizer()).is_empty());
         }
         assert_eq!(parse_similarity_threshold("0").unwrap(), 0);
         assert_eq!(parse_similarity_threshold("100").unwrap(), 100);
@@ -3649,14 +3859,14 @@ mod tests {
             DuplicateFrameRetention::First,
             DuplicateFrameRetention::Last,
         ] {
-            assert!(!duplicate_retention_label(retention).is_empty());
+            assert!(!duplicate_retention_label(retention, crate::test_localizer()).is_empty());
         }
         for mode in [
             DuplicateDelayMode::Keep,
             DuplicateDelayMode::Sum,
             DuplicateDelayMode::Average,
         ] {
-            assert!(!duplicate_delay_label(mode).is_empty());
+            assert!(!duplicate_delay_label(mode, crate::test_localizer()).is_empty());
         }
     }
 
@@ -3675,7 +3885,7 @@ mod tests {
             let settings = build_transition_settings(&state).unwrap();
             assert_eq!(settings.duration, DurationUs::new(100_000).unwrap());
             assert_eq!(settings.steps, 5);
-            assert!(!transition_choice_label(choice).is_empty());
+            assert!(!transition_choice_label(choice, crate::test_localizer()).is_empty());
             assert!(matches!(
                 (choice, settings.kind),
                 (TransitionChoice::FadeToNext, TransitionKind::FadeToNext)
@@ -3828,7 +4038,7 @@ mod tests {
             results,
             [Ok(EditorUiAction::Notice {
                 operation: EditorUiOperation::RepairJournal,
-                message,
+                message: message.into(),
             })]
         );
         assert!(repair_journal_notice(None).contains("already clean"));
@@ -4238,6 +4448,7 @@ mod tests {
                     &mut state,
                     Instant::now(),
                     &mut Vec::new(),
+                    crate::test_localizer(),
                 );
                 let height = ui.cursor().top() - top;
                 assert!(

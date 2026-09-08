@@ -3,6 +3,8 @@ use super::{
     store::{Snapshot, Store},
 };
 use crate::background_task::BackgroundTask;
+use crate::ui_notice::Notice;
+use gif_from_screen_localization::Message;
 
 enum Stored {
     Loaded(Snapshot),
@@ -18,7 +20,7 @@ pub(super) struct SettingsIo {
     revision: u64,
     saved_revision: u64,
     save_pending: bool,
-    notice: Option<String>,
+    notice: Option<Notice>,
 }
 
 impl SettingsIo {
@@ -42,7 +44,10 @@ impl SettingsIo {
             Ok(store) => Self::new(Some(store)),
             Err(error) => {
                 let mut io = Self::new(None);
-                io.notice = Some(error);
+                io.notice = Some(Notice::new(
+                    Message::ShortcutsSettingsUnavailable,
+                    &[("error", &error)],
+                ));
                 io
             }
         }
@@ -58,6 +63,9 @@ impl SettingsIo {
         if save {
             self.revision = self.revision.wrapping_add(1);
             self.save_pending = true;
+            if self.store.is_some() && self.baseline.is_some() {
+                self.notice = Some(Message::ShortcutsSettingsSaving.into());
+            }
         }
     }
 
@@ -69,8 +77,8 @@ impl SettingsIo {
             || (self.store.is_some()
                 && (!self.attempted_load || (self.save_pending && self.baseline.is_some())))
     }
-    pub fn notice(&self) -> Option<&str> {
-        self.notice.as_deref()
+    pub fn notice(&self) -> Option<&Notice> {
+        self.notice.as_ref()
     }
     pub fn needs_reload(&self) -> bool {
         self.store.is_some()
@@ -96,11 +104,19 @@ impl SettingsIo {
                     self.baseline = Some(snapshot);
                     self.saved_revision = revision;
                     self.save_pending = revision != self.revision;
-                    self.notice = None;
+                    self.notice = Some(
+                        if self.save_pending {
+                            Message::ShortcutsSettingsSaving
+                        } else {
+                            Message::ShortcutsSettingsSaved
+                        }
+                        .into(),
+                    );
                 }
                 Err(error) => {
-                    self.notice = Some(format!(
-                        "Shortcut settings were not saved or loaded: {error}"
+                    self.notice = Some(Notice::new(
+                        Message::ShortcutsSettingsIoFailed,
+                        &[("error", &error)],
                     ));
                     self.save_pending = false;
                     self.baseline = None;
@@ -115,7 +131,10 @@ impl SettingsIo {
                 if let Err(error) = self.task.start("shortcut-settings-load", move |_| {
                     store.load().map(Stored::Loaded)
                 }) {
-                    self.notice = Some(error);
+                    self.notice = Some(Notice::new(
+                        Message::ShortcutsSettingsLoadStartFailed,
+                        &[("error", &error)],
+                    ));
                 }
             } else if self.save_pending
                 && let Some(baseline) = self.baseline.clone()
@@ -127,8 +146,13 @@ impl SettingsIo {
                         .save(&baseline, settings)
                         .map(|snapshot| Stored::Saved { revision, snapshot })
                 }) {
-                    self.notice = Some(error);
+                    self.notice = Some(Notice::new(
+                        Message::ShortcutsSettingsSaveStartFailed,
+                        &[("error", &error)],
+                    ));
                     self.save_pending = false;
+                } else {
+                    self.notice = Some(Message::ShortcutsSettingsSaving.into());
                 }
             }
         }
@@ -137,8 +161,7 @@ impl SettingsIo {
 
     fn loaded(&mut self, snapshot: Snapshot) -> Option<Settings> {
         let settings = if self.touched {
-            self.notice =
-                Some("Saved shortcuts were loaded, but your newer edits were kept.".into());
+            self.notice = Some(Message::ShortcutsSettingsNewerEditsKept.into());
             None
         } else {
             self.notice = None;

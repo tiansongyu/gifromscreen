@@ -70,6 +70,13 @@ impl EditorCanvasState {
         self.crop.reconcile(workspace);
     }
 
+    /// A UI-layout change must not reinterpret an in-flight pointer sequence.
+    /// Preserve the display scale, scroll position and already-confirmed crop.
+    pub(crate) fn cancel_layout_gestures(&mut self) {
+        self.panning = false;
+        self.crop.cancel_layout_gesture();
+    }
+
     pub(crate) fn show_zoom(&mut self, ui: &mut egui::Ui) {
         let before = self.zoom;
         ui.horizontal_wrapped(|ui| {

@@ -47,6 +47,69 @@ fn starting_a_countdown_keeps_template_argument_names_untranslated() {
 }
 
 #[test]
+fn live_countdown_suppresses_only_its_initial_notice_by_identity() {
+    let mut app = GifFromScreenApp::default();
+    let notice =
+        crate::ui_notice::Notice::new(Message::RecorderCountdownNotice, &[("seconds", "3")]);
+    let initial = notice.to_string();
+    app.notice = Some(notice);
+    for tag in ["en", "zh"] {
+        assert!(
+            app.recorder_notice_text(RecorderStage::Countdown(1), localizer(tag))
+                .is_none()
+        );
+        assert!(
+            app.recorder_notice_text(RecorderStage::Ready, localizer(tag))
+                .is_some()
+        );
+    }
+    app.notice = Some(initial.clone().into());
+    assert_eq!(
+        app.recorder_notice_text(RecorderStage::Countdown(1), localizer("zh")),
+        Some(initial)
+    );
+    app.notice = Some(Message::RecorderPauseRequested.into());
+    assert_eq!(
+        app.recorder_notice_text(RecorderStage::Paused, localizer("zh")),
+        Some(
+            localizer("zh")
+                .text(Message::RecorderPauseRequested)
+                .to_owned()
+        )
+    );
+}
+
+#[test]
+fn preference_poll_retranslates_existing_notice_without_mutating_capture_settings() {
+    let context = egui::Context::default();
+    let mut app = GifFromScreenApp::default();
+    app.settings.region_x = -1920;
+    app.settings.region_y = 75;
+    app.settings.output = "/tmp/文件/{frames}.gif".to_owned();
+    let settings = format!("{:?}", app.settings);
+    app.notice = Some(crate::ui_notice::Notice::new(
+        Message::RecorderProjectReady,
+        &[
+            ("frames", "30"),
+            ("seconds", "3.000"),
+            ("path", "/tmp/文件/{frames}.gfsproj"),
+        ],
+    ));
+    for tag in ["zh", "en", "fr", "zh"] {
+        app.language_settings = crate::preferences::LanguageSettings::with_language(
+            gif_from_screen_localization::LanguagePreference::explicit(tag).unwrap(),
+        );
+        app.poll_language_settings(&context);
+        let notice = app.notice.as_ref().unwrap();
+        assert_eq!(notice.message_id(), Some(Message::RecorderProjectReady));
+        assert_eq!(&**notice, notice.render(localizer(tag)));
+        assert!(notice.contains("/tmp/文件/{frames}.gfsproj"));
+        assert_eq!(format!("{:?}", app.settings), settings);
+        assert!(app.job.is_none());
+    }
+}
+
+#[test]
 fn chinese_catalog_templates_have_real_egui_glyphs_in_both_ui_families() {
     let chinese = localizer("zh");
     let characters = gif_from_screen_localization::ALL_MESSAGES
@@ -283,7 +346,7 @@ fn actual_catalog_change_cancels_screen_space_gestures_without_touching_committe
     app.settings.region_height = original_region.size().height();
     let before = format!("{:?}", app.settings);
     for tag in ["en", "ar"] {
-        app.sync_recorder_language(localizer(tag));
+        app.sync_ui_language(localizer(tag));
         assert_eq!(app.region_picker.as_ref().unwrap().drag_start, Some(start));
         assert_eq!(
             app.wayland_frozen_preview.as_ref().unwrap().drag_current,
@@ -297,7 +360,7 @@ fn actual_catalog_change_cancels_screen_space_gestures_without_touching_committe
             Some(original_region)
         );
     }
-    app.sync_recorder_language(localizer("zh"));
+    app.sync_ui_language(localizer("zh"));
     let picker = app.region_picker.as_ref().unwrap();
     assert!(picker.drag_start.is_none() && picker.drag_current.is_none());
     assert_eq!(picker.selection, Some(original_region));
@@ -319,12 +382,12 @@ fn actual_catalog_change_cancels_screen_space_gestures_without_touching_committe
     assert_eq!(live.source_size, source_size);
     assert_eq!(format!("{:?}", app.settings), before);
     app.wayland_crop_controller.as_mut().unwrap().drag_start = Some(start);
-    app.sync_recorder_language(localizer("zh"));
+    app.sync_ui_language(localizer("zh"));
     assert_eq!(
         app.wayland_crop_controller.as_ref().unwrap().drag_start,
         Some(start)
     );
-    app.sync_recorder_language(localizer("en"));
+    app.sync_ui_language(localizer("en"));
     assert!(
         app.wayland_crop_controller
             .as_ref()

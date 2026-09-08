@@ -24,6 +24,10 @@ The next main-branch slice connects [recorder controls and settings](RECORDER-LO
 to en/zh, preserves source geometry and control identities, and cancels unfinished
 preview gestures when text layout changes. This is newer than Preview 1 and does
 not relabel that frozen release as containing later code.
+The [editor/shortcut/notice slice](EDITOR-LOCALIZATION.md) adds late-rendered
+message identities, primary editor controls and language-layout gesture guards.
+Remaining tool bodies, preview/import/export forms, additional catalogs and
+non-locale ordinary-drawing mapping protection stay open.
 
 ## Playback timing: implemented, bounded native manual acceptance recorded
 

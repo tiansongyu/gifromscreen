@@ -160,7 +160,7 @@ fn compact_timeout_is_visible_nonblocking_and_does_not_repeat_window_requests() 
     let mut app = GifFromScreenApp::default();
     let size = egui::vec2(1280.0, 720.0);
     app.wayland_crop_controller = Some(controller(&context));
-    app.notice = Some("Existing recording status.".to_owned());
+    app.notice = Some("Existing recording status.".to_owned().into());
     app.main_window_snapshot = Some(MainWindowSnapshot {
         position: None,
         size,
@@ -709,7 +709,11 @@ fn prepared_page_overflow_scrolls_without_hiding_top_actions() {
     for size in [egui::vec2(640.0, 480.0), egui::vec2(1280.0, 720.0)] {
         for font_scale in [1.0, 2.0] {
             let (context, mut app) = preparation_fixture(font_scale);
-            app.notice = Some("Diagnostic detail must remain accessible.\n".repeat(40));
+            app.notice = Some(
+                "Diagnostic detail must remain accessible.\n"
+                    .repeat(40)
+                    .into(),
+            );
             preparation_frame(&context, &mut app, size, Vec::new());
             let before = preparation_frame(&context, &mut app, size, Vec::new());
             let scroll_id = context

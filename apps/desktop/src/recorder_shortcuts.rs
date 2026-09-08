@@ -266,13 +266,13 @@ impl GifFromScreenApp {
                         continue;
                     }
                     if let Err(error) = self.open_recorder_overlay(context) {
-                        self.notice = Some(error);
+                        self.notice = Some(error.into());
                     }
                     break; // A second queued press must not skip first presentation/geometry.
                 }
                 Dispatch::OpenController => {
                     if let Err(error) = self.open_wayland_crop_controller(context) {
-                        self.notice = Some(error);
+                        self.notice = Some(error.into());
                     }
                     break;
                 }

@@ -5,6 +5,7 @@ mod tests;
 
 use std::time::{Duration, Instant};
 
+use crate::ui_notice::Notice;
 use eframe::egui;
 use gif_from_screen_capture::{PhysicalPosition, PhysicalRect, PhysicalSize};
 use gif_from_screen_capture_linux::{
@@ -28,7 +29,7 @@ pub(super) struct RecorderOverlay {
     controller_geometry: Option<gif_from_screen_capture_linux::ControllerGeometry>,
     request: Option<GuideRequest>,
     acknowledged: Option<u64>,
-    failure: Option<String>,
+    failure: Option<Notice>,
     window: ControllerWindow,
     window_state: WindowState,
     workareas: Vec<PhysicalRect>,
@@ -122,26 +123,22 @@ impl RecorderOverlay {
         self.failure.is_some()
     }
 
-    fn cancel_invalid_start(
-        &mut self,
-        context: &egui::Context,
-        now: Instant,
-    ) -> Option<&'static str> {
+    fn cancel_invalid_start(&mut self, context: &egui::Context, now: Instant) -> Option<Notice> {
         let started = self.pending_live_start?;
         let notice = if now.saturating_duration_since(started) >= CHANGE_TIMEOUT {
-            "Start expired while preparing the controls. Retry after the recorder is ready."
+            Message::RecorderStartExpired
         } else if self
             .settle
             .as_ref()
             .is_some_and(|settle| matches!(settle.hide, HidePhase::Acknowledged))
             && !Self::is_hidden(context)
         {
-            "Start cancelled because the controls were restored before capture began."
+            Message::RecorderStartRestored
         } else {
             return None;
         };
         self.cancel_start(context);
-        Some(notice)
+        Some(notice.into())
     }
 
     fn is_hidden(context: &egui::Context) -> bool {
@@ -197,7 +194,7 @@ impl RecorderOverlay {
         if let Some(guide) = &self.guide
             && let Err(error) = guide.request(request)
         {
-            self.failure = Some(error);
+            self.failure = Some(error.into());
             return;
         }
         self.request = Some(request);
@@ -210,7 +207,7 @@ impl RecorderOverlay {
         let update = guide.poll();
         self.controller_geometry = update.controller;
         match update.status {
-            GuideStatus::Failed(error) => self.failure = Some(error),
+            GuideStatus::Failed(error) => self.failure = Some(error.into()),
             GuideStatus::Stopped => {
                 self.failure = Some("The recording guide stopped. Reopen the recorder.".into());
             }
@@ -329,10 +326,7 @@ impl RecorderOverlay {
         }
         let settle = self.settle.as_mut().unwrap();
         if now.saturating_duration_since(settle.started) >= CHANGE_TIMEOUT {
-            self.failure = Some(
-                "The recorder could not finish hiding or updating its controls; stopping safely."
-                    .into(),
-            );
+            self.failure = Some(Message::RecorderControlsSettleFailed.into());
             return false;
         }
         if context.cumulative_frame_nr().saturating_sub(settle.frame) < 2
@@ -567,7 +561,11 @@ impl GifFromScreenApp {
         self.recorder_overlay = Some(overlay);
         self.main_window_snapshot = Some(snapshot);
         self.pending_recorder_start = None;
-        self.notice = Some(localizer.text(Message::RecorderBorderDragHint).into());
+        self.notice = Some(Notice::localized(
+            localizer,
+            Message::RecorderBorderDragHint,
+            &[],
+        ));
         context.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
         context.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
             egui::WindowLevel::AlwaysOnTop,
@@ -675,7 +673,7 @@ impl GifFromScreenApp {
             overlay.pending_live_start = None;
         }
         if let Some(notice) = overlay.cancel_invalid_start(context, now) {
-            self.notice = Some(notice.into());
+            self.notice = Some(notice);
         }
         let start = overlay.pending_live_start.is_some() && overlay.settled(context, now, hidden);
         finish_change(
@@ -705,7 +703,7 @@ impl GifFromScreenApp {
             overlay.pending_live_start = None;
         }
         if let Err(error) = self.start_recording() {
-            self.notice = Some(error);
+            self.notice = Some(error.into());
             if let Some(overlay) = &mut self.recorder_overlay {
                 overlay.cancel_start(context);
             }
@@ -738,7 +736,7 @@ impl GifFromScreenApp {
         let localizer = self.language_settings.localizer();
         let mut action = RecorderOverlayAction::None;
         if visible {
-            let notice = self.controller_notice(overlay);
+            let notice = self.controller_notice(overlay, stage);
             let input_ready =
                 overlay.ready() && (overlay.change.is_none() || (overlay.recovering && paused));
             // The independent window can be recovered while capture is paused.
@@ -781,11 +779,18 @@ impl GifFromScreenApp {
         action
     }
 
-    fn controller_notice(&self, overlay: &RecorderOverlay) -> String {
+    fn controller_notice(&self, overlay: &RecorderOverlay, stage: RecorderStage) -> String {
         let localizer = self.language_settings.localizer();
-        let status = self.shortcut_tool.status_summary().unwrap_or_default();
-        let notice = if let Some(error) = &overlay.failure {
-            error.as_str()
+        let status = self
+            .shortcut_tool
+            .status_summary(localizer)
+            .unwrap_or_default();
+        let failure = overlay
+            .failure
+            .as_ref()
+            .map(|notice| notice.render(localizer));
+        let notice = if let Some(error) = failure.as_deref() {
+            error
         } else if overlay.recovering {
             localizer.text(Message::RecorderRecoveringControls)
         } else if overlay.change.is_some() {
@@ -795,8 +800,8 @@ impl GifFromScreenApp {
         } else {
             ""
         };
-        let message = self
-            .notice
+        let current_notice = self.recorder_notice_text(stage, localizer);
+        let message = current_notice
             .as_deref()
             .filter(|message| *message != notice)
             .unwrap_or_default();
@@ -827,9 +832,11 @@ impl GifFromScreenApp {
                     return true;
                 }
                 RecorderOverlayAction::Snapshot => {
-                    self.notice = Some(
-                        "Snapshot not captured while the recording position is changing.".into(),
-                    );
+                    self.notice = Some(Notice::localized(
+                        self.language_settings.localizer(),
+                        Message::RecorderSnapshotDuringMove,
+                        &[],
+                    ));
                     return true;
                 }
                 _ => {}
@@ -938,7 +945,7 @@ fn finish_change(
     context: &egui::Context,
     now: Instant,
     hidden: bool,
-    notice: &mut Option<String>,
+    notice: &mut Option<Notice>,
 ) {
     let Some(job) = job else {
         return;
@@ -997,8 +1004,9 @@ fn finish_change(
     overlay.recovering = false;
     overlay.settle = None;
     if rejected > 0 {
-        *notice = Some(format!(
-            "{rejected} snapshot requests were not captured while the recording region changed."
+        *notice = Some(Notice::new(
+            Message::RecorderSnapshotsRejectedForMove,
+            &[("count", &rejected.to_string())],
         ));
     }
 }

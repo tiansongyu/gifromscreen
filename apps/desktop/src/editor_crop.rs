@@ -13,6 +13,7 @@ struct Session {
     rect: PhysicalRect,
     fields: [String; 4],
     gesture: Option<Gesture>,
+    suppress_primary_until_release: bool,
 }
 
 #[derive(Debug)]
@@ -62,6 +63,7 @@ impl DirectCropDraft {
             rect,
             fields: fields(rect),
             gesture: None,
+            suppress_primary_until_release: false,
         });
         self.notice = None;
         Ok(())
@@ -91,6 +93,30 @@ impl DirectCropDraft {
             session.rect = gesture.previous_rect;
             session.fields = gesture.previous_fields;
         }
+    }
+
+    /// Keep the confirmed crop and typed fields, but discard any unfinished
+    /// pointer sequence from the old layout, including a pre-drag-threshold click.
+    pub(crate) fn cancel_layout_gesture(&mut self) {
+        self.cancel_gesture();
+        if let Some(session) = &mut self.session {
+            session.suppress_primary_until_release = true;
+        }
+    }
+
+    fn suppress_layout_sequence(&mut self, ui: &egui::Ui) -> bool {
+        let Some(session) = &mut self.session else {
+            return false;
+        };
+        if !session.suppress_primary_until_release {
+            return false;
+        }
+        if !ui.input(|input| input.pointer.primary_down()) {
+            session.suppress_primary_until_release = false;
+        }
+        // Consume the release pass too: egui can still report clicked/drag_stopped
+        // in it. A subsequent fresh press is accepted normally.
+        true
     }
 
     pub(crate) fn apply(&mut self, workspace: &mut EditorWorkspace) -> Result<(), String> {
@@ -223,6 +249,10 @@ impl DirectCropDraft {
             self.cancel();
             return;
         }
+        if self.suppress_layout_sequence(ui) {
+            return;
+        }
+        let session = self.session.as_ref().expect("active crop checked");
         let mapping_changed = session.canvas.width.get() != rendered[0]
             || session.canvas.height.get() != rendered[1]
             || session

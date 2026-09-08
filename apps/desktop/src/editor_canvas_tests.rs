@@ -275,6 +275,193 @@ fn panning_does_not_author_or_finish_a_freehand_stroke() {
 }
 
 #[test]
+fn layout_cancel_stops_pan_without_resetting_zoom_or_scroll_and_new_pan_still_works() {
+    let context = egui::Context::default();
+    let preview = preview(&context);
+    let size = egui::vec2(420.0, 500.0);
+    let mut canvas = EditorCanvasState {
+        zoom: PreviewZoom::Double,
+        ..Default::default()
+    };
+    frame(&context, &mut canvas, &preview, size, Vec::new());
+    let button = |pos, pressed| {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Middle,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    };
+    let start = canvas.viewport.unwrap().center();
+    frame(&context, &mut canvas, &preview, size, button(start, true));
+    let moved = start - egui::vec2(30.0, 20.0);
+    frame(
+        &context,
+        &mut canvas,
+        &preview,
+        size,
+        vec![egui::Event::PointerMoved(moved)],
+    );
+    assert!(canvas.panning);
+    let previous_offset = canvas.scroll_offset;
+    let previous_viewport = canvas.viewport;
+    canvas.cancel_layout_gestures();
+    assert!(!canvas.panning);
+    assert_eq!(canvas.zoom, PreviewZoom::Double);
+    assert_eq!(canvas.scroll_offset, previous_offset);
+    assert_eq!(canvas.viewport, previous_viewport);
+    frame(
+        &context,
+        &mut canvas,
+        &preview,
+        size,
+        vec![egui::Event::PointerMoved(moved - egui::vec2(10.0, 10.0))],
+    );
+    assert!(!canvas.panning);
+    assert_eq!(canvas.scroll_offset, previous_offset);
+    frame(&context, &mut canvas, &preview, size, button(moved, false));
+    frame(&context, &mut canvas, &preview, size, button(start, true));
+    assert!(canvas.panning);
+    frame(&context, &mut canvas, &preview, size, button(start, false));
+    assert!(!canvas.panning);
+}
+
+fn drawing_frame(
+    context: &egui::Context,
+    state: &mut crate::editor_ui::EditorUiState,
+    preview: &EditorPreview,
+    top: f32,
+    events: Vec<egui::Event>,
+) -> egui::Rect {
+    let mut image = egui::Rect::NOTHING;
+    let _ = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(420.0, 500.0),
+            )),
+            events,
+            focused: true,
+            ..Default::default()
+        },
+        |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                ui.add_space(top);
+                let sense = if state.drawing_overlay.phase
+                    == crate::editor_ui::DrawingDraftPhase::Capturing
+                {
+                    egui::Sense::drag()
+                } else {
+                    egui::Sense::hover()
+                };
+                image = state
+                    .canvas
+                    .show_image(ui, preview, sense, true, |_, response| {
+                        crate::update_drawing_draft_from_preview(
+                            response,
+                            preview.rendered_size,
+                            &mut state.drawing_overlay,
+                        );
+                    })
+                    .unwrap()
+                    .rect;
+            });
+        },
+    );
+    image
+}
+
+#[test]
+fn editor_layout_cancel_discards_only_capturing_stroke_and_preserves_ready_stroke_and_project() {
+    use crate::editor_ui::{DrawingDraftPhase, EditorUiState};
+    let (_directory, workspace) = workspace();
+    let before = workspace.manifest().clone();
+    let selection = workspace.selection().clone();
+    let root = workspace.project_root();
+    let manifest_bytes = std::fs::read(root.join("manifest.json")).unwrap();
+    let journal_bytes = std::fs::read(root.join("journal.ndjson")).unwrap();
+    let context = egui::Context::default();
+    let mut preview = preview(&context);
+    preview.rendered_size = [8, 6];
+    let mut state = EditorUiState::default();
+    state.drawing_overlay.name = "保留绘制名称".to_owned();
+    state
+        .drawing_overlay
+        .begin_for_selection(&workspace)
+        .unwrap();
+    let image = drawing_frame(&context, &mut state, &preview, 0.0, Vec::new());
+    let button = |pos, pressed| {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    };
+    let start = image.min + image.size() * 0.25;
+    let end = image.min + image.size() * 0.75;
+    drawing_frame(&context, &mut state, &preview, 0.0, button(start, true));
+    drawing_frame(
+        &context,
+        &mut state,
+        &preview,
+        0.0,
+        vec![egui::Event::PointerMoved(end)],
+    );
+    assert_eq!(state.drawing_overlay.phase, DrawingDraftPhase::Capturing);
+    assert!(!state.drawing_overlay.points.is_empty());
+    state.cancel_layout_gestures();
+    drawing_frame(
+        &context,
+        &mut state,
+        &preview,
+        36.0,
+        vec![egui::Event::PointerMoved(end + egui::vec2(10.0, 0.0))],
+    );
+    drawing_frame(&context, &mut state, &preview, 36.0, button(end, false));
+    assert_eq!(state.drawing_overlay.phase, DrawingDraftPhase::Idle);
+    assert!(state.drawing_overlay.points.is_empty());
+    assert_eq!(state.drawing_overlay.name, "保留绘制名称");
+    state
+        .drawing_overlay
+        .begin_for_selection(&workspace)
+        .unwrap();
+    let image = drawing_frame(&context, &mut state, &preview, 36.0, Vec::new());
+    let start = image.min + image.size() * 0.25;
+    let end = image.min + image.size() * 0.75;
+    drawing_frame(&context, &mut state, &preview, 36.0, button(start, true));
+    drawing_frame(
+        &context,
+        &mut state,
+        &preview,
+        36.0,
+        vec![egui::Event::PointerMoved(end)],
+    );
+    drawing_frame(&context, &mut state, &preview, 36.0, button(end, false));
+    assert_eq!(state.drawing_overlay.phase, DrawingDraftPhase::Ready);
+    let ready = format!("{:?}", state.drawing_overlay);
+    state.cancel_layout_gestures();
+    drawing_frame(&context, &mut state, &preview, 0.0, Vec::new());
+    assert_eq!(format!("{:?}", state.drawing_overlay), ready);
+    assert_eq!(workspace.manifest(), &before);
+    assert_eq!(workspace.selection(), &selection);
+    assert_eq!(
+        std::fs::read(root.join("manifest.json")).unwrap(),
+        manifest_bytes
+    );
+    assert_eq!(
+        std::fs::read(root.join("journal.ndjson")).unwrap(),
+        journal_bytes
+    );
+}
+
+#[test]
 fn invalid_extents_are_rejected_instead_of_creating_unbounded_geometry() {
     for zoom in [PreviewZoom::Fit, PreviewZoom::Native, PreviewZoom::Double] {
         for scale in [0.0, -1.0, f32::NAN, f32::INFINITY] {

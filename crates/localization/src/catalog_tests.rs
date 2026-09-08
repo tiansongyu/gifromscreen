@@ -13,7 +13,7 @@ fn localizer(tag: &str) -> Localizer {
 
 #[test]
 fn initial_key_ids_are_unique_and_both_catalogs_have_every_declared_message() {
-    assert_eq!(ALL_MESSAGES.len(), 285);
+    assert_eq!(ALL_MESSAGES.len(), 459);
     let ids: BTreeSet<_> = ALL_MESSAGES.iter().map(|message| message.id()).collect();
     assert_eq!(ids.len(), ALL_MESSAGES.len());
     for tag in ["en", "zh"] {
@@ -435,4 +435,188 @@ fn virtual_portal_chooser_labels_have_exact_english_and_explicit_fallback() {
         assert_eq!(fallback.source, CatalogSource::EnglishFallback);
         assert_eq!(fallback.language_tag, "en");
     }
+}
+
+#[test]
+fn catalog_ids_and_parameter_names_remain_machine_readable_not_translated() {
+    for &message in ALL_MESSAGES {
+        assert!(
+            message
+                .id()
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        );
+        for name in message.parameters() {
+            assert!(!name.is_empty());
+            assert!(
+                name.bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            );
+        }
+    }
+}
+
+#[test]
+fn shortcut_descriptions_and_diagnostic_arguments_are_never_key_lookups() {
+    let trigger = "Ctrl+Shift+F7 / 用户 {action}";
+    let error = "org.freedesktop.portal.Error {count}: /home/用户/{error}";
+    for tag in ["en", "zh"] {
+        let localizer = localizer(tag);
+        let action = localizer.text(Message::ShortcutsActionStartPause);
+        assert_eq!(
+            localizer
+                .format(
+                    Message::ShortcutsRegisteredBinding,
+                    &[("trigger", trigger), ("action", action),]
+                )
+                .unwrap(),
+            format!("{action} — {trigger}")
+        );
+        for message in [
+            Message::ShortcutsRegistrationFailed,
+            Message::ShortcutsInvalidBindings,
+            Message::ShortcutsSettingsIoFailed,
+            Message::ShortcutsSettingsUnavailable,
+        ] {
+            assert!(
+                localizer
+                    .format(message, &[("error", error)])
+                    .unwrap()
+                    .contains(error)
+            );
+        }
+        assert_eq!(
+            localizer.format(
+                Message::ShortcutsRegisteredBinding,
+                &[("action", action), ("description", trigger),]
+            ),
+            Err(FormatError::UnknownArgument)
+        );
+    }
+}
+
+#[test]
+fn editor_named_counts_reorder_without_swapping_values_or_touching_ids() {
+    let arguments = [("frames", "3"), ("snapshots", "2")];
+    assert_eq!(
+        localizer("en")
+            .format(Message::EditorClipboardSummary, &arguments)
+            .unwrap(),
+        "Clipboard: 3 frame(s) in 2 snapshot(s)"
+    );
+    assert_eq!(
+        localizer("zh")
+            .format(Message::EditorClipboardSummary, &arguments)
+            .unwrap(),
+        "剪贴板：2 份快照，共 3 帧"
+    );
+    for tag in ["en", "zh"] {
+        let localizer = localizer(tag);
+        let id = "用户-{frames}-42";
+        let duration = "1.234s {id}";
+        let output = localizer
+            .format(
+                Message::EditorClipboardEntry,
+                &[("id", id), ("frames", "3"), ("duration", duration)],
+            )
+            .unwrap();
+        assert!(output.starts_with(&format!("#{id} · ")));
+        assert!(output.ends_with(duration));
+        assert!(localizer.text(Message::EditorTimeRange).ends_with(") ms"));
+        assert_eq!(
+            localizer.format(
+                Message::EditorFilmstripFrame,
+                &[("帧号", "1"), ("duration", "125000"),]
+            ),
+            Err(FormatError::UnknownArgument)
+        );
+        assert!(
+            localizer
+                .format(
+                    Message::EditorFilmstripFrame,
+                    &[("number", "1"), ("duration", "125000"),]
+                )
+                .unwrap()
+                .ends_with("125000 µs")
+        );
+    }
+}
+
+#[test]
+fn recording_notice_identity_can_render_again_without_rewriting_raw_arguments() {
+    let message = Message::RecorderSnapshotCaptured;
+    let arguments = [("sequence", "7"), ("seconds", "0.125")];
+    assert_eq!(
+        localizer("en").format(message, &arguments).unwrap(),
+        "Snapshot captured from native frame 7 at 0.125s."
+    );
+    assert_eq!(
+        localizer("zh").format(message, &arguments).unwrap(),
+        "已从时间为 0.125s 的原生帧 7 采集快照。"
+    );
+    let error = "PermissionDenied {path} {sequence}";
+    let path = "/home/用户/{error}/Recording Paused.gfsproj";
+    let arguments = [("error", error), ("path", path)];
+    let before = arguments;
+    for tag in ["en", "zh"] {
+        let output = localizer(tag)
+            .format(Message::RecorderFailedRecoverable, &arguments)
+            .unwrap();
+        assert!(output.contains(error));
+        assert!(output.ends_with(path));
+        assert_eq!(arguments, before);
+        assert_eq!(
+            localizer(tag).format(Message::RecorderSnapshotRejected, &[("error", error)]),
+            Err(FormatError::UnknownArgument)
+        );
+        assert!(
+            localizer(tag)
+                .format(Message::RecorderSnapshotRejected, &[("reason", error)])
+                .unwrap()
+                .ends_with(error)
+        );
+    }
+}
+
+#[test]
+fn editor_result_receipts_keep_operation_ids_and_literal_errors() {
+    let operation = "SetFrameDuration";
+    let error = "PermissionDenied: /home/用户/{operation}/原始 {error}";
+    let arguments = [("error", error), ("operation", operation)];
+    assert_eq!(
+        localizer("en")
+            .format(Message::EditorOperationFailed, &arguments)
+            .unwrap(),
+        format!("Editor {operation} failed: {error}")
+    );
+    assert_eq!(
+        localizer("zh")
+            .format(Message::EditorOperationFailed, &arguments)
+            .unwrap(),
+        format!("编辑器操作 {operation} 失败：{error}")
+    );
+    for tag in ["en", "zh"] {
+        let localizer = localizer(tag);
+        assert_eq!(
+            localizer.format(Message::EditorOperationFailed, &[("error", error)]),
+            Err(FormatError::MissingArgument("operation"))
+        );
+        assert_eq!(
+            localizer.format(
+                Message::EditorOperationFailed,
+                &[("operation", operation), ("reason", error)]
+            ),
+            Err(FormatError::UnknownArgument)
+        );
+        assert!(Message::EditorUndoCompleted.parameters().is_empty());
+        assert!(Message::EditorRedoCompleted.parameters().is_empty());
+    }
+    assert_eq!(
+        localizer("en").text(Message::EditorUndoCompleted),
+        "Undid the previous edit."
+    );
+    assert_eq!(
+        localizer("en").text(Message::EditorRedoCompleted),
+        "Reapplied the edit."
+    );
 }

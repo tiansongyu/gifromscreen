@@ -2,38 +2,44 @@ use super::{
     LinuxDisplayServer, Settings, ShortcutAction, ShortcutBinding, ShortcutKey, ShortcutStatus,
     ShortcutTool, egui,
 };
+use gif_from_screen_localization::{Localizer, Message};
 
 impl ShortcutTool {
-    pub(crate) fn show(&mut self, ui: &mut egui::Ui, display: Option<LinuxDisplayServer>) {
-        ui.heading("Global recorder shortcuts");
-        ui.weak("Optional recorder controls, not keystroke recording. No shortcut is registered on the launcher or outside recorder scope.");
-        ui.weak("Open/prepare the recorder first; press again to start once the frame/controller is ready.");
+    pub(crate) fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        display: Option<LinuxDisplayServer>,
+        localizer: Localizer,
+    ) {
+        ui.heading(localizer.text(Message::RecorderGlobalShortcuts));
+        ui.weak(localizer.text(Message::ShortcutsHelp));
+        ui.weak(localizer.text(Message::ShortcutsPrepareHint));
         ui.horizontal_wrapped(|ui| {
             if !self.settings.enabled {
-                if action_button(ui, "enable", "Enable shortcuts", true) {
+                if action_button(ui, "enable", localizer.text(Message::ShortcutsEnable), true) {
                     self.notice = self.set_enabled(true).err();
                 }
-            } else if action_button(ui, "disable", "Disable shortcuts", true) {
+            } else if action_button(ui, "disable", localizer.text(Message::ShortcutsDisable), true) {
                 self.notice = self.set_enabled(false).err();
             }
             if matches!(self.status, ShortcutStatus::Registering)
-                && action_button(ui, "cancel", "Cancel registration", true)
+                && action_button(ui, "cancel", localizer.text(Message::ShortcutsCancelRegistration), true)
             {
                 self.notice = self.set_enabled(false).err();
             }
             if self.settings.enabled
                 && (matches!(self.status, ShortcutStatus::Failed(_) | ShortcutStatus::Stopped)
                     || matches!(&self.status, ShortcutStatus::Active(bindings) if bindings.len() < self.settings.bindings.len()))
-                && action_button(ui, "retry", "Retry registration", true)
+                && action_button(ui, "retry", localizer.text(Message::ShortcutsRetryRegistration), true)
             {
                 self.retry();
             }
             let changed = self.draft_bindings != self.settings.bindings;
-            if action_button(ui, "apply", "Apply bindings", changed) {
+            if action_button(ui, "apply", localizer.text(Message::ShortcutsApplyBindings), changed) {
                 self.notice = self.apply_bindings().err();
             }
         });
-        self.show_status(ui, display);
+        self.show_status(ui, display, localizer);
         let before = self.draft_bindings.clone();
         egui::ScrollArea::vertical()
             .id_salt("recorder-shortcut-bindings")
@@ -41,7 +47,9 @@ impl ShortcutTool {
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 for binding in &mut self.draft_bindings {
-                    ui.push_id(binding.action.id(), |ui| binding_controls(ui, binding));
+                    ui.push_id(binding.action.id(), |ui| {
+                        binding_controls(ui, binding, localizer);
+                    });
                 }
             });
         if self.draft_bindings != before {
@@ -51,57 +59,76 @@ impl ShortcutTool {
             enabled: self.settings.enabled,
             bindings: self.draft_bindings.clone(),
         };
-        if let Err(error) = draft.validate() {
-            ui.colored_label(ui.visuals().warn_fg_color, error);
+        if let Err(error) = draft.validate_for_ui() {
+            ui.colored_label(ui.visuals().warn_fg_color, error.render(localizer));
         } else if self.draft_bindings != self.settings.bindings {
-            ui.weak("Edits are not active yet. Apply waits for the previous registration to close before binding the new keys.");
+            ui.weak(localizer.text(Message::ShortcutsEditsPending));
         }
         if let Some(notice) = &self.notice {
-            ui.colored_label(ui.visuals().warn_fg_color, notice);
+            ui.colored_label(ui.visuals().warn_fg_color, notice.render(localizer));
         }
         if let Some(notice) = self.io.notice() {
-            ui.colored_label(ui.visuals().warn_fg_color, notice);
+            ui.colored_label(ui.visuals().warn_fg_color, notice.render(localizer));
         }
-        if self.io.needs_reload() && ui.button("Retry loading shortcut settings").clicked() {
+        if self.io.needs_reload()
+            && action_button(
+                ui,
+                "reload-settings",
+                localizer.text(Message::ShortcutsRetryLoading),
+                true,
+            )
+        {
             self.io.retry_load();
         }
-        ui.weak("If registration is unavailable, denied, conflicting or incomplete, use the recorder's visible buttons and timed stop. Discard has no global shortcut.");
+        ui.weak(localizer.text(Message::ShortcutsButtonsFallback));
     }
 
-    fn show_status(&self, ui: &mut egui::Ui, display: Option<LinuxDisplayServer>) {
+    fn show_status(
+        &self,
+        ui: &mut egui::Ui,
+        display: Option<LinuxDisplayServer>,
+        localizer: Localizer,
+    ) {
         if !self.settings.enabled {
-            ui.label("Shortcuts are disabled.");
+            ui.label(localizer.text(Message::ShortcutsDisabled));
         } else if !self.scope {
-            ui.label("Enabled preference; registration starts only in recorder scope.");
+            ui.label(localizer.text(Message::ShortcutsScopePending));
         } else if display.is_none() {
             ui.colored_label(
                 ui.visuals().warn_fg_color,
-                "No supported Linux display was detected; recorder buttons remain available.",
+                localizer.text(Message::ShortcutsNoDisplay),
             );
         }
         match &self.status {
             ShortcutStatus::Registering => {
-                ui.label("Registering… Complete or cancel the system permission dialog.");
+                ui.label(localizer.text(Message::ShortcutsRegistering));
             }
             ShortcutStatus::Stopping => {
-                ui.label("Stopping the previous registration… Its actions are already ignored. Use recorder buttons meanwhile.");
+                ui.label(localizer.text(Message::ShortcutsStopping));
             }
             ShortcutStatus::Stopped => {
-                ui.weak("No shortcut registration is active.");
+                ui.weak(localizer.text(Message::ShortcutsInactive));
             }
             ShortcutStatus::Failed(error) => {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
-                    format!("Registration failed: {error}"),
+                    crate::format_message(
+                        localizer,
+                        Message::ShortcutsRegistrationFailed,
+                        &[("error", error)],
+                    ),
                 );
             }
             ShortcutStatus::Active(bindings) => {
-                ui.label("Actually registered by the desktop:");
+                ui.label(localizer.text(Message::ShortcutsActuallyRegistered));
                 for binding in bindings {
-                    ui.label(format!(
-                        "{} — {}",
-                        action_label(binding.action),
-                        binding.trigger_description
+                    ui.label(crate::format_message(
+                        localizer,
+                        Message::ShortcutsRegisteredBinding,
+                        &[
+                            ("action", action_label(binding.action, localizer)),
+                            ("trigger", &binding.trigger_description),
+                        ],
                     ));
                 }
                 for requested in &self.settings.bindings {
@@ -111,9 +138,10 @@ impl ShortcutTool {
                     {
                         ui.colored_label(
                             ui.visuals().warn_fg_color,
-                            format!(
-                                "{} was not registered. Use its recorder button.",
-                                action_label(requested.action)
+                            crate::format_message(
+                                localizer,
+                                Message::ShortcutsMissingBinding,
+                                &[("action", action_label(requested.action, localizer))],
                             ),
                         );
                     }
@@ -123,15 +151,15 @@ impl ShortcutTool {
     }
 }
 
-fn action_label(action: ShortcutAction) -> &'static str {
-    match action {
-        ShortcutAction::StartPause => "Start / pause / resume",
-        ShortcutAction::Stop => "Stop and save",
-        ShortcutAction::Snapshot => "Manual snapshot",
-    }
+fn action_label(action: ShortcutAction, localizer: Localizer) -> &'static str {
+    localizer.text(match action {
+        ShortcutAction::StartPause => Message::ShortcutsActionStartPause,
+        ShortcutAction::Stop => Message::RecorderStop,
+        ShortcutAction::Snapshot => Message::ShortcutsActionSnapshot,
+    })
 }
 
-fn action_button(ui: &mut egui::Ui, id: &str, label: &str, enabled: bool) -> bool {
+pub(super) fn action_button(ui: &mut egui::Ui, id: &str, label: &str, enabled: bool) -> bool {
     ui.push_id(id, |ui| ui.add_enabled(enabled, egui::Button::new(label)))
         .inner
         .clicked()
@@ -144,8 +172,8 @@ fn key_label(key: ShortcutKey) -> String {
     }
 }
 
-fn binding_controls(ui: &mut egui::Ui, binding: &mut ShortcutBinding) {
-    ui.label(action_label(binding.action));
+fn binding_controls(ui: &mut egui::Ui, binding: &mut ShortcutBinding, localizer: Localizer) {
+    ui.label(action_label(binding.action, localizer));
     ui.horizontal_wrapped(|ui| {
         egui::ComboBox::from_id_salt("key")
             .width(65.0)

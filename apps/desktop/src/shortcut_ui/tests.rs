@@ -2,12 +2,17 @@ use super::*;
 use gif_from_screen_capture_linux::RegisteredShortcut;
 use std::sync::{Arc, Mutex};
 
+fn localizer(tag: &str) -> Localizer {
+    Localizer::new(gif_from_screen_localization::find_language(tag).unwrap())
+}
+
 struct FakeState {
     running: bool,
     status: ShortcutStatus,
     actions: Vec<ShortcutAction>,
     stops: usize,
     handler: Option<ShortcutActionHandler>,
+    dropped_actions: u64,
 }
 struct Fake(Arc<Mutex<FakeState>>);
 impl Registration for Fake {
@@ -27,7 +32,7 @@ impl Registration for Fake {
         ShortcutUpdate {
             status: state.status.clone(),
             actions: std::mem::take(&mut state.actions),
-            dropped_actions: 0,
+            dropped_actions: std::mem::take(&mut state.dropped_actions),
         }
     }
 }
@@ -55,6 +60,7 @@ fn tool_with_io(io: SettingsIo) -> (ShortcutTool, Arc<Mutex<Starts>>) {
                 actions: Vec::new(),
                 stops: 0,
                 handler: None,
+                dropped_actions: 0,
             }));
             let mut starts = output.lock().unwrap();
             starts.slots.push(Arc::clone(&state));
@@ -181,12 +187,20 @@ fn failure_requires_explicit_retry_and_partial_registration_is_preserved() {
         poll(&mut tool, true);
     }
     assert_eq!(starts.lock().unwrap().slots.len(), 1);
-    assert!(tool.status_summary().unwrap().contains("conflict"));
+    assert!(
+        tool.status_summary(localizer("en"))
+            .unwrap()
+            .contains("conflict")
+    );
     tool.retry();
     poll(&mut tool, true);
     active(&slot(&starts, 1), 2);
     poll(&mut tool, true);
-    assert!(tool.status_summary().unwrap().contains("2/3"));
+    assert!(
+        tool.status_summary(localizer("en"))
+            .unwrap()
+            .contains("2/3")
+    );
     assert!(matches!(&tool.status, ShortcutStatus::Active(bindings) if bindings.len() == 2));
 }
 
@@ -302,6 +316,15 @@ fn draw(
     tool: &mut ShortcutTool,
     events: Vec<egui::Event>,
 ) -> egui::FullOutput {
+    draw_localized(context, tool, events, localizer("en"))
+}
+
+fn draw_localized(
+    context: &egui::Context,
+    tool: &mut ShortcutTool,
+    events: Vec<egui::Event>,
+    localizer: Localizer,
+) -> egui::FullOutput {
     context.run(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -314,15 +337,20 @@ fn draw(
         },
         |context| {
             egui::CentralPanel::default().show(context, |ui| {
-                tool.show(ui, Some(LinuxDisplayServer::X11));
+                tool.show(ui, Some(LinuxDisplayServer::X11), localizer);
             });
         },
     )
 }
 
-fn click(context: &egui::Context, tool: &mut ShortcutTool, position: egui::Pos2) {
+fn click_localized(
+    context: &egui::Context,
+    tool: &mut ShortcutTool,
+    position: egui::Pos2,
+    localizer: Localizer,
+) {
     for pressed in [true, false] {
-        draw(
+        draw_localized(
             context,
             tool,
             vec![
@@ -334,14 +362,25 @@ fn click(context: &egui::Context, tool: &mut ShortcutTool, position: egui::Pos2)
                     modifiers: egui::Modifiers::NONE,
                 },
             ],
+            localizer,
         );
     }
 }
 
 #[test]
 fn small_window_large_fonts_keep_enable_cancel_disable_and_retry_clickable() {
+    exercise_registration_buttons(localizer("en"));
+}
+
+#[test]
+fn chinese_real_fonts_keep_enable_cancel_disable_and_retry_clickable() {
+    exercise_registration_buttons(localizer("zh"));
+}
+
+fn exercise_registration_buttons(localizer: Localizer) {
     for scale in [1.0, 1.5, 2.0] {
         let context = egui::Context::default();
+        crate::preferences::fonts::install(&context);
         context.style_mut(|style| {
             style.animation_time = 0.0;
             for font in style.text_styles.values_mut() {
@@ -349,16 +388,20 @@ fn small_window_large_fonts_keep_enable_cancel_disable_and_retry_clickable() {
             }
         });
         let (mut tool, starts) = tool();
-        let output = draw(&context, &mut tool, Vec::new());
-        let enable = visible_text(&output, "Enable shortcuts").expect("enable must be visible");
-        click(&context, &mut tool, enable.center());
+        let output = draw_localized(&context, &mut tool, Vec::new(), localizer);
+        let enable = visible_text(&output, localizer.text(Message::ShortcutsEnable))
+            .expect("enable must be visible");
+        click_localized(&context, &mut tool, enable.center(), localizer);
         assert!(tool.settings.enabled);
         tool.poll(&context, Some(LinuxDisplayServer::X11), true);
-        let output = draw(&context, &mut tool, Vec::new());
-        let cancel =
-            visible_text(&output, "Cancel registration").expect("cancel must stay visible");
-        assert!(visible_text(&output, "Disable shortcuts").is_some());
-        click(&context, &mut tool, cancel.center());
+        let output = draw_localized(&context, &mut tool, Vec::new(), localizer);
+        let cancel = visible_text(
+            &output,
+            localizer.text(Message::ShortcutsCancelRegistration),
+        )
+        .expect("cancel must stay visible");
+        assert!(visible_text(&output, localizer.text(Message::ShortcutsDisable)).is_some());
+        click_localized(&context, &mut tool, cancel.center(), localizer);
         assert!(!tool.settings.enabled);
         assert_eq!(slot(&starts, 0).lock().unwrap().stops, 1);
         terminal(&slot(&starts, 0));
@@ -372,12 +415,189 @@ fn small_window_large_fonts_keep_enable_cancel_disable_and_retry_clickable() {
             state.running = false;
         }
         poll(&mut tool, true);
-        let output = draw(&context, &mut tool, Vec::new());
-        let retry = visible_text(&output, "Retry registration").expect("retry must stay visible");
-        click(&context, &mut tool, retry.center());
+        let output = draw_localized(&context, &mut tool, Vec::new(), localizer);
+        let retry = visible_text(&output, localizer.text(Message::ShortcutsRetryRegistration))
+            .expect("retry must stay visible");
+        click_localized(&context, &mut tool, retry.center(), localizer);
         poll(&mut tool, true);
         assert_eq!(starts.lock().unwrap().slots.len(), 3);
     }
+}
+
+#[test]
+fn live_registration_and_existing_notices_translate_without_rewriting_os_tokens() {
+    let (mut tool, starts) = tool();
+    let context = egui::Context::default();
+    crate::preferences::fonts::install(&context);
+    tool.set_enabled(true).unwrap();
+    poll(&mut tool, true);
+    let requested = tool.settings.bindings.clone();
+    let raw = "Ctrl+Shift+F7 / 系统 {action}";
+    let bindings = vec![RegisteredShortcut {
+        action: ShortcutAction::StartPause,
+        trigger_description: raw.into(),
+    }];
+    slot(&starts, 0).lock().unwrap().status = ShortcutStatus::Active(bindings.clone());
+    slot(&starts, 0).lock().unwrap().dropped_actions = 9;
+    poll(&mut tool, true);
+    for language in [localizer("en"), localizer("zh"), localizer("en")] {
+        assert_eq!(
+            tool.status_summary(language).unwrap(),
+            language
+                .format(Message::ShortcutsSummaryRegistered, &[("count", "1")])
+                .unwrap()
+        );
+        assert_eq!(
+            tool.notice.as_ref().unwrap().render(language),
+            language
+                .format(Message::ShortcutsQueueOverflow, &[("count", "9")])
+                .unwrap()
+        );
+        let output = draw_localized(&context, &mut tool, Vec::new(), language);
+        assert!(
+            visible_text(&output, language.text(Message::ShortcutsActuallyRegistered)).is_some()
+        );
+        let actual = language
+            .format(
+                Message::ShortcutsRegisteredBinding,
+                &[
+                    ("action", language.text(Message::ShortcutsActionStartPause)),
+                    ("trigger", raw),
+                ],
+            )
+            .unwrap();
+        assert!(visible_text(&output, &actual).is_some());
+        let missing = language
+            .format(
+                Message::ShortcutsMissingBinding,
+                &[("action", language.text(Message::RecorderStop))],
+            )
+            .unwrap();
+        assert!(visible_text(&output, &missing).is_some());
+        assert_eq!(tool.settings.bindings, requested);
+        assert_eq!(tool.draft_bindings, requested);
+        assert!(matches!(&tool.status, ShortcutStatus::Active(actual) if actual == &bindings));
+    }
+    assert_eq!(starts.lock().unwrap().slots.len(), 1);
+    assert_eq!(slot(&starts, 0).lock().unwrap().stops, 0);
+}
+
+#[test]
+fn failed_and_inactive_summaries_translate_but_leave_diagnostics_literal() {
+    let (mut tool, _) = tool();
+    assert!(tool.status_summary(localizer("zh")).is_none());
+    tool.settings.enabled = true;
+    for (status, message) in [
+        (
+            ShortcutStatus::Registering,
+            Message::ShortcutsSummaryPending,
+        ),
+        (ShortcutStatus::Stopping, Message::ShortcutsSummaryStopping),
+        (ShortcutStatus::Stopped, Message::ShortcutsSummaryInactive),
+    ] {
+        tool.status = status;
+        for language in [localizer("en"), localizer("zh")] {
+            assert_eq!(
+                tool.status_summary(language).unwrap(),
+                language.text(message)
+            );
+        }
+    }
+    let raw = "Denied Ctrl+Shift+F7: /tmp/快捷键/{error}";
+    tool.status = ShortcutStatus::Failed(raw.into());
+    assert_eq!(
+        tool.status_summary(localizer("zh")).unwrap(),
+        localizer("zh")
+            .format(Message::ShortcutsSummaryFailed, &[("error", raw)])
+            .unwrap()
+    );
+}
+
+#[test]
+fn invalid_drafts_have_typed_warnings_but_disabling_still_uses_valid_applied_bindings() {
+    let (mut tool, starts) = tool();
+    tool.set_enabled(true).unwrap();
+    poll(&mut tool, true);
+    let applied = tool.settings.bindings.clone();
+    tool.draft_bindings[0].trigger = ShortcutTrigger {
+        key: ShortcutKey::Character('A'),
+        control: false,
+        shift: true,
+        alt: false,
+        super_key: false,
+    };
+    let error = tool.apply_bindings().unwrap_err();
+    assert_eq!(error.message_id(), Some(Message::ShortcutsInvalidTrigger));
+    assert_eq!(
+        error.render(localizer("zh")),
+        localizer("zh").text(Message::ShortcutsInvalidTrigger)
+    );
+    assert_eq!(tool.settings.bindings, applied);
+    assert_eq!(slot(&starts, 0).lock().unwrap().stops, 0);
+    tool.draft_bindings = applied.clone();
+    tool.draft_bindings[1].trigger = tool.draft_bindings[0].trigger;
+    let error = tool.apply_bindings().unwrap_err();
+    assert_eq!(error.message_id(), Some(Message::ShortcutsUniqueBindings));
+    tool.set_enabled(false).unwrap();
+    assert!(!tool.settings.enabled);
+    assert_eq!(tool.settings.bindings, applied);
+    assert_eq!(slot(&starts, 0).lock().unwrap().stops, 1);
+    tool.draft_bindings.pop();
+    assert_eq!(
+        tool.apply_bindings().unwrap_err().message_id(),
+        Some(Message::ShortcutsConfigureAll)
+    );
+}
+
+#[test]
+fn localized_action_buttons_keep_semantic_ids_when_caption_or_state_changes_during_press() {
+    let context = egui::Context::default();
+    crate::preferences::fonts::install(&context);
+    let frame = |message, id, events| {
+        let mut clicked = false;
+        let output = context.run(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    clicked = view::action_button(ui, id, message, true);
+                });
+            },
+        );
+        (output, clicked)
+    };
+    let press = localizer("en").text(Message::ShortcutsCancelRegistration);
+    let release = localizer("zh").text(Message::ShortcutsRetryRegistration);
+    let first = frame(press, "cancel", Vec::new()).0;
+    let position = visible_text(&first, press).unwrap().left_center() + egui::vec2(2.0, 0.0);
+    let event = |pressed| {
+        vec![
+            egui::Event::PointerMoved(position),
+            egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    };
+    frame(press, "cancel", event(true));
+    let (output, clicked) = frame(release, "retry", event(false));
+    assert!(
+        visible_text(&output, release).unwrap().contains(position),
+        "release really hits the replacement button"
+    );
+    assert!(!clicked, "old Cancel press cannot become translated Retry");
+    frame(press, "cancel", Vec::new());
+    frame(press, "cancel", event(true));
+    let same_action = localizer("zh").text(Message::ShortcutsCancelRegistration);
+    let (_, clicked) = frame(same_action, "cancel", event(false));
+    assert!(
+        clicked,
+        "changing only the language retains the same action ID"
+    );
 }
 
 #[test]

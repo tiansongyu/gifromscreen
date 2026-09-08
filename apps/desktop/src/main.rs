@@ -42,6 +42,7 @@ mod shortcut_ui;
 mod static_sequence_ui;
 mod text_overlay_ui;
 mod thumbnail_cache;
+mod ui_notice;
 mod video_import_ui;
 mod watermark_decode_job;
 mod watermark_ui;
@@ -55,6 +56,7 @@ mod x11_controller_ui;
 mod x11_controller_window;
 mod x11_recorder;
 use gif_from_screen_localization::{Localizer, Message};
+use ui_notice::Notice;
 use x11_recorder::RecorderOverlay;
 
 use std::{
@@ -561,22 +563,20 @@ impl RecordingRetarget {
         }
     }
 
-    fn poll(&mut self, controller: &RecordingController, allow_next: bool) -> Option<String> {
+    fn poll(&mut self, controller: &RecordingController, allow_next: bool) -> Option<Notice> {
         let status = self.pending.as_mut()?.status();
         let (completion, notice) = match status {
             TargetUpdateStatus::Applied => (RetargetCompletion::Applied, None),
             TargetUpdateStatus::Rejected(error) => (
                 RetargetCompletion::Rejected,
-                Some(format!(
-                    "Could not move the capture area; recording continues at its last accepted position: {error}"
+                Some(Notice::new(
+                    Message::RecorderRetargetRejected,
+                    &[("error", &error.to_string())],
                 )),
             ),
             TargetUpdateStatus::WorkerExited => (
                 RetargetCompletion::WorkerExited,
-                Some(
-                    "Could not move the capture area because the recording worker has exited."
-                        .to_owned(),
-                ),
+                Some(Message::RecorderRetargetWorkerExited.into()),
             ),
             // Pending and future non-terminal states remain in flight.
             _ => return None,
@@ -645,7 +645,7 @@ impl RecordingJob {
         }
     }
 
-    fn poll_retarget(&mut self, allow_next: bool) -> Option<String> {
+    fn poll_retarget(&mut self, allow_next: bool) -> Option<Notice> {
         self.retarget
             .as_mut()?
             .poll(&self.controller, allow_next && !self.terminal_requested)
@@ -665,7 +665,7 @@ impl RecordingJob {
         }
     }
 
-    fn poll_snapshots(&mut self) -> Option<String> {
+    fn poll_snapshots(&mut self) -> Option<Notice> {
         let request_count = self.snapshot_requests.len();
         let mut notice = None;
         for _ in 0..request_count {
@@ -675,19 +675,29 @@ impl RecordingJob {
             match request.status() {
                 SnapshotTriggerStatus::Pending => self.snapshot_requests.push_back(request),
                 SnapshotTriggerStatus::Captured(receipt) => {
-                    notice = Some(format!(
-                        "Snapshot captured from native frame {} at {:.3}s.",
-                        receipt.sequence(),
-                        Duration::from_micros(receipt.captured_at().as_micros()).as_secs_f64()
+                    notice = Some(Notice::new(
+                        Message::RecorderSnapshotCaptured,
+                        &[
+                            ("sequence", &receipt.sequence().to_string()),
+                            (
+                                "seconds",
+                                &format!(
+                                    "{:.3}",
+                                    Duration::from_micros(receipt.captured_at().as_micros())
+                                        .as_secs_f64()
+                                ),
+                            ),
+                        ],
                     ));
                 }
                 SnapshotTriggerStatus::Rejected(reason) => {
-                    notice = Some(format!("Snapshot was not captured: {reason}"));
+                    notice = Some(Notice::new(
+                        Message::RecorderSnapshotRejected,
+                        &[("reason", &reason.to_string())],
+                    ));
                 }
                 SnapshotTriggerStatus::WorkerExited => {
-                    notice = Some(
-                        "Snapshot was not captured because the recording worker exited.".to_owned(),
-                    );
+                    notice = Some(Message::RecorderSnapshotWorkerExited.into());
                 }
                 _ => {
                     self.snapshot_requests.push_back(request);
@@ -792,12 +802,12 @@ struct RecorderOverlayFrame {
 
 struct GifFromScreenApp {
     language_settings: preferences::LanguageSettings,
-    recorder_ui_language: &'static str,
+    ui_language: &'static str,
     x11_window_id: Option<u32>,
     pending_recorder_start: Option<Instant>,
     shortcut_tool: shortcut_ui::ShortcutTool,
     view: AppView,
-    notice: Option<String>,
+    notice: Option<Notice>,
     settings: RecordingSettings,
     sources: Vec<CaptureSource>,
     selected_source: usize,
@@ -854,7 +864,7 @@ impl Default for GifFromScreenApp {
     fn default() -> Self {
         Self {
             language_settings: preferences::LanguageSettings::default(),
-            recorder_ui_language: "en",
+            ui_language: "en",
             pending_recorder_start: None,
             x11_window_id: None,
             shortcut_tool: shortcut_ui::ShortcutTool::default(),
@@ -937,8 +947,7 @@ impl eframe::App for GifFromScreenApp {
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
         self.receive_background_messages(context);
-        self.language_settings.poll(context);
-        self.sync_recorder_language(self.language_settings.localizer());
+        self.poll_language_settings(context);
         if !closing_controller {
             self.handle_worker_shutdown(context);
         }
@@ -1038,12 +1047,25 @@ impl eframe::App for GifFromScreenApp {
 }
 
 impl GifFromScreenApp {
-    fn sync_recorder_language(&mut self, localizer: Localizer) {
-        let language = localizer.resolve(Message::RecorderStart).language_tag;
-        if self.recorder_ui_language == language {
+    fn poll_language_settings(&mut self, context: &egui::Context) {
+        self.language_settings.poll(context);
+        if let Some(notice) = &mut self.notice {
+            notice.refresh(self.language_settings.localizer());
+        }
+        self.sync_ui_language(self.language_settings.localizer());
+    }
+
+    fn sync_ui_language(&mut self, localizer: Localizer) {
+        let language = if localizer.coverage().translated == 0 {
+            "en"
+        } else {
+            localizer.requested_language().tag
+        };
+        if self.ui_language == language {
             return;
         }
-        self.recorder_ui_language = language;
+        self.ui_language = language;
+        self.editor_ui_state.cancel_layout_gestures();
         // A translation can change the preview's position within the window.
         // Discard only unfinished screen-space gestures, not confirmed source
         // rectangles or capture settings. Native X11 guide geometry is separate.
@@ -1097,10 +1119,15 @@ impl GifFromScreenApp {
                 }
                 if update.timed_out {
                     let warning = "The compositor did not confirm the requested window size or maximized state. Adjust or restore it manually; the app remains usable.";
-                    self.notice = Some(self.notice.take().map_or_else(
-                        || warning.to_owned(),
-                        |notice| format!("{notice} {warning}"),
-                    ));
+                    self.notice = Some(
+                        self.notice
+                            .take()
+                            .map_or_else(
+                                || warning.to_owned(),
+                                |notice| format!("{notice} {warning}"),
+                            )
+                            .into(),
+                    );
                 }
                 if update.finished {
                     *pending = None;
@@ -1202,15 +1229,15 @@ impl GifFromScreenApp {
         self.receive_watermark_messages();
         self.receive_text_messages();
         if let Some(notice) = self.project_insert.poll(self.editor_workspace.as_mut()) {
-            self.notice = Some(notice);
+            self.notice = Some(notice.into());
         }
         if let Some(result) = self.video_import.poll() {
             self.notice = Some(match result {
                 Ok(project) => match self.activate_blank_project(project) {
-                    Ok(_) => "Video imported into an editable project. Choose frames, add annotations, or export a GIF.".to_owned(),
-                    Err(error) => format!("Video imported, but could not open the editor: {error}"),
+                    Ok(_) => "Video imported into an editable project. Choose frames, add annotations, or export a GIF.".to_owned().into(),
+                    Err(error) => format!("Video imported, but could not open the editor: {error}").into(),
                 },
-                Err(error) => error,
+                Err(error) => error.into(),
             });
         }
         if let Some(result) = self.camera_recorder.poll() {
@@ -1220,16 +1247,16 @@ impl GifFromScreenApp {
             self.activate_live_result(result, "Board");
         }
         if let Some(notice) = self.project_library.poll() {
-            self.notice = Some(notice);
+            self.notice = Some(notice.into());
         }
         if let Some(notice) = self.motion_tools.poll(&mut self.editor_workspace) {
-            self.notice = Some(notice);
+            self.notice = Some(notice.into());
         }
         if let Some(notice) = self.annotation_tools.poll(&mut self.editor_workspace) {
-            self.notice = Some(notice);
+            self.notice = Some(notice.into());
         }
         if let Some(notice) = self.auto_tasks.poll(&mut self.editor_workspace) {
-            self.notice = Some(notice);
+            self.notice = Some(notice.into());
         }
         self.remember_active_project();
     }
@@ -1251,12 +1278,15 @@ impl GifFromScreenApp {
     fn activate_live_result(&mut self, result: Result<ActiveProject, String>, source: &str) {
         self.notice = Some(match result {
             Ok(project) => match self.activate_blank_project(project) {
-                Ok(_) => format!("{source} recording saved. Edit its frames or export a GIF."),
+                Ok(_) => {
+                    format!("{source} recording saved. Edit its frames or export a GIF.").into()
+                }
                 Err(error) => {
                     format!("{source} recording saved but could not open the editor: {error}")
+                        .into()
                 }
             },
-            Err(error) => error,
+            Err(error) => error.into(),
         });
     }
 
@@ -1315,13 +1345,13 @@ impl GifFromScreenApp {
         if let Some(reason) = file_drop_block_reason(self.file_drop_activity()) {
             self.notice = Some(format!(
                 "Cannot accept dropped files while {reason}. Finish the active operation and try again."
-            ));
+            ).into());
             return;
         }
         let route = match prepare_file_drop_route(dropped_paths) {
             Ok(route) => route,
             Err(error) => {
-                self.notice = Some(error);
+                self.notice = Some(error.into());
                 return;
             }
         };
@@ -1329,7 +1359,7 @@ impl GifFromScreenApp {
             self.editor_ui_state.pause_preview();
         }
         if let Err(error) = self.start_file_drop_route(route) {
-            self.notice = Some(format!("Could not start dropped-file operation: {error}"));
+            self.notice = Some(format!("Could not start dropped-file operation: {error}").into());
         }
     }
 
@@ -1403,7 +1433,7 @@ impl GifFromScreenApp {
                 self.view = AppView::ImportImageSequence;
                 self.notice = Some(
                     "Image sequence loaded in dropped-file order. Review timing, loop, and target, then start the bounded import."
-                        .to_owned(),
+                        .to_owned().into(),
                 );
                 Ok(())
             }
@@ -1418,24 +1448,24 @@ impl GifFromScreenApp {
                 self.open_project_path = path.to_string_lossy().into_owned();
                 self.open_project_take_over_lock = false;
                 if let Err(error) = self.start_open_project() {
-                    self.notice = Some(format!("Could not open startup project: {error}"));
+                    self.notice = Some(format!("Could not open startup project: {error}").into());
                 }
             }
             StartupIntent::ImportGif(path) => {
                 self.view = AppView::ImportGif;
                 self.import_gif_path = path.to_string_lossy().into_owned();
                 if let Err(error) = self.start_import_gif() {
-                    self.notice = Some(format!("Could not import startup GIF: {error}"));
+                    self.notice = Some(format!("Could not import startup GIF: {error}").into());
                 }
             }
             StartupIntent::ImportImage(path) => {
                 self.view = AppView::ImportImage;
                 self.import_image_path = path.to_string_lossy().into_owned();
                 if let Err(error) = self.start_import_image() {
-                    self.notice = Some(format!("Could not import startup image: {error}"));
+                    self.notice = Some(format!("Could not import startup image: {error}").into());
                 }
             }
-            StartupIntent::Invalid(message) => self.notice = Some(message),
+            StartupIntent::Invalid(message) => self.notice = Some(message.into()),
             StartupIntent::ImportVideo(path) => {
                 self.view = AppView::ImportVideo;
                 self.video_import.input = path.to_string_lossy().into_owned();
@@ -1491,7 +1521,7 @@ impl GifFromScreenApp {
                     self.view = AppView::ImportGif;
                     self.notice = Some(
                         "GIF import uses strict 10,000-frame, 16K-canvas, and 512 MiB limits. Import cannot currently be cancelled once started."
-                            .to_owned(),
+                            .to_owned().into(),
                     );
                 }
                 if landing_action(
@@ -1503,7 +1533,7 @@ impl GifFromScreenApp {
                     self.view = AppView::ImportImage;
                     self.notice = Some(
                         "Static image import uses strict 16K and 512 MiB limits with a 100 ms frame. Import cannot currently be cancelled once started."
-                            .to_owned(),
+                            .to_owned().into(),
                     );
                 }
             });
@@ -1520,7 +1550,7 @@ impl GifFromScreenApp {
                     self.view = AppView::NewBlankAnimation;
                     self.notice = Some(
                         "Choose the canvas, background, first-frame duration, and a new project path."
-                            .to_owned(),
+                            .to_owned().into(),
                     );
                 }
                 if landing_action(
@@ -1532,7 +1562,7 @@ impl GifFromScreenApp {
                     self.view = AppView::ImportImageSequence;
                     self.notice = Some(
                         "Add at least two same-sized images or drop them together. Their order can be adjusted before import."
-                            .to_owned(),
+                            .to_owned().into(),
                     );
                 }
             });
@@ -1596,7 +1626,7 @@ impl GifFromScreenApp {
         self.open_project_path = path.to_string_lossy().into_owned();
         self.open_project_take_over_lock = false;
         if let Err(error) = self.start_open_project() {
-            self.notice = Some(error);
+            self.notice = Some(error.into());
         }
     }
 
@@ -1655,7 +1685,7 @@ impl GifFromScreenApp {
                     self.open_picker
                         .show(ui, &mut self.open_project_path, PathKind::Project)
                 {
-                    self.notice = Some(notice);
+                    self.notice = Some(notice.into());
                 }
             });
         });
@@ -1688,7 +1718,7 @@ impl GifFromScreenApp {
                 .clicked()
                 && let Err(error) = self.start_open_project()
             {
-                self.notice = Some(format!("Could not start opening project: {error}"));
+                self.notice = Some(format!("Could not start opening project: {error}").into());
             }
             if ui
                 .add_enabled(
@@ -1729,9 +1759,11 @@ impl GifFromScreenApp {
             )
             .map_err(|error| error.to_string())?;
         self.notice = Some(if self.open_project_take_over_lock {
-            "Opening project with explicit stale-lock takeover…".to_owned()
+            "Opening project with explicit stale-lock takeover…"
+                .to_owned()
+                .into()
         } else {
-            "Opening project in the background…".to_owned()
+            "Opening project in the background…".to_owned().into()
         });
         Ok(())
     }
@@ -1759,7 +1791,7 @@ impl GifFromScreenApp {
                     self.gif_picker
                         .show(ui, &mut self.import_gif_path, PathKind::Gif)
                 {
-                    self.notice = Some(notice);
+                    self.notice = Some(notice.into());
                 }
             });
         });
@@ -1770,7 +1802,7 @@ impl GifFromScreenApp {
                 .clicked()
                 && let Err(error) = self.start_import_gif()
             {
-                self.notice = Some(format!("Could not start GIF import: {error}"));
+                self.notice = Some(format!("Could not start GIF import: {error}").into());
             }
             if ui
                 .add_enabled(
@@ -1809,7 +1841,7 @@ impl GifFromScreenApp {
             .map_err(|error| error.to_string())?;
         self.notice = Some(
             "Importing GIF in the background. The bounded decode/persist operation cannot be cancelled."
-                .to_owned(),
+                .to_owned().into(),
         );
         Ok(())
     }
@@ -1837,7 +1869,7 @@ impl GifFromScreenApp {
                     self.image_picker
                         .show(ui, &mut self.import_image_path, PathKind::Image)
                 {
-                    self.notice = Some(notice);
+                    self.notice = Some(notice.into());
                 }
             });
         });
@@ -1848,7 +1880,7 @@ impl GifFromScreenApp {
                 .clicked()
                 && let Err(error) = self.start_import_image()
             {
-                self.notice = Some(format!("Could not start image import: {error}"));
+                self.notice = Some(format!("Could not start image import: {error}").into());
             }
             if ui
                 .add_enabled(
@@ -1887,7 +1919,7 @@ impl GifFromScreenApp {
             .map_err(|error| error.to_string())?;
         self.notice = Some(
             "Importing static image in the background. The bounded decode/persist operation cannot be cancelled."
-                .to_owned(),
+                .to_owned().into(),
         );
         Ok(())
     }
@@ -1898,11 +1930,12 @@ impl GifFromScreenApp {
             StaticSequenceUiAction::None => {}
             StaticSequenceUiAction::Start => {
                 if let Err(error) = self.start_import_sequence() {
-                    self.notice = Some(format!("Could not start image-sequence import: {error}"));
+                    self.notice =
+                        Some(format!("Could not start image-sequence import: {error}").into());
                 }
             }
             StaticSequenceUiAction::Back => self.view = AppView::Landing,
-            StaticSequenceUiAction::Notice(message) => self.notice = Some(message),
+            StaticSequenceUiAction::Notice(message) => self.notice = Some(message.into()),
         }
         if let Some(notice) = &self.notice {
             ui.add_space(12.0);
@@ -1918,7 +1951,7 @@ impl GifFromScreenApp {
             .map_err(|error| error.to_string())?;
         self.notice = Some(format!(
             "Importing {frame_count} ordered images in the background. This bounded operation cannot be cancelled."
-        ));
+        ).into());
         Ok(())
     }
 
@@ -1928,7 +1961,8 @@ impl GifFromScreenApp {
             BlankProjectUiAction::None => {}
             BlankProjectUiAction::Start => {
                 if let Err(error) = self.start_blank_project() {
-                    self.notice = Some(format!("Could not start blank project creation: {error}"));
+                    self.notice =
+                        Some(format!("Could not start blank project creation: {error}").into());
                 }
             }
             BlankProjectUiAction::Back => self.view = AppView::Landing,
@@ -1946,7 +1980,7 @@ impl GifFromScreenApp {
             .map_err(|error| error.to_string())?;
         self.notice = Some(
             "Creating the bounded blank animation in the background. This operation cannot be cancelled."
-                .to_owned(),
+                .to_owned().into(),
         );
         Ok(())
     }
@@ -1977,10 +2011,10 @@ impl GifFromScreenApp {
                 .clicked()
                 && let Err(error) = self.open_recorder_overlay(ui.ctx())
             {
-                self.notice = Some(error);
+                self.notice = Some(error.into());
             }
         });
-        if let Some(summary) = self.shortcut_tool.status_summary() {
+        if let Some(summary) = self.shortcut_tool.status_summary(localizer) {
             ui.add(egui::Label::new(&summary).truncate())
                 .on_hover_text(summary);
         }
@@ -2004,7 +2038,9 @@ impl GifFromScreenApp {
         ui.separator();
         egui::CollapsingHeader::new(localizer.text(Message::RecorderGlobalShortcuts))
             .id_salt("global-recorder-shortcuts")
-            .show(ui, |ui| self.shortcut_tool.show(ui, self.display_server));
+            .show(ui, |ui| {
+                self.shortcut_tool.show(ui, self.display_server, localizer);
+            });
         if let Some(progress) = self.progress {
             ui.add_space(12.0);
             ui.label(format_message(
@@ -2066,7 +2102,7 @@ impl GifFromScreenApp {
                         .annotation_tools
                         .queue_binding_confirmation(workspace, declare_common_clock)
                 {
-                    self.notice = Some(error);
+                    self.notice = Some(error.into());
                 }
             },
         );
@@ -2092,12 +2128,12 @@ impl GifFromScreenApp {
             EditorExportAction::None => {}
             EditorExportAction::Start => {
                 if let Err(error) = self.start_editor_export() {
-                    self.notice = Some(error);
+                    self.notice = Some(error.into());
                 }
             }
             EditorExportAction::Cancel => {
                 if self.export_job.cancel() {
-                    self.notice = Some("Cancelling GIF export…".to_owned());
+                    self.notice = Some("Cancelling GIF export…".to_owned().into());
                 }
             }
         }
@@ -2121,6 +2157,7 @@ impl GifFromScreenApp {
     }
 
     fn show_editor_work_area(&mut self, ui: &mut egui::Ui) {
+        let localizer = self.language_settings.localizer();
         let cine_input_enabled = !self.source_workers_active()
             && !self.text_overlay.is_running()
             && self.watermark_job.state() == WatermarkDecodeJobState::Idle
@@ -2137,7 +2174,7 @@ impl GifFromScreenApp {
         let watermark_running = self.watermark_job.state() == WatermarkDecodeJobState::Running;
         let mut results = ui
             .add_enabled_ui(!watermark_running, |ui| {
-                show_editor_chrome(ui, workspace, &mut self.editor_ui_state)
+                show_editor_chrome(ui, workspace, &mut self.editor_ui_state, localizer)
             })
             .inner;
         let mut watermark_action = WatermarkUiAction::None;
@@ -2150,10 +2187,11 @@ impl GifFromScreenApp {
                     &mut self.text_overlay,
                     &mut self.watermark_ui,
                     self.watermark_job.state(),
+                    localizer,
                 );
                 results.extend(tool_results);
                 if notice.is_some() {
-                    self.notice = notice;
+                    self.notice = notice.map(Notice::from);
                 }
                 watermark_action = action;
             };
@@ -2188,14 +2226,18 @@ impl GifFromScreenApp {
                     .queue_track_conversion(workspace, *track_id)
                 {
                     Ok(()) => {
-                        self.notice =
-                            Some("Converting the complete layer to frame ownership…".to_owned());
+                        self.notice = Some(
+                            "Converting the complete layer to frame ownership…"
+                                .to_owned()
+                                .into(),
+                        );
                     }
-                    Err(error) => self.notice = Some(error),
+                    Err(error) => self.notice = Some(error.into()),
                 }
                 continue;
             }
-            if let Some(notice) = editor_result_notice(result) {
+            if let Some(mut notice) = editor_result_notice(result) {
+                notice.refresh(localizer);
                 self.notice = Some(notice);
             }
         }
@@ -2203,9 +2245,11 @@ impl GifFromScreenApp {
             match PendingWatermark::start(&self.watermark_ui, workspace, &mut self.watermark_job) {
                 Ok(pending) => {
                     self.pending_watermark = Some(pending);
-                    self.notice = Some("Decoding watermark in the background…".to_owned());
+                    self.notice = Some("Decoding watermark in the background…".to_owned().into());
                 }
-                Err(error) => self.notice = Some(format!("Could not decode watermark: {error}")),
+                Err(error) => {
+                    self.notice = Some(format!("Could not decode watermark: {error}").into());
+                }
             }
         }
     }
@@ -2306,7 +2350,7 @@ impl GifFromScreenApp {
                 .clicked()
                 && let Err(error) = self.begin_region_picker(ui.ctx())
             {
-                self.notice = Some(error);
+                self.notice = Some(error.into());
             }
         }
         self.show_recording_source_description(ui, localizer);
@@ -2462,7 +2506,11 @@ impl GifFromScreenApp {
             self.settings.region_y = selection.origin().y;
             self.settings.region_width = selection.size().width();
             self.settings.region_height = selection.size().height();
-            self.notice = Some(localizer.text(Message::RecorderRegionUpdated).into());
+            self.notice = Some(Notice::localized(
+                localizer,
+                Message::RecorderRegionUpdated,
+                &[],
+            ));
             self.region_picker = None;
         } else if cancel {
             self.region_picker = None;
@@ -2498,6 +2546,18 @@ impl GifFromScreenApp {
         }
     }
 
+    fn recorder_notice_text(&self, stage: RecorderStage, localizer: Localizer) -> Option<String> {
+        let notice = self.notice.as_ref()?;
+        if matches!(stage, RecorderStage::Countdown(_))
+            && notice.message_id() == Some(Message::RecorderCountdownNotice)
+        {
+            // The live countdown already displays the remaining time. Do not
+            // repeat its initial duration as though it were still remaining.
+            return None;
+        }
+        Some(notice.render(localizer))
+    }
+
     fn handle_recorder_overlay_action(
         &mut self,
         context: &egui::Context,
@@ -2514,7 +2574,7 @@ impl GifFromScreenApp {
                     self.recorder_stage()
                 ));
                 if let Err(error) = result {
-                    self.notice = Some(error);
+                    self.notice = Some(error.into());
                 }
             }
             RecorderOverlayAction::CancelCountdown => {
@@ -2522,32 +2582,28 @@ impl GifFromScreenApp {
                     overlay.cancel_start(context);
                 }
                 if self.recording_countdown.cancel() {
-                    self.notice = Some(localizer.text(Message::RecorderCountdownCancelled).into());
+                    self.notice = Some(Notice::localized(
+                        localizer,
+                        Message::RecorderCountdownCancelled,
+                        &[],
+                    ));
                     context.request_repaint();
                 }
             }
             RecorderOverlayAction::Pause => {
-                if let Some(job) = &mut self.job
-                    && job.request_pause(true)
-                {
-                    self.notice = Some(localizer.text(Message::RecorderPauseRequested).to_owned());
-                }
+                self.request_recording_pause(true);
             }
             RecorderOverlayAction::Resume => {
-                if let Some(job) = &mut self.job
-                    && job.request_pause(false)
-                {
-                    self.notice = Some(localizer.text(Message::RecorderResumeRequested).to_owned());
-                }
+                self.request_recording_pause(false);
             }
             RecorderOverlayAction::Snapshot => {
                 if let Some(job) = &mut self.job {
                     job.trigger_snapshot();
-                    self.notice = Some(
-                        localizer
-                            .text(Message::RecorderSnapshotRequested)
-                            .to_owned(),
-                    );
+                    self.notice = Some(Notice::localized(
+                        localizer,
+                        Message::RecorderSnapshotRequested,
+                        &[],
+                    ));
                     context.request_repaint();
                 }
             }
@@ -2555,7 +2611,11 @@ impl GifFromScreenApp {
                 if let Some(job) = &mut self.job {
                     job.stop_retargeting();
                     let _ = job.controller.stop();
-                    self.notice = Some(localizer.text(Message::RecorderStoppingProject).into());
+                    self.notice = Some(Notice::localized(
+                        localizer,
+                        Message::RecorderStoppingProject,
+                        &[],
+                    ));
                 }
             }
             RecorderOverlayAction::Discard => {
@@ -2563,7 +2623,11 @@ impl GifFromScreenApp {
                     job.stop_retargeting();
                     let _ = job.controller.discard();
                     job.cancellation.cancel();
-                    self.notice = Some(localizer.text(Message::RecorderDiscarding).into());
+                    self.notice = Some(Notice::localized(
+                        localizer,
+                        Message::RecorderDiscarding,
+                        &[],
+                    ));
                 } else {
                     self.close_recorder_overlay();
                 }
@@ -2576,12 +2640,33 @@ impl GifFromScreenApp {
                     );
                     job.stop_retargeting();
                     let _ = job.controller.stop();
-                    self.notice =
-                        Some(localizer.text(Message::RecorderClosingAndSaving).to_owned());
+                    self.notice = Some(
+                        localizer
+                            .text(Message::RecorderClosingAndSaving)
+                            .to_owned()
+                            .into(),
+                    );
                 } else {
                     self.close_recorder_overlay();
                 }
             }
+        }
+    }
+
+    fn request_recording_pause(&mut self, paused: bool) {
+        if let Some(job) = &mut self.job
+            && job.request_pause(paused)
+        {
+            let message = if paused {
+                Message::RecorderPauseRequested
+            } else {
+                Message::RecorderResumeRequested
+            };
+            self.notice = Some(Notice::localized(
+                self.language_settings.localizer(),
+                message,
+                &[],
+            ));
         }
     }
 
@@ -2604,7 +2689,7 @@ impl GifFromScreenApp {
         {
             CountdownStart::Immediate => self.prepare_live_recording(),
             CountdownStart::Started => {
-                self.notice = Some(format_message(
+                self.notice = Some(Notice::localized(
                     localizer,
                     Message::RecorderCountdownNotice,
                     &[("seconds", &self.settings.countdown_seconds.to_string())],
@@ -2633,7 +2718,7 @@ impl GifFromScreenApp {
                     && self.job.is_none()
                     && let Err(error) = self.prepare_live_recording()
                 {
-                    self.notice = Some(error);
+                    self.notice = Some(error.into());
                 }
             }
         }
@@ -2713,7 +2798,7 @@ impl GifFromScreenApp {
             })
             .map_err(|error| format!("could not start recording worker: {error}"))?;
 
-        self.notice = Some(localizer.text(Message::RecorderStarted).into());
+        self.notice = Some(Notice::localized(localizer, Message::RecorderStarted, &[]));
         self.progress = None;
         self.job = Some(RecordingJob {
             shortcut_state: recorder_shortcuts::LiveShortcutState::default(),
@@ -2770,7 +2855,11 @@ impl GifFromScreenApp {
         self.job = Some(job);
         self.attach_recording_shortcuts();
         self.progress = None;
-        self.notice = Some(localizer.text(Message::RecorderWaylandStarted).to_owned());
+        self.notice = Some(Notice::localized(
+            localizer,
+            Message::RecorderWaylandStarted,
+            &[],
+        ));
         Ok(())
     }
 
@@ -2782,9 +2871,13 @@ impl GifFromScreenApp {
         self.source_catalog_attempted = true;
         match self.source_catalog_job.start() {
             Ok(()) => {
-                self.notice = Some(localizer.text(Message::RecorderSourcesLoading).to_owned());
+                self.notice = Some(Notice::localized(
+                    localizer,
+                    Message::RecorderSourcesLoading,
+                    &[],
+                ));
             }
-            Err(error) => self.notice = Some(error.to_string()),
+            Err(error) => self.notice = Some(error.to_string().into()),
         }
     }
 
@@ -2794,7 +2887,11 @@ impl GifFromScreenApp {
             return;
         }
         let Some(result) = self.source_catalog_job.take_result() else {
-            self.notice = Some(localizer.text(Message::RecorderSourcesNoResult).to_owned());
+            self.notice = Some(Notice::localized(
+                localizer,
+                Message::RecorderSourcesNoResult,
+                &[],
+            ));
             return;
         };
         match result {
@@ -2813,7 +2910,7 @@ impl GifFromScreenApp {
                     LinuxDisplayServer::Wayland => "Wayland",
                     _ => localizer.text(Message::RecorderUnknown),
                 };
-                self.notice = Some(format_message(
+                self.notice = Some(Notice::localized(
                     localizer,
                     Message::RecorderSourcesFound,
                     &[
@@ -2826,7 +2923,7 @@ impl GifFromScreenApp {
                 self.display_server = None;
                 self.sources.clear();
                 self.selected_source = 0;
-                self.notice = Some(format_message(
+                self.notice = Some(Notice::localized(
                     localizer,
                     Message::RecorderSourcesFailed,
                     &[("error", &error.to_string())],
@@ -2860,11 +2957,11 @@ impl GifFromScreenApp {
         self.wayland_prepare_job
             .start(source, cadence, self.settings.cursor.capture_mode())
             .map_err(|error| error.to_string())?;
-        self.notice = Some(
-            localizer
-                .text(Message::RecorderWaylandOpeningChooser)
-                .to_owned(),
-        );
+        self.notice = Some(Notice::localized(
+            localizer,
+            Message::RecorderWaylandOpeningChooser,
+            &[],
+        ));
         Ok(())
     }
 
@@ -2873,7 +2970,11 @@ impl GifFromScreenApp {
         for event in self.wayland_prepare_job.drain() {
             match event {
                 WaylandPrepareJobEvent::StateChanged(state) => {
-                    self.notice = Some(wayland_prepare_state_notice(state, localizer).to_owned());
+                    self.notice = Some(
+                        wayland_prepare_state_notice(state, localizer)
+                            .to_owned()
+                            .into(),
+                    );
                 }
                 WaylandPrepareJobEvent::PreviewReady(preview) => {
                     match frozen_preview_image(&preview) {
@@ -2894,7 +2995,7 @@ impl GifFromScreenApp {
                                 drag_current: None,
                                 drag_initial_region: None,
                             });
-                            self.notice = Some(format_message(
+                            self.notice = Some(Notice::localized(
                                 localizer,
                                 Message::RecorderPreparedNotice,
                                 &[
@@ -2906,7 +3007,7 @@ impl GifFromScreenApp {
                         Err(error) => {
                             let _ = self.wayland_prepare_job.cancel();
                             self.shortcut_tool.reset_recording_scope();
-                            self.notice = Some(error);
+                            self.notice = Some(error.into());
                         }
                     }
                 }
@@ -2917,17 +3018,17 @@ impl GifFromScreenApp {
                         self.restore_main_window = true;
                     }
                     self.notice = Some(match self.wayland_prepare_job.take_result() {
-                        Some(Ok(WaylandPrepareOutcome::Cancelled)) => localizer
-                            .text(Message::RecorderPreparationCancelled)
-                            .to_owned(),
-                        Some(Err(error)) => format_message(
+                        Some(Ok(WaylandPrepareOutcome::Cancelled)) => {
+                            Notice::localized(localizer, Message::RecorderPreparationCancelled, &[])
+                        }
+                        Some(Err(error)) => Notice::localized(
                             localizer,
                             Message::RecorderPreparationFailed,
                             &[("error", &error.to_string())],
                         ),
-                        None => localizer
-                            .text(Message::RecorderPreparationNoResult)
-                            .to_owned(),
+                        None => {
+                            Notice::localized(localizer, Message::RecorderPreparationNoResult, &[])
+                        }
                     });
                 }
             }
@@ -3002,15 +3103,15 @@ impl GifFromScreenApp {
         if open.clicked()
             && let Err(error) = self.open_wayland_crop_controller(ui.ctx())
         {
-            self.notice = Some(error);
+            self.notice = Some(error.into());
         }
         if cancel.clicked() && self.wayland_prepare_job.cancel() {
             self.shortcut_tool.reset_recording_scope();
-            self.notice = Some(
-                localizer
-                    .text(Message::RecorderPreparationCancellationRequested)
-                    .to_owned(),
-            );
+            self.notice = Some(Notice::localized(
+                localizer,
+                Message::RecorderPreparationCancellationRequested,
+                &[],
+            ));
         }
     }
 
@@ -3046,13 +3147,13 @@ impl GifFromScreenApp {
                 if let Some(preview) = &mut self.wayland_frozen_preview {
                     preview.selection = region;
                 }
-                self.notice = Some(
-                    localizer
-                        .text(Message::RecorderWaylandRegionApplied)
-                        .to_owned(),
-                );
+                self.notice = Some(Notice::localized(
+                    localizer,
+                    Message::RecorderWaylandRegionApplied,
+                    &[],
+                ));
             }
-            Err(error) => self.notice = Some(error),
+            Err(error) => self.notice = Some(error.into()),
         }
     }
 
@@ -3139,11 +3240,11 @@ impl GifFromScreenApp {
         self.main_window_snapshot = Some(snapshot);
         self.restore_main_window = false;
         trace_wayland_controller("controller state installed");
-        self.notice = Some(
-            localizer
-                .text(Message::RecorderSourceControllerActive)
-                .to_owned(),
-        );
+        self.notice = Some(Notice::localized(
+            localizer,
+            Message::RecorderSourceControllerActive,
+            &[],
+        ));
         // Wayland cannot hide/unhide a toplevel. Reuse this surface and render
         // only recorder controls, retaining the launcher/editor state in memory.
         context.send_viewport_cmd(egui::ViewportCommand::Title(
@@ -3178,17 +3279,20 @@ impl GifFromScreenApp {
         };
         let progress = self.progress;
         let manual_snapshots = self.settings.cadence == RecordingCadenceChoice::Manual;
-        let recorder_notice = self
-            .shortcut_tool
-            .status_summary()
-            .map(|summary| format!("{summary}\n{}", self.notice.as_deref().unwrap_or_default()));
+        let current_notice = self.recorder_notice_text(stage, localizer);
+        let recorder_notice = self.shortcut_tool.status_summary(localizer).map(|summary| {
+            format!(
+                "{summary}\n{}",
+                current_notice.as_deref().unwrap_or_default()
+            )
+        });
         let frame = draw_wayland_crop_controller(
             context,
             stage,
             progress,
             &mut controller,
             manual_snapshots,
-            recorder_notice.as_deref().or(self.notice.as_deref()),
+            recorder_notice.as_deref().or(current_notice.as_deref()),
             self.sources
                 .get(self.selected_source)
                 .is_some_and(|source| source.kind() == CaptureSourceKind::Monitor),
@@ -3217,40 +3321,32 @@ impl GifFromScreenApp {
             RecorderOverlayAction::None => {}
             RecorderOverlayAction::Start => {
                 if let Err(error) = self.begin_recording(context) {
-                    self.notice = Some(error);
+                    self.notice = Some(error.into());
                 }
             }
             RecorderOverlayAction::CancelCountdown => {
                 if self.recording_countdown.cancel() {
-                    self.notice = Some(
-                        localizer
-                            .text(Message::RecorderCountdownCancelled)
-                            .to_owned(),
-                    );
+                    self.notice = Some(Notice::localized(
+                        localizer,
+                        Message::RecorderCountdownCancelled,
+                        &[],
+                    ));
                 }
             }
             RecorderOverlayAction::Pause => {
-                if let Some(job) = &mut self.job
-                    && job.request_pause(true)
-                {
-                    self.notice = Some(localizer.text(Message::RecorderPauseRequested).to_owned());
-                }
+                self.request_recording_pause(true);
             }
             RecorderOverlayAction::Resume => {
-                if let Some(job) = &mut self.job
-                    && job.request_pause(false)
-                {
-                    self.notice = Some(localizer.text(Message::RecorderResumeRequested).to_owned());
-                }
+                self.request_recording_pause(false);
             }
             RecorderOverlayAction::Snapshot => {
                 if let Some(job) = &mut self.job {
                     job.trigger_snapshot();
-                    self.notice = Some(
-                        localizer
-                            .text(Message::RecorderSnapshotRequested)
-                            .to_owned(),
-                    );
+                    self.notice = Some(Notice::localized(
+                        localizer,
+                        Message::RecorderSnapshotRequested,
+                        &[],
+                    ));
                     context.request_repaint();
                 }
             }
@@ -3258,7 +3354,11 @@ impl GifFromScreenApp {
                 if let Some(job) = &mut self.job {
                     job.stop_retargeting();
                     let _ = job.controller.stop();
-                    self.notice = Some(localizer.text(Message::RecorderStoppingProject).to_owned());
+                    self.notice = Some(Notice::localized(
+                        localizer,
+                        Message::RecorderStoppingProject,
+                        &[],
+                    ));
                 }
             }
             RecorderOverlayAction::Discard => {
@@ -3266,7 +3366,11 @@ impl GifFromScreenApp {
                     job.stop_retargeting();
                     let _ = job.controller.discard();
                     job.cancellation.cancel();
-                    self.notice = Some(localizer.text(Message::RecorderDiscarding).to_owned());
+                    self.notice = Some(Notice::localized(
+                        localizer,
+                        Message::RecorderDiscarding,
+                        &[],
+                    ));
                 } else {
                     self.close_wayland_crop_controller();
                 }
@@ -3275,8 +3379,12 @@ impl GifFromScreenApp {
                 if let Some(job) = &mut self.job {
                     job.stop_retargeting();
                     let _ = job.controller.stop();
-                    self.notice =
-                        Some(localizer.text(Message::RecorderClosingAndSaving).to_owned());
+                    self.notice = Some(
+                        localizer
+                            .text(Message::RecorderClosingAndSaving)
+                            .to_owned()
+                            .into(),
+                    );
                 } else {
                     self.close_wayland_crop_controller();
                 }
@@ -3296,11 +3404,11 @@ impl GifFromScreenApp {
     fn refresh_sources(&mut self) {
         let localizer = self.language_settings.localizer();
         if self.source_catalog_job.state() == CaptureSourceJobState::Loading {
-            self.notice = Some(
-                localizer
-                    .text(Message::RecorderRefreshAlreadyRunning)
-                    .to_owned(),
-            );
+            self.notice = Some(Notice::localized(
+                localizer,
+                Message::RecorderRefreshAlreadyRunning,
+                &[],
+            ));
             return;
         }
         if self.wayland_prepare_job.is_active() {
@@ -3311,13 +3419,13 @@ impl GifFromScreenApp {
         self.source_catalog_attempted = true;
         match self.source_catalog_job.start() {
             Ok(()) => {
-                self.notice = Some(
-                    localizer
-                        .text(Message::RecorderRefreshingSources)
-                        .to_owned(),
-                );
+                self.notice = Some(Notice::localized(
+                    localizer,
+                    Message::RecorderRefreshingSources,
+                    &[],
+                ));
             }
-            Err(error) => self.notice = Some(error.to_string()),
+            Err(error) => self.notice = Some(error.to_string().into()),
         }
     }
 
@@ -3342,65 +3450,32 @@ impl GifFromScreenApp {
                     if let Some(job) = &mut self.job {
                         job.stop_retargeting();
                     }
-                    self.notice = Some(
-                        localizer
-                            .text(Message::RecorderFinalizingProject)
-                            .to_owned(),
-                    );
+                    self.notice = Some(Notice::localized(
+                        localizer,
+                        Message::RecorderFinalizingProject,
+                        &[],
+                    ));
                 }
                 JobMessage::Finished(RecordingCompletion::Completed(project)) => {
-                    let discarded = self
-                        .job
-                        .as_ref()
-                        .is_some_and(|job| job.cancellation.is_cancelled());
-                    if discarded {
-                        self.notice = Some(match remove_completed_project(*project) {
-                            Ok(()) => localizer.text(Message::RecorderDiscarded).to_owned(),
-                            Err(error) => format_message(
-                                localizer,
-                                Message::RecorderDiscardCleanupFailed,
-                                &[("error", &error)],
-                            ),
-                        });
-                    } else {
-                        self.notice = Some(
-                            match activate_editor(
-                                &mut self.view,
-                                &mut self.editor_workspace,
-                                *project,
-                            ) {
-                                Ok(summary) => {
-                                    self.queue_created_tasks();
-                                    self.editor_ui_state = EditorUiState::default();
-                                    self.editor_preview_cache = EditorPreviewCache::new();
-                                    self.editor_export_settings = EditorExportSettings::default();
-                                    format_message(
-                                        localizer,
-                                        Message::RecorderProjectReady,
-                                        &[
-                                            ("frames", &summary.frames.to_string()),
-                                            (
-                                                "seconds",
-                                                &format!(
-                                                    "{:.3}",
-                                                    Duration::from_micros(summary.duration_us)
-                                                        .as_secs_f64()
-                                                ),
-                                            ),
-                                            ("path", &summary.project_path.display().to_string()),
-                                        ],
-                                    )
-                                }
-                                Err(error) => format!("Could not open recorded project: {error}"),
-                            },
-                        );
-                    }
+                    self.notice = Some(self.accept_recorded_project(*project, localizer));
                     self.finish_recording_job();
                 }
                 JobMessage::Finished(RecordingCompletion::Discarded { cleanup_error }) => {
                     self.notice = Some(cleanup_error.map_or_else(
-                        || "Recording discarded; its autosave project was removed.".to_owned(),
-                        |error| format!("Recording discarded, but {error}"),
+                        || {
+                            Notice::localized(
+                                localizer,
+                                Message::RecorderDiscardedAutosaveRemoved,
+                                &[],
+                            )
+                        },
+                        |error| {
+                            Notice::localized(
+                                localizer,
+                                Message::RecorderDiscardCleanupIssue,
+                                &[("error", &error)],
+                            )
+                        },
                     ));
                     self.finish_recording_job();
                 }
@@ -3409,17 +3484,69 @@ impl GifFromScreenApp {
                     recovery_path,
                 }) => {
                     self.notice = Some(recovery_path.map_or_else(
-                        || format!("Recording failed before autosave project creation: {error}"),
+                        || {
+                            Notice::localized(
+                                localizer,
+                                Message::RecorderFailedBeforeAutosave,
+                                &[("error", &error)],
+                            )
+                        },
                         |path| {
-                            format!(
-                                "Recording failed: {error}. Recoverable autosave retained at {}",
-                                path.display()
+                            Notice::localized(
+                                localizer,
+                                Message::RecorderFailedRecoverable,
+                                &[("error", &error), ("path", &path.display().to_string())],
                             )
                         },
                     ));
                     self.finish_recording_job();
                 }
             }
+        }
+    }
+
+    fn accept_recorded_project(&mut self, project: ActiveProject, localizer: Localizer) -> Notice {
+        if self
+            .job
+            .as_ref()
+            .is_some_and(|job| job.cancellation.is_cancelled())
+        {
+            return match remove_completed_project(project) {
+                Ok(()) => Notice::localized(localizer, Message::RecorderDiscarded, &[]),
+                Err(error) => Notice::localized(
+                    localizer,
+                    Message::RecorderDiscardCleanupFailed,
+                    &[("error", &error)],
+                ),
+            };
+        }
+        match activate_editor(&mut self.view, &mut self.editor_workspace, project) {
+            Ok(summary) => {
+                self.queue_created_tasks();
+                self.editor_ui_state = EditorUiState::default();
+                self.editor_preview_cache = EditorPreviewCache::new();
+                self.editor_export_settings = EditorExportSettings::default();
+                Notice::localized(
+                    localizer,
+                    Message::RecorderProjectReady,
+                    &[
+                        ("frames", &summary.frames.to_string()),
+                        (
+                            "seconds",
+                            &format!(
+                                "{:.3}",
+                                Duration::from_micros(summary.duration_us).as_secs_f64()
+                            ),
+                        ),
+                        ("path", &summary.project_path.display().to_string()),
+                    ],
+                )
+            }
+            Err(error) => Notice::localized(
+                localizer,
+                Message::RecorderRecordedProjectOpenFailed,
+                &[("error", &error)],
+            ),
         }
     }
 
@@ -3452,7 +3579,7 @@ impl GifFromScreenApp {
         self.export_job
             .start(snapshot, output, options)
             .map_err(|error| error.to_string())?;
-        self.notice = Some("GIF export started…".to_owned());
+        self.notice = Some("GIF export started…".to_owned().into());
         Ok(())
     }
 
@@ -3470,7 +3597,7 @@ impl GifFromScreenApp {
             export_result_notice,
         );
         self.export_job = ExportJob::default();
-        self.notice = Some(notice);
+        self.notice = Some(notice.into());
     }
 
     fn receive_open_project_messages(&mut self) {
@@ -3486,11 +3613,11 @@ impl GifFromScreenApp {
         self.open_project_job = OpenProjectJob::default();
         self.notice = Some(match result {
             Some(Ok(opened)) => match self.activate_opened_project(opened) {
-                Ok(notice) => notice,
-                Err(error) => format!("Could not prepare opened project: {error}"),
+                Ok(notice) => notice.into(),
+                Err(error) => format!("Could not prepare opened project: {error}").into(),
             },
-            Some(Err(error)) => open_project_error_notice(&error),
-            None => "Project-open worker finished without a result.".to_owned(),
+            Some(Err(error)) => open_project_error_notice(&error).into(),
+            None => "Project-open worker finished without a result.".into(),
         });
     }
 
@@ -3507,13 +3634,16 @@ impl GifFromScreenApp {
         self.import_gif_job = ImportGifJob::default();
         self.notice = Some(match result {
             Some(Ok(project)) => match self.activate_imported_gif(project) {
-                Ok(notice) => notice,
-                Err(error) => format!("Could not prepare imported GIF project: {error}"),
+                Ok(notice) => notice.into(),
+                Err(error) => format!("Could not prepare imported GIF project: {error}").into(),
             },
             Some(Err(error)) => format!(
                 "Could not import GIF: {error}. You can correct the path or file and retry."
-            ),
-            None => "GIF import worker finished without a result. You can retry safely.".to_owned(),
+            )
+            .into(),
+            None => "GIF import worker finished without a result. You can retry safely."
+                .to_owned()
+                .into(),
         });
     }
 
@@ -3548,15 +3678,16 @@ impl GifFromScreenApp {
         self.import_image_job = ImportStaticImageJob::default();
         self.notice = Some(match result {
             Some(Ok(project)) => match self.activate_imported_image(project) {
-                Ok(notice) => notice,
-                Err(error) => format!("Could not prepare imported image project: {error}"),
+                Ok(notice) => notice.into(),
+                Err(error) => format!("Could not prepare imported image project: {error}").into(),
             },
             Some(Err(error)) => format!(
                 "Could not import image: {error}. You can correct the path or file and retry."
-            ),
-            None => {
-                "Image import worker finished without a result. You can retry safely.".to_owned()
-            }
+            )
+            .into(),
+            None => "Image import worker finished without a result. You can retry safely."
+                .to_owned()
+                .into(),
         });
     }
 
@@ -3596,14 +3727,14 @@ impl GifFromScreenApp {
         self.import_sequence_job = ImportStaticSequenceJob::default();
         self.notice = Some(match result {
             Some(Ok(project)) => match self.activate_imported_sequence(project) {
-                Ok(notice) => notice,
-                Err(error) => format!("Could not prepare imported image sequence: {error}"),
+                Ok(notice) => notice.into(),
+                Err(error) => format!("Could not prepare imported image sequence: {error}").into(),
             },
             Some(Err(error)) => format!(
                 "Could not import image sequence: {error}. Adjust the ordered inputs or settings and retry."
-            ),
+            ).into(),
             None => {
-                "Image-sequence worker finished without a result. You can retry safely.".to_owned()
+                "Image-sequence worker finished without a result. You can retry safely.".to_owned().into()
             }
         });
     }
@@ -3645,15 +3776,16 @@ impl GifFromScreenApp {
         self.blank_project_job = BlankProjectJob::default();
         self.notice = Some(match result {
             Some(Ok(project)) => match self.activate_blank_project(project) {
-                Ok(notice) => notice,
-                Err(error) => format!("Could not prepare the blank project editor: {error}"),
+                Ok(notice) => notice.into(),
+                Err(error) => format!("Could not prepare the blank project editor: {error}").into(),
             },
             Some(Err(error)) => format!(
                 "Could not create blank animation: {error}. Adjust the original form and retry."
-            ),
-            None => {
-                "Blank-project worker finished without a result. You can retry safely.".to_owned()
-            }
+            )
+            .into(),
+            None => "Blank-project worker finished without a result. You can retry safely."
+                .to_owned()
+                .into(),
         });
     }
 
@@ -3689,22 +3821,24 @@ impl GifFromScreenApp {
                         source_size.width.get(),
                         source_size.height.get(),
                         source_path.display()
-                    ),
+                    ).into(),
                     Err(error) => format!(
                         "Watermark decoded but could not be added: {error}. Adjust the form and retry."
-                    ),
+                    ).into(),
                 }
             }
             Some(Err(error)) => {
-                format!("Could not decode watermark: {error}. Adjust the form and retry.")
+                format!("Could not decode watermark: {error}. Adjust the form and retry.").into()
             }
-            None => "Watermark decoder finished without a result; retry safely.".to_owned(),
+            None => "Watermark decoder finished without a result; retry safely."
+                .to_owned()
+                .into(),
         });
     }
 
     fn receive_text_messages(&mut self) {
         if let Some(notice) = self.text_overlay.poll(self.editor_workspace.as_mut()) {
-            self.notice = Some(notice);
+            self.notice = Some(notice.into());
         }
     }
 
@@ -3745,7 +3879,7 @@ impl GifFromScreenApp {
             None => return,
         };
         if let Err(error) = self.auto_tasks.queue_created(workspace, trigger) {
-            self.notice = Some(error);
+            self.notice = Some(error.into());
         }
     }
 
@@ -3788,18 +3922,21 @@ enum EditorExportAction {
     Cancel,
 }
 
-fn editor_result_notice(result: EditorUiResult) -> Option<String> {
+fn editor_result_notice(result: EditorUiResult) -> Option<Notice> {
     match result {
         Ok(EditorUiAction::Notice { message, .. }) => Some(message),
         Ok(EditorUiAction::Project(editor_ui::EditorUiOperation::Undo)) => {
-            Some("Undid the previous edit.".to_owned())
+            Some(Message::EditorUndoCompleted.into())
         }
         Ok(EditorUiAction::Project(editor_ui::EditorUiOperation::Redo)) => {
-            Some("Reapplied the edit.".to_owned())
+            Some(Message::EditorRedoCompleted.into())
         }
-        Err(failure) => Some(format!(
-            "Editor {:?} failed: {}",
-            failure.operation, failure.message
+        Err(failure) => Some(Notice::new(
+            Message::EditorOperationFailed,
+            &[
+                ("operation", &format!("{:?}", failure.operation)),
+                ("error", &failure.message),
+            ],
         )),
         Ok(_) => None,
     }
@@ -3812,6 +3949,7 @@ fn show_editor_inspector(
     text: &mut TextOverlayTool,
     watermark: &mut WatermarkUiState,
     watermark_job: WatermarkDecodeJobState,
+    localizer: Localizer,
 ) -> (Vec<EditorUiResult>, Option<String>, WatermarkUiAction) {
     let mut results = Vec::new();
     let mut notice = None;
@@ -3823,7 +3961,7 @@ fn show_editor_inspector(
         .show(ui, |ui| {
             results = ui
                 .add_enabled_ui(watermark_job != WatermarkDecodeJobState::Running, |ui| {
-                    show_editor_tool_panel(ui, workspace, state)
+                    show_editor_tool_panel(ui, workspace, state, localizer)
                 })
                 .inner;
             if state.overlays_selected() && state.overlay_tool == OverlayTool::Text {
@@ -7661,16 +7799,18 @@ mod tests {
         assert_eq!(
             editor_result_notice(Ok(EditorUiAction::Notice {
                 operation,
-                message: "Preserved journal at /tmp/rejected".to_owned(),
-            })),
-            Some("Preserved journal at /tmp/rejected".to_owned())
+                message: "Preserved journal at /tmp/rejected".into(),
+            }))
+            .as_deref(),
+            Some("Preserved journal at /tmp/rejected")
         );
         assert_eq!(
             editor_result_notice(Err(EditorUiFailure {
                 operation,
                 message: "repair failed".to_owned(),
-            })),
-            Some("Editor RepairJournal failed: repair failed".to_owned())
+            }))
+            .as_deref(),
+            Some("Editor RepairJournal failed: repair failed")
         );
         assert_eq!(
             editor_result_notice(Ok(EditorUiAction::Selection(operation))),
@@ -7870,7 +8010,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while app.auto_tasks.is_running() || app.auto_tasks.is_loading() {
             if let Some(notice) = app.auto_tasks.poll(&mut app.editor_workspace) {
-                app.notice = Some(notice);
+                app.notice = Some(notice.into());
             }
             assert!(
                 Instant::now() < deadline,

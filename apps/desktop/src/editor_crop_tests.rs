@@ -234,3 +234,140 @@ fn crop_pointer_mapping_commits_only_on_apply_and_lost_mapping_restores_previous
     );
     assert_eq!(workspace.manifest(), &before);
 }
+
+#[test]
+fn layout_change_consumes_pre_threshold_release_then_accepts_fresh_click_and_drag() {
+    let (_directory, workspace) = workspace();
+    let before = workspace.manifest().clone();
+    let mut draft = DirectCropDraft::default();
+    draft
+        .begin(&workspace, workspace.selection().current().unwrap(), [8, 6])
+        .unwrap();
+    let confirmed = PhysicalRect::new(2, 1, 4, 3).unwrap();
+    let typed = ["02", "01", "4", "3"].map(str::to_owned);
+    let session = draft.session.as_mut().unwrap();
+    session.rect = confirmed;
+    session.fields.clone_from(&typed);
+    let context = egui::Context::default();
+    let image = egui::Rect::from_min_size(egui::pos2(40.0, 30.0), egui::vec2(160.0, 120.0));
+    gesture_frame(&context, &mut draft, image, Vec::new(), true);
+    let point = egui::pos2(110.0, 90.0);
+    gesture_frame(&context, &mut draft, image, pointer(point, true), true);
+    assert!(draft.session.as_ref().unwrap().gesture.is_none());
+    draft.cancel_layout_gesture();
+    let moved = image.translate(egui::vec2(10.0, 10.0));
+    gesture_frame(&context, &mut draft, moved, pointer(point, false), true);
+    let session = draft.session.as_ref().unwrap();
+    assert_eq!(session.rect, confirmed);
+    assert_eq!(session.fields, typed);
+    assert!(!session.suppress_primary_until_release);
+    let click = moved.min + egui::vec2(50.0, 50.0);
+    gesture_frame(&context, &mut draft, moved, pointer(click, true), true);
+    gesture_frame(&context, &mut draft, moved, pointer(click, false), true);
+    assert_eq!(
+        draft.session.as_ref().unwrap().rect,
+        PhysicalRect::new(2, 2, 1, 1).unwrap()
+    );
+    let start = moved.min + egui::vec2(20.0, 20.0);
+    let end = moved.min + egui::vec2(80.0, 80.0);
+    gesture_frame(&context, &mut draft, moved, pointer(start, true), true);
+    gesture_frame(
+        &context,
+        &mut draft,
+        moved,
+        vec![egui::Event::PointerMoved(end)],
+        true,
+    );
+    gesture_frame(&context, &mut draft, moved, pointer(end, false), true);
+    assert_eq!(
+        draft.session.as_ref().unwrap().rect,
+        PhysicalRect::new(1, 1, 3, 3).unwrap()
+    );
+    assert_eq!(workspace.manifest(), &before);
+}
+
+#[test]
+fn layout_change_rolls_back_active_crop_and_preserves_confirmed_numeric_spelling() {
+    let (_directory, workspace) = workspace();
+    let before = workspace.manifest().clone();
+    let mut draft = DirectCropDraft::default();
+    draft
+        .begin(&workspace, workspace.selection().current().unwrap(), [8, 6])
+        .unwrap();
+    let confirmed = PhysicalRect::new(2, 2, 2, 2).unwrap();
+    let typed = ["002", "02", "2", "2"].map(str::to_owned);
+    let session = draft.session.as_mut().unwrap();
+    session.rect = confirmed;
+    session.fields.clone_from(&typed);
+    let context = egui::Context::default();
+    let image = egui::Rect::from_min_size(egui::pos2(40.0, 30.0), egui::vec2(160.0, 120.0));
+    gesture_frame(&context, &mut draft, image, Vec::new(), true);
+    gesture_frame(
+        &context,
+        &mut draft,
+        image,
+        pointer(egui::pos2(60.0, 50.0), true),
+        true,
+    );
+    gesture_frame(
+        &context,
+        &mut draft,
+        image,
+        vec![egui::Event::PointerMoved(egui::pos2(140.0, 110.0))],
+        true,
+    );
+    assert!(draft.session.as_ref().unwrap().gesture.is_some());
+    assert_ne!(draft.session.as_ref().unwrap().rect, confirmed);
+    draft.cancel_layout_gesture();
+    assert_eq!(draft.session.as_ref().unwrap().rect, confirmed);
+    assert_eq!(draft.session.as_ref().unwrap().fields, typed);
+    let moved = image.translate(egui::vec2(-10.0, 10.0));
+    gesture_frame(
+        &context,
+        &mut draft,
+        moved,
+        vec![egui::Event::PointerMoved(egui::pos2(100.0, 70.0))],
+        true,
+    );
+    assert!(
+        draft
+            .session
+            .as_ref()
+            .unwrap()
+            .suppress_primary_until_release
+    );
+    gesture_frame(
+        &context,
+        &mut draft,
+        moved,
+        pointer(egui::pos2(100.0, 70.0), false),
+        true,
+    );
+    let session = draft.session.as_ref().unwrap();
+    assert_eq!(session.rect, confirmed);
+    assert_eq!(session.fields, typed);
+    assert!(session.gesture.is_none() && !session.suppress_primary_until_release);
+    assert_eq!(workspace.manifest(), &before);
+}
+
+#[test]
+fn layout_change_with_no_pointer_keeps_ready_crop_and_clears_its_temporary_gate() {
+    let (_directory, workspace) = workspace();
+    let mut draft = DirectCropDraft::default();
+    draft
+        .begin(&workspace, workspace.selection().current().unwrap(), [8, 6])
+        .unwrap();
+    let typed = ["0001", "2", "3", "2"].map(str::to_owned);
+    draft.session.as_mut().unwrap().fields.clone_from(&typed);
+    let confirmed = PhysicalRect::new(1, 2, 3, 2).unwrap();
+    draft.session.as_mut().unwrap().rect = confirmed;
+    draft.cancel_layout_gesture();
+    let context = egui::Context::default();
+    let image = egui::Rect::from_min_size(egui::pos2(40.0, 30.0), egui::vec2(160.0, 120.0));
+    gesture_frame(&context, &mut draft, image, Vec::new(), true);
+    let session = draft.session.as_ref().unwrap();
+    assert!(!session.suppress_primary_until_release);
+    assert_eq!(session.rect, confirmed);
+    assert_eq!(session.fields, typed);
+    assert!(draft.active());
+}

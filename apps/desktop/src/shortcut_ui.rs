@@ -2,12 +2,14 @@
 
 use std::time::Duration;
 
+use crate::ui_notice::Notice;
 use eframe::egui;
 use gif_from_screen_capture_linux::{
     GlobalShortcutService, LinuxDisplayServer, ShortcutAction, ShortcutActionHandler,
     ShortcutBinding, ShortcutKey, ShortcutStatus, ShortcutTrigger, ShortcutUpdate,
     default_shortcut_bindings, validate_bindings,
 };
+use gif_from_screen_localization::{Localizer, Message};
 
 mod persistence;
 mod store;
@@ -39,6 +41,34 @@ impl Settings {
             return Err("Configure all three recorder actions.".into());
         }
         validate_bindings(&self.bindings)
+    }
+
+    fn validate_for_ui(&self) -> Result<(), Notice> {
+        // The existing validator remains authoritative for registration and
+        // storage. Only classify its failure for display; never accept data here.
+        self.validate().map_err(|error| {
+            let message = if self.bindings.len() != 3 {
+                Some(Message::ShortcutsConfigureAll)
+            } else if self
+                .bindings
+                .iter()
+                .any(|binding| binding.trigger.validate().is_err())
+            {
+                Some(Message::ShortcutsInvalidTrigger)
+            } else if self.bindings.iter().enumerate().any(|(index, binding)| {
+                self.bindings[..index]
+                    .iter()
+                    .any(|other| other.action == binding.action || other.trigger == binding.trigger)
+            }) {
+                Some(Message::ShortcutsUniqueBindings)
+            } else {
+                None
+            };
+            message.map_or_else(
+                || Notice::new(Message::ShortcutsInvalidBindings, &[("error", &error)]),
+                Notice::from,
+            )
+        })
     }
 }
 
@@ -84,7 +114,7 @@ pub(crate) struct ShortcutTool {
     stopping: bool,
     attempted_generation: Option<u64>,
     shutdown_requested: bool,
-    notice: Option<String>,
+    notice: Option<Notice>,
 }
 
 impl Default for ShortcutTool {
@@ -150,22 +180,23 @@ impl ShortcutTool {
         self.invalidate();
     }
 
-    pub(crate) fn status_summary(&self) -> Option<String> {
+    pub(crate) fn status_summary(&self, localizer: Localizer) -> Option<String> {
         if !self.settings.enabled {
             return None;
         }
         Some(match &self.status {
-            ShortcutStatus::Active(bindings) => {
-                format!("Shortcuts: {}/3 registered", bindings.len())
-            }
-            ShortcutStatus::Registering => {
-                "Shortcuts: registration pending; use recorder buttons".into()
-            }
-            ShortcutStatus::Stopping => "Shortcuts: stopping old registration; use buttons".into(),
-            ShortcutStatus::Stopped => "Shortcuts: inactive; use recorder buttons".into(),
-            ShortcutStatus::Failed(error) => format!(
-                "Shortcuts unavailable: {}",
-                error.chars().take(160).collect::<String>()
+            ShortcutStatus::Active(bindings) => crate::format_message(
+                localizer,
+                Message::ShortcutsSummaryRegistered,
+                &[("count", &bindings.len().to_string())],
+            ),
+            ShortcutStatus::Registering => localizer.text(Message::ShortcutsSummaryPending).into(),
+            ShortcutStatus::Stopping => localizer.text(Message::ShortcutsSummaryStopping).into(),
+            ShortcutStatus::Stopped => localizer.text(Message::ShortcutsSummaryInactive).into(),
+            ShortcutStatus::Failed(error) => crate::format_message(
+                localizer,
+                Message::ShortcutsSummaryFailed,
+                &[("error", &error.chars().take(160).collect::<String>())],
             ),
         })
     }
@@ -208,9 +239,9 @@ impl ShortcutTool {
                 actions = update.actions;
             }
             if update.dropped_actions > 0 {
-                self.notice = Some(format!(
-                    "{} shortcut presses exceeded the bounded queue. Recorder buttons remain available.",
-                    update.dropped_actions
+                self.notice = Some(Notice::new(
+                    Message::ShortcutsQueueOverflow,
+                    &[("count", &update.dropped_actions.to_string())],
                 ));
             }
             self.status = update.status;
@@ -242,7 +273,7 @@ impl ShortcutTool {
         actions
     }
 
-    fn set_enabled(&mut self, enabled: bool) -> Result<(), String> {
+    fn set_enabled(&mut self, enabled: bool) -> Result<(), Notice> {
         let settings = Settings {
             enabled,
             bindings: if enabled {
@@ -254,15 +285,15 @@ impl ShortcutTool {
         self.accept(settings)
     }
 
-    fn apply_bindings(&mut self) -> Result<(), String> {
+    fn apply_bindings(&mut self) -> Result<(), Notice> {
         self.accept(Settings {
             enabled: self.settings.enabled,
             bindings: self.draft_bindings.clone(),
         })
     }
 
-    fn accept(&mut self, settings: Settings) -> Result<(), String> {
-        settings.validate()?;
+    fn accept(&mut self, settings: Settings) -> Result<(), Notice> {
+        settings.validate_for_ui()?;
         self.io.edited(true);
         if self.settings != settings {
             self.settings = settings;

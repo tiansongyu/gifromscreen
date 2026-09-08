@@ -6,9 +6,11 @@ wire format, injected-system-locale negotiation and an initial English/Simplifie
 Chinese message catalog. The desktop now offers System plus 29 saved choices,
 asynchronous private preference storage, immediate launcher/navigation switching
 and an embedded licensed CJK fallback. Other catalogs explicitly fall back to
-English. The recording form, source-local Wayland controls and compact X11
-controls/window snapping now use explicit localizers. Shortcut settings, remaining
-recorder notices and the editor/import/tool interfaces still require migration.
+English. The recording form, source-local Wayland controls, compact X11 controls,
+window snapping, shortcut settings, and editor navigation/Frames/Timing/Transform
+now use explicit localizers. Typed notices re-render at presentation time. The
+remaining editor tool bodies, import/export forms and detailed errors still
+require migration; see [editor/notice scope](EDITOR-LOCALIZATION.md).
 The target includes the entire application-owned UI, not merely language selection.
 See [the first desktop acceptance record](LOCALIZATION-QA-2026-09-08.md).
 The [recorder integration contract](RECORDER-LOCALIZATION.md) separates automated
