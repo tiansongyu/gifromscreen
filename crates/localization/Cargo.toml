@@ -1,0 +1,17 @@
+[package]
+name = "gif-from-screen-localization"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Locale registry and preferences foundation, independent of UI and catalogs"
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

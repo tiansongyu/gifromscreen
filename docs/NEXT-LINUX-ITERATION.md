@@ -2,6 +2,17 @@
 
 This list retains specific gaps after the native GNOME recording acceptance. It does not replace the full [feature matrix](FEATURE_MATRIX.md) or [release gates](LINUX-STATUS.md).
 
+## New user-facing priority: language, README and Releases
+
+After the current package/source-material work, implement the user's new request:
+complete application language options with a persisted override and System default,
+then a product-focused README, real operation GIFs and verified Release downloads.
+The [localization plan](LOCALIZATION-PLAN.md) records the 29-language reference
+target and the font/shaping/RTL gates; a selector or English fallback alone is not
+completion. The [README/Release plan](README-RELEASE-PLAN.md) preserves real package
+readiness and working links. These additions do not discard the functional and
+platform requirements below or authorize calling a preview build fully complete.
+
 ## Playback timing: implemented, bounded native manual acceptance recorded
 
 `PlaybackTiming::Measured` and `PlaybackTiming::Fixed(Duration)` now separate GIF playback from sampling cadence in the workflow. Fixed mode assigns one final delay to each retained frame, including the last; omitted unchanged samples and delivery gaps do not accumulate fixed delay. Raw active capture timestamps and input events remain unchanged. Status distinguishes observed source-sample span from GIF playback duration. The pinned upstream evidence, save-failure exception and measured-mode interval-assignment difference are recorded in [Capture playback timing](CAPTURE-PLAYBACK-TIMING.md).
