@@ -196,6 +196,7 @@ pub(crate) enum DrawingDraftPhase {
 #[derive(Debug)]
 pub(crate) struct DrawingOverlayDraft {
     target: Option<OverlaySelectionAnchor>,
+    pub(crate) preview_gesture: crate::drawing_preview::PreviewGesture,
     pub(crate) phase: DrawingDraftPhase,
     pub(crate) name: String,
     pub(crate) width: u16,
@@ -221,6 +222,7 @@ impl Default for DrawingOverlayDraft {
     fn default() -> Self {
         Self {
             target: None,
+            preview_gesture: crate::drawing_preview::PreviewGesture::default(),
             phase: DrawingDraftPhase::Idle,
             name: "Drawing".to_owned(),
             width: 4,
@@ -262,16 +264,27 @@ impl DrawingOverlayDraft {
     }
 
     pub(crate) fn begin(&mut self) {
+        self.preview_gesture.reset_for_begin();
         self.points.clear();
         self.limit_reached = false;
         self.phase = DrawingDraftPhase::Capturing;
     }
 
     pub(crate) fn cancel(&mut self) {
+        self.preview_gesture.reset_for_begin();
         self.target = None;
         self.points.clear();
         self.limit_reached = false;
         self.phase = DrawingDraftPhase::Idle;
+    }
+
+    /// Input loss invalidates only the unfinished stroke, not its explicitly
+    /// selected target or tool style. A fresh primary press may retry it.
+    pub(crate) fn discard_preview_stroke(&mut self) {
+        if self.phase == DrawingDraftPhase::Capturing {
+            self.points.clear();
+            self.limit_reached = false;
+        }
     }
 
     pub(crate) fn push_point(&mut self, point: StrokePoint) {

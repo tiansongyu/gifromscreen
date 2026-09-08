@@ -6,6 +6,130 @@ use gif_from_screen_domain::{
 };
 use gif_from_screen_project::ActiveProject;
 
+fn language(tag: &str) -> Localizer {
+    Localizer::new(gif_from_screen_localization::find_language(tag).unwrap())
+}
+
+fn zoom_frame(
+    context: &egui::Context,
+    canvas: &mut EditorCanvasState,
+    language: Localizer,
+    events: Vec<egui::Event>,
+) -> egui::FullOutput {
+    context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(320.0, 200.0),
+            )),
+            events,
+            focused: true,
+            ..Default::default()
+        },
+        |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                canvas.show_zoom(ui, language);
+            });
+        },
+    )
+}
+
+fn visible_label(output: &egui::FullOutput, wanted: &str) -> egui::Rect {
+    output
+        .shapes
+        .iter()
+        .find_map(|shape| {
+            if let egui::Shape::Text(text) = &shape.shape
+                && text.galley.text() == wanted
+            {
+                let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                shape.clip_rect.contains_rect(rect).then_some(rect)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| panic!("missing or clipped zoom label: {wanted:?}"))
+}
+
+#[test]
+fn chinese_zoom_buttons_have_real_font_layout_and_preserve_physical_pixel_scale() {
+    for font_scale in [1.0, 2.0] {
+        let context = egui::Context::default();
+        crate::preferences::fonts::install(&context);
+        context.style_mut(|style| {
+            style.animation_time = 0.0;
+            for font in style.text_styles.values_mut() {
+                font.size *= font_scale;
+            }
+        });
+        let mut canvas = EditorCanvasState::default();
+        for (message, expected) in [
+            (Message::PreviewZoomDouble, PreviewZoom::Double),
+            (Message::PreviewZoomNative, PreviewZoom::Native),
+            (Message::PreviewZoomFit, PreviewZoom::Fit),
+        ] {
+            zoom_frame(&context, &mut canvas, language("zh"), Vec::new());
+            let output = zoom_frame(&context, &mut canvas, language("zh"), Vec::new());
+            let position = visible_label(&output, language("zh").text(message)).center();
+            for pressed in [true, false] {
+                zoom_frame(
+                    &context,
+                    &mut canvas,
+                    language("zh"),
+                    vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            assert_eq!(canvas.zoom, expected);
+            let before = canvas
+                .zoom
+                .extent([640, 420], egui::vec2(320.0, 360.0), 1.25)
+                .unwrap();
+            canvas.scroll_offset = egui::vec2(10.0, 20.0);
+            zoom_frame(&context, &mut canvas, language("en"), Vec::new());
+            assert_eq!(canvas.zoom, expected);
+            assert_eq!(canvas.scroll_offset, egui::vec2(10.0, 20.0));
+            assert_eq!(
+                canvas
+                    .zoom
+                    .extent([640, 420], egui::vec2(320.0, 360.0), 1.25)
+                    .unwrap(),
+                before
+            );
+        }
+    }
+}
+
+#[test]
+fn preview_geometry_errors_translate_without_changing_validation_or_scale() {
+    let error = PreviewZoom::Native
+        .extent([640, 420], egui::vec2(320.0, 360.0), f32::NAN)
+        .unwrap_err();
+    assert_eq!(error.message_id(), Some(Message::PreviewInvalidGeometry));
+    for language in [language("en"), language("zh")] {
+        assert_eq!(
+            error.render(language),
+            language.text(Message::PreviewInvalidGeometry)
+        );
+    }
+    let error = checked_extent(f64::MAX, 1.0).unwrap_err();
+    assert_eq!(
+        error.message_id(),
+        Some(Message::PreviewUnrepresentableExtent)
+    );
+    assert_eq!(
+        error.render(language("zh")),
+        language("zh").text(Message::PreviewUnrepresentableExtent)
+    );
+}
+
 pub(super) fn workspace() -> (tempfile::TempDir, EditorWorkspace) {
     let directory = tempfile::tempdir().unwrap();
     let size = PhysicalSize::new(8, 6).unwrap();
@@ -222,13 +346,21 @@ fn panning_does_not_author_or_finish_a_freehand_stroke() {
             |context| {
                 egui::CentralPanel::default().show(context, |ui| {
                     canvas
-                        .show_image(ui, &preview, egui::Sense::drag(), true, |_, response| {
-                            crate::update_drawing_draft_from_preview(
-                                response,
-                                preview.rendered_size,
-                                draft,
-                            );
-                        })
+                        .show_image(
+                            ui,
+                            &preview,
+                            egui::Sense::click_and_drag(),
+                            true,
+                            |ui, response| {
+                                crate::drawing_preview::update(
+                                    ui,
+                                    response,
+                                    preview.rendered_size,
+                                    true,
+                                    draft,
+                                );
+                            },
+                        )
                         .unwrap();
                 });
             },
@@ -353,16 +485,18 @@ fn drawing_frame(
                 let sense = if state.drawing_overlay.phase
                     == crate::editor_ui::DrawingDraftPhase::Capturing
                 {
-                    egui::Sense::drag()
+                    egui::Sense::click_and_drag()
                 } else {
                     egui::Sense::hover()
                 };
                 image = state
                     .canvas
-                    .show_image(ui, preview, sense, true, |_, response| {
-                        crate::update_drawing_draft_from_preview(
+                    .show_image(ui, preview, sense, true, |ui, response| {
+                        crate::drawing_preview::update(
+                            ui,
                             response,
                             preview.rendered_size,
+                            true,
                             &mut state.drawing_overlay,
                         );
                     })

@@ -1,6 +1,278 @@
 use super::*;
 use crate::editor_canvas::tests::workspace;
 
+fn language(tag: &str) -> Localizer {
+    Localizer::new(gif_from_screen_localization::find_language(tag).unwrap())
+}
+
+struct Controls {
+    _directory: tempfile::TempDir,
+    workspace: EditorWorkspace,
+    draft: DirectCropDraft,
+    context: egui::Context,
+    language: Localizer,
+    viewport: egui::Rect,
+    enabled: bool,
+}
+
+impl Controls {
+    fn new(width: f32, height: f32, font_scale: f32, language: Localizer) -> Self {
+        let (directory, workspace) = workspace();
+        let context = egui::Context::default();
+        crate::preferences::fonts::install(&context);
+        context.style_mut(|style| {
+            style.animation_time = 0.0;
+            for font in style.text_styles.values_mut() {
+                font.size *= font_scale;
+            }
+        });
+        Self {
+            _directory: directory,
+            workspace,
+            draft: DirectCropDraft::default(),
+            context,
+            language,
+            viewport: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, height)),
+            enabled: true,
+        }
+    }
+
+    fn frame(&mut self, events: Vec<egui::Event>) -> (egui::FullOutput, CropOutcome) {
+        let mut outcome = CropOutcome::default();
+        let frame = self.workspace.selection().current().unwrap();
+        let size = self.workspace.manifest().canvas.size;
+        let output = self.context.run(
+            egui::RawInput {
+                screen_rect: Some(self.viewport),
+                events,
+                focused: true,
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    outcome = self.draft.show_controls(
+                        ui,
+                        &mut self.workspace,
+                        frame,
+                        [size.width.get(), size.height.get()],
+                        self.enabled,
+                        self.language,
+                    );
+                });
+            },
+        );
+        (output, outcome)
+    }
+
+    fn text(&mut self, wanted: &str) -> egui::Rect {
+        self.frame(Vec::new());
+        let output = self.frame(Vec::new()).0;
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape
+                    && text.galley.text() == wanted
+                {
+                    let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                    (shape.clip_rect.contains_rect(rect) && self.viewport.contains_rect(rect))
+                        .then_some(rect)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("missing or clipped crop control: {wanted:?}"))
+    }
+
+    fn click(&mut self, wanted: &str) -> CropOutcome {
+        let position = self.text(wanted).center();
+        self.frame(pointer(position, true));
+        self.frame(pointer(position, false)).1
+    }
+
+    fn replace_text(&mut self, previous: &str, next: &str) {
+        let output = self.frame(Vec::new()).0;
+        // TextEdit horizontally scrolls long values; click its actual visible
+        // text intersection rather than requiring the entire value to fit.
+        let position = output
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape
+                    && text.galley.text() == previous
+                {
+                    let rect = egui::Rect::from_min_size(text.pos, text.galley.size())
+                        .intersect(shape.clip_rect)
+                        .intersect(self.viewport);
+                    rect.is_positive().then_some(rect.center())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("missing editable text {previous:?}"));
+        self.frame(pointer(position, true));
+        self.frame(pointer(position, false));
+        self.frame(vec![
+            egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                // egui-winit marks Linux Ctrl as both physical Ctrl and the
+                // platform command modifier used by TextEdit's Select All.
+                modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+            },
+            egui::Event::Text(next.into()),
+            egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+            },
+        ]);
+    }
+}
+
+#[test]
+fn chinese_fields_keep_original_spelling_and_apply_once_then_undo_redo_and_reopen() {
+    let mut controls = Controls::new(460.0, 340.0, 1.0, language("zh"));
+    let before = controls.workspace.manifest().clone();
+    assert!(
+        controls
+            .click(controls.language.text(Message::CropStart))
+            .started
+    );
+    for (previous, next) in [("8", "004"), ("6", " 03 "), ("0", "+02"), ("0", "01")] {
+        controls.replace_text(previous, next);
+    }
+    let spelling = ["+02", "01", "004", " 03 "].map(str::to_owned);
+    assert_eq!(controls.draft.session.as_ref().unwrap().fields, spelling);
+    assert_eq!(controls.workspace.manifest(), &before);
+    controls.language = language("en");
+    controls.frame(Vec::new());
+    assert_eq!(controls.draft.session.as_ref().unwrap().fields, spelling);
+    controls.language = language("zh");
+    assert!(
+        controls
+            .click(controls.language.text(Message::CropApplyAll))
+            .applied
+    );
+    assert!(!controls.draft.active());
+    assert!(!controls.frame(Vec::new()).1.applied);
+    let after = controls.workspace.manifest().clone();
+    assert_eq!(after.revision.get(), before.revision.get() + 1);
+    assert_eq!(after.canvas.size, PhysicalSize::new(4, 3).unwrap());
+    assert_eq!(
+        controls.draft.notice.as_ref().unwrap().message_id(),
+        Some(Message::CropApplied)
+    );
+    controls.text(language("zh").text(Message::CropApplied));
+    controls.language = language("en");
+    controls.text(language("en").text(Message::CropApplied));
+    controls.workspace.undo().unwrap();
+    assert_eq!(
+        controls.workspace.manifest().timeline.frames,
+        before.timeline.frames
+    );
+    controls.workspace.redo().unwrap();
+    controls.workspace.checkpoint_and_compact().unwrap();
+    let expected = controls.workspace.manifest().clone();
+    let root = controls.workspace.project_root().to_path_buf();
+    drop(controls.workspace);
+    let opened = gif_from_screen_project::ActiveProject::open(
+        &root,
+        gif_from_screen_project::LockPolicy::FailIfPresent,
+    )
+    .unwrap();
+    assert_eq!(opened.project.manifest(), &expected);
+}
+
+#[test]
+fn chinese_numeric_input_rejects_localized_numbers_without_rewriting_text_or_project() {
+    let mut controls = Controls::new(460.0, 340.0, 1.0, language("zh"));
+    controls.click(controls.language.text(Message::CropStart));
+    let before = controls.workspace.manifest().clone();
+    let mut previous = "8";
+    for invalid in ["三", "４", "-1", "1.5", "4294967296"] {
+        controls.replace_text(previous, invalid);
+        assert_eq!(controls.draft.session.as_ref().unwrap().fields[2], invalid);
+        controls.text(controls.language.text(Message::CropUnsignedPixels));
+        assert!(
+            !controls
+                .click(controls.language.text(Message::CropApplyAll))
+                .applied
+        );
+        assert_eq!(controls.workspace.manifest(), &before);
+        previous = invalid;
+    }
+    controls.replace_text(previous, "0");
+    controls.text(controls.language.text(Message::CropEmptySize));
+    assert!(
+        !controls
+            .click(controls.language.text(Message::CropApplyAll))
+            .applied
+    );
+    assert_eq!(controls.workspace.manifest(), &before);
+    controls.click(controls.language.text(Message::CropCancel));
+    assert!(!controls.draft.active());
+}
+
+#[test]
+fn unsigned_parser_and_typed_bounds_errors_keep_the_same_numeric_boundary() {
+    let canvas = PhysicalSize::new(8, 6).unwrap();
+    for (fields, message) in [
+        (["-1", "0", "2", "2"], Message::CropUnsignedPixels),
+        (["0", "0", "0", "2"], Message::CropEmptySize),
+        (["7", "0", "2", "2"], Message::CropFitsImage),
+        (
+            ["4294967295", "0", "1", "1"],
+            Message::CropCoordinateOverflow,
+        ),
+    ] {
+        let fields = fields.map(str::to_owned);
+        let error = parse_fields(&fields, canvas).unwrap_err();
+        assert_eq!(error.message_id(), Some(message));
+        assert_eq!(error.render(language("zh")), language("zh").text(message));
+    }
+    let spelling = [" 02 ", "+01", "004", "3"].map(str::to_owned);
+    assert_eq!(
+        parse_fields(&spelling, canvas).unwrap(),
+        PhysicalRect::new(2, 1, 4, 3).unwrap()
+    );
+    assert_eq!(spelling, [" 02 ", "+01", "004", "3"].map(str::to_owned));
+}
+
+#[test]
+fn chinese_large_font_layout_keeps_start_apply_cancel_and_disabled_states_accessible() {
+    for scale in [1.0, 1.5, 2.0] {
+        let mut controls = Controls::new(320.0, 420.0, scale, language("zh"));
+        let before = controls.workspace.manifest().clone();
+        controls.enabled = false;
+        assert!(
+            !controls
+                .click(controls.language.text(Message::CropStart))
+                .started
+        );
+        assert!(!controls.draft.active());
+        controls.enabled = true;
+        assert!(
+            controls
+                .click(controls.language.text(Message::CropStart))
+                .started
+        );
+        controls.enabled = false;
+        assert!(
+            !controls
+                .click(controls.language.text(Message::CropApplyAll))
+                .applied
+        );
+        controls.click(controls.language.text(Message::CropCancel));
+        assert!(!controls.draft.active());
+        assert_eq!(controls.workspace.manifest(), &before);
+    }
+}
+
 #[test]
 fn reverse_drag_uses_rendered_pixels_not_preview_texture_pixels() {
     let image = egui::Rect::from_min_size(egui::pos2(50.0, 20.0), egui::vec2(320.0, 210.0));
@@ -88,6 +360,14 @@ fn changing_selection_revision_or_project_rejects_stale_crop() {
         assert!(draft.apply(&mut workspace).is_err());
         assert_eq!(workspace.manifest(), &before);
         assert!(!draft.active());
+        let notice = draft.notice.as_ref().unwrap();
+        assert_eq!(notice.message_id(), Some(Message::CropDraftDiscarded));
+        for language in [language("en"), language("zh")] {
+            assert_eq!(
+                notice.render(language),
+                language.text(Message::CropDraftDiscarded)
+            );
+        }
     }
 }
 

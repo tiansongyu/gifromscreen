@@ -13,7 +13,7 @@ fn localizer(tag: &str) -> Localizer {
 
 #[test]
 fn initial_key_ids_are_unique_and_both_catalogs_have_every_declared_message() {
-    assert_eq!(ALL_MESSAGES.len(), 459);
+    assert_eq!(ALL_MESSAGES.len(), 587);
     let ids: BTreeSet<_> = ALL_MESSAGES.iter().map(|message| message.id()).collect();
     assert_eq!(ids.len(), ALL_MESSAGES.len());
     for tag in ["en", "zh"] {
@@ -619,4 +619,126 @@ fn editor_result_receipts_keep_operation_ids_and_literal_errors() {
         localizer("en").text(Message::EditorRedoCompleted),
         "Reapplied the edit."
     );
+}
+
+#[test]
+fn export_report_keeps_selected_encoded_counts_and_user_path_distinct() {
+    let path = "/home/用户/{bytes}/GIF {encoded_frames}.gif";
+    let arguments = [
+        ("path", path),
+        ("bytes", "4096"),
+        ("encoded_frames", "3"),
+        ("selected_frames", "7"),
+    ];
+    assert_eq!(
+        localizer("en")
+            .format(Message::ExportCompletedReport, &arguments)
+            .unwrap(),
+        format!("Exported 7 selected frames as 3 GIF images (4096 bytes) to {path}")
+    );
+    assert_eq!(
+        localizer("zh")
+            .format(Message::ExportCompletedReport, &arguments)
+            .unwrap(),
+        format!("已将 7 个选中帧导出为 3 幅 GIF 图像（4096 字节），保存到 {path}")
+    );
+    assert_eq!(Message::ExportFinished.parameters(), ["frames", "path"]);
+    assert_eq!(Message::ExportFailed.parameters(), ["reason"]);
+    assert_eq!(
+        localizer("zh").format(Message::ExportFailed, &[("error", "raw")]),
+        Err(FormatError::UnknownArgument)
+    );
+}
+
+#[test]
+fn export_progress_uses_one_total_parameter_and_retains_technical_labels() {
+    for tag in ["en", "zh"] {
+        let localizer = localizer(tag);
+        let phase = localizer.text(Message::ExportPhaseRendering);
+        let output = localizer
+            .format(
+                Message::ExportProgress,
+                &[
+                    ("phase", phase),
+                    ("frames_rendered", "5"),
+                    ("frames_encoded", "2"),
+                    ("total_frames", "7"),
+                ],
+            )
+            .unwrap();
+        assert!(output.starts_with(phase));
+        assert!(output.contains("5/7"));
+        assert!(output.contains("2/7"));
+        assert_eq!(localizer.text(Message::ExportQuantizerNeuQuant), "NeuQuant");
+        assert_eq!(
+            localizer.text(Message::ExportDitherFloydSteinberg),
+            "Floyd–Steinberg"
+        );
+        assert_eq!(localizer.text(Message::ExportDitherBayer), "Bayer 4×4");
+        assert_eq!(localizer.text(Message::PreviewZoomNative), "100%");
+        assert_eq!(localizer.text(Message::CropFieldX), "X");
+        assert_eq!(
+            localizer.format(
+                Message::ExportProgress,
+                &[
+                    ("phase", phase),
+                    ("frames_rendered", "5"),
+                    ("frames_encoded", "2"),
+                    ("total_frames", "7"),
+                    ("total_frames", "8"),
+                ]
+            ),
+            Err(FormatError::DuplicateArgument("total_frames"))
+        );
+    }
+}
+
+#[test]
+fn preset_names_and_crop_diagnostics_are_not_translation_templates() {
+    let name = "我的预设 {name} #RRGGBB / 100%";
+    let error = "PermissionDenied: /home/用户/{error}/原始诊断";
+    for tag in ["en", "zh"] {
+        let localizer = localizer(tag);
+        for message in [
+            Message::ExportPresetLoaded,
+            Message::ExportPresetSaved,
+            Message::ExportPresetUpdated,
+            Message::ExportPresetRenamed,
+        ] {
+            let output = localizer.format(message, &[("name", name)]).unwrap();
+            assert!(output.contains(name));
+            assert_eq!(
+                localizer.format(message, &[("名称", name)]),
+                Err(FormatError::UnknownArgument)
+            );
+        }
+        for message in [
+            Message::CropInvalidBounds,
+            Message::CropOperationFailed,
+            Message::CropStartFailed,
+            Message::PreviewRenderFailed,
+            Message::ExportPresetFailed,
+        ] {
+            assert!(
+                localizer
+                    .format(message, &[("error", error)])
+                    .unwrap()
+                    .ends_with(error)
+            );
+        }
+        assert!(
+            localizer
+                .text(Message::ExportCustomPaletteHint)
+                .contains("#RRGGBB")
+        );
+        assert_eq!(
+            Message::PreviewRenderedSizes.parameters(),
+            [
+                "rendered_width",
+                "rendered_height",
+                "preview_width",
+                "preview_height"
+            ]
+        );
+    }
 }

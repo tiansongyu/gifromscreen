@@ -6,6 +6,10 @@ Chinese. Global-shortcut settings, actual registration summaries, binding-valida
 explanations and asynchronous settings notices use explicit localizers too.
 This extends [recorder localization](RECORDER-LOCALIZATION.md), not all 29 languages.
 
+The subsequent [preview/crop/export slice](PREVIEW-EXPORT-LOCALIZATION.md) extends
+this scope on main beyond Preview 2. The 459-entry count and verification totals
+below describe the earlier, frozen editor/shortcut slice.
+
 The catalog has 459 en/zh messages: the preceding 285 plus 39 shortcut, 117
 editor-control, 15 recorder-notice and three editor-result messages. Existing
 IDs, argument contracts and the original 285 translations are retained. Other
@@ -59,8 +63,9 @@ catalog change calls `EditorUiState::cancel_layout_gestures`:
 - Existing Cinemagraph mapping-change protection is retained and retested.
 
 Unavailable languages sharing English fallback do not spuriously cancel gestures.
-This closes the language-switch path; general ordinary-drawing mapping-epoch
-protection for other programmatic layout changes remains separate work.
+This closes the language-switch path. Subsequent main-branch work adds
+[ordinary-drawing mapping and press ownership protection](DRAWING-PREVIEW-INPUT.md)
+for other layout changes; it is not included in Preview 2.
 
 ## Verification and remaining scope
 
@@ -74,8 +79,8 @@ sequences across a layout change. Original English and Cinemagraph cases remain.
 Native acceptance is recorded separately; unit rendering is not physical desktop,
 global-shortcut or IME certification.
 
-Still open: Effects/Overlays/Project tool bodies, remaining preview/crop text,
-import/camera/board/automation/export dialogs, detailed errors, additional-language
+Still open: Effects/Overlays/Project tool bodies,
+import/camera/board/automation dialogs, detailed errors, additional-language
 catalogs, RTL/shaping and IME. [Native acceptance](EDITOR-LOCALIZATION-QA-2026-09-08.md)
 records actual editor and shortcut checks. [Preview 2](LINUX-PREVIEW-2-QA.md) includes
 this slice; Preview 1 remains the earlier frozen build.

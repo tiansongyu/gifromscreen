@@ -1,9 +1,11 @@
 //! Presets restore encoder choices only, never a path or overwrite permission.
 
+use crate::ui_notice::Notice;
 use eframe::egui;
 use gif_from_screen_domain::{
     GifExportPreset, GifLoop, GifPaletteStrategy, GifPresetOptions, validate_export_preset,
 };
+use gif_from_screen_localization::{Localizer, Message};
 
 use crate::{
     EditorExportSettings, ExportLoopChoice, ExportPaletteChoice, ProjectFrameSelection,
@@ -11,9 +13,9 @@ use crate::{
 };
 
 impl EditorExportSettings {
-    fn export_preset(&self) -> Result<GifExportPreset, String> {
+    fn export_preset(&self) -> Result<GifExportPreset, Notice> {
         if self.custom_palette_text.len() > gif_from_screen_domain::MAX_CUSTOM_PALETTE_TEXT_BYTES {
-            return Err("Preset custom palette text must not exceed 4096 bytes.".to_owned());
+            return Err(Message::ExportPresetPaletteLimit.into());
         }
         build_project_export_options(self, ProjectFrameSelection::All)?;
         let preset = GifExportPreset {
@@ -43,7 +45,7 @@ impl EditorExportSettings {
         Ok(preset)
     }
 
-    fn load_export_preset(&mut self, preset: &GifExportPreset) -> Result<(), String> {
+    fn load_export_preset(&mut self, preset: &GifExportPreset) -> Result<(), Notice> {
         validate_export_preset(preset)?;
         let options = preset.options.clone().unwrap_or_else(|| GifPresetOptions {
             finite_loop_count: match preset.repeat {
@@ -58,9 +60,9 @@ impl EditorExportSettings {
             palette: match preset.palette {
                 GifPaletteStrategy::PerFrame => ExportPaletteChoice::Local,
                 GifPaletteStrategy::Global => ExportPaletteChoice::Global,
-                GifPaletteStrategy::Adaptive => return Err(
-                    "This legacy preset uses Adaptive palette selection, which is not available in the editor. Choose an explicit palette and save a new preset.".to_owned()
-                ),
+                GifPaletteStrategy::Adaptive => {
+                    return Err(Message::ExportPresetAdaptiveUnsupported.into());
+                }
             },
             quantizer: options.quantizer,
             custom_palette_text: options.custom_palette_text,
@@ -87,7 +89,7 @@ impl EditorExportSettings {
 struct PresetUiState {
     selected: String,
     name: String,
-    notice: Option<String>,
+    notice: Option<Result<Notice, Notice>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -103,6 +105,7 @@ pub(crate) fn show_export_presets(
     ui: &mut egui::Ui,
     settings: &mut EditorExportSettings,
     workspace: &mut EditorWorkspace,
+    localizer: Localizer,
 ) {
     let id = ui.id().with((
         "export-presets",
@@ -118,10 +121,10 @@ pub(crate) fn show_export_presets(
     }
     let mut action = None;
     ui.horizontal_wrapped(|ui| {
-        ui.label("Project preset");
+        ui.label(localizer.text(Message::ExportProjectPreset));
         egui::ComboBox::from_id_salt("export-preset-list")
             .selected_text(if state.selected.is_empty() {
-                "Choose a preset"
+                localizer.text(Message::ExportChoosePreset)
             } else {
                 &state.selected
             })
@@ -137,9 +140,15 @@ pub(crate) fn show_export_presets(
             });
         ui.add_enabled_ui(!state.selected.is_empty(), |ui| {
             for (label, requested) in [
-                ("Load", PresetAction::Load),
-                ("Update selected", PresetAction::Update),
-                ("Delete", PresetAction::Delete),
+                (
+                    localizer.text(Message::ExportPresetLoad),
+                    PresetAction::Load,
+                ),
+                (
+                    localizer.text(Message::ExportPresetUpdate),
+                    PresetAction::Update,
+                ),
+                (localizer.text(Message::EditorDelete), PresetAction::Delete),
             ] {
                 if ui.button(label).clicked() {
                     action = Some(requested);
@@ -150,37 +159,46 @@ pub(crate) fn show_export_presets(
     ui.horizontal_wrapped(|ui| {
         ui.add(
             egui::TextEdit::singleline(&mut state.name)
-                .hint_text("Preset name")
+                .hint_text(localizer.text(Message::ExportPresetName))
                 .char_limit(64)
                 .desired_width(220.0),
         );
-        if ui.button("Save new").clicked() {
+        if ui
+            .button(localizer.text(Message::ExportPresetSaveNew))
+            .clicked()
+        {
             action = Some(PresetAction::SaveNew);
         }
         if ui
             .add_enabled(
                 !state.selected.is_empty(),
-                egui::Button::new("Rename selected"),
+                egui::Button::new(localizer.text(Message::ExportPresetRename)),
             )
             .clicked()
         {
             action = Some(PresetAction::Rename);
         }
     });
-    ui.weak("Saved inside this project · changes support Undo · loading clears overwrite permission and keeps the output path.");
+    ui.weak(localizer.text(Message::ExportPresetStorageHint));
     if let Some(action) = action {
-        state.notice = Some(
-            match apply_preset_action(action, &mut state, settings, workspace) {
-                Ok(message) => message,
-                Err(error) => format!("Preset: {error}"),
-            },
-        );
+        state.notice = Some(apply_preset_action(action, &mut state, settings, workspace));
     }
     if let Some(notice) = &state.notice {
-        ui.label(notice);
+        ui.label(preset_notice_text(notice, localizer));
     }
     ui.add_space(8.0);
     ui.data_mut(|data| data.insert_temp(id, state));
+}
+
+fn preset_notice_text(notice: &Result<Notice, Notice>, localizer: Localizer) -> String {
+    match notice {
+        Ok(notice) => notice.render(localizer),
+        Err(error) => crate::format_message(
+            localizer,
+            Message::ExportPresetFailed,
+            &[("error", &error.render(localizer))],
+        ),
+    }
 }
 
 fn apply_preset_action(
@@ -188,41 +206,47 @@ fn apply_preset_action(
     state: &mut PresetUiState,
     settings: &mut EditorExportSettings,
     workspace: &mut EditorWorkspace,
-) -> Result<String, String> {
+) -> Result<Notice, Notice> {
     match action {
         PresetAction::Load => {
             let preset = workspace
                 .manifest()
                 .export_presets
                 .get(&state.selected)
-                .ok_or_else(|| "Select an existing preset first.".to_owned())?;
+                .ok_or_else(|| Notice::from(Message::ExportPresetSelectFirst))?;
             settings.load_export_preset(preset)?;
-            Ok(format!(
-                "Loaded {}. Review the current frame selection before exporting.",
-                state.selected
+            Ok(Notice::new(
+                Message::ExportPresetLoaded,
+                &[("name", &state.selected)],
             ))
         }
         PresetAction::SaveNew => {
             workspace.save_export_preset(&state.name, settings.export_preset()?, false)?;
             state.selected = state.name.trim().to_owned();
-            Ok(format!("Saved {} in this project.", state.selected))
+            Ok(Notice::new(
+                Message::ExportPresetSaved,
+                &[("name", &state.selected)],
+            ))
         }
         PresetAction::Update => {
             workspace.save_export_preset(&state.selected, settings.export_preset()?, true)?;
-            Ok(format!(
-                "Updated {}. Undo restores its previous settings.",
-                state.selected
+            Ok(Notice::new(
+                Message::ExportPresetUpdated,
+                &[("name", &state.selected)],
             ))
         }
         PresetAction::Rename => {
             workspace.rename_export_preset(&state.selected, &state.name)?;
             state.selected = state.name.trim().to_owned();
-            Ok(format!("Renamed preset to {}.", state.selected))
+            Ok(Notice::new(
+                Message::ExportPresetRenamed,
+                &[("name", &state.selected)],
+            ))
         }
         PresetAction::Delete => {
             workspace.delete_export_preset(&state.selected)?;
             state.selected.clear();
-            Ok("Deleted preset. Undo restores it.".to_owned())
+            Ok(Message::ExportPresetDeleted.into())
         }
     }
 }
@@ -459,5 +483,190 @@ mod tests {
         settings.load_export_preset(&preset).unwrap();
         assert_eq!(settings.loop_choice, ExportLoopChoice::Infinite);
         assert_eq!(settings.finite_loop_count, 42);
+    }
+
+    fn language(tag: &str) -> Localizer {
+        Localizer::new(gif_from_screen_localization::find_language(tag).unwrap())
+    }
+
+    fn assert_success_languages(
+        result: &Result<Notice, Notice>,
+        message: Message,
+        name: Option<&str>,
+    ) {
+        assert_eq!(result.as_ref().unwrap().message_id(), Some(message));
+        let arguments: Vec<_> = name.map(|name| ("name", name)).into_iter().collect();
+        let first = preset_notice_text(result, language("en"));
+        for tag in ["en", "zh", "en"] {
+            let localizer = language(tag);
+            assert_eq!(
+                preset_notice_text(result, localizer),
+                localizer.format(message, &arguments).unwrap()
+            );
+        }
+        assert_eq!(preset_notice_text(result, language("en")), first);
+    }
+
+    fn assert_failure_languages(result: &Result<Notice, Notice>, message: Message) {
+        assert_eq!(result.as_ref().unwrap_err().message_id(), Some(message));
+        let first = preset_notice_text(result, language("en"));
+        for tag in ["en", "zh", "en"] {
+            let localizer = language(tag);
+            let expected = localizer
+                .format(
+                    Message::ExportPresetFailed,
+                    &[("error", localizer.text(message))],
+                )
+                .unwrap();
+            assert_eq!(preset_notice_text(result, localizer), expected);
+        }
+        assert_eq!(preset_notice_text(result, language("en")), first);
+    }
+
+    #[test]
+    fn real_save_load_delete_receipts_switch_language_without_changing_user_names_or_options() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = workspace(directory.path());
+        let original = settings();
+        let mut settings = original.clone();
+        let name = "用户 {name}";
+        let mut state = PresetUiState {
+            name: name.into(),
+            ..Default::default()
+        };
+        let saved = apply_preset_action(
+            PresetAction::SaveNew,
+            &mut state,
+            &mut settings,
+            &mut workspace,
+        );
+        let manifest = workspace.manifest().clone();
+        assert_success_languages(&saved, Message::ExportPresetSaved, Some(name));
+        assert_eq!(
+            preset_notice_text(&saved, language("zh")),
+            "已在此工程中保存 用户 {name}。"
+        );
+        assert_eq!(workspace.manifest(), &manifest);
+        assert_eq!(state.name, name);
+        assert_eq!(state.selected, name);
+        assert_eq!(settings, original);
+        let stored = &manifest.export_presets[name];
+        assert_eq!(
+            stored.options.as_ref().unwrap().custom_palette_text,
+            original.custom_palette_text
+        );
+
+        settings.dither = ExportDitherChoice::Atkinson;
+        let loaded = apply_preset_action(
+            PresetAction::Load,
+            &mut state,
+            &mut settings,
+            &mut workspace,
+        );
+        assert_success_languages(&loaded, Message::ExportPresetLoaded, Some(name));
+        assert_eq!(
+            settings,
+            EditorExportSettings {
+                overwrite: false,
+                ..original
+            }
+        );
+        assert_eq!(workspace.manifest(), &manifest);
+        assert_eq!(state.selected, name);
+
+        let before_delete = settings.clone();
+        let deleted = apply_preset_action(
+            PresetAction::Delete,
+            &mut state,
+            &mut settings,
+            &mut workspace,
+        );
+        let deleted_manifest = workspace.manifest().clone();
+        assert_success_languages(&deleted, Message::ExportPresetDeleted, None);
+        assert!(state.selected.is_empty());
+        assert!(workspace.manifest().export_presets.is_empty());
+        assert_eq!(workspace.manifest(), &deleted_manifest);
+        assert_eq!(settings, before_delete);
+        workspace.undo().unwrap();
+        assert_eq!(workspace.manifest().export_presets, manifest.export_presets);
+    }
+
+    #[test]
+    fn no_selection_and_legacy_adaptive_errors_relocalize_without_mutating_settings_or_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = workspace(directory.path());
+        let mut settings = settings();
+        let original = settings.clone();
+        let mut state = PresetUiState::default();
+        let before = workspace.manifest().clone();
+        let missing = apply_preset_action(
+            PresetAction::Load,
+            &mut state,
+            &mut settings,
+            &mut workspace,
+        );
+        assert_failure_languages(&missing, Message::ExportPresetSelectFirst);
+        assert_eq!(
+            preset_notice_text(&missing, language("zh")),
+            "预设：请先选择一个已有预设。"
+        );
+        assert_eq!(workspace.manifest(), &before);
+        assert_eq!(settings, original);
+        let mut legacy = settings.export_preset().unwrap();
+        legacy.palette = GifPaletteStrategy::Adaptive;
+        workspace
+            .save_export_preset("旧预设 {name}", legacy, false)
+            .unwrap();
+        state.selected = "旧预设 {name}".into();
+        let before = workspace.manifest().clone();
+        let unsupported = apply_preset_action(
+            PresetAction::Load,
+            &mut state,
+            &mut settings,
+            &mut workspace,
+        );
+        assert_failure_languages(&unsupported, Message::ExportPresetAdaptiveUnsupported);
+        assert_eq!(workspace.manifest(), &before);
+        assert_eq!(settings, original);
+        assert!(
+            settings.overwrite,
+            "a rejected load must not change the current permission"
+        );
+        assert_eq!(state.selected, "旧预设 {name}");
+    }
+
+    #[test]
+    fn preset_palette_limit_remains_4096_bytes_and_failure_notice_changes_language_later() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = workspace(directory.path());
+        let mut settings = settings();
+        settings.custom_palette_text = format!("{:<4096}", "#000000,#FFFFFF");
+        settings.custom_transparent_index = 0;
+        assert_eq!(settings.custom_palette_text.len(), 4096);
+        let mut state = PresetUiState {
+            name: "最大文本".into(),
+            ..Default::default()
+        };
+        let saved = apply_preset_action(
+            PresetAction::SaveNew,
+            &mut state,
+            &mut settings,
+            &mut workspace,
+        );
+        assert!(saved.is_ok());
+        let before = workspace.manifest().clone();
+        settings.custom_palette_text.push(' ');
+        let original = settings.clone();
+        let too_large = apply_preset_action(
+            PresetAction::Update,
+            &mut state,
+            &mut settings,
+            &mut workspace,
+        );
+        assert_failure_languages(&too_large, Message::ExportPresetPaletteLimit);
+        assert_eq!(workspace.manifest(), &before);
+        assert_eq!(settings, original);
+        assert_eq!(state.selected, "最大文本");
+        assert!(settings.overwrite);
     }
 }

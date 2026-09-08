@@ -18,12 +18,15 @@ mod cinemagraph_draft;
 mod cinemagraph_preview;
 mod countdown;
 mod custom_palette_input;
+mod drawing_preview;
 mod editor_canvas;
 mod editor_export_presets;
 mod editor_preview;
 mod editor_ui;
 mod editor_workspace;
 mod export_job;
+#[cfg(test)]
+mod export_localization_tests;
 mod fixed_crop_session;
 mod image_effect_ui;
 mod import_gif_job;
@@ -103,7 +106,7 @@ use gif_from_screen_capture::{
 use gif_from_screen_capture_linux::{LinuxDisplayServer, X11CaptureBackend};
 use gif_from_screen_domain::{
     DurationUs, FrameId, PhysicalPoint as ProjectPhysicalPoint, PhysicalPx,
-    PhysicalSize as ProjectPhysicalSize, ProjectId, Rgba, StrokePoint, UnixTimeMs,
+    PhysicalSize as ProjectPhysicalSize, ProjectId, Rgba, UnixTimeMs,
 };
 use gif_from_screen_gif::{
     CancellationFlag, CancellationToken as _, DeltaMode, DitherMode, EncodeOptions, LoopBehavior,
@@ -855,6 +858,7 @@ struct GifFromScreenApp {
     pending_watermark: Option<PendingWatermark>,
     editor_workspace: Option<EditorWorkspace>,
     editor_ui_state: EditorUiState,
+    drawing_input: drawing_preview::InputBoundary,
     editor_preview_cache: EditorPreviewCache,
     editor_export_settings: EditorExportSettings,
     export_job: ExportJob,
@@ -917,6 +921,7 @@ impl Default for GifFromScreenApp {
             pending_watermark: None,
             editor_workspace: None,
             editor_ui_state: EditorUiState::default(),
+            drawing_input: drawing_preview::InputBoundary::default(),
             editor_preview_cache: EditorPreviewCache::new(),
             editor_export_settings: EditorExportSettings::default(),
             export_job: ExportJob::default(),
@@ -934,6 +939,19 @@ impl Drop for GifFromScreenApp {
 }
 
 impl eframe::App for GifFromScreenApp {
+    fn raw_input_hook(&mut self, context: &egui::Context, input: &mut egui::RawInput) {
+        let enabled = self.view == AppView::Editor
+            && self.shutdown == ShutdownState::Active
+            && self.recorder_overlay.is_none()
+            && self.wayland_crop_controller.is_none();
+        self.drawing_input.filter(
+            context,
+            input,
+            enabled,
+            &mut self.editor_ui_state.drawing_overlay,
+        );
+    }
+
     fn update(&mut self, context: &egui::Context, frame: &mut eframe::Frame) {
         // Do not accept a last UI edit after this frame's close gate has already
         // decided to exit. Also cover the final frame of a deferred shutdown.
@@ -965,6 +983,9 @@ impl eframe::App for GifFromScreenApp {
         }
         self.advance_recording_countdown(context);
         self.restore_main_window_if_requested(context);
+        if self.recorder_overlay.is_some() || self.wayland_crop_controller.is_some() {
+            drawing_preview::invalidate(context, &mut self.editor_ui_state.drawing_overlay);
+        }
         if self.recorder_overlay.is_some() {
             self.show_recorder_overlay(context);
             if self.recorder_overlay.is_some() {
@@ -998,8 +1019,25 @@ impl eframe::App for GifFromScreenApp {
             context.request_repaint_after(Duration::from_millis(33));
         }
 
-        self.show_app_header(context);
+        self.show_main_view(context);
+        if allow_preference_changes && self.shutdown == ShutdownState::Active {
+            self.language_settings.show(context);
+        }
+    }
 
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        // Ordinary pages paint opaque panels. The mapped recorder parent and
+        // the capture hole stay transparent when the main page is not painted.
+        [0.0, 0.0, 0.0, 0.0]
+    }
+}
+
+impl GifFromScreenApp {
+    fn show_main_view(&mut self, context: &egui::Context) {
+        self.show_app_header(context);
+        // Route changes made by a page take effect next frame. Track what was
+        // actually drawn so a hidden editor cannot retain an old pointer hold.
+        let editor_visible = self.view == AppView::Editor;
         egui::CentralPanel::default().show(context, |ui| match self.view {
             AppView::Landing => self.show_landing(ui),
             AppView::OpenProject => self.show_open_project(ui),
@@ -1034,19 +1072,11 @@ impl eframe::App for GifFromScreenApp {
             }
             AppView::Editor => self.show_editor(ui),
         });
-        if allow_preference_changes && self.shutdown == ShutdownState::Active {
-            self.language_settings.show(context);
+        if !editor_visible {
+            drawing_preview::invalidate(context, &mut self.editor_ui_state.drawing_overlay);
         }
     }
 
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // Ordinary pages paint opaque panels. The mapped recorder parent and
-        // the capture hole stay transparent when the main page is not painted.
-        [0.0, 0.0, 0.0, 0.0]
-    }
-}
-
-impl GifFromScreenApp {
     fn poll_language_settings(&mut self, context: &egui::Context) {
         self.language_settings.poll(context);
         if let Some(notice) = &mut self.notice {
@@ -2064,14 +2094,17 @@ impl GifFromScreenApp {
 
     fn show_editor(&mut self, ui: &mut egui::Ui) {
         if self.auto_tasks.is_running() {
+            drawing_preview::invalidate(ui.ctx(), &mut self.editor_ui_state.drawing_overlay);
             self.auto_tasks.show_running(ui);
             return;
         }
         if self.annotation_tools.is_running() {
+            drawing_preview::invalidate(ui.ctx(), &mut self.editor_ui_state.drawing_overlay);
             self.annotation_tools.show_running(ui);
             return;
         }
         if self.motion_tools.is_running() {
+            drawing_preview::invalidate(ui.ctx(), &mut self.editor_ui_state.drawing_overlay);
             self.motion_tools.show_running(ui);
             return;
         }
@@ -2079,6 +2112,7 @@ impl GifFromScreenApp {
     }
 
     fn show_editor_contents(&mut self, ui: &mut egui::Ui) {
+        let localizer = self.language_settings.localizer();
         self.show_editor_work_area(ui);
         let motion_enabled = !self.source_workers_active()
             && !self.text_overlay.is_running()
@@ -2108,7 +2142,7 @@ impl GifFromScreenApp {
         );
         let open_copy = self.project_library.show_save_as(ui, workspace);
         ui.separator();
-        let export_action = egui::CollapsingHeader::new("Export GIF")
+        let export_action = egui::CollapsingHeader::new(localizer.text(Message::ExportTitle))
             .id_salt("editor-export-options")
             .show(ui, |ui| {
                 show_export_panel(
@@ -2120,6 +2154,7 @@ impl GifFromScreenApp {
                     self.watermark_job.state() == WatermarkDecodeJobState::Running
                         || self.motion_tools.is_running()
                         || self.annotation_tools.is_running(),
+                    localizer,
                 )
             })
             .body_returned
@@ -2127,13 +2162,15 @@ impl GifFromScreenApp {
         match export_action {
             EditorExportAction::None => {}
             EditorExportAction::Start => {
-                if let Err(error) = self.start_editor_export() {
-                    self.notice = Some(error.into());
+                if let Err(mut error) = self.start_editor_export() {
+                    error.refresh(self.language_settings.localizer());
+                    self.notice = Some(error);
                 }
             }
             EditorExportAction::Cancel => {
                 if self.export_job.cancel() {
-                    self.notice = Some("Cancelling GIF export…".to_owned().into());
+                    self.notice =
+                        Some(Notice::localized(localizer, Message::ExportCancelling, &[]));
                 }
             }
         }
@@ -2164,6 +2201,7 @@ impl GifFromScreenApp {
             && !export_job_is_active(self.export_job.state());
         let Some(workspace) = &mut self.editor_workspace else {
             ui.label("No active editor project.");
+            drawing_preview::invalidate(ui.ctx(), &mut self.editor_ui_state.drawing_overlay);
             return;
         };
         self.motion_tools.reconcile_cinemagraph(workspace);
@@ -2205,6 +2243,7 @@ impl GifFromScreenApp {
                     &mut self.editor_ui_state,
                     &mut self.motion_tools,
                     cine_input_enabled,
+                    localizer,
                 );
             });
         } else {
@@ -2215,6 +2254,7 @@ impl GifFromScreenApp {
                 &mut self.editor_ui_state,
                 &mut self.motion_tools,
                 cine_input_enabled,
+                localizer,
             );
             ui.separator();
             inspector(ui, workspace, &mut self.editor_ui_state);
@@ -3550,15 +3590,15 @@ impl GifFromScreenApp {
         }
     }
 
-    fn start_editor_export(&mut self) -> Result<(), String> {
+    fn start_editor_export(&mut self) -> Result<(), Notice> {
         let workspace = self
             .editor_workspace
             .as_ref()
-            .ok_or_else(|| "No active editor project is available for export.".to_owned())?;
+            .ok_or_else(|| Notice::from(Message::ExportNoProject))?;
         if !workspace.asset_issues().is_empty() {
-            return Err(format!(
-                "Cannot export while the project has {} unresolved asset issue(s).",
-                workspace.asset_issues().len()
+            return Err(Notice::new(
+                Message::ExportBlockedAssets,
+                &[("count", &workspace.asset_issues().len().to_string())],
             ));
         }
         let timeline_order: Vec<_> = workspace
@@ -3579,7 +3619,11 @@ impl GifFromScreenApp {
         self.export_job
             .start(snapshot, output, options)
             .map_err(|error| error.to_string())?;
-        self.notice = Some("GIF export started…".to_owned().into());
+        self.notice = Some(Notice::localized(
+            self.language_settings.localizer(),
+            Message::ExportStarted,
+            &[],
+        ));
         Ok(())
     }
 
@@ -3593,11 +3637,11 @@ impl GifFromScreenApp {
             return;
         }
         let notice = self.export_job.take_result().map_or_else(
-            || "GIF export worker finished without a result.".to_owned(),
+            || Notice::from(Message::ExportWorkerNoResult),
             export_result_notice,
         );
         self.export_job = ExportJob::default();
-        self.notice = Some(notice.into());
+        self.notice = Some(notice);
     }
 
     fn receive_open_project_messages(&mut self) {
@@ -3996,6 +4040,7 @@ fn show_editor_preview_panel(
     state: &mut EditorUiState,
     motion: &mut MotionTools,
     cine_input_enabled: bool,
+    localizer: Localizer,
 ) {
     state.drawing_overlay.reconcile(workspace);
     state.canvas.reconcile(workspace);
@@ -4013,18 +4058,20 @@ fn show_editor_preview_panel(
         state.canvas.crop.cancel();
     }
     ui.heading(if cine_reference.is_some() {
-        "Cinemagraph reference · frame 1"
+        localizer.text(Message::PreviewCinemagraphReference)
     } else if transition.is_some() {
-        "Transition preview"
+        localizer.text(Message::PreviewTransitionTitle)
     } else {
-        "Current frame preview"
+        localizer.text(Message::PreviewCurrentFrameTitle)
     });
-    state.canvas.show_zoom(ui);
-    if show_preview_asset_issues(ui, workspace) {
+    state.canvas.show_zoom(ui, localizer);
+    if show_preview_asset_issues(ui, workspace, localizer) {
+        drawing_preview::invalidate(ui.ctx(), &mut state.drawing_overlay);
         return;
     }
     let Some(frame_id) = cine_reference.or_else(|| workspace.selection().current()) else {
-        ui.label("Select a frame to preview it.");
+        ui.label(localizer.text(Message::PreviewSelectFrame));
+        drawing_preview::invalidate(ui.ctx(), &mut state.drawing_overlay);
         return;
     };
     let preview = if state.canvas.zoom == editor_canvas::PreviewZoom::Fit {
@@ -4056,14 +4103,20 @@ fn show_editor_preview_panel(
                 cinemagraph: cine_reference.is_some(),
                 input_enabled: cine_input_enabled,
             },
+            localizer,
         ),
         Err(error) => {
+            drawing_preview::invalidate(ui.ctx(), &mut state.drawing_overlay);
             ui.colored_label(
                 ui.visuals().error_fg_color,
-                format!("Could not render preview: {error}"),
+                format_message(
+                    localizer,
+                    Message::PreviewRenderFailed,
+                    &[("error", &error.to_string())],
+                ),
             );
             if state.canvas.zoom != editor_canvas::PreviewZoom::Fit {
-                ui.label("Exact-pixel views keep the existing texture/cache limits. Choose Fit for a bounded downsampled preview.");
+                ui.label(localizer.text(Message::PreviewExactLimitHint));
             }
         }
     }
@@ -4084,6 +4137,7 @@ fn draw_editor_preview(
     motion: &mut MotionTools,
     preview: &editor_preview::EditorPreview,
     target: EditorPreviewTarget,
+    localizer: Localizer,
 ) {
     let editable = target.transition.is_none() && state.playback.is_none();
     let crop = state.canvas.crop.show_controls(
@@ -4092,21 +4146,32 @@ fn draw_editor_preview(
         target.frame_id,
         preview.rendered_size,
         editable && target.input_enabled && !target.cinemagraph,
+        localizer,
     );
     if crop.started {
         state.pause_preview();
         state.drawing_overlay.cancel();
     }
     if crop.applied {
+        drawing_preview::invalidate(ui.ctx(), &mut state.drawing_overlay);
         state.pause_preview();
         ui.ctx().request_repaint();
         return;
     }
     let crop_active = state.canvas.crop.active();
-    let sense = if (target.cinemagraph && target.input_enabled) || (crop_active && editable) {
+    let drawing_enabled = editable
+        && target.input_enabled
+        && !target.cinemagraph
+        && !motion.cinemagraph_editing()
+        && !crop_active;
+    if !drawing_enabled {
+        drawing_preview::invalidate(ui.ctx(), &mut state.drawing_overlay);
+    }
+    let sense = if (target.cinemagraph && target.input_enabled)
+        || (crop_active && editable)
+        || (drawing_enabled && state.drawing_overlay.phase == DrawingDraftPhase::Capturing)
+    {
         egui::Sense::click_and_drag()
-    } else if editable && state.drawing_overlay.phase == DrawingDraftPhase::Capturing {
-        egui::Sense::drag()
     } else {
         egui::Sense::hover()
     };
@@ -4123,12 +4188,16 @@ fn draw_editor_preview(
                     preview.rendered_size,
                     target.input_enabled && editable,
                 );
-            } else if editable && !motion.cinemagraph_editing() && !crop_active {
-                update_drawing_draft_from_preview(
-                    response,
-                    preview.rendered_size,
-                    &mut state.drawing_overlay,
-                );
+            }
+            drawing_preview::update(
+                ui,
+                response,
+                preview.rendered_size,
+                drawing_enabled
+                    && !ui.input(|input| input.pointer.button_down(egui::PointerButton::Middle)),
+                &mut state.drawing_overlay,
+            );
+            if drawing_enabled {
                 paint_drawing_draft(
                     ui.painter(),
                     response.rect,
@@ -4139,32 +4208,42 @@ fn draw_editor_preview(
         },
     );
     if let Err(error) = shown {
-        ui.colored_label(ui.visuals().error_fg_color, error);
+        drawing_preview::invalidate(ui.ctx(), &mut state.drawing_overlay);
+        ui.colored_label(ui.visuals().error_fg_color, error.render(localizer));
     }
     if let Some(step) = target.transition {
-        ui.weak(format!(
-            "Transition step {} · select an original frame to edit",
-            step.step
+        ui.weak(format_message(
+            localizer,
+            Message::PreviewTransitionStep,
+            &[("step", &step.step.to_string())],
         ));
     }
-    ui.weak(format!(
-        "Rendered {}×{} · preview {}×{}",
-        preview.rendered_size[0],
-        preview.rendered_size[1],
-        preview.preview_size[0],
-        preview.preview_size[1]
+    ui.weak(format_message(
+        localizer,
+        Message::PreviewRenderedSizes,
+        &[
+            ("rendered_width", &preview.rendered_size[0].to_string()),
+            ("rendered_height", &preview.rendered_size[1].to_string()),
+            ("preview_width", &preview.preview_size[0].to_string()),
+            ("preview_height", &preview.preview_size[1].to_string()),
+        ],
     ));
 }
 
-fn show_preview_asset_issues(ui: &mut egui::Ui, workspace: &EditorWorkspace) -> bool {
+fn show_preview_asset_issues(
+    ui: &mut egui::Ui,
+    workspace: &EditorWorkspace,
+    localizer: Localizer,
+) -> bool {
     if workspace.asset_issues().is_empty() {
         return false;
     }
     ui.colored_label(
         ui.visuals().error_fg_color,
-        format!(
-            "Preview and export are blocked by {} unresolved asset issue(s).",
-            workspace.asset_issues().len()
+        format_message(
+            localizer,
+            Message::PreviewBlockedAssets,
+            &[("count", &workspace.asset_issues().len().to_string())],
         ),
     );
     for issue in workspace.asset_issues() {
@@ -4186,29 +4265,6 @@ fn show_editor_preview_image(
     let response = ui.interact(rect, allocation.id.with("image-pixels"), sense);
     response.widget_info(|| egui::WidgetInfo::new(egui::WidgetType::Image));
     response
-}
-
-fn update_drawing_draft_from_preview(
-    response: &egui::Response,
-    rendered_size: [u32; 2],
-    draft: &mut DrawingOverlayDraft,
-) {
-    if draft.phase != DrawingDraftPhase::Capturing {
-        return;
-    }
-    if (response.drag_started_by(egui::PointerButton::Primary)
-        || response.dragged_by(egui::PointerButton::Primary))
-        && let Some(position) = response.interact_pointer_pos()
-        && let Some(point) = map_drawing_preview_point(response.rect, position, rendered_size)
-    {
-        draft.push_point(StrokePoint {
-            point,
-            pressure_milli: 1_000,
-        });
-    }
-    if response.drag_stopped_by(egui::PointerButton::Primary) {
-        draft.finish_stroke();
-    }
 }
 
 #[allow(
@@ -4299,22 +4355,27 @@ fn show_export_panel(
     job: &ExportJob,
     workspace: &mut EditorWorkspace,
     editor_mutation_active: bool,
+    localizer: Localizer,
 ) -> EditorExportAction {
-    ui.heading("Export GIF");
+    ui.heading(localizer.text(Message::ExportTitle));
     let selected_count = workspace.selection().len();
     let asset_issue_count = workspace.asset_issues().len();
     let active = export_job_is_active(job.state());
     ui.add_enabled_ui(!active && !editor_mutation_active, |ui| {
-        editor_export_presets::show_export_presets(ui, settings, workspace);
-        show_export_configuration(ui, output, settings, selected_count);
+        editor_export_presets::show_export_presets(ui, settings, workspace, localizer);
+        show_export_configuration(ui, output, settings, selected_count, localizer);
     });
     if editor_mutation_active {
-        ui.weak("Finish the active editor asset job before exporting.");
+        ui.weak(localizer.text(Message::ExportFinishAssetJob));
     }
     if asset_issue_count > 0 {
         ui.colored_label(
             ui.visuals().error_fg_color,
-            format!("Resolve {asset_issue_count} asset issue(s) before exporting."),
+            format_message(
+                localizer,
+                Message::ExportResolveAssets,
+                &[("count", &asset_issue_count.to_string())],
+            ),
         );
     }
 
@@ -4323,7 +4384,7 @@ fn show_export_panel(
             if ui
                 .add_enabled(
                     asset_issue_count == 0 && !editor_mutation_active,
-                    egui::Button::new("Export GIF"),
+                    egui::Button::new(localizer.text(Message::ExportTitle)),
                 )
                 .clicked()
             {
@@ -4334,24 +4395,26 @@ fn show_export_panel(
         }
         ExportJobState::Running | ExportJobState::Cancelling => {
             if let Some(progress) = job.latest_progress() {
-                ui.label(format!(
-                    "{:?}: rendered {}/{}, encoded {}/{}",
-                    progress.phase,
-                    progress.frames_rendered,
-                    progress.total_frames,
-                    progress.frames_encoded,
-                    progress.total_frames
+                ui.label(format_message(
+                    localizer,
+                    Message::ExportProgress,
+                    &[
+                        ("phase", export_phase_label(progress.phase, localizer)),
+                        ("frames_rendered", &progress.frames_rendered.to_string()),
+                        ("frames_encoded", &progress.frames_encoded.to_string()),
+                        ("total_frames", &progress.total_frames.to_string()),
+                    ],
                 ));
             } else {
-                ui.label("Starting export worker…");
+                ui.label(localizer.text(Message::ExportStartingWorker));
             }
             if ui
                 .add_enabled(
                     job.state() == ExportJobState::Running,
                     egui::Button::new(if job.state() == ExportJobState::Cancelling {
-                        "Cancelling…"
+                        localizer.text(Message::ExportCancelling)
                     } else {
-                        "Cancel export"
+                        localizer.text(Message::ExportCancel)
                     }),
                 )
                 .clicked()
@@ -4362,7 +4425,7 @@ fn show_export_panel(
             }
         }
         ExportJobState::Finished => {
-            ui.label("Finishing export result…");
+            ui.label(localizer.text(Message::ExportFinishingResult));
             EditorExportAction::None
         }
     }
@@ -4377,54 +4440,63 @@ fn show_export_configuration(
     output: &mut String,
     settings: &mut EditorExportSettings,
     selected_count: usize,
+    localizer: Localizer,
 ) {
     egui::Grid::new("editor_export_configuration")
         .num_columns(2)
         .spacing([16.0, 6.0])
         .show(ui, |ui| {
-            ui.label("Output");
+            ui.label(localizer.text(Message::ExportOutputLabel));
             ui.text_edit_singleline(output);
             ui.end_row();
 
-            ui.label("Frames");
+            ui.label(localizer.text(Message::EditorFramesTab));
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut settings.frame_scope, ExportFrameScope::All, "All");
+                ui.selectable_value(
+                    &mut settings.frame_scope,
+                    ExportFrameScope::All,
+                    localizer.text(Message::ExportScopeAll),
+                );
                 ui.selectable_value(
                     &mut settings.frame_scope,
                     ExportFrameScope::Selected,
-                    format!("Selected ({selected_count})"),
+                    format_message(
+                        localizer,
+                        Message::ExportScopeSelectedCount,
+                        &[("count", &selected_count.to_string())],
+                    ),
                 );
             });
             ui.end_row();
 
-            ui.label("Maximum colors");
+            ui.label(localizer.text(Message::ExportMaximumColors));
             ui.add(egui::DragValue::new(&mut settings.max_colors).range(2..=256));
             ui.end_row();
 
-            ui.label("Palette");
+            ui.label(localizer.text(Message::ExportPalette));
             egui::ComboBox::from_id_salt("editor_export_palette")
                 .selected_text(match settings.palette {
-                    ExportPaletteChoice::Local => "Local per frame",
-                    ExportPaletteChoice::Global => "Global",
+                    ExportPaletteChoice::Local => localizer.text(Message::ExportPaletteLocal),
+                    ExportPaletteChoice::Global => localizer.text(Message::ExportPaletteGlobal),
                 })
                 .show_ui(ui, |ui| {
                     ui.selectable_value(
                         &mut settings.palette,
                         ExportPaletteChoice::Local,
-                        "Local per frame",
+                        localizer.text(Message::ExportPaletteLocal),
                     );
                     ui.selectable_value(
                         &mut settings.palette,
                         ExportPaletteChoice::Global,
-                        "Global",
+                        localizer.text(Message::ExportPaletteGlobal),
                     );
                 });
             ui.end_row();
 
-            ui.label("Quantizer");
+            ui.label(localizer.text(Message::ExportQuantizer));
             ui.vertical(|ui| {
                 egui::ComboBox::from_id_salt("editor_export_quantizer")
-                    .selected_text(export_quantizer_label(settings.quantizer))
+                    .selected_text(export_quantizer_label(settings.quantizer, localizer))
                     .show_ui(ui, |ui| {
                         for choice in [
                             ExportQuantizerChoice::MedianCut,
@@ -4441,20 +4513,22 @@ fn show_export_configuration(
                             ui.selectable_value(
                                 &mut settings.quantizer,
                                 choice,
-                                export_quantizer_label(choice),
+                                export_quantizer_label(choice, localizer),
                             );
                         }
                     });
                 if let Some(required) = fixed_palette_required_colors(settings.quantizer) {
-                    ui.weak(format!(
-                        "Fixed palette · at least {required} colors including transparency"
+                    ui.weak(format_message(
+                        localizer,
+                        Message::ExportFixedPaletteMinimum,
+                        &[("required", &required.to_string())],
                     ));
                 }
             });
             ui.end_row();
 
             if settings.quantizer == ExportQuantizerChoice::Custom {
-                ui.label("Custom colors");
+                ui.label(localizer.text(Message::ExportCustomColors));
                 ui.vertical(|ui| {
                     ui.add(
                         egui::TextEdit::multiline(&mut settings.custom_palette_text)
@@ -4463,34 +4537,32 @@ fn show_export_configuration(
                             .desired_width(430.0)
                             .hint_text("#000000, #FFFFFF"),
                     );
-                    ui.weak(
-                        "2..=256 strict #RRGGBB entries separated by commas or whitespace; count must not exceed Maximum colors.",
-                    );
+                    ui.weak(localizer.text(Message::ExportCustomPaletteHint));
                 });
                 ui.end_row();
 
-                ui.label("Custom transparency");
+                ui.label(localizer.text(Message::ExportCustomTransparency));
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         ui.checkbox(
                             &mut settings.custom_transparency_enabled,
-                            "Use transparent palette index",
+                            localizer.text(Message::ExportTransparentIndex),
                         );
                         ui.add_enabled(
                             settings.custom_transparency_enabled,
                             egui::DragValue::new(&mut settings.custom_transparent_index)
                                 .range(0..=u16::from(u8::MAX)),
                         );
-                        ui.weak("zero-based");
+                        ui.weak(localizer.text(Message::ExportZeroBased));
                     });
-                    ui.weak("Required when rendered pixels cross the alpha threshold.");
+                    ui.weak(localizer.text(Message::ExportTransparencyRequired));
                 });
                 ui.end_row();
             }
 
-            ui.label("Dither");
+            ui.label(localizer.text(Message::ExportDither));
             egui::ComboBox::from_id_salt("editor_export_dither")
-                .selected_text(export_dither_label(settings.dither))
+                .selected_text(export_dither_label(settings.dither, localizer))
                 .show_ui(ui, |ui| {
                     for choice in [
                         ExportDitherChoice::None,
@@ -4511,27 +4583,27 @@ fn show_export_configuration(
                         ui.selectable_value(
                             &mut settings.dither,
                             choice,
-                            export_dither_label(choice),
+                            export_dither_label(choice, localizer),
                         );
                     }
                 });
             ui.end_row();
 
-            ui.label("Alpha threshold");
+            ui.label(localizer.text(Message::ExportAlphaThreshold));
             ui.add(egui::DragValue::new(&mut settings.alpha_threshold).range(0..=255));
             ui.end_row();
 
-            ui.label("Loop");
+            ui.label(localizer.text(Message::ExportLoop));
             ui.horizontal(|ui| {
                 ui.selectable_value(
                     &mut settings.loop_choice,
                     ExportLoopChoice::Infinite,
-                    "Infinite",
+                    localizer.text(Message::ExportLoopInfinite),
                 );
                 ui.selectable_value(
                     &mut settings.loop_choice,
                     ExportLoopChoice::Finite,
-                    "Finite",
+                    localizer.text(Message::ExportLoopFinite),
                 );
                 if settings.loop_choice == ExportLoopChoice::Finite {
                     ui.add(
@@ -4541,46 +4613,74 @@ fn show_export_configuration(
             });
             ui.end_row();
 
-            ui.label("Optimization");
+            ui.label(localizer.text(Message::ExportOptimization));
             ui.horizontal(|ui| {
-                ui.checkbox(&mut settings.delta, "Changed rectangles");
-                ui.checkbox(&mut settings.overwrite, "Overwrite output");
+                ui.checkbox(
+                    &mut settings.delta,
+                    localizer.text(Message::ExportChangedRectangles),
+                );
+                ui.checkbox(
+                    &mut settings.overwrite,
+                    localizer.text(Message::ExportOverwriteOutput),
+                );
             });
             ui.end_row();
         });
 }
 
-const fn export_quantizer_label(choice: ExportQuantizerChoice) -> &'static str {
+fn export_phase_label(
+    phase: gif_from_screen_application::ProjectExportPhase,
+    localizer: Localizer,
+) -> &'static str {
+    use gif_from_screen_application::ProjectExportPhase;
+    localizer.text(match phase {
+        ProjectExportPhase::Preparing => Message::ExportPhasePreparing,
+        ProjectExportPhase::AnalyzingPalette => Message::ExportPhaseAnalyzingPalette,
+        ProjectExportPhase::SamplingPalette => Message::ExportPhaseSamplingPalette,
+        ProjectExportPhase::Rendering => Message::ExportPhaseRendering,
+        ProjectExportPhase::Encoding => Message::RecorderPhaseEncoding,
+        ProjectExportPhase::Syncing => Message::ExportPhaseSyncing,
+        ProjectExportPhase::Committing => Message::RecorderPhaseCommitting,
+        ProjectExportPhase::Complete => Message::RecorderPhaseComplete,
+        _ => Message::RecorderUnknown,
+    })
+}
+
+fn export_quantizer_label(choice: ExportQuantizerChoice, localizer: Localizer) -> &'static str {
     match choice {
-        ExportQuantizerChoice::MedianCut => "Median cut",
-        ExportQuantizerChoice::Octree => "Octree",
-        ExportQuantizerChoice::Wu => "Wu variance",
-        ExportQuantizerChoice::Grayscale => "Grayscale",
-        ExportQuantizerChoice::MostUsed => "Most used",
-        ExportQuantizerChoice::NeuQuant => "NeuQuant",
-        ExportQuantizerChoice::WebSafe216 => "Web safe 216 (fixed)",
-        ExportQuantizerChoice::Monochrome => "Monochrome (fixed)",
-        ExportQuantizerChoice::Windows16 => "Windows 16 (fixed)",
-        ExportQuantizerChoice::Custom => "Custom palette",
+        ExportQuantizerChoice::MedianCut => localizer.text(Message::ExportQuantizerMedianCut),
+        ExportQuantizerChoice::Octree => localizer.text(Message::ExportQuantizerOctree),
+        ExportQuantizerChoice::Wu => localizer.text(Message::ExportQuantizerWu),
+        ExportQuantizerChoice::Grayscale => localizer.text(Message::ExportQuantizerGrayscale),
+        ExportQuantizerChoice::MostUsed => localizer.text(Message::ExportQuantizerMostUsed),
+        ExportQuantizerChoice::NeuQuant => localizer.text(Message::ExportQuantizerNeuQuant),
+        ExportQuantizerChoice::WebSafe216 => localizer.text(Message::ExportQuantizerWebSafe),
+        ExportQuantizerChoice::Monochrome => localizer.text(Message::ExportQuantizerMonochrome),
+        ExportQuantizerChoice::Windows16 => localizer.text(Message::ExportQuantizerWindows),
+        ExportQuantizerChoice::Custom => localizer.text(Message::ExportQuantizerCustom),
     }
 }
 
-const fn export_dither_label(choice: ExportDitherChoice) -> &'static str {
+fn export_dither_label(choice: ExportDitherChoice, localizer: Localizer) -> &'static str {
     match choice {
-        ExportDitherChoice::None => "None",
-        ExportDitherChoice::Bayer => "Bayer 4×4",
-        ExportDitherChoice::Dotted => "Dotted halftone",
-        ExportDitherChoice::BlueNoise => "Blue noise",
-        ExportDitherChoice::InterleavedNoise => "Interleaved gradient noise",
-        ExportDitherChoice::FloydSteinberg => "Floyd–Steinberg",
-        ExportDitherChoice::Atkinson => "Atkinson",
-        ExportDitherChoice::Burkes => "Burkes",
-        ExportDitherChoice::Sierra => "Sierra",
-        ExportDitherChoice::SierraLite => "Sierra Lite",
-        ExportDitherChoice::TwoRowSierra => "Two-row Sierra",
-        ExportDitherChoice::JarvisJudiceNinke => "Jarvis–Judice–Ninke",
-        ExportDitherChoice::Stucki => "Stucki",
-        ExportDitherChoice::StevensonArce => "Stevenson–Arce",
+        ExportDitherChoice::None => localizer.text(Message::ExportDitherNone),
+        ExportDitherChoice::Bayer => localizer.text(Message::ExportDitherBayer),
+        ExportDitherChoice::Dotted => localizer.text(Message::ExportDitherDotted),
+        ExportDitherChoice::BlueNoise => localizer.text(Message::ExportDitherBlueNoise),
+        ExportDitherChoice::InterleavedNoise => {
+            localizer.text(Message::ExportDitherInterleavedNoise)
+        }
+        ExportDitherChoice::FloydSteinberg => localizer.text(Message::ExportDitherFloydSteinberg),
+        ExportDitherChoice::Atkinson => localizer.text(Message::ExportDitherAtkinson),
+        ExportDitherChoice::Burkes => localizer.text(Message::ExportDitherBurkes),
+        ExportDitherChoice::Sierra => localizer.text(Message::ExportDitherSierra),
+        ExportDitherChoice::SierraLite => localizer.text(Message::ExportDitherSierraLite),
+        ExportDitherChoice::TwoRowSierra => localizer.text(Message::ExportDitherTwoRowSierra),
+        ExportDitherChoice::JarvisJudiceNinke => {
+            localizer.text(Message::ExportDitherJarvisJudiceNinke)
+        }
+        ExportDitherChoice::Stucki => localizer.text(Message::ExportDitherStucki),
+        ExportDitherChoice::StevensonArce => localizer.text(Message::ExportDitherStevensonArce),
     }
 }
 
@@ -5365,9 +5465,9 @@ fn resolve_export_selection(
     scope: ExportFrameScope,
     timeline_order: &[FrameId],
     selected: &BTreeSet<FrameId>,
-) -> Result<ProjectFrameSelection, String> {
+) -> Result<ProjectFrameSelection, Notice> {
     if timeline_order.is_empty() {
-        return Err("The project has no frames to export.".to_owned());
+        return Err(Message::ExportNoFrames.into());
     }
     match scope {
         ExportFrameScope::All => Ok(ProjectFrameSelection::All),
@@ -5378,9 +5478,7 @@ fn resolve_export_selection(
                 .filter(|frame_id| selected.contains(frame_id))
                 .collect();
             if ordered.is_empty() {
-                return Err(
-                    "Select at least one frame before exporting Selected frames.".to_owned(),
-                );
+                return Err(Message::ExportNoSelectedFrames.into());
             }
             Ok(ProjectFrameSelection::Ordered(ordered))
         }
@@ -5390,21 +5488,28 @@ fn resolve_export_selection(
 fn build_project_export_options(
     settings: &EditorExportSettings,
     frames: ProjectFrameSelection,
-) -> Result<ProjectGifExportOptions, String> {
+) -> Result<ProjectGifExportOptions, Notice> {
     if !(2..=256).contains(&settings.max_colors) {
-        return Err("Maximum colors must be between 2 and 256.".to_owned());
+        return Err(Message::ExportColorsRange.into());
     }
     let custom_palette = if settings.quantizer == ExportQuantizerChoice::Custom {
         let transparent_index = settings
             .custom_transparency_enabled
             .then_some(settings.custom_transparent_index);
         let palette = parse_custom_palette(&settings.custom_palette_text, transparent_index)
-            .map_err(|error| format!("Invalid custom palette: {error}"))?;
+            .map_err(|error| {
+                Notice::new(
+                    Message::ExportInvalidCustomPalette,
+                    &[("error", &error.to_string())],
+                )
+            })?;
         if palette.color_count() > usize::from(settings.max_colors) {
-            return Err(format!(
-                "Custom palette contains {} colors, above Maximum colors {}.",
-                palette.color_count(),
-                settings.max_colors
+            return Err(Notice::new(
+                Message::ExportCustomPaletteTooLarge,
+                &[
+                    ("count", &palette.color_count().to_string()),
+                    ("maximum", &settings.max_colors.to_string()),
+                ],
             ));
         }
         Some(palette)
@@ -5414,12 +5519,13 @@ fn build_project_export_options(
     if let Some(required) = fixed_palette_required_colors(settings.quantizer)
         && settings.max_colors < required
     {
-        return Err(format!(
-            "The selected fixed palette requires at least {required} colors including transparency."
+        return Err(Notice::new(
+            Message::ExportFixedPaletteRequired,
+            &[("required", &required.to_string())],
         ));
     }
     if settings.loop_choice == ExportLoopChoice::Finite && settings.finite_loop_count == 0 {
-        return Err("Finite loop count must be at least one.".to_owned());
+        return Err(Message::ExportFiniteLoopMinimum.into());
     }
     let palette_mode = match settings.palette {
         ExportPaletteChoice::Local => PaletteMode::LocalPerFrame,
@@ -5497,17 +5603,17 @@ const fn fixed_palette_required_colors(choice: ExportQuantizerChoice) -> Option<
     }
 }
 
-fn validate_export_output(output: &str) -> Result<PathBuf, String> {
+fn validate_export_output(output: &str) -> Result<PathBuf, Notice> {
     let output = PathBuf::from(output.trim());
     if output.file_name().is_none() {
-        return Err("Export output must identify a GIF file.".to_owned());
+        return Err(Message::ExportOutputFileRequired.into());
     }
     if output
         .extension()
         .and_then(|extension| extension.to_str())
         .is_none_or(|extension| !extension.eq_ignore_ascii_case("gif"))
     {
-        return Err("Export output filename must end in .gif.".to_owned());
+        return Err(Message::ExportOutputGifExtension.into());
     }
     Ok(output)
 }
@@ -5566,16 +5672,29 @@ const fn can_navigate_back(
             && matches!(blank_state, BlankProjectJobState::Running)))
 }
 
-fn export_result_notice(result: Result<ProjectGifExportReport, ExportJobError>) -> String {
+fn export_result_notice(result: Result<ProjectGifExportReport, ExportJobError>) -> Notice {
     match result {
-        Ok(report) => format!(
-            "Exported {} selected frames as {} GIF images ({} bytes) to {}",
-            report.selected_frames,
-            report.encoding.encoded_frames,
-            report.bytes_written,
-            report.output_path.display()
+        Ok(report) => Notice::new(
+            Message::ExportCompletedReport,
+            &[
+                ("selected_frames", &report.selected_frames.to_string()),
+                (
+                    "encoded_frames",
+                    &report.encoding.encoded_frames.to_string(),
+                ),
+                ("bytes", &report.bytes_written.to_string()),
+                ("path", &report.output_path.display().to_string()),
+            ],
         ),
-        Err(error) => format!("GIF export failed: {error}"),
+        Err(ExportJobError::Export(error))
+            if matches!(
+                *error,
+                gif_from_screen_application::ProjectGifExportError::Cancelled
+            ) =>
+        {
+            Message::ExportCancelled.into()
+        }
+        Err(error) => Notice::new(Message::ExportFailed, &[("reason", &error.to_string())]),
     }
 }
 

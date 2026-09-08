@@ -26,11 +26,16 @@ preview gestures when text layout changes. This is newer than Preview 1 and does
 not relabel that frozen release as containing later code.
 The [editor/shortcut/notice slice](EDITOR-LOCALIZATION.md) adds late-rendered
 message identities, primary editor controls and language-layout gesture guards.
-Remaining tool bodies, preview/import/export forms, additional catalogs and
-non-locale ordinary-drawing mapping protection stay open.
+Remaining tool bodies, import forms and additional catalogs stay open.
 These primary editor/shortcut/notice changes are now downloadable in
 [Linux Preview 2](LINUX-PREVIEW-2-QA.md). Their [native acceptance](EDITOR-LOCALIZATION-QA-2026-09-08.md)
 does not close the remaining desktop/translation and frame-fidelity requirements.
+
+The next [preview/crop/export slice](PREVIEW-EXPORT-LOCALIZATION.md) on main adds
+translated configuration, validation, progress and retained preset/result notices.
+It does not retroactively change Preview 2 or complete the remaining tool catalogs.
+The same main-branch work adds [ordinary drawing input ownership](DRAWING-PREVIEW-INPUT.md),
+including general mapping-change cancellation and fast native input batches.
 
 ## Playback timing: implemented, bounded native manual acceptance recorded
 

@@ -1,6 +1,6 @@
 # Localization implementation and acceptance plan
 
-Status: launcher and recorder language slices implemented on main, 2026-09-08. The
+Status: preview/crop/export language slice added on main, 2026-09-09. The
 `gif-from-screen-localization` crate provides the registry, validated preference
 wire format, injected-system-locale negotiation and an initial English/Simplified
 Chinese message catalog. The desktop now offers System plus 29 saved choices,
@@ -8,8 +8,10 @@ asynchronous private preference storage, immediate launcher/navigation switching
 and an embedded licensed CJK fallback. Other catalogs explicitly fall back to
 English. The recording form, source-local Wayland controls, compact X11 controls,
 window snapping, shortcut settings, and editor navigation/Frames/Timing/Transform
-now use explicit localizers. Typed notices re-render at presentation time. The
-remaining editor tool bodies, import/export forms and detailed errors still
+now use explicit localizers. [Preview/crop and GIF export controls](PREVIEW-EXPORT-LOCALIZATION.md)
+also include typed parameter-validation, preset and completion notices. Typed
+notices re-render at presentation time. The remaining editor tool bodies, import
+forms and detailed errors still
 require migration; see [editor/notice scope](EDITOR-LOCALIZATION.md).
 The target includes the entire application-owned UI, not merely language selection.
 See [the first desktop acceptance record](LOCALIZATION-QA-2026-09-08.md).

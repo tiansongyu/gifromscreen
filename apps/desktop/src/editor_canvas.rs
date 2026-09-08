@@ -1,8 +1,9 @@
 //! Display-only editor zoom/pan and an independent, explicitly applied crop draft.
 
 use eframe::egui;
+use gif_from_screen_localization::{Localizer, Message};
 
-use crate::{editor_preview::EditorPreview, editor_workspace::EditorWorkspace};
+use crate::{editor_preview::EditorPreview, editor_workspace::EditorWorkspace, ui_notice::Notice};
 
 #[path = "editor_crop.rs"]
 mod crop;
@@ -25,16 +26,14 @@ impl PreviewZoom {
         rendered: [u32; 2],
         available: egui::Vec2,
         ppp: f32,
-    ) -> Result<egui::Vec2, String> {
+    ) -> Result<egui::Vec2, Notice> {
         if rendered.contains(&0)
             || !available.is_finite()
             || available.min_elem() <= 0.0
             || !ppp.is_finite()
             || ppp <= 0.0
         {
-            return Err(
-                "Preview dimensions, viewport and pixel scale must be finite and positive".into(),
-            );
+            return Err(Message::PreviewInvalidGeometry.into());
         }
         let width = f64::from(rendered[0]);
         let height = f64::from(rendered[1]);
@@ -48,10 +47,10 @@ impl PreviewZoom {
 }
 
 #[allow(clippy::cast_possible_truncation)]
-fn checked_extent(width: f64, height: f64) -> Result<egui::Vec2, String> {
+fn checked_extent(width: f64, height: f64) -> Result<egui::Vec2, Notice> {
     let size = egui::vec2(width as f32, height as f32);
     if !size.is_finite() || size.min_elem() <= 0.0 {
-        return Err("Preview display extent cannot be represented by the UI".into());
+        return Err(Message::PreviewUnrepresentableExtent.into());
     }
     Ok(size)
 }
@@ -77,26 +76,28 @@ impl EditorCanvasState {
         self.crop.cancel_layout_gesture();
     }
 
-    pub(crate) fn show_zoom(&mut self, ui: &mut egui::Ui) {
+    pub(crate) fn show_zoom(&mut self, ui: &mut egui::Ui, localizer: Localizer) {
         let before = self.zoom;
-        ui.horizontal_wrapped(|ui| {
-            for (zoom, label) in [
-                (PreviewZoom::Fit, "Fit"),
-                (PreviewZoom::Native, "100%"),
-                (PreviewZoom::Double, "200%"),
-            ] {
-                ui.selectable_value(&mut self.zoom, zoom, label);
-            }
+        ui.push_id("editor-preview-zoom", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for (zoom, message) in [
+                    (PreviewZoom::Fit, Message::PreviewZoomFit),
+                    (PreviewZoom::Native, Message::PreviewZoomNative),
+                    (PreviewZoom::Double, Message::PreviewZoomDouble),
+                ] {
+                    ui.selectable_value(&mut self.zoom, zoom, localizer.text(message));
+                }
+            });
         });
         if before != self.zoom {
             self.scroll_offset = egui::Vec2::ZERO;
             self.panning = false;
             self.crop.cancel_gesture();
         }
-        ui.small(match self.zoom {
-            PreviewZoom::Fit => "Fit may downsample large images; small images can be enlarged for visibility.",
-            PreviewZoom::Native | PreviewZoom::Double => "100% = one image pixel per physical screen pixel. Use scrollbars, wheel or middle-drag to pan.",
-        });
+        ui.small(localizer.text(match self.zoom {
+            PreviewZoom::Fit => Message::PreviewFitHint,
+            PreviewZoom::Native | PreviewZoom::Double => Message::PreviewExactPixelHint,
+        }));
     }
 
     /// Calls every overlay painter within the same clipped scrolling viewport.
@@ -108,7 +109,7 @@ impl EditorCanvasState {
         sense: egui::Sense,
         editable: bool,
         overlay: impl FnOnce(&mut egui::Ui, &egui::Response),
-    ) -> Result<egui::Response, String> {
+    ) -> Result<egui::Response, Notice> {
         let available = egui::vec2(ui.available_width().max(1.0), CANVAS_HEIGHT);
         let size = self.zoom.extent(
             preview.rendered_size,

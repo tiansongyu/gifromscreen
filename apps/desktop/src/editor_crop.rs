@@ -1,9 +1,11 @@
 //! A source-sized crop draft; only explicit Apply reaches the ordered editor command.
 
 use eframe::egui;
-use gif_from_screen_domain::{FrameId, PhysicalRect, PhysicalSize};
+use gif_from_screen_domain::{FrameId, PhysicalRect, PhysicalSize, UnitError};
+use gif_from_screen_localization::{Localizer, Message};
 
 use crate::editor_workspace::{EditorWorkspace, OverlaySelectionAnchor};
+use crate::ui_notice::Notice;
 
 #[derive(Debug)]
 struct Session {
@@ -27,7 +29,7 @@ struct Gesture {
 #[derive(Debug, Default)]
 pub(crate) struct DirectCropDraft {
     session: Option<Session>,
-    notice: Option<String>,
+    notice: Option<Notice>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -46,18 +48,16 @@ impl DirectCropDraft {
         workspace: &EditorWorkspace,
         frame_id: FrameId,
         rendered: [u32; 2],
-    ) -> Result<(), String> {
+    ) -> Result<(), Notice> {
         if workspace.selection().current() != Some(frame_id) {
-            return Err("Select an original frame before starting a crop draft".into());
+            return Err(Message::CropSelectOriginal.into());
         }
-        let canvas =
-            PhysicalSize::new(rendered[0], rendered[1]).map_err(|error| error.to_string())?;
-        let rect =
-            PhysicalRect::new(0, 0, rendered[0], rendered[1]).map_err(|error| error.to_string())?;
+        let canvas = PhysicalSize::new(rendered[0], rendered[1]).map_err(bounds_error)?;
+        let rect = PhysicalRect::new(0, 0, rendered[0], rendered[1]).map_err(bounds_error)?;
         self.session = Some(Session {
-            anchor: workspace
-                .overlay_selection_anchor()
-                .map_err(|error| error.to_string())?,
+            anchor: workspace.overlay_selection_anchor().map_err(|error| {
+                Notice::new(Message::CropStartFailed, &[("error", &error.to_string())])
+            })?,
             frame_id,
             canvas,
             rect,
@@ -80,9 +80,7 @@ impl DirectCropDraft {
                 || workspace.selection().current() != Some(session.frame_id)
         }) {
             self.session = None;
-            self.notice = Some(
-                "Crop draft discarded because the project, revision or selection changed.".into(),
-            );
+            self.notice = Some(Message::CropDraftDiscarded.into());
         }
     }
 
@@ -119,24 +117,26 @@ impl DirectCropDraft {
         true
     }
 
-    pub(crate) fn apply(&mut self, workspace: &mut EditorWorkspace) -> Result<(), String> {
-        let session = self.session.as_ref().ok_or("No crop draft is active")?;
+    pub(crate) fn apply(&mut self, workspace: &mut EditorWorkspace) -> Result<(), Notice> {
+        let session = self.session.as_ref().ok_or(Message::CropNoDraft)?;
         if !session.anchor.matches(workspace) {
             self.reconcile(workspace);
-            return Err("Crop draft is stale; start a new draft for the current selection".into());
+            return Err(Message::CropStaleDraft.into());
         }
         if session.gesture.is_some() {
-            return Err("Finish the crop gesture before applying".into());
+            return Err(Message::CropFinishGesture.into());
         }
         let crop = parse_fields(&session.fields, session.canvas)?;
         // Despite its historical name, this command crops every composed frame,
         // seals prior artwork, updates the canvas and records one undoable edit.
-        workspace
-            .set_selection_crop(crop)
-            .map_err(|error| error.to_string())?;
+        workspace.set_selection_crop(crop).map_err(|error| {
+            Notice::new(
+                Message::CropOperationFailed,
+                &[("error", &error.to_string())],
+            )
+        })?;
         self.session = None;
-        self.notice =
-            Some("Crop applied to all frames. Undo restores the previous image layout.".into());
+        self.notice = Some(Message::CropApplied.into());
         Ok(())
     }
 
@@ -147,12 +147,19 @@ impl DirectCropDraft {
         frame_id: FrameId,
         rendered: [u32; 2],
         enabled: bool,
+        localizer: Localizer,
     ) -> CropOutcome {
         self.reconcile(workspace);
         let mut outcome = CropOutcome::default();
         if self.session.is_none() {
             if ui
-                .add_enabled(enabled, egui::Button::new("Crop on preview…"))
+                .push_id("editor-crop-start", |ui| {
+                    ui.add_enabled(
+                        enabled,
+                        egui::Button::new(localizer.text(Message::CropStart)),
+                    )
+                })
+                .inner
                 .clicked()
             {
                 match self.begin(workspace, frame_id, rendered) {
@@ -161,16 +168,25 @@ impl DirectCropDraft {
                 }
             }
         } else {
-            ui.strong("Crop draft · applies to all frames");
-            ui.small("Drag over the image or edit pixel bounds. Nothing changes until Apply.");
+            ui.strong(localizer.text(Message::CropTitle));
+            ui.small(localizer.text(Message::CropHelp));
             let session = self.session.as_mut().expect("checked active crop");
             ui.add_enabled_ui(enabled && session.gesture.is_none(), |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    for (label, value) in ["X", "Y", "W", "H"].into_iter().zip(&mut session.fields)
+                    for (index, (message, value)) in [
+                        Message::CropFieldX,
+                        Message::CropFieldY,
+                        Message::CropFieldWidth,
+                        Message::CropFieldHeight,
+                    ]
+                    .into_iter()
+                    .zip(&mut session.fields)
+                    .enumerate()
                     {
-                        ui.label(label);
+                        ui.label(localizer.text(message));
                         ui.add(
                             egui::TextEdit::singleline(value)
+                                .id_salt(("editor-crop-field", index))
                                 .desired_width(52.0)
                                 .char_limit(10),
                         );
@@ -182,28 +198,33 @@ impl DirectCropDraft {
                 session.rect = rect;
             }
             if let Err(error) = &parsed {
-                ui.colored_label(ui.visuals().error_fg_color, error);
+                ui.colored_label(ui.visuals().error_fg_color, error.render(localizer));
             }
             let can_apply = enabled && parsed.is_ok() && session.gesture.is_none();
             let mut apply = false;
             let mut cancel = false;
-            ui.horizontal_wrapped(|ui| {
-                apply = ui
-                    .add_enabled(can_apply, egui::Button::new("Apply crop to all frames"))
-                    .clicked();
-                cancel = ui.button("Cancel crop").clicked();
+            ui.push_id("editor-crop-actions", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    apply = ui
+                        .add_enabled(
+                            can_apply,
+                            egui::Button::new(localizer.text(Message::CropApplyAll)),
+                        )
+                        .clicked();
+                    cancel = ui.button(localizer.text(Message::CropCancel)).clicked();
+                });
             });
             if cancel {
                 self.cancel();
             } else if apply {
                 match self.apply(workspace) {
                     Ok(()) => outcome.applied = true,
-                    Err(error) => self.notice = Some(format!("Crop operation failed: {error}")),
+                    Err(error) => self.notice = Some(error),
                 }
             }
         }
         if let Some(notice) = &self.notice {
-            ui.label(notice);
+            ui.label(notice.render(localizer));
         }
         outcome
     }
@@ -339,20 +360,28 @@ fn fields(rect: PhysicalRect) -> [String; 4] {
     .map(|value| value.to_string())
 }
 
-fn parse_fields(fields: &[String; 4], canvas: PhysicalSize) -> Result<PhysicalRect, String> {
+fn parse_fields(fields: &[String; 4], canvas: PhysicalSize) -> Result<PhysicalRect, Notice> {
     let mut values = [0; 4];
     for (index, field) in fields.iter().enumerate() {
         values[index] = field
             .trim()
             .parse::<u32>()
-            .map_err(|_| "Crop coordinates must be unsigned whole pixels")?;
+            .map_err(|_| Message::CropUnsignedPixels)?;
     }
-    let rect = PhysicalRect::new(values[0], values[1], values[2], values[3])
-        .map_err(|error| error.to_string())?;
+    let rect =
+        PhysicalRect::new(values[0], values[1], values[2], values[3]).map_err(bounds_error)?;
     if !rect.fits_within(canvas) {
-        return Err("Crop must fit inside the current rendered image".into());
+        return Err(Message::CropFitsImage.into());
     }
     Ok(rect)
+}
+
+fn bounds_error(error: UnitError) -> Notice {
+    match error {
+        UnitError::EmptyPhysicalSize => Message::CropEmptySize.into(),
+        UnitError::PhysicalCoordinateOverflow => Message::CropCoordinateOverflow.into(),
+        other => Notice::new(Message::CropInvalidBounds, &[("error", &other.to_string())]),
+    }
 }
 
 fn map_point(image: egui::Rect, point: egui::Pos2, size: [u32; 2]) -> Option<[f64; 2]> {
