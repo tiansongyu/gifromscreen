@@ -40,6 +40,12 @@ before asset I/O; reverse drag and release/loss ordering; invalid numeric bounds
 stale project/revision/selection; and composed pixels through whole-animation
 crop, Undo/Redo, checkpoint and reopen.
 
+A follow-up interaction regression restricts freehand drawing to the primary
+button. Middle/right drags cannot add points or finish a stroke, while left drag
+still works inside the actual scrolling viewport. This prevents middle-button
+panning from accidentally authoring artwork. The regression passes on Rust
+1.98.0 and 1.88.0; it is synthetic egui input, not a new native drawing run.
+
 ## Bounded native acceptance
 
 Private lab `/tmp/gfs-wayland-qa._lktjgzc`, Xvfb 1440×1000, GNOME/Mutter 42.9,

@@ -198,6 +198,83 @@ fn middle_drag_starts_only_inside_the_current_viewport_and_stops_on_release() {
 }
 
 #[test]
+fn panning_does_not_author_or_finish_a_freehand_stroke() {
+    use crate::editor_ui::{DrawingDraftPhase, DrawingOverlayDraft};
+    let context = egui::Context::default();
+    let preview = preview(&context);
+    let mut canvas = EditorCanvasState {
+        zoom: PreviewZoom::Double,
+        ..Default::default()
+    };
+    let mut draft = DrawingOverlayDraft::default();
+    draft.begin();
+    let mut draw = |events, draft: &mut DrawingOverlayDraft| {
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(420.0, 500.0),
+                )),
+                focused: true,
+                events,
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    canvas
+                        .show_image(ui, &preview, egui::Sense::drag(), true, |_, response| {
+                            crate::update_drawing_draft_from_preview(
+                                response,
+                                preview.rendered_size,
+                                draft,
+                            );
+                        })
+                        .unwrap();
+                });
+            },
+        );
+    };
+    draw(Vec::new(), &mut draft);
+    for button in [
+        egui::PointerButton::Middle,
+        egui::PointerButton::Secondary,
+        egui::PointerButton::Primary,
+    ] {
+        let start = egui::pos2(150.0, 160.0);
+        let end = egui::pos2(100.0, 120.0);
+        draw(
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            &mut draft,
+        );
+        draw(vec![egui::Event::PointerMoved(end)], &mut draft);
+        draw(
+            vec![egui::Event::PointerButton {
+                pos: end,
+                button,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut draft,
+        );
+        if button == egui::PointerButton::Primary {
+            assert!(!draft.points.is_empty());
+            assert_eq!(draft.phase, DrawingDraftPhase::Ready);
+        } else {
+            assert!(draft.points.is_empty());
+            assert_eq!(draft.phase, DrawingDraftPhase::Capturing);
+        }
+    }
+}
+
+#[test]
 fn invalid_extents_are_rejected_instead_of_creating_unbounded_geometry() {
     for zoom in [PreviewZoom::Fit, PreviewZoom::Native, PreviewZoom::Double] {
         for scale in [0.0, -1.0, f32::NAN, f32::INFINITY] {

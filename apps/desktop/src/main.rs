@@ -3823,7 +3823,8 @@ fn update_drawing_draft_from_preview(
     if draft.phase != DrawingDraftPhase::Capturing {
         return;
     }
-    if (response.drag_started() || response.dragged())
+    if (response.drag_started_by(egui::PointerButton::Primary)
+        || response.dragged_by(egui::PointerButton::Primary))
         && let Some(position) = response.interact_pointer_pos()
         && let Some(point) = map_drawing_preview_point(response.rect, position, rendered_size)
     {
@@ -3832,7 +3833,7 @@ fn update_drawing_draft_from_preview(
             pressure_milli: 1_000,
         });
     }
-    if response.drag_stopped() {
+    if response.drag_stopped_by(egui::PointerButton::Primary) {
         draft.finish_stroke();
     }
 }
