@@ -144,7 +144,9 @@ The [isolated nested GNOME plan](WAYLAND-NESTED-QA-PLAN.md) has been executed; s
   ready for redistribution. The [first actual image test](APPIMAGE-DEVELOPMENT-QA-2026-09-08.md)
   found extract-and-run cleanup failure. The [source-built fix](APPIMAGE-RUNTIME-QA-2026-09-08.md)
   now passes normal FUSE/extract execution, cleanup and same-input repackaging.
-  Source/license, AppImage Wayland and broader hardware gates remain open.
+  [AppImage Wayland window-source acceptance](APPIMAGE-WAYLAND-QA-2026-09-08.md)
+  now covers Cancel/Share, timed recording, pause/move/resume and reopened GIFs.
+  Source/license, desktop registration and broader Wayland/hardware gates remain open.
   [Flatpak](FLATPAK-PLAN.md) additionally requires application
   permission/storage changes before its package can cover existing features.
 

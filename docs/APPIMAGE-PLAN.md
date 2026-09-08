@@ -143,7 +143,11 @@ Acceptance order:
    independent-machine reproducible compilation from this packaging check.
 5. Native GNOME Wayland Portal Share/Cancel, private PipeWire capture, pause,
    region movement, stop, project reopening and GIF export using the AppImage.
-   Repeat on another supported desktop and test explicit desktop registration.
+   The nested GNOME window-source flow now has
+   [separate actual-AppImage evidence](APPIMAGE-WAYLAND-QA-2026-09-08.md).
+   Repeat on another supported desktop, broaden monitor/source-loss coverage
+   and test explicit desktop registration; one software-rendered run is not
+   the complete platform matrix.
 6. Complete source/license material and metadata validation, then enable a
    dedicated artifact workflow. Signing/stable release distribution remain
    separate gates. Do not upload a development-only image as a release.

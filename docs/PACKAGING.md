@@ -95,6 +95,10 @@ failure; a source-built fix now passes extract-and-run and FUSE cleanup plus
 same-input byte-identical repackaging. See the
 [new measured record](APPIMAGE-RUNTIME-QA-2026-09-08.md) and
 [original failure](APPIMAGE-DEVELOPMENT-QA-2026-09-08.md).
+The actual AppImage now also passes bounded nested-GNOME window capture,
+pause/crop movement and GUI/CLI GIF export; see
+[Wayland package acceptance](APPIMAGE-WAYLAND-QA-2026-09-08.md). This does not
+replace the remaining hardware, desktop-registration and source-material gates.
 The [Flatpak plan](FLATPAK-PLAN.md) identifies application changes for durable
 projects, folder-scoped exports, Camera Portal and X11 namespace-safe ownership;
 it does not include an unbuilt placeholder manifest. Signed releases, an in-place
