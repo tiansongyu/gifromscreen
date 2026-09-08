@@ -1,5 +1,10 @@
 # Owned X11 display for portable smoke tests
 
+This is the historical acceptance record for the initial owned-display harness.
+The startup policy was subsequently changed to a single 30-second readiness
+deadline with fuller diagnostics and 12 tests; see [the current policy](PACKAGING.md#owned-display-readiness).
+The five-second deadline and three-test counts below describe that original run.
+
 Portable run `34184700324` for `a2b40da` successfully built and inspected the
 archive, then failed before showing the desktop with
 `WinitEventLoop ... XNotSupported(XOpenDisplayFailed)`. The separate Linux CI

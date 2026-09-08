@@ -117,6 +117,14 @@ real invalid-output subprocess pipes, and real overlapping private Xvfb servers.
 The real portable-archive window smoke also passed locally with the revised
 harness; these checks are separate from the full recording acceptance matrix.
 
+Follow-up [portable CI 34237971373](https://github.com/tiansongyu/gifromscreen/actions/runs/34237971373)
+and [Linux CI 34237971358](https://github.com/tiansongyu/gifromscreen/actions/runs/34237971358)
+passed for `8ca42c0ec1952d74886924463ffa11ecefb78f74`. The portable run passed actual
+archive construction, deterministic repackaging, safe installation tests, owned
+display lifecycle, native packaged-window launch and artifact upload. The earlier
+documentation-only `506df5b` run also passed with the old timeout; neither green
+run diagnoses the earlier server delay, and the failed run remains a failure.
+
 ## Verification scope and remaining formats
 
 The automated suite validates the real archive, CLI GIF export, installation under prefixes with spaces/reserved characters, idempotent reinstall, refusal to replace foreign files/symlinks, checksum corruption, modified-installed-file protection, traversal protection, and preservation of unlisted projects during uninstall. Xvfb verifies that the packaged desktop displays a native X11 window. These checks do not substitute for GNOME/KDE Wayland sharing permission and compositor testing.
