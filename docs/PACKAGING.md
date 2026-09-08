@@ -92,6 +92,31 @@ GitHub Actions dependencies in the packaging workflow are pinned to immutable co
 
 The portable workflow restores a separate dependency cache for `target/portable-build`, after selecting Rust 1.88.0. Cache saves are limited to main-branch runs. A cache hit never bypasses the locked release build, source/binary receipt checks, deterministic repackaging, installation tests or native-window smoke test. This follows the cache action's [custom workspace/target configuration](https://github.com/Swatinem/rust-cache/tree/6323deb102c322ba6fcbdcafc7e3dddab59af2b6); it is a build-time optimization, not additional evidence of reproducible compilation or runtime correctness.
 
+### Owned display readiness
+
+The private-Xvfb harness waits for one newly created server to publish its
+`-displayfd` readiness notification, then verifies a real connection before
+launching the packaged app. Its default startup deadline is 30 seconds, with an
+explicit finite `(0, 120]` override for tests. It never falls back to host DISPLAY
+or starts a replacement server after an observation timeout. Timeout, early exit,
+EOF and invalid/oversized protocol data are distinct errors; diagnostics include
+the owned PID, elapsed time, budget, status and a bounded byte prefix. Cleanup
+still terminates/reaps only that owned child.
+
+This follows a [portable CI failure](https://github.com/tiansongyu/gifromscreen/actions/runs/34236118164)
+where the previous five-second deadline expired while the child was alive and
+stderr was empty. The specific runner delay was **not reproduced or diagnosed**.
+Displayfd is emitted after server initialization, not immediately after choosing
+a display number; see the pinned [Xserver initialization sequence](https://gitlab.freedesktop.org/xorg/xserver/-/blob/xorg-server-21.1.4/dix/main.c#L153)
+and [readiness notification](https://gitlab.freedesktop.org/xorg/xserver/-/blob/xorg-server-21.1.4/os/connection.c#L198).
+No fixed display-collision delay is claimed.
+
+The 12 harness tests cover delayed/partial publication under a fake clock,
+unchanged absolute deadlines, timeout/exit/EOF/invalid input, one-child cleanup,
+real invalid-output subprocess pipes, and real overlapping private Xvfb servers.
+The real portable-archive window smoke also passed locally with the revised
+harness; these checks are separate from the full recording acceptance matrix.
+
 ## Verification scope and remaining formats
 
 The automated suite validates the real archive, CLI GIF export, installation under prefixes with spaces/reserved characters, idempotent reinstall, refusal to replace foreign files/symlinks, checksum corruption, modified-installed-file protection, traversal protection, and preservation of unlisted projects during uninstall. Xvfb verifies that the packaged desktop displays a native X11 window. These checks do not substitute for GNOME/KDE Wayland sharing permission and compositor testing.
