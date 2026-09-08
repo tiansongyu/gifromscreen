@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 import time
 
-from test_portable import extract_checked
+from portable_archive import extract_checked
 from owned_xvfb import owned_display, stop_child
 
 

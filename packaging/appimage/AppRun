@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+# Derive the bundle location from this entrypoint, not caller-supplied APPDIR.
+gfs_appdir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+export PIPEWIRE_CONFIG_DIR="$gfs_appdir/usr/share/gifromscreen/pipewire"
+export PIPEWIRE_CONFIG_NAME=client.conf
+export PIPEWIRE_MODULE_DIR="$gfs_appdir/usr/lib/pipewire-0.3"
+export SPA_PLUGIN_DIR="$gfs_appdir/usr/lib/spa-0.2"
+export XKB_CONFIG_ROOT="$gfs_appdir/usr/share/X11/xkb"
+
+# Per-ELF RUNPATH resolves private libraries. Do not export LD_LIBRARY_PATH or
+# replace PATH: file-import FFmpeg/ffprobe continue to use their host libraries.
+case "${1-}" in
+    --cli)
+        shift
+        exec "$gfs_appdir/usr/bin/gif-from-screen-cli" "$@"
+        ;;
+    *) exec "$gfs_appdir/usr/bin/gif-from-screen" "$@" ;;
+esac

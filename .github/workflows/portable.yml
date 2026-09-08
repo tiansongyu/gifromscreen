@@ -48,6 +48,13 @@ jobs:
       - name: Test build identity and target isolation
         run: python3 scripts/test_build_portable.py
 
+      - name: Test AppImage development packaging boundaries
+        run: |
+          python3 scripts/test_appimage_tools.py
+          python3 scripts/test_build_appimage.py
+          python3 scripts/test_appimage_native.py
+          python3 scripts/test_owned_process.py
+
       - name: Verify deterministic repackaging
         run: |
           python3 scripts/build_portable.py --skip-build --output-dir target/package-second

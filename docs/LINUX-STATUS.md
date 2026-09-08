@@ -139,6 +139,12 @@ The [isolated nested GNOME plan](WAYLAND-NESTED-QA-PLAN.md) has been executed; s
 - [x] Crop and resize.
 - [x] GIF colors, loop, duration, duplicate merge, progress, cancellation.
 - [ ] Flatpak and AppImage preview packages.
+  AppImage now has a real local development assembler, pinned tools, native
+  dependency/RUNPATH inventory and process-owned smoke harness; it is not yet
+  ready for redistribution. The [first actual image test](APPIMAGE-DEVELOPMENT-QA-2026-09-08.md)
+  found extract-and-run cleanup failure. Source/license and native Wayland/FUSE
+  gates remain open. [Flatpak](FLATPAK-PLAN.md) additionally requires application
+  permission/storage changes before its package can cover existing features.
 
 ### M2 — editor parity
 

@@ -86,6 +86,15 @@ The portable workflow restores a separate dependency cache for `target/portable-
 
 The automated suite validates the real archive, CLI GIF export, installation under prefixes with spaces/reserved characters, idempotent reinstall, refusal to replace foreign files/symlinks, checksum corruption, modified-installed-file protection, traversal protection, and preservation of unlisted projects during uninstall. Xvfb verifies that the packaged desktop displays a native X11 window. These checks do not substitute for GNOME/KDE Wayland sharing permission and compositor testing.
 
-AppImage and Flatpak are not claimed as deliverables: no unbuilt placeholder manifest is included. They need separate validation of portal permissions, bundled-library policies, runtime lifecycle, and reproducible build tooling. Signed releases, an in-place updater, and a machine-verified complete binary SBOM also remain separate work.
+AppImage and Flatpak are not yet claimed as distributable deliverables. The
+[AppImage development builder](APPIMAGE-PLAN.md) now assembles an actual local
+image with checked tooling, private native dependencies and tests, but explicitly
+blocks publication while corresponding-source materials and runtime/platform
+acceptance remain incomplete. Its real extract-and-run smoke test exposed a
+runtime cleanup failure; see the [measured record](APPIMAGE-DEVELOPMENT-QA-2026-09-08.md).
+The [Flatpak plan](FLATPAK-PLAN.md) identifies application changes for durable
+projects, folder-scoped exports, Camera Portal and X11 namespace-safe ownership;
+it does not include an unbuilt placeholder manifest. Signed releases, an in-place
+updater, and a machine-verified complete binary SBOM remain separate work.
 
 References: [desktop-entry specification](https://specifications.freedesktop.org/desktop-entry/latest/), [GitHub artifact action](https://github.com/actions/upload-artifact), [Rust toolchain action](https://github.com/dtolnay/rust-toolchain), [Apache 2.0 text](https://www.apache.org/licenses/LICENSE-2.0.txt), [MIT license](https://opensource.org/license/mit), [CC0 1.0 legal code](https://creativecommons.org/publicdomain/zero/1.0/legalcode.txt).
