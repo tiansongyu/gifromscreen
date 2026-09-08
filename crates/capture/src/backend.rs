@@ -173,7 +173,12 @@ pub enum CaptureCadence {
     Interval(Duration),
     /// Capture only when explicitly triggered.
     Manual,
-    /// Capture when supported input activity occurs.
+    /// Explicitly opt in to capture when supported input activity occurs.
+    /// X11 coalesces key/button presses (including scroll buttons) while capture
+    /// is busy; releases and movement alone do not trigger a frame.
+    /// Triggering does not imply that input metadata will be retained.
+    /// Current X11 triggers cover the whole desktop, including recorder controls;
+    /// raw events alone cannot precisely identify their destination window.
     OnInteraction,
 }
 
@@ -229,8 +234,9 @@ pub struct CaptureRequest {
     pub cursor: CursorCaptureMode,
     /// Whether native damage information should be requested when available.
     pub prefer_damage: bool,
-    /// Explicit opt-in to session-scoped passive keyboard/button recording.
+    /// Explicit opt-in to retaining session-scoped passive keyboard/button metadata.
     /// This may capture sensitive input from other applications. Never enabled implicitly.
+    /// `OnInteraction` independently enables transient input-triggered sampling.
     pub input_events: bool,
 }
 
@@ -329,6 +335,14 @@ pub trait CaptureSession: Send {
     /// The returned request contains the most recently accepted target after
     /// a successful [`CaptureSession::update_target`] call.
     fn request(&self) -> &CaptureRequest;
+
+    /// Active session time, excluding pauses, when the backend exposes a clock
+    /// independently of frame arrival. This supports event-driven duration
+    /// limits before their first frame, including already-started sessions.
+    /// The default None preserves compatibility for other adapters.
+    fn active_elapsed(&self) -> Option<Duration> {
+        None
+    }
 
     /// Changes the source or source-local rectangle used by subsequent frames.
     ///

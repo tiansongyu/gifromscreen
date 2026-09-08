@@ -593,6 +593,7 @@ fn collect_session(
                 options.fixed_duration_us,
             );
         }
+        arm_interaction_deadline(&mut options.limit, session)?;
         if duration_deadline_reached(options.limit) {
             break StopReason::DurationReached;
         }
@@ -608,6 +609,9 @@ fn collect_session(
         match session.poll_frame(poll_interval)? {
             FramePoll::Frame(frame) => {
                 ensure_not_cancelled(cancellation)?;
+                if interaction_deadline_reached(session, options.limit) {
+                    break StopReason::DurationReached;
+                }
                 let next_stream_index = stream_index
                     .checked_add(1)
                     .ok_or_else(|| collection_counter_overflow("native frame index"))?;
@@ -730,6 +734,7 @@ fn collect_session_to_sink(
                 options.fixed_duration_us,
             );
         }
+        arm_interaction_deadline(&mut options.limit, session)?;
         if duration_deadline_reached(options.limit) {
             break StopReason::DurationReached;
         }
@@ -741,6 +746,9 @@ fn collect_session_to_sink(
         match session.poll_frame(poll_interval)? {
             FramePoll::Frame(frame) => {
                 ensure_not_cancelled(cancellation)?;
+                if interaction_deadline_reached(session, options.limit) {
+                    break StopReason::DurationReached;
+                }
                 let (outcome, retained) =
                     state.observe_frame(&frame, &mut options, sink, controlled_manual)?;
                 if controlled_manual && let Some(retained) = retained {
@@ -1095,6 +1103,42 @@ fn update_sink_duration(
 
 fn duration_deadline_reached(limit: ValidatedLimit) -> bool {
     matches!(limit, ValidatedLimit::Duration { deadline: Some(deadline), .. } if Instant::now() >= deadline)
+}
+
+fn interaction_deadline_reached(session: &dyn CaptureSession, limit: ValidatedLimit) -> bool {
+    matches!(
+        session.request().cadence,
+        gif_from_screen_capture::CaptureCadence::OnInteraction
+    ) && duration_deadline_reached(limit)
+}
+
+fn arm_interaction_deadline(
+    limit: &mut ValidatedLimit,
+    session: &dyn CaptureSession,
+) -> Result<(), WorkflowError> {
+    if !matches!(
+        session.request().cadence,
+        gif_from_screen_capture::CaptureCadence::OnInteraction
+    ) {
+        return Ok(());
+    }
+    let ValidatedLimit::Duration {
+        duration_us,
+        deadline,
+    } = limit
+    else {
+        return Ok(());
+    };
+    if deadline.is_none() {
+        let remaining = Duration::from_micros(*duration_us)
+            .saturating_sub(session.active_elapsed().unwrap_or(Duration::ZERO));
+        *deadline = Some(Instant::now().checked_add(remaining).ok_or_else(|| {
+            WorkflowError::InvalidCollectionOption(
+                "interaction duration exceeds the monotonic clock".into(),
+            )
+        })?);
+    }
+    Ok(())
 }
 
 fn reset_duration_deadline(limit: &mut ValidatedLimit) {

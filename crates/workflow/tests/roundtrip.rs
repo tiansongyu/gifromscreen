@@ -40,6 +40,7 @@ struct TrackingSession {
     inner: Box<dyn CaptureSession>,
     calls: Arc<SessionCallCounts>,
     stalled: bool,
+    reported_active_elapsed: Option<Duration>,
 }
 
 impl CaptureSession for TrackingSession {
@@ -49,6 +50,11 @@ impl CaptureSession for TrackingSession {
 
     fn request(&self) -> &CaptureRequest {
         self.inner.request()
+    }
+
+    fn active_elapsed(&self) -> Option<Duration> {
+        self.reported_active_elapsed
+            .or_else(|| self.inner.active_elapsed())
     }
 
     fn update_target(&mut self, target: CaptureTarget) -> Result<(), CaptureError> {
@@ -136,6 +142,7 @@ impl CaptureBackend for CountingBackend {
             inner,
             calls: Arc::clone(&self.session_calls),
             stalled: self.stalled,
+            reported_active_elapsed: None,
         }))
     }
 }

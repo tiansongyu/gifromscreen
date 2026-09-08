@@ -31,15 +31,15 @@ use x11rb::{
 
 use super::*;
 
-struct PrivateXvfb {
+pub(super) struct PrivateXvfb {
     child: Arc<Mutex<Child>>,
-    display: String,
+    pub(super) display: String,
     watchdog_stop: Option<mpsc::SyncSender<()>>,
     watchdog: Option<thread::JoinHandle<()>>,
 }
 
 impl PrivateXvfb {
-    fn start() -> Self {
+    pub(super) fn start() -> Self {
         let mut child = Command::new("Xvfb")
             .args([
                 "-displayfd",

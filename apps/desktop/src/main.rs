@@ -232,6 +232,7 @@ enum RecordingCadenceChoice {
     FixedFps,
     Periodic,
     Manual,
+    Interaction,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -272,11 +273,17 @@ enum RecordingCursor {
 }
 
 #[derive(Clone, Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each capture cadence retains its own independent playback preference"
+)]
 struct RecordingPlaybackSettings {
     fixed_frame_rate: bool,
     manual_fixed: bool,
     periodic_fixed: bool,
     periodic_frame_delay_ms: u64,
+    interaction_fixed: bool,
+    interaction_frame_delay_ms: u64,
 }
 
 impl Default for RecordingPlaybackSettings {
@@ -286,6 +293,8 @@ impl Default for RecordingPlaybackSettings {
             manual_fixed: true,
             periodic_fixed: true,
             periodic_frame_delay_ms: 66,
+            interaction_fixed: true,
+            interaction_frame_delay_ms: 500,
         }
     }
 }
@@ -1894,6 +1903,13 @@ impl GifFromScreenApp {
             ui.add(egui::Label::new(&summary).truncate())
                 .on_hover_text(summary);
         }
+        if let Some(notice) = &self.notice {
+            egui::ScrollArea::vertical()
+                .id_salt("screen-recorder-status")
+                .max_height(96.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| ui.label(notice));
+        }
         ui.separator();
         egui::ScrollArea::vertical()
             .id_salt("screen-recorder-settings")
@@ -1916,10 +1932,6 @@ impl GifFromScreenApp {
                 progress.capture_duration.as_secs_f32(),
                 progress.playback_duration.as_secs_f32()
             ));
-        }
-        if let Some(notice) = &self.notice {
-            ui.add_space(12.0);
-            ui.label(notice);
         }
     }
 
@@ -2147,7 +2159,11 @@ impl GifFromScreenApp {
                         .range(0..=MAX_RECORDING_DURATION_MS),
                 );
                 ui.end_row();
-                show_recording_cadence_settings(ui, &mut self.settings);
+                show_recording_cadence_settings(
+                    ui,
+                    &mut self.settings,
+                    self.display_server == Some(LinuxDisplayServer::X11),
+                );
                 show_frame_retention_setting(ui, &mut self.settings);
                 show_recording_annotations_setting(
                     ui,
@@ -2677,6 +2693,9 @@ impl GifFromScreenApp {
     }
 
     fn begin_wayland_preparation(&mut self) -> Result<(), String> {
+        if self.settings.cadence == RecordingCadenceChoice::Interaction {
+            return Err("Interaction snapshots require X11. Choose continuous, periodic or manual capture on Wayland.".into());
+        }
         if self.settings.input_events || self.settings.cursor == RecordingCursor::Editable {
             return Err("Choose a hidden/embedded cursor and disable X11 input events before opening the Wayland source chooser.".to_owned());
         }
@@ -5421,6 +5440,7 @@ const fn recording_cadence_label(choice: RecordingCadenceChoice) -> &'static str
         RecordingCadenceChoice::FixedFps => "Continuous FPS",
         RecordingCadenceChoice::Periodic => "Periodic snapshots",
         RecordingCadenceChoice::Manual => "Manual snapshots",
+        RecordingCadenceChoice::Interaction => "Desktop interaction snapshots (X11)",
     }
 }
 
@@ -5432,7 +5452,7 @@ const fn recording_interval_unit_label(unit: RecordingIntervalUnit) -> &'static 
     }
 }
 
-fn show_recording_cadence_settings(ui: &mut egui::Ui, settings: &mut RecordingSettings) {
+fn show_recording_cadence_settings(ui: &mut egui::Ui, settings: &mut RecordingSettings, x11: bool) {
     ui.label("Capture frequency");
     egui::ComboBox::from_id_salt("recording_cadence")
         .selected_text(recording_cadence_label(settings.cadence))
@@ -5448,6 +5468,13 @@ fn show_recording_cadence_settings(ui: &mut egui::Ui, settings: &mut RecordingSe
                     recording_cadence_label(choice),
                 );
             }
+            ui.add_enabled_ui(x11, |ui| {
+                ui.selectable_value(
+                    &mut settings.cadence,
+                    RecordingCadenceChoice::Interaction,
+                    recording_cadence_label(RecordingCadenceChoice::Interaction),
+                );
+            });
         });
     ui.end_row();
     match settings.cadence {
@@ -5479,6 +5506,14 @@ fn show_recording_cadence_settings(ui: &mut egui::Ui, settings: &mut RecordingSe
             ui.end_row();
         }
         RecordingCadenceChoice::Manual => {}
+        RecordingCadenceChoice::Interaction => {
+            ui.label("Interaction scope");
+            ui.vertical(|ui| {
+                ui.label("Key presses, mouse-button presses and wheel events anywhere on this X11 desktop, including recorder controls. Motion and releases do not trigger snapshots.");
+                ui.weak("Only while recording; paused input is discarded. Bursts coalesce while capture is busy. Key values and click coordinates are not saved unless input annotations are enabled separately.");
+            });
+            ui.end_row();
+        }
     }
     show_recording_playback_settings(ui, settings);
 }
@@ -5513,6 +5548,13 @@ fn show_recording_playback_settings(ui: &mut egui::Ui, settings: &mut RecordingS
             } else {
                 ui.weak("Earlier frames follow active time between clicks; this is only the final frame's delay.");
             }
+        }
+        RecordingCadenceChoice::Interaction => {
+            ui.checkbox(&mut settings.playback.interaction_fixed, "Fixed frame delay");
+            ui.add(egui::DragValue::new(&mut settings.playback.interaction_frame_delay_ms)
+                .range(1..=MAX_RECORDING_DURATION_MS)
+                .suffix(if settings.playback.interaction_fixed { " ms per frame" } else { " ms final frame" }));
+            ui.weak("GIF playback delay is independent of time between input events. Captures have no added trigger delay.");
         }
     });
     ui.end_row();
@@ -5597,6 +5639,7 @@ fn recording_cadence(settings: &RecordingSettings) -> Result<CaptureCadence, Str
             CaptureCadence::interval(recording_period(settings)?).map_err(|error| error.to_string())
         }
         RecordingCadenceChoice::Manual => Ok(CaptureCadence::Manual),
+        RecordingCadenceChoice::Interaction => Ok(CaptureCadence::OnInteraction),
     }
 }
 
@@ -5618,6 +5661,15 @@ fn recording_tail_frame_duration(settings: &RecordingSettings) -> Result<Duratio
                 ));
             }
             Ok(Duration::from_millis(settings.manual_frame_duration_ms))
+        }
+        RecordingCadenceChoice::Interaction => {
+            let delay = settings.playback.interaction_frame_delay_ms;
+            if !(1..=MAX_RECORDING_DURATION_MS).contains(&delay) {
+                return Err(format!(
+                    "Final interaction frame duration must be between 1 and {MAX_RECORDING_DURATION_MS} ms."
+                ));
+            }
+            Ok(Duration::from_millis(delay))
         }
     }
 }
@@ -5863,6 +5915,9 @@ fn recording_playback_timing(
         }
         RecordingCadenceChoice::Manual if settings.playback.manual_fixed => {
             Some(settings.manual_frame_duration_ms)
+        }
+        RecordingCadenceChoice::Interaction if settings.playback.interaction_fixed => {
+            Some(settings.playback.interaction_frame_delay_ms)
         }
         _ => None,
     };
@@ -6644,6 +6699,87 @@ mod tests {
         assert!(matches!(options.limit, CollectionLimit::UntilStopped));
         assert_eq!(options.frame_retention, FrameRetention::ChangesOnly);
         assert_eq!(options.tail_frame_duration, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn recorder_notice_is_visible_above_the_settings_scroll_area() {
+        let mut app = GifFromScreenApp::default();
+        app.source_catalog_attempted = true;
+        let notice = "Recording failed: no frames. The empty autosave is retained.";
+        app.notice = Some(notice.into());
+        let context = egui::Context::default();
+        let render = |app: &mut GifFromScreenApp| {
+            context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(640.0, 480.0),
+                    )),
+                    focused: true,
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| app.show_screen_recorder(ui));
+                },
+            )
+        };
+        render(&mut app);
+        let output = render(&mut app);
+        let (clip, text) = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == notice => {
+                    Some((shape.clip_rect, text))
+                }
+                _ => None,
+            })
+            .expect("the status must not be culled below the settings");
+        assert!(text.pos.y < 200.0);
+        assert!(clip.contains(text.pos));
+        assert!(text.pos.y + text.galley.size().y < 200.0);
+    }
+
+    #[test]
+    fn interaction_settings_separate_sampling_playback_and_sensitive_metadata() {
+        let mut settings = RecordingSettings {
+            cadence: RecordingCadenceChoice::Interaction,
+            // Unrelated cadence settings must not constrain event sampling.
+            fps: 0,
+            interval_count: 0,
+            ..RecordingSettings::default()
+        };
+        assert_eq!(
+            recording_cadence(&settings).unwrap(),
+            CaptureCadence::OnInteraction
+        );
+        assert!(!settings.input_events);
+        let options = collection_options(&settings).unwrap();
+        assert_eq!(options.frame_retention, FrameRetention::All);
+        assert_eq!(options.tail_frame_duration, Duration::from_millis(500));
+        assert_eq!(
+            options.playback_timing,
+            gif_from_screen_workflow::PlaybackTiming::Fixed(Duration::from_millis(500))
+        );
+        settings.playback.interaction_fixed = false;
+        assert_eq!(
+            collection_options(&settings).unwrap().playback_timing,
+            gif_from_screen_workflow::PlaybackTiming::Measured
+        );
+        for invalid in [0, MAX_RECORDING_DURATION_MS + 1] {
+            settings.playback.interaction_frame_delay_ms = invalid;
+            assert!(collection_options(&settings).is_err());
+        }
+    }
+
+    #[test]
+    fn interaction_on_wayland_is_rejected_before_starting_permission_or_capture_work() {
+        let mut app = GifFromScreenApp::default();
+        app.settings.cadence = RecordingCadenceChoice::Interaction;
+        let error = app.begin_wayland_preparation().unwrap_err();
+        assert!(error.contains("require X11"));
+        assert!(!app.wayland_prepare_job.is_active());
+        assert!(app.job.is_none());
     }
 
     #[test]

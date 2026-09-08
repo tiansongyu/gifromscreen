@@ -1,5 +1,7 @@
 //! Explicitly opted-in XI2 raw events. One connection/thread exists only while recording.
 //! No grabs, evdev devices, periodic keymap polling, or process-wide listeners are used.
+//! Interaction triggers currently cover the entire desktop, including this
+//! application's controls: raw events do not identify their destination window.
 use gif_from_screen_capture::{
     ButtonState, CaptureError, CaptureErrorKind, CaptureTimestamp, InputEvent, KeyState,
     PhysicalPosition, PhysicalRect, PointerButton, RecoveryHint,
@@ -7,7 +9,7 @@ use gif_from_screen_capture::{
 use std::{
     collections::VecDeque,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
@@ -24,6 +26,39 @@ use x11rb::{
 };
 
 const EVENT_LIMIT: usize = 512;
+
+#[derive(Clone, Copy)]
+pub(super) enum InputMode {
+    Metadata,
+    Interaction { record_metadata: bool },
+}
+
+impl InputMode {
+    fn records_metadata(self) -> bool {
+        matches!(
+            self,
+            Self::Metadata
+                | Self::Interaction {
+                    record_metadata: true
+                }
+        )
+    }
+
+    fn triggers_frames(self) -> bool {
+        matches!(self, Self::Interaction { .. })
+    }
+}
+
+#[derive(Default)]
+struct InteractionGate {
+    pending: bool,
+}
+
+impl InteractionGate {
+    fn take_ready(&mut self) -> bool {
+        std::mem::take(&mut self.pending)
+    }
+}
 
 pub(super) fn available(connection: &RustConnection) -> bool {
     connection
@@ -51,6 +86,7 @@ struct EventQueue {
     events: VecDeque<InputEvent>,
     dropped: u32,
     failure: Option<String>,
+    interaction: InteractionGate,
 }
 
 impl EventQueue {
@@ -67,6 +103,7 @@ pub(super) struct InputRecorder {
     connection: Arc<RustConnection>,
     stop: Arc<AtomicBool>,
     queue: Arc<Mutex<EventQueue>>,
+    signal: Arc<Condvar>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -75,6 +112,7 @@ impl InputRecorder {
         display: Option<&str>,
         session_started: Instant,
         paused: Duration,
+        mode: InputMode,
     ) -> Result<Self, CaptureError> {
         let (connection, screen) =
             x11rb::connect(display).map_err(|cause| error("connect", cause))?;
@@ -86,19 +124,24 @@ impl InputRecorder {
             ));
         }
         let root = connection.setup().roots[screen].root;
-        let keys = KeyLabels::read(&connection)?;
+        let keys = mode
+            .records_metadata()
+            .then(|| KeyLabels::read(&connection))
+            .transpose()?;
         connection
             .xinput_xi_select_events(
                 root,
                 &[EventMask {
                     // XIAllMasterDevices prevents receiving both master and slave duplicates.
                     deviceid: 1,
-                    mask: vec![
+                    mask: vec![if mode.records_metadata() {
                         XIEventMask::RAW_KEY_PRESS
                             | XIEventMask::RAW_KEY_RELEASE
                             | XIEventMask::RAW_BUTTON_PRESS
-                            | XIEventMask::RAW_BUTTON_RELEASE,
-                    ],
+                            | XIEventMask::RAW_BUTTON_RELEASE
+                    } else {
+                        XIEventMask::RAW_KEY_PRESS | XIEventMask::RAW_BUTTON_PRESS
+                    }],
                 }],
             )
             .map_err(|cause| error("subscribe", cause))?
@@ -106,6 +149,8 @@ impl InputRecorder {
             .map_err(|cause| error("subscribe", cause))?;
         connection.flush().map_err(|cause| error("flush", cause))?;
         let queue = Arc::new(Mutex::new(EventQueue::default()));
+        let signal = Arc::new(Condvar::new());
+        let thread_signal = Arc::clone(&signal);
         let stop = Arc::new(AtomicBool::new(false));
         let thread_queue = Arc::clone(&queue);
         let thread_stop = Arc::clone(&stop);
@@ -118,15 +163,20 @@ impl InputRecorder {
                     &worker_connection,
                     root,
                     keys,
-                    session_started,
-                    paused,
+                    InputSession {
+                        started: session_started,
+                        paused,
+                        mode,
+                    },
                     &thread_stop,
                     &thread_queue,
+                    &thread_signal,
                 ) {
                     thread_queue
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .failure = Some(cause.to_string());
+                    thread_signal.notify_one();
                 }
                 // Dropping the private X connection removes every event subscription.
             })
@@ -135,8 +185,39 @@ impl InputRecorder {
             connection,
             stop,
             queue,
+            signal,
             worker: Some(worker),
         })
+    }
+
+    pub(super) fn wait_for_interaction(&self, timeout: Duration) -> Result<bool, CaptureError> {
+        // An unusually large caller timeout must not hold recorder controls for
+        // seconds. Normal collector poll intervals are shorter than this cap.
+        let deadline = Instant::now() + timeout.min(Duration::from_millis(100));
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(failure) = &queue.failure {
+                return Err(error("worker stopped", failure));
+            }
+            if self.stop.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            let now = Instant::now();
+            if queue.interaction.take_ready() {
+                return Ok(true);
+            }
+            if now >= deadline {
+                return Ok(false);
+            }
+            let (next, _) = self
+                .signal
+                .wait_timeout(queue, deadline.saturating_duration_since(now))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            queue = next;
+        }
     }
 
     pub(super) fn drain(
@@ -171,6 +252,7 @@ impl InputRecorder {
 impl Drop for InputRecorder {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        self.signal.notify_one();
         // A stalled X server must not keep pause/stop waiting for QueryPointer.
         // Shutting down only this private socket also removes all subscriptions.
         let _ = rustix::net::shutdown(self.connection.stream(), rustix::net::Shutdown::Both);
@@ -219,14 +301,21 @@ impl EventClock {
     }
 }
 
+#[derive(Clone, Copy)]
+struct InputSession {
+    started: Instant,
+    paused: Duration,
+    mode: InputMode,
+}
+
 fn run(
     connection: &RustConnection,
     root: u32,
-    mut keys: KeyLabels,
-    started: Instant,
-    paused: Duration,
+    mut keys: Option<KeyLabels>,
+    session: InputSession,
     stop: &AtomicBool,
     queue: &Mutex<EventQueue>,
+    signal: &Condvar,
 ) -> Result<(), CaptureError> {
     let mut clock = EventClock::default();
     while !stop.load(Ordering::Acquire) {
@@ -235,10 +324,36 @@ fn run(
         let event = connection
             .wait_for_event()
             .map_err(|cause| error("wait", cause))?;
-        let active_us =
-            u64::try_from(started.elapsed().saturating_sub(paused).as_micros()).unwrap_or(u64::MAX);
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let trigger = session.mode.triggers_frames()
+            && matches!(
+                &event,
+                Event::XinputRawKeyPress(_) | Event::XinputRawButtonPress(_)
+            );
+        // Trigger-only mode never builds/stores InputEvent values, reads a key
+        // label/modifier map, or queries pointer positions. Only a coalesced bit
+        // survives dispatch; no second XI2 feed exists when metadata is enabled.
+        if !session.mode.records_metadata() {
+            if trigger {
+                deliver(queue, signal, None, true);
+            }
+            continue;
+        }
+        let active_us = u64::try_from(
+            session
+                .started
+                .elapsed()
+                .saturating_sub(session.paused)
+                .as_micros(),
+        )
+        .unwrap_or(u64::MAX);
         let event = match event {
             Event::XinputRawKeyPress(event) | Event::XinputRawKeyRelease(event) => {
+                let Some(keys) = keys.as_mut() else {
+                    continue;
+                };
                 let pressed = event.event_type == xinput::RAW_KEY_PRESS_EVENT;
                 let repeat = event.flags.contains(KeyEventFlags::KEY_REPEAT);
                 let modifiers = keys.update(event.detail, pressed);
@@ -285,19 +400,32 @@ fn run(
                 }
             }
             Event::MappingNotify(_) => {
-                keys = KeyLabels::read(connection)?;
+                keys = Some(KeyLabels::read(connection)?);
                 continue;
             }
             _ => continue,
         };
         if !stop.load(Ordering::Acquire) {
-            queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(event);
+            deliver(queue, signal, Some(event), trigger);
         }
     }
     Ok(())
+}
+
+fn deliver(queue: &Mutex<EventQueue>, signal: &Condvar, event: Option<InputEvent>, trigger: bool) {
+    let mut queue = queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(event) = event {
+        queue.push(event);
+    }
+    queue.interaction.pending |= trigger;
+    // Metadata and the trigger become observable together. Otherwise a frame
+    // could consume a trigger before its optional metadata had been dispatched.
+    drop(queue);
+    if trigger {
+        signal.notify_one();
+    }
 }
 
 struct KeyLabels {
@@ -417,6 +545,57 @@ impl KeyLabels {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn interaction_bursts_coalesce_without_a_rate_limit_or_sensitive_event_buffer() {
+        let queue = Mutex::new(EventQueue::default());
+        let signal = Condvar::new();
+        for _ in 0..100_000 {
+            deliver(&queue, &signal, None, true);
+        }
+        let mut state = queue.lock().unwrap();
+        assert!(state.events.is_empty());
+        assert_eq!(state.dropped, 0);
+        assert!(state.interaction.take_ready());
+        assert!(!state.interaction.take_ready());
+        drop(state);
+        // A new input after admission can immediately request the next frame;
+        // there is no artificial 20fps/50ms cap and no backlog of old frames.
+        deliver(&queue, &signal, None, true);
+        assert!(queue.lock().unwrap().interaction.take_ready());
+    }
+
+    #[test]
+    fn metadata_and_interaction_admission_share_one_atomic_queue_delivery() {
+        let queue = Mutex::new(EventQueue::default());
+        let signal = Condvar::new();
+        let event = InputEvent::Key {
+            at: CaptureTimestamp::from_micros(14),
+            native_code: 38,
+            text: Some("a".into()),
+            state: KeyState::Pressed,
+            repeat: false,
+            modifiers: 0,
+        };
+        deliver(&queue, &signal, Some(event.clone()), true);
+        let mut state = queue.lock().unwrap();
+        assert!(state.interaction.take_ready());
+        assert_eq!(state.events.pop_front(), Some(event));
+        assert!(state.events.is_empty());
+        assert!(
+            !InputMode::Interaction {
+                record_metadata: false
+            }
+            .records_metadata()
+        );
+        assert!(
+            InputMode::Interaction {
+                record_metadata: true
+            }
+            .records_metadata()
+        );
+        assert!(!InputMode::Metadata.triggers_frames());
+    }
+
     #[test]
     fn queue_is_bounded_and_reports_loss() {
         let mut queue = EventQueue::default();

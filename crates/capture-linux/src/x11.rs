@@ -16,6 +16,10 @@ mod input;
 #[path = "x11_cursor_edge_tests.rs"]
 mod cursor_edge_tests;
 
+#[cfg(all(test, target_os = "linux", feature = "native-x11"))]
+#[path = "x11_interaction_tests.rs"]
+mod interaction_tests;
+
 #[cfg(all(target_os = "linux", feature = "native-x11"))]
 mod native {
     use std::collections::{HashSet, VecDeque};
@@ -506,17 +510,10 @@ mod native {
                 }
                 _ => return Err(invalid_target("unknown cursor capture mode")),
             }
-            if matches!(request.cadence, CaptureCadence::OnInteraction) {
+            if input_mode(request).is_some() && !self.inner.input_available {
                 return Err(CaptureError::new(
                     CaptureErrorKind::UnsupportedCapability,
-                    "interaction-triggered capture needs XInput support, which is not implemented yet",
-                    RecoveryHint::ChangeRequest,
-                ));
-            }
-            if request.input_events && !self.inner.input_available {
-                return Err(CaptureError::new(
-                    CaptureErrorKind::UnsupportedCapability,
-                    "input recording requires XInput 2 on the selected X11 server",
+                    "input recording or interaction sampling requires XInput 2 on the selected X11 server",
                     RecoveryHint::ChangeRequest,
                 ));
             }
@@ -570,13 +567,13 @@ mod native {
         ) -> Result<Box<dyn CaptureSession>, CaptureError> {
             let canvas_size = self.validate_request(&request)?;
             let started_at = Instant::now();
-            let input = request
-                .input_events
-                .then(|| {
+            let input = input_mode(&request)
+                .map(|mode| {
                     super::input::InputRecorder::start(
                         self.inner.display.as_deref(),
                         started_at,
                         Duration::ZERO,
+                        mode,
                     )
                 })
                 .transpose()?;
@@ -592,6 +589,18 @@ mod native {
                 accumulated_pause: Duration::ZERO,
                 input,
             }))
+        }
+    }
+
+    fn input_mode(request: &CaptureRequest) -> Option<super::input::InputMode> {
+        if request.cadence == CaptureCadence::OnInteraction {
+            Some(super::input::InputMode::Interaction {
+                record_metadata: request.input_events,
+            })
+        } else {
+            request
+                .input_events
+                .then_some(super::input::InputMode::Metadata)
         }
     }
 
@@ -637,6 +646,20 @@ mod native {
             &self.request
         }
 
+        fn active_elapsed(&self) -> Option<Duration> {
+            if !matches!(
+                self.state,
+                CaptureSessionState::Recording | CaptureSessionState::Paused
+            ) {
+                return None;
+            }
+            let end = self.paused_at.unwrap_or_else(Instant::now);
+            Some(active_session_elapsed(
+                end.saturating_duration_since(self.started_at),
+                self.accumulated_pause,
+            ))
+        }
+
         fn update_target(&mut self, target: CaptureTarget) -> Result<(), CaptureError> {
             if !matches!(
                 self.state,
@@ -675,11 +698,12 @@ mod native {
                 self.accumulated_pause
                     .saturating_add(now.saturating_duration_since(paused_at))
             });
-            let input = if self.request.input_events {
+            let input = if let Some(mode) = input_mode(&self.request) {
                 Some(super::input::InputRecorder::start(
                     self.backend.inner.display.as_deref(),
                     self.started_at,
                     accumulated_pause,
+                    mode,
                 )?)
             } else {
                 None
@@ -728,6 +752,25 @@ mod native {
                 _ => return Ok(FramePoll::Pending),
             }
 
+            if self.request.cadence == CaptureCadence::OnInteraction {
+                let ready = self
+                    .input
+                    .as_ref()
+                    .ok_or_else(|| {
+                        invalid_target("interaction sampling requires an active XI2 listener")
+                    })?
+                    .wait_for_interaction(timeout);
+                match ready {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(FramePoll::Pending),
+                    Err(error) => {
+                        self.state = CaptureSessionState::Failed;
+                        self.input = None;
+                        return Err(error);
+                    }
+                }
+            }
+
             if let Some(period) = self.period() {
                 let now = Instant::now();
                 if self.next_due > now {
@@ -757,7 +800,9 @@ mod native {
                     Some(self.canvas_size),
                 )
                 .and_then(|mut frame| {
-                    if let Some(input) = &self.input {
+                    if let Some(input) = &self.input
+                        && self.request.input_events
+                    {
                         let origin = frame
                             .capture_origin()
                             .expect("X11 captures retain their resolved origin");

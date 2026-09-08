@@ -81,9 +81,12 @@ these tasks extend them rather than replace their state machines.
    accepted rectangle, coalesce movement while one request is in flight, and
    retain fixed canvas size during recording. Optional X11 cursor-follow comes
    after those controls; Wayland source-local movement is not global tracking.
-3. **X11 interaction sampling.** Connect bounded XI2 triggers to capture cadence
-   without requiring sensitive key metadata persistence. Keep burst limits,
-   pause exclusion, input-listener teardown and fixed GIF-delay semantics.
+3. **X11 interaction sampling: desktop-wide mode connected.** One bounded XI2
+   feed triggers frames without requiring sensitive metadata persistence, drops
+   paused/pending input, coalesces bursts and supplies fixed 500 ms playback by
+   default. [Native pause/move/resume/GIF and empty timed-stop evidence](X11-INTERACTION-SAMPLING.md)
+   is recorded. Precise exclusion of recorder controls, optional trigger delay,
+   physical input/repeat/grab acceptance and exact upstream parity remain open.
 4. **Recover and continue from a lost source.** Preserve the existing project,
    request a new authorized source explicitly, keep the canvas or request a
    compatible crop, and use a new capture clock. Cancelled permission must not

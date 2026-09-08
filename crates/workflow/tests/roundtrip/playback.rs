@@ -17,6 +17,216 @@ const ROUTES: [Route; 4] = [
     Route::PrestartedSink,
 ];
 
+#[test]
+fn fixed_interaction_timing_keeps_raw_clock_and_filters_changes_on_all_routes() {
+    let mut interaction = request();
+    interaction.cadence = CaptureCadence::OnInteraction;
+    assert!(!interaction.input_events);
+    let frames = samples();
+    for retention in [FrameRetention::All, FrameRetention::ChangesOnly] {
+        for route in ROUTES {
+            let run = run_route(
+                route,
+                &frames,
+                interaction.clone(),
+                &CollectOptions {
+                    frame_retention: retention,
+                    ..fixed_options()
+                },
+            );
+            let retained = if retention == FrameRetention::All {
+                vec![0, 1, 2, 3]
+            } else {
+                vec![0, 2]
+            };
+            assert_eq!(run.summary.frames, retained.len() as u64);
+            assert_eq!(run.summary.duration_us, retained.len() as u64 * 66_000);
+            assert_eq!(run.summary.capture_duration_us, 7_200_000_000);
+            for (metadata, index) in run.metadata.iter().zip(retained) {
+                assert_eq!(metadata.captured_at, frames[index].captured_at());
+                assert!(metadata.input_events.is_empty());
+            }
+            assert!(run.frames.iter().all(|frame| frame.duration_us() == 66_000));
+        }
+    }
+}
+
+struct PollBudget(AtomicUsize);
+impl gif_from_screen_gif::CancellationToken for PollBudget {
+    fn is_cancelled(&self) -> bool {
+        self.0.fetch_add(1, Ordering::Relaxed) >= 500
+    }
+}
+
+#[test]
+fn interaction_prestarted_active_time_is_counted_before_any_frame_is_polled() {
+    let backend = SyntheticCaptureBackend::new(Vec::new());
+    let mut interaction = request();
+    interaction.cadence = CaptureCadence::OnInteraction;
+    let calls = Arc::new(SessionCallCounts::default());
+    let mut session = TrackingSession {
+        inner: backend.start_session(interaction).unwrap(),
+        calls: Arc::clone(&calls),
+        stalled: true,
+        reported_active_elapsed: Some(Duration::from_secs(2)),
+    };
+    let (_controller, mut control) = RecordingController::channel();
+    let mut sink = TestFrameSink::default();
+    let error = collect_prestarted_controlled_to_sink(
+        &mut session,
+        &CollectOptions {
+            limit: CollectionLimit::Duration(Duration::from_secs(1)),
+            ..fixed_options()
+        },
+        &mut control,
+        &mut sink,
+        &PollBudget(AtomicUsize::new(0)),
+        &mut NoopWorkflowProgress,
+    )
+    .unwrap_err();
+    assert!(matches!(error, WorkflowError::EmptyCapture));
+    assert_eq!(
+        calls.polls.load(Ordering::Relaxed),
+        0,
+        "already-spent active time cannot be restarted by attaching the collector"
+    );
+    assert!(sink.events.is_empty());
+}
+
+#[test]
+fn interaction_idle_cancellation_discards_and_other_cadence_deadlines_remain_unchanged() {
+    for cadence in [CaptureCadence::OnInteraction, CaptureCadence::Manual] {
+        for sink_only in [false, true] {
+            let mut backend = CountingBackend::new(Vec::new());
+            backend.stalled = true;
+            let mut capture = request();
+            capture.cadence = cadence;
+            let (_controller, mut control) = RecordingController::channel();
+            let mut sink = TestFrameSink::default();
+            let options = CollectOptions {
+                // Manual's pre-existing first-sample clock intentionally stays
+                // unchanged in this cohort; interaction cancellation is idle.
+                limit: if cadence == CaptureCadence::Manual {
+                    CollectionLimit::Duration(Duration::from_micros(1))
+                } else {
+                    CollectionLimit::UntilStopped
+                },
+                poll_interval: Duration::from_millis(1),
+                ..fixed_options()
+            };
+            let budget = PollBudget(AtomicUsize::new(490));
+            let error = if sink_only {
+                collect_controlled_to_sink(
+                    &backend,
+                    capture,
+                    &options,
+                    &mut control,
+                    &mut sink,
+                    &budget,
+                    &mut NoopWorkflowProgress,
+                )
+                .unwrap_err()
+            } else {
+                collect_controlled(
+                    &backend,
+                    capture,
+                    &options,
+                    &mut control,
+                    &budget,
+                    &mut NoopWorkflowProgress,
+                )
+                .unwrap_err()
+            };
+            assert!(matches!(error, WorkflowError::Cancelled));
+            assert_eq!(backend.session_calls.discards.load(Ordering::Relaxed), 1);
+            assert!(sink.events.is_empty());
+        }
+    }
+}
+
+#[test]
+fn interaction_duration_without_input_expires_and_excludes_initial_pause_on_all_routes() {
+    for route in ROUTES {
+        for initially_paused in [false, true] {
+            let mut backend = CountingBackend::new(Vec::new());
+            backend.stalled = true;
+            let mut interaction = request();
+            interaction.cadence = CaptureCadence::OnInteraction;
+            let (controller, mut control) = RecordingController::channel();
+            if initially_paused {
+                assert!(controller.pause());
+            }
+            let mut resumed = false;
+            let mut progress = |progress: WorkflowProgress| {
+                if progress.phase == WorkflowPhase::Paused && !resumed {
+                    std::thread::sleep(Duration::from_millis(30));
+                    assert!(controller.resume());
+                    resumed = true;
+                }
+            };
+            let options = CollectOptions {
+                limit: CollectionLimit::Duration(Duration::from_millis(20)),
+                poll_interval: Duration::from_millis(1),
+                ..fixed_options()
+            };
+            let budget = PollBudget(AtomicUsize::new(0));
+            let started = std::time::Instant::now();
+            let mut sink = TestFrameSink::default();
+            let error = match route {
+                Route::Buffered => collect_controlled(
+                    &backend,
+                    interaction,
+                    &options,
+                    &mut control,
+                    &budget,
+                    &mut progress,
+                )
+                .unwrap_err(),
+                Route::BufferedSink => collect_controlled_with_sink(
+                    &backend,
+                    interaction,
+                    &options,
+                    &mut control,
+                    &mut sink,
+                    &budget,
+                    &mut progress,
+                )
+                .unwrap_err(),
+                Route::SinkOnly => collect_controlled_to_sink(
+                    &backend,
+                    interaction,
+                    &options,
+                    &mut control,
+                    &mut sink,
+                    &budget,
+                    &mut progress,
+                )
+                .unwrap_err(),
+                Route::PrestartedSink => {
+                    let mut session = backend.start_session(interaction).unwrap();
+                    collect_prestarted_controlled_to_sink(
+                        session.as_mut(),
+                        &options,
+                        &mut control,
+                        &mut sink,
+                        &budget,
+                        &mut progress,
+                    )
+                    .unwrap_err()
+                }
+            };
+            assert!(
+                matches!(error, WorkflowError::EmptyCapture),
+                "{route:?}: {error}"
+            );
+            assert!(sink.events.is_empty());
+            let minimum = if initially_paused { 50 } else { 20 };
+            assert!(started.elapsed() >= Duration::from_millis(minimum));
+            assert_eq!(resumed, initially_paused);
+        }
+    }
+}
+
 struct TestRun {
     summary: CollectionSummary,
     frames: Vec<RgbaFrame>,
