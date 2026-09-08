@@ -69,3 +69,23 @@ backend failure notices, other import/camera/board/editor/export/tool screens,
 and the other 27 catalogs still require migration and validation. Complex-script
 shaping, BiDi, logical/visual cursor movement and IME remain separate release
 gates. The [full localization plan](LOCALIZATION-PLAN.md) is unchanged in scope.
+
+## Native follow-up findings
+
+The first Chinese Wayland run of commit `904a5ae` prepared a source, applied
+the exact (50,100), 200 × 150 crop, recorded 30 frames for a 3-second timed stop,
+and reopened/exported a 3,000 ms GIF. It also exposed a real localized-notice bug:
+the countdown's named argument `seconds` had accidentally been translated to the
+display label for that unit. The toolbar countdown still worked, but the separate
+notice showed `Unknown message argument`. The argument key is now a literal;
+an actual `begin_recording` regression checks the resulting notice in both en/zh.
+This is why generic catalog tests alone are not full call-site acceptance.
+
+The source drop-down exposed another omission: the two synthetic Portal chooser
+entries have application-owned English descriptions. A presentation-only adapter
+now recognizes precisely Wayland + no geometry + the backend's known ID and
+matching kind, and translates those two prompts. Real window/source names and
+descriptors remain untouched. Tests use the backend's public source factory and
+reject relabeling for other backends, unknown IDs, mismatched kinds or geometry.
+The message set now has 285 entries; these follow-up corrections are newer than
+the initial 283-message cohort above and do not rewrite its native evidence.

@@ -22,6 +22,14 @@ pub(crate) struct LanguageSettings {
 }
 
 impl LanguageSettings {
+    #[cfg(test)]
+    pub(crate) fn with_language(language: LanguagePreference) -> Self {
+        Self {
+            preferences: Preferences { language },
+            ..Self::default()
+        }
+    }
+
     /// Called only by the native entry point. Unit defaults never access the
     /// developer's environment or configuration directory.
     pub(crate) fn from_environment() -> Self {

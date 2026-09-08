@@ -13,6 +13,7 @@ mod board_recorder_ui;
 mod camera_recorder_ui;
 mod capture_binding_ui;
 mod capture_source_job;
+mod capture_source_label;
 mod cinemagraph_draft;
 mod cinemagraph_preview;
 mod countdown;
@@ -2219,7 +2220,14 @@ impl GifFromScreenApp {
                 ui.horizontal(|ui| {
                     let selected_name = self.sources.get(self.selected_source).map_or_else(
                         || localizer.text(Message::RecorderNoCaptureSource).to_owned(),
-                        |source| source.name().into(),
+                        |source| {
+                            capture_source_label::display_name(
+                                source,
+                                self.display_server,
+                                localizer,
+                            )
+                            .into()
+                        },
                     );
                     egui::ComboBox::from_id_salt("capture_source")
                         .selected_text(selected_name)
@@ -2228,7 +2236,11 @@ impl GifFromScreenApp {
                                 ui.selectable_value(
                                     &mut self.selected_source,
                                     index,
-                                    source.name(),
+                                    capture_source_label::display_name(
+                                        source,
+                                        self.display_server,
+                                        localizer,
+                                    ),
                                 );
                             }
                         });
@@ -2595,10 +2607,7 @@ impl GifFromScreenApp {
                 self.notice = Some(format_message(
                     localizer,
                     Message::RecorderCountdownNotice,
-                    &[(
-                        localizer.text(Message::RecorderIntervalSeconds),
-                        &self.settings.countdown_seconds.to_string(),
-                    )],
+                    &[("seconds", &self.settings.countdown_seconds.to_string())],
                 ));
                 context.request_repaint();
                 Ok(())

@@ -17,6 +17,36 @@ fn localizer(tag: &str) -> Localizer {
 }
 
 #[test]
+fn starting_a_countdown_keeps_template_argument_names_untranslated() {
+    let directory = tempfile::tempdir().unwrap();
+    for tag in ["en", "zh"] {
+        let context = egui::Context::default();
+        let mut app = GifFromScreenApp::default();
+        app.language_settings = crate::preferences::LanguageSettings::with_language(
+            gif_from_screen_localization::LanguagePreference::explicit(tag).unwrap(),
+        );
+        app.settings.output = directory
+            .path()
+            .join(format!("{tag}.gif"))
+            .display()
+            .to_string();
+        app.settings.countdown_seconds = 3;
+        app.begin_recording(&context).unwrap();
+        assert_eq!(app.recorder_stage(), RecorderStage::Countdown(3));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some(if tag == "zh" {
+                "录制将在 3 秒后开始…"
+            } else {
+                "Recording starts in 3 seconds…"
+            })
+        );
+        assert!(app.recording_countdown.cancel());
+        assert!(app.job.is_none());
+    }
+}
+
+#[test]
 fn chinese_catalog_templates_have_real_egui_glyphs_in_both_ui_families() {
     let chinese = localizer("zh");
     let characters = gif_from_screen_localization::ALL_MESSAGES

@@ -360,6 +360,8 @@ messages! {
     RecorderNoX11Source => ("recorder-no-x11-source", [], "No X11 capture source is selected.", "尚未选择 X11 录制来源。"),
     RecorderSourcesLoading => ("recorder-sources-loading", [], "Loading Linux capture sources…", "正在加载 Linux 录制来源…"),
     RecorderWaylandStarted => ("recorder-wayland-started", [], "Wayland recording started from the prepared session…", "已使用准备好的会话开始 Wayland 录制…"),
+    RecorderChoosePortalScreen => ("recorder-choose-portal-screen", [], "Choose a screen with the system portal", "通过系统 Portal 选择显示器"),
+    RecorderChoosePortalWindow => ("recorder-choose-portal-window", [], "Choose a window with the system portal", "通过系统 Portal 选择窗口"),
     ExportTitle => ("export-title", [], "Export GIF", "导出 GIF"),
     ExportDestination => ("export-destination", [], "Output path", "输出路径"),
     ExportStart => ("export-start", [], "Export", "导出"),

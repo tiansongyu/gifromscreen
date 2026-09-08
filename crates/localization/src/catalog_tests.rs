@@ -13,7 +13,7 @@ fn localizer(tag: &str) -> Localizer {
 
 #[test]
 fn initial_key_ids_are_unique_and_both_catalogs_have_every_declared_message() {
-    assert_eq!(ALL_MESSAGES.len(), 283);
+    assert_eq!(ALL_MESSAGES.len(), 285);
     let ids: BTreeSet<_> = ALL_MESSAGES.iter().map(|message| message.id()).collect();
     assert_eq!(ids.len(), ALL_MESSAGES.len());
     for tag in ["en", "zh"] {
@@ -411,4 +411,28 @@ fn source_discovery_keeps_protocol_names_and_raw_diagnostics_literal() {
         ),
         Err(FormatError::UnknownArgument)
     );
+}
+
+#[test]
+fn virtual_portal_chooser_labels_have_exact_english_and_explicit_fallback() {
+    for (message, english, chinese) in [
+        (
+            Message::RecorderChoosePortalScreen,
+            "Choose a screen with the system portal",
+            "通过系统 Portal 选择显示器",
+        ),
+        (
+            Message::RecorderChoosePortalWindow,
+            "Choose a window with the system portal",
+            "通过系统 Portal 选择窗口",
+        ),
+    ] {
+        assert!(message.parameters().is_empty());
+        assert_eq!(localizer("en").text(message), english);
+        assert_eq!(localizer("zh").text(message), chinese);
+        let fallback = localizer("fr").resolve(message);
+        assert_eq!(fallback.text, english);
+        assert_eq!(fallback.source, CatalogSource::EnglishFallback);
+        assert_eq!(fallback.language_tag, "en");
+    }
 }
