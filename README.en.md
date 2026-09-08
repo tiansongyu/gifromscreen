@@ -64,6 +64,8 @@ Wayland does not offer a universal transparent desktop frame, automatic controll
 
 The app follows the system locale by default and saves an explicit override from **Language**. English and Simplified Chinese cover the launcher, recorder controls, shortcut settings, core Frames/Timing/Transform editor controls, and [preview, crop and GIF export](docs/PREVIEW-EXPORT-LOCALIZATION.md). Migrated existing notices update with the language; advanced tools and some forms still need translation.
 
+The main branch additionally covers [effects, shapes, drawing, layer management and project statistics](docs/ADVANCED-EDITOR-LOCALIZATION.md). These later changes are not included in the Preview 3 download.
+
 The 29 entries are translation targets, not 29 completed catalogs. Unavailable translations visibly fall back to English while preserving the selected preference. See the [localization plan](docs/LOCALIZATION-PLAN.md).
 
 ![Switching between English and Chinese in the real app with automatically saved language preferences](docs/assets/language-switch.gif)

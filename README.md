@@ -64,6 +64,8 @@ Wayland 不提供通用的全局透明取景框，也不能保证自动排除控
 
 默认跟随系统语言，也可在“语言 / Language”中切换并保存选择。目前中英文覆盖首页、录制控制、快捷键设置、编辑器主要帧/计时/变换操作，以及[预览、裁剪和 GIF 导出](docs/PREVIEW-EXPORT-LOCALIZATION.md)。已迁移的提示也能随语言更新；高级工具和部分表单仍在迁移。
 
+主分支已继续补充[效果、形状、绘图、图层管理和工程统计](docs/ADVANCED-EDITOR-LOCALIZATION.md)；这些后续改动尚未包含在 Preview 3 下载中。
+
 语言列表中的 29 项是覆盖目标，不代表 29 套完整译文。尚未提供的译文会明确回退到英语，原选择仍会保存；详细范围见[本地化计划](docs/LOCALIZATION-PLAN.md)。
 
 ![真实界面即时切换中英文并自动保存语言选择](docs/assets/language-switch.gif)

@@ -13,7 +13,7 @@ fn localizer(tag: &str) -> Localizer {
 
 #[test]
 fn initial_key_ids_are_unique_and_both_catalogs_have_every_declared_message() {
-    assert_eq!(ALL_MESSAGES.len(), 587);
+    assert_eq!(ALL_MESSAGES.len(), 743);
     let ids: BTreeSet<_> = ALL_MESSAGES.iter().map(|message| message.id()).collect();
     assert_eq!(ids.len(), ALL_MESSAGES.len());
     for tag in ["en", "zh"] {
@@ -739,6 +739,174 @@ fn preset_names_and_crop_diagnostics_are_not_translation_templates() {
                 "preview_width",
                 "preview_height"
             ]
+        );
+    }
+}
+
+#[test]
+fn advanced_effect_field_labels_are_parameterless_and_preserve_raw_parse_details() {
+    for label in [
+        Message::EffectFieldBlurRadius,
+        Message::EffectFieldBlockSize,
+        Message::EffectFieldTonePercent,
+        Message::EffectFieldBorderTop,
+        Message::EffectFieldBorderRight,
+        Message::EffectFieldBorderBottom,
+        Message::EffectFieldBorderLeft,
+        Message::EffectFieldShadowBlur,
+        Message::EffectFieldShadowX,
+        Message::EffectFieldShadowY,
+        Message::EffectFieldRegionX,
+        Message::EffectFieldRegionY,
+        Message::EffectFieldRegionWidth,
+        Message::EffectFieldRegionHeight,
+        Message::EffectFieldRed,
+        Message::EffectFieldGreen,
+        Message::EffectFieldBlue,
+        Message::EffectFieldAlpha,
+        Message::EffectFieldIndex,
+    ] {
+        assert!(label.parameters().is_empty());
+    }
+    let error = "invalid digit: {field} 用户输入 -1.25";
+    assert_eq!(
+        localizer("en")
+            .format(
+                Message::EditorInputInvalid,
+                &[
+                    (
+                        "field",
+                        localizer("en").text(Message::EffectFieldBlurRadius)
+                    ),
+                    ("error", error),
+                ]
+            )
+            .unwrap(),
+        format!("invalid blur radius: {error}")
+    );
+    assert_eq!(
+        localizer("zh")
+            .format(
+                Message::EditorInputInvalid,
+                &[
+                    (
+                        "field",
+                        localizer("zh").text(Message::EffectFieldBlurRadius)
+                    ),
+                    ("error", error),
+                ]
+            )
+            .unwrap(),
+        format!("模糊半径无效：{error}")
+    );
+    assert_eq!(
+        localizer("zh")
+            .format(
+                Message::EditorInputRequired,
+                &[("field", localizer("zh").text(Message::EffectFieldShadowX)),]
+            )
+            .unwrap(),
+        "请输入阴影 X 偏移。"
+    );
+    assert_eq!(
+        localizer("zh").format(
+            Message::EditorInputInvalid,
+            &[("字段", "模糊半径"), ("error", error),]
+        ),
+        Err(FormatError::UnknownArgument)
+    );
+}
+
+#[test]
+fn layer_rows_keep_user_names_and_absolute_pagination_values_literal() {
+    let name = "Screen / 用户 {kind} #{number}";
+    for tag in ["en", "zh"] {
+        let localizer = localizer(tag);
+        let kind = localizer.text(Message::EditorContentShape);
+        let ownership = localizer.text(Message::EditorFrameOwned);
+        let output = localizer
+            .format(
+                Message::EditorLayerRow,
+                &[
+                    ("number", "65"),
+                    ("name", name),
+                    ("kind", kind),
+                    ("count", "3"),
+                    ("ownership", ownership),
+                ],
+            )
+            .unwrap();
+        assert!(output.contains(name));
+        assert!(output.contains(kind));
+        assert!(output.ends_with(ownership));
+    }
+    let arguments = [
+        ("start", "65"),
+        ("end", "128"),
+        ("total", "129"),
+        ("page", "2"),
+        ("pages", "3"),
+    ];
+    assert_eq!(
+        localizer("en")
+            .format(Message::EditorLayerPage, &arguments)
+            .unwrap(),
+        "Layers 65–128 of 129 · Page 2 / 3"
+    );
+    assert_eq!(
+        localizer("zh")
+            .format(Message::EditorLayerPage, &arguments)
+            .unwrap(),
+        "图层 65–128，共 129 个 · 第 2 / 3 页"
+    );
+}
+
+#[test]
+fn project_statistics_and_preserved_journal_do_not_localize_user_data() {
+    let arguments = [
+        ("number", "3"),
+        ("start", "0.000001 s"),
+        ("delay", "0.001234 s"),
+    ];
+    assert_eq!(
+        localizer("en")
+            .format(Message::EditorStatsCurrentValue, &arguments)
+            .unwrap(),
+        "#3 · start 0.000001 s · delay 0.001234 s"
+    );
+    assert_eq!(
+        localizer("zh")
+            .format(Message::EditorStatsCurrentValue, &arguments)
+            .unwrap(),
+        "#3 · 开始 0.000001 s · 延时 0.001234 s"
+    );
+    let path = "/home/用户/{path}/记录.journal";
+    for tag in ["en", "zh"] {
+        let localizer = localizer(tag);
+        assert!(
+            localizer
+                .format(Message::EditorJournalPreserved, &[("path", path)])
+                .unwrap()
+                .contains(path)
+        );
+        assert!(
+            localizer
+                .format(Message::EffectBlurRange, &[("maximum", "128")])
+                .unwrap()
+                .contains("128")
+        );
+        assert!(
+            localizer
+                .format(Message::EditorDrawingTooManyPoints, &[("limit", "32768")])
+                .unwrap()
+                .contains("32768")
+        );
+        assert_eq!(
+            localizer.format(
+                Message::EditorDrawingTooManyPoints,
+                &[("MAX_DRAWING_DRAFT_POINTS", "32768")]
+            ),
+            Err(FormatError::UnknownArgument)
         );
     }
 }

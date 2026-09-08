@@ -3,12 +3,18 @@ use gif_from_screen_domain::{
     AnnotationMode, AnnotationRequest, EditTaskTrigger, EditingTask, EditingTaskAction,
     EditingTaskPreset, EditingTaskSources, MAX_EDIT_TASKS, MAX_EDITING_PRESETS, Rgba, TaskDelay,
 };
+use gif_from_screen_localization::Localizer;
 
 use super::AutoTasks;
 use crate::editor_workspace::EditorWorkspace;
 
 impl AutoTasks {
-    pub(crate) fn show(&mut self, ui: &mut egui::Ui, workspace: Option<&EditorWorkspace>) {
+    pub(crate) fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        workspace: Option<&EditorWorkspace>,
+        localizer: Localizer,
+    ) {
         egui::CollapsingHeader::new("Automatic tasks & editing presets").id_salt("automatic-editing-tasks").default_open(true).show(ui, |ui| {
             ui.label("Apply a saved, ordered editing chain after recording or import. Reuse it manually with one undo for the whole chain.");
             if self.is_loading() { ui.horizontal(|ui| { ui.spinner(); ui.label("Loading or saving editing presets…"); }); }
@@ -52,7 +58,7 @@ impl AutoTasks {
                                     if ui.button("Move down").clicked() { operation = Some((index, 1)); }
                                     if ui.button("Delete task").clicked() { operation = Some((index, 0)); }
                                 });
-                                ui.add_enabled_ui(task.enabled, |ui| show_task(ui, &mut task.action));
+                                ui.add_enabled_ui(task.enabled, |ui| show_task(ui, &mut task.action, localizer));
                             });
                         });
                     }
@@ -101,10 +107,14 @@ impl AutoTasks {
     }
 }
 
-fn show_task(ui: &mut egui::Ui, action: &mut EditingTaskAction) {
+fn show_task(ui: &mut egui::Ui, action: &mut EditingTaskAction, localizer: Localizer) {
     match action {
-        EditingTaskAction::ImageBorder { style } => crate::image_effect_ui::show_border(ui, style),
-        EditingTaskAction::ImageShadow { style } => crate::image_effect_ui::show_shadow(ui, style),
+        EditingTaskAction::ImageBorder { style } => {
+            crate::image_effect_ui::show_border(ui, style, localizer);
+        }
+        EditingTaskAction::ImageShadow { style } => {
+            crate::image_effect_ui::show_shadow(ui, style, localizer);
+        }
         EditingTaskAction::Delay { mode } => {
             let mut selected = match mode {
                 TaskDelay::Override { .. } => 0,

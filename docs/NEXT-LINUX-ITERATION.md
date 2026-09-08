@@ -38,6 +38,14 @@ The same main-branch work adds [ordinary drawing input ownership](DRAWING-PREVIE
 including general mapping-change cancellation and fast native input batches.
 These changes are now downloadable as [Preview 3](LINUX-PREVIEW-3-QA.md), with
 [separate native source-build acceptance](PREVIEW-EXPORT-QA-2026-09-09.md).
+Subsequent main-branch work [localizes advanced editor controls](ADVANCED-EDITOR-LOCALIZATION.md),
+including typed field-label validation, effects, shape/drawing/layer management and
+project statistics/storage. Preview 3 remains unchanged; remaining tool bodies and
+all additional-language/font/IME gates are not marked complete.
+The [pinned shape audit](SHAPE-PARITY-2026-09-09.md) identifies Triangle, rounded
+rectangles and direct multi-object manipulation as actual remaining upstream
+features. Dormant dash properties are not mislabeled as an upstream GUI feature;
+existing Line/Arrow project semantics must remain intact.
 
 ## Playback timing: implemented, bounded native manual acceptance recorded
 

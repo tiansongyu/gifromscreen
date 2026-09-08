@@ -63,7 +63,14 @@ fn draw(
         },
         |context| {
             egui::CentralPanel::default().show(context, |ui| {
-                show_overlay_track_list(ui, workspace, state, Instant::now(), &mut results);
+                show_overlay_track_list(
+                    ui,
+                    workspace,
+                    state,
+                    Instant::now(),
+                    &mut results,
+                    crate::test_localizer(),
+                );
             });
         },
     );

@@ -1066,7 +1066,11 @@ impl GifFromScreenApp {
                     egui::ScrollArea::vertical()
                         .id_salt("editing-tasks-page")
                         .show(ui, |ui| {
-                            self.auto_tasks.show(ui, self.editor_workspace.as_ref());
+                            self.auto_tasks.show(
+                                ui,
+                                self.editor_workspace.as_ref(),
+                                self.language_settings.localizer(),
+                            );
                         });
                 }
             }
@@ -3975,6 +3979,9 @@ fn editor_result_notice(result: EditorUiResult) -> Option<Notice> {
         Ok(EditorUiAction::Project(editor_ui::EditorUiOperation::Redo)) => {
             Some(Message::EditorRedoCompleted.into())
         }
+        // Application validation already names the affected setting in plain
+        // language. Keep its identity; wrapping rendered text would freeze it.
+        Err(failure) if failure.message.message_id().is_some() => Some(failure.message),
         Err(failure) => Some(Notice::new(
             Message::EditorOperationFailed,
             &[
@@ -7926,7 +7933,7 @@ mod tests {
         assert_eq!(
             editor_result_notice(Err(EditorUiFailure {
                 operation,
-                message: "repair failed".to_owned(),
+                message: "repair failed".into(),
             }))
             .as_deref(),
             Some("Editor RepairJournal failed: repair failed")
@@ -7943,6 +7950,45 @@ mod tests {
             editor_result_notice(Ok(EditorUiAction::Playback { playing: true })),
             None
         );
+    }
+
+    #[test]
+    fn editor_validation_reaches_the_shell_with_retranslatable_labels_and_no_project_action() {
+        let operation = EditorUiOperation::AddEffect;
+        let validation = crate::ui_notice::Notice::with_messages(
+            gif_from_screen_localization::Message::EditorInputRequired,
+            &[],
+            &[(
+                "field",
+                gif_from_screen_localization::Message::EffectFieldBlurRadius,
+            )],
+        );
+        let mut notice = editor_result_notice(Err(EditorUiFailure {
+            operation,
+            message: validation.clone(),
+        }))
+        .unwrap();
+        assert_eq!(notice, validation);
+        assert_eq!(&*notice, "blur radius is required");
+        let chinese = gif_from_screen_localization::Localizer::new(
+            gif_from_screen_localization::find_language("zh").unwrap(),
+        );
+        notice.refresh(chinese);
+        assert_eq!(&*notice, "请输入模糊半径。");
+        assert_eq!(
+            notice.message_id(),
+            Some(gif_from_screen_localization::Message::EditorInputRequired)
+        );
+
+        // A raw diagnostic that happens to have identical English text is not
+        // silently promoted to an application message or stripped of context.
+        let raw = editor_result_notice(Err(EditorUiFailure {
+            operation,
+            message: "blur radius is required".into(),
+        }))
+        .unwrap();
+        assert_eq!(&*raw, "Editor AddEffect failed: blur radius is required");
+        assert!(raw.render(chinese).ends_with("blur radius is required"));
     }
 
     #[test]

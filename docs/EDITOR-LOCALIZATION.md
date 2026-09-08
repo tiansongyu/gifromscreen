@@ -79,7 +79,9 @@ sequences across a layout change. Original English and Cinemagraph cases remain.
 Native acceptance is recorded separately; unit rendering is not physical desktop,
 global-shortcut or IME certification.
 
-Still open: Effects/Overlays/Project tool bodies,
+The subsequent [advanced-editor slice](ADVANCED-EDITOR-LOCALIZATION.md) covers
+effects, shapes/drawing/layers, project storage and statistics on main beyond
+Preview 3. Still open: text/title and image/watermark tool bodies,
 import/camera/board/automation dialogs, detailed errors, additional-language
 catalogs, RTL/shaping and IME. [Native acceptance](EDITOR-LOCALIZATION-QA-2026-09-08.md)
 records actual editor and shortcut checks. [Preview 2](LINUX-PREVIEW-2-QA.md) includes

@@ -680,7 +680,7 @@ pub(crate) enum EditorUiAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EditorUiFailure {
     pub(crate) operation: EditorUiOperation,
-    pub(crate) message: String,
+    pub(crate) message: Notice,
 }
 
 /// One successful action or recoverable failure produced during an egui frame.
@@ -763,33 +763,37 @@ fn show_active_tool(
         EditorToolTab::Transform => {
             show_transform_toolbar(ui, workspace, state, now, results, localizer);
         }
-        EditorToolTab::Effects => show_effect_toolbar(ui, workspace, state, now, results),
+        EditorToolTab::Effects => {
+            show_effect_toolbar(ui, workspace, state, now, results, localizer);
+        }
         EditorToolTab::Overlays => {
             ui.horizontal_wrapped(|ui| {
-                for (tool, label) in [
-                    (OverlayTool::Text, "Text & titles"),
-                    (OverlayTool::Image, "Image"),
-                    (OverlayTool::Shape, "Shape"),
-                    (OverlayTool::Drawing, "Draw"),
-                    (OverlayTool::Layers, "Layers"),
+                for (tool, message) in [
+                    (OverlayTool::Text, Message::EditorOverlayTextTab),
+                    (OverlayTool::Image, Message::EditorOverlayImageTab),
+                    (OverlayTool::Shape, Message::EditorOverlayShapeTab),
+                    (OverlayTool::Drawing, Message::EditorOverlayDrawTab),
+                    (OverlayTool::Layers, Message::EditorOverlayLayersTab),
                 ] {
-                    ui.selectable_value(&mut state.overlay_tool, tool, label);
+                    ui.selectable_value(&mut state.overlay_tool, tool, localizer.text(message));
                 }
             });
             match state.overlay_tool {
                 OverlayTool::Shape => {
-                    show_shape_overlay_toolbar(ui, workspace, state, now, results);
+                    show_shape_overlay_toolbar(ui, workspace, state, now, results, localizer);
                 }
                 OverlayTool::Drawing => {
-                    show_drawing_overlay_controls(ui, workspace, state, now, results);
+                    show_drawing_overlay_controls(ui, workspace, state, now, results, localizer);
                 }
-                OverlayTool::Layers => show_overlay_track_list(ui, workspace, state, now, results),
+                OverlayTool::Layers => {
+                    show_overlay_track_list(ui, workspace, state, now, results, localizer);
+                }
                 OverlayTool::Text | OverlayTool::Image => {}
             }
         }
         EditorToolTab::Project => {
-            show_project_storage_toolbar(ui, workspace, results);
-            show_editor_statistics(ui, workspace, results);
+            show_project_storage_toolbar(ui, workspace, results, localizer);
+            show_editor_statistics(ui, workspace, results, localizer);
         }
     }
 }
@@ -952,29 +956,40 @@ fn show_project_storage_toolbar(
     ui: &mut egui::Ui,
     workspace: &mut EditorWorkspace,
     results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
 ) {
     ui.horizontal_wrapped(|ui| {
-        if ui.button("Save checkpoint").clicked() {
+        if ui
+            .button(localizer.text(Message::EditorSaveCheckpoint))
+            .clicked()
+        {
             match workspace.checkpoint() {
                 Ok(()) => push_notice(
                     results,
                     EditorUiOperation::SaveCheckpoint,
-                    "Project manifest checkpoint saved.",
+                    Notice::localized(localizer, Message::EditorCheckpointSaved, &[]),
                 ),
                 Err(error) => push_failure(results, EditorUiOperation::SaveCheckpoint, error),
             }
         }
-        if ui.button("Save & compact").clicked() {
+        if ui
+            .button(localizer.text(Message::EditorSaveCompact))
+            .clicked()
+        {
             match workspace.checkpoint_and_compact() {
                 Ok(()) => push_notice(
                     results,
                     EditorUiOperation::SaveAndCompact,
-                    "Project checkpoint saved and journal compacted.",
+                    Notice::localized(localizer, Message::EditorCompacted, &[]),
                 ),
                 Err(error) => push_failure(results, EditorUiOperation::SaveAndCompact, error),
             }
         }
-        if workspace.journal_requires_repair() && ui.button("Repair journal").clicked() {
+        if workspace.journal_requires_repair()
+            && ui
+                .button(localizer.text(Message::EditorRepairJournal))
+                .clicked()
+        {
             match workspace.repair_journal() {
                 Ok(preserved) => push_notice(
                     results,
@@ -991,8 +1006,10 @@ fn show_editor_statistics(
     ui: &mut egui::Ui,
     workspace: &EditorWorkspace,
     results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
 ) {
-    egui::CollapsingHeader::new("Statistics")
+    egui::CollapsingHeader::new(localizer.text(Message::EditorStatistics))
+        .id_salt("Statistics") // Keep the original English identity across languages.
         .default_open(false)
         .show(ui, |ui| match workspace.statistics() {
             Ok(statistics) => {
@@ -1000,15 +1017,15 @@ fn show_editor_statistics(
                     .num_columns(2)
                     .spacing([16.0, 4.0])
                     .show(ui, |ui| {
-                        statistic_row(ui, "Frames", statistics.frame_count.to_string());
+                        statistic_row(ui, localizer.text(Message::EditorStatsFrames), statistics.frame_count.to_string());
                         statistic_row(
                             ui,
-                            "Selected frames",
+                            localizer.text(Message::EditorStatsSelectedFrames),
                             statistics.selected_frame_count.to_string(),
                         );
                         statistic_row(
                             ui,
-                            "Canvas",
+                            localizer.text(Message::EditorStatsCanvas),
                             format!(
                                 "{} × {}",
                                 statistics.canvas.width.get(),
@@ -1017,51 +1034,50 @@ fn show_editor_statistics(
                         );
                         statistic_row(
                             ui,
-                            "Total duration",
+                            localizer.text(Message::EditorStatsTotalDuration),
                             format_duration_us(statistics.total_duration_us),
                         );
                         statistic_row(
                             ui,
-                            "Selected duration",
+                            localizer.text(Message::EditorStatsSelectedDuration),
                             format_duration_us(statistics.selection_duration_us),
                         );
                         statistic_row(
                             ui,
-                            "Minimum delay",
-                            format_optional_duration(statistics.minimum_delay_us),
+                            localizer.text(Message::EditorStatsMinimumDelay),
+                            format_optional_duration(statistics.minimum_delay_us, localizer),
                         );
                         statistic_row(
                             ui,
-                            "Maximum delay",
-                            format_optional_duration(statistics.maximum_delay_us),
+                            localizer.text(Message::EditorStatsMaximumDelay),
+                            format_optional_duration(statistics.maximum_delay_us, localizer),
                         );
                         statistic_row(
                             ui,
-                            "Average delay",
-                            format_optional_duration(statistics.average_delay_us),
+                            localizer.text(Message::EditorStatsAverageDelay),
+                            format_optional_duration(statistics.average_delay_us, localizer),
                         );
                         statistic_row(
                             ui,
-                            "Unique assets",
+                            localizer.text(Message::EditorStatsUniqueAssets),
                             statistics.unique_asset_count.to_string(),
                         );
                         statistic_row(
                             ui,
-                            "Asset descriptor bytes",
+                            localizer.text(Message::EditorStatsAssetBytes),
                             statistics.asset_descriptor_bytes.to_string(),
                         );
                         let current = statistics.current_frame.map_or_else(
-                            || "None".to_owned(),
+                            || localizer.text(Message::EditorOptionalNone).to_owned(),
                             |current| {
-                                format!(
-                                    "#{} · start {} · delay {}",
-                                    current.frame_number,
-                                    format_duration_us(current.start_us),
-                                    format_duration_us(current.duration_us)
-                                )
+                                crate::format_message(localizer, Message::EditorStatsCurrentValue, &[
+                                    ("number", &current.frame_number.to_string()),
+                                    ("start", &format_duration_us(current.start_us)),
+                                    ("delay", &format_duration_us(current.duration_us)),
+                                ])
                             },
                         );
-                        statistic_row(ui, "Current frame", current);
+                        statistic_row(ui, localizer.text(Message::EditorStatsCurrentFrame), current);
                     });
             }
             Err(error) => {
@@ -1085,14 +1101,22 @@ fn format_duration_us(duration_us: u64) -> String {
     )
 }
 
-fn format_optional_duration(duration_us: Option<u64>) -> String {
-    duration_us.map_or_else(|| "None".to_owned(), format_duration_us)
+fn format_optional_duration(duration_us: Option<u64>, localizer: Localizer) -> String {
+    duration_us.map_or_else(
+        || localizer.text(Message::EditorOptionalNone).to_owned(),
+        format_duration_us,
+    )
 }
 
-fn repair_journal_notice(preserved: Option<&std::path::Path>) -> String {
+fn repair_journal_notice(preserved: Option<&std::path::Path>) -> Notice {
     preserved.map_or_else(
-        || "Journal is already clean; no repair was needed.".to_owned(),
-        |path| format!("Rejected journal preserved at {}.", path.display()),
+        || Message::EditorJournalClean.into(),
+        |path| {
+            Notice::new(
+                Message::EditorJournalPreserved,
+                &[("path", &path.display().to_string())],
+            )
+        },
     )
 }
 
@@ -2228,12 +2252,13 @@ fn show_effect_toolbar(
     state: &mut EditorUiState,
     now: Instant,
     results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
 ) {
     ui.group(|ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.strong("Frame effects");
+            ui.strong(localizer.text(Message::EffectsTitle));
             egui::ComboBox::from_id_salt("frame_effect_choice")
-                .selected_text(effect_choice_label(state.effect_choice))
+                .selected_text(effect_choice_label(state.effect_choice, localizer))
                 .show_ui(ui, |ui| {
                     for choice in [
                         EffectChoice::Blur,
@@ -2248,16 +2273,16 @@ fn show_effect_toolbar(
                         ui.selectable_value(
                             &mut state.effect_choice,
                             choice,
-                            effect_choice_label(choice),
+                            effect_choice_label(choice, localizer),
                         );
                     }
                 });
-            ui.label("Replace #");
+            ui.label(localizer.text(Message::EffectsReplaceNumber));
             compact_input(ui, &mut state.effect_index_input);
         });
-        show_effect_inputs(ui, state);
+        show_effect_inputs(ui, state, localizer);
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Add effect").clicked() {
+            if ui.button(localizer.text(Message::EffectsAdd)).clicked() {
                 match build_image_effect(state) {
                     Ok(effect) => {
                         let result = workspace.add_image_effect(effect);
@@ -2270,10 +2295,12 @@ fn show_effect_toolbar(
                             result,
                         );
                     }
-                    Err(message) => push_failure(results, EditorUiOperation::AddEffect, message),
+                    Err(message) => {
+                        push_validation_failure(results, EditorUiOperation::AddEffect, message);
+                    }
                 }
             }
-            if ui.button("Replace effect").clicked() {
+            if ui.button(localizer.text(Message::EffectsReplace)).clicked() {
                 match parse_effect_index(state)
                     .and_then(|index| build_image_effect(state).map(|effect| (index, effect)))
                 {
@@ -2289,11 +2316,15 @@ fn show_effect_toolbar(
                         );
                     }
                     Err(message) => {
-                        push_failure(results, EditorUiOperation::ReplaceEffect, message);
+                        push_validation_failure(results, EditorUiOperation::ReplaceEffect, message);
                     }
                 }
             }
-            if ui.button("Clear effects").on_hover_text("Selected frames, unless a canvas-changing border or shadow is involved: then all frames are cleared to keep a consistent animation size. Undo restores the whole edit.").clicked() {
+            if ui
+                .button(localizer.text(Message::EffectsClear))
+                .on_hover_text(localizer.text(Message::EffectsClearHint))
+                .clicked()
+            {
                 let result = workspace.clear_selection_effects();
                 record_project_result(
                     workspace,
@@ -2305,33 +2336,33 @@ fn show_effect_toolbar(
                 );
             }
         });
-        ui.weak("Adding shadow or an outer border affects all frames. Replacing or clearing canvas effects also uses all frames; later artwork keeps its authored stage coordinates.");
+        ui.weak(localizer.text(Message::EffectsCanvasScopeHint));
     });
 }
 
-fn show_effect_inputs(ui: &mut egui::Ui, state: &mut EditorUiState) {
+fn show_effect_inputs(ui: &mut egui::Ui, state: &mut EditorUiState, localizer: Localizer) {
     match state.effect_choice {
         EffectChoice::Blur
         | EffectChoice::Pixelate
         | EffectChoice::Darken
         | EffectChoice::Lighten => {
             ui.horizontal_wrapped(|ui| {
-                ui.label("Canvas region X/Y/W/H");
+                ui.label(localizer.text(Message::EffectsRegion));
                 compact_input(ui, &mut state.effect_region_x_input);
                 compact_input(ui, &mut state.effect_region_y_input);
                 compact_input(ui, &mut state.effect_region_width_input);
                 compact_input(ui, &mut state.effect_region_height_input);
                 match state.effect_choice {
                     EffectChoice::Blur => {
-                        ui.label("Radius");
+                        ui.label(localizer.text(Message::EffectsRadius));
                         compact_input(ui, &mut state.effect_blur_radius_input);
                     }
                     EffectChoice::Pixelate => {
-                        ui.label("Block");
+                        ui.label(localizer.text(Message::EffectsBlock));
                         compact_input(ui, &mut state.effect_pixel_block_input);
                     }
                     EffectChoice::Darken | EffectChoice::Lighten => {
-                        ui.label("Percent");
+                        ui.label(localizer.text(Message::EffectsPercent));
                         compact_input(ui, &mut state.effect_tone_percent_input);
                     }
                     EffectChoice::Border
@@ -2343,55 +2374,55 @@ fn show_effect_inputs(ui: &mut egui::Ui, state: &mut EditorUiState) {
         }
         EffectChoice::Border => {
             ui.horizontal_wrapped(|ui| {
-                ui.label("Edges T/R/B/L");
+                ui.label(localizer.text(Message::EffectsEdges));
                 compact_input(ui, &mut state.effect_border_top_input);
                 compact_input(ui, &mut state.effect_border_right_input);
                 compact_input(ui, &mut state.effect_border_bottom_input);
                 compact_input(ui, &mut state.effect_border_left_input);
-                show_effect_color_inputs(ui, state);
+                show_effect_color_inputs(ui, state, localizer);
             });
         }
         EffectChoice::Shadow => {
             ui.horizontal_wrapped(|ui| {
-                ui.label("Offset X/Y");
+                ui.label(localizer.text(Message::EffectsOffset));
                 compact_input(ui, &mut state.effect_shadow_offset_x_input);
                 compact_input(ui, &mut state.effect_shadow_offset_y_input);
-                ui.label("Blur");
+                ui.label(localizer.text(Message::EffectsBlur));
                 compact_input(ui, &mut state.effect_shadow_blur_input);
-                show_effect_color_inputs(ui, state);
+                show_effect_color_inputs(ui, state, localizer);
             });
         }
         EffectChoice::ImageBorder => {
-            crate::image_effect_ui::show_border(ui, &mut state.image_border);
+            crate::image_effect_ui::show_border(ui, &mut state.image_border, localizer);
         }
         EffectChoice::ImageShadow => {
-            crate::image_effect_ui::show_shadow(ui, &mut state.image_shadow);
+            crate::image_effect_ui::show_shadow(ui, &mut state.image_shadow, localizer);
         }
     }
 }
 
-fn show_effect_color_inputs(ui: &mut egui::Ui, state: &mut EditorUiState) {
-    ui.label("RGBA");
+fn show_effect_color_inputs(ui: &mut egui::Ui, state: &mut EditorUiState, localizer: Localizer) {
+    ui.label(localizer.text(Message::EffectsRgba));
     compact_input(ui, &mut state.effect_color_red_input);
     compact_input(ui, &mut state.effect_color_green_input);
     compact_input(ui, &mut state.effect_color_blue_input);
     compact_input(ui, &mut state.effect_color_alpha_input);
 }
 
-const fn effect_choice_label(choice: EffectChoice) -> &'static str {
-    match choice {
-        EffectChoice::Blur => "Blur",
-        EffectChoice::Pixelate => "Pixelate",
-        EffectChoice::Darken => "Darken",
-        EffectChoice::Lighten => "Lighten",
-        EffectChoice::Border => "Legacy inset border",
-        EffectChoice::Shadow => "Legacy clipped shadow",
-        EffectChoice::ImageBorder => "Border · inner / outer",
-        EffectChoice::ImageShadow => "Shadow · expanded canvas",
-    }
+fn effect_choice_label(choice: EffectChoice, localizer: Localizer) -> &'static str {
+    localizer.text(match choice {
+        EffectChoice::Blur => Message::EffectChoiceBlur,
+        EffectChoice::Pixelate => Message::EffectChoicePixelate,
+        EffectChoice::Darken => Message::EffectChoiceDarken,
+        EffectChoice::Lighten => Message::EffectChoiceLighten,
+        EffectChoice::Border => Message::EffectChoiceLegacyBorder,
+        EffectChoice::Shadow => Message::EffectChoiceLegacyShadow,
+        EffectChoice::ImageBorder => Message::EffectChoiceImageBorder,
+        EffectChoice::ImageShadow => Message::EffectChoiceImageShadow,
+    })
 }
 
-fn build_image_effect(state: &EditorUiState) -> Result<ComposedImageEffect, String> {
+fn build_image_effect(state: &EditorUiState) -> Result<ComposedImageEffect, Notice> {
     match state.effect_choice {
         EffectChoice::ImageBorder => {
             state.image_border.validate()?;
@@ -2405,16 +2436,20 @@ fn build_image_effect(state: &EditorUiState) -> Result<ComposedImageEffect, Stri
     }
 }
 
-fn build_effect(state: &EditorUiState) -> Result<Effect, String> {
+fn build_effect(state: &EditorUiState) -> Result<Effect, Notice> {
     match state.effect_choice {
         EffectChoice::ImageBorder | EffectChoice::ImageShadow => {
-            Err("Use the current-image effect builder for canvas effects.".to_owned())
+            Err(Message::EffectUseImageBuilder.into())
         }
         EffectChoice::Blur => {
-            let radius = parse_input::<u16>(&state.effect_blur_radius_input, "blur radius")?;
+            let radius = parse_localized_input::<u16>(
+                &state.effect_blur_radius_input,
+                Message::EffectFieldBlurRadius,
+            )?;
             if !(1..=MAX_FRAME_EFFECT_BLUR_RADIUS).contains(&radius) {
-                return Err(format!(
-                    "blur radius must be between 1 and {MAX_FRAME_EFFECT_BLUR_RADIUS}"
+                return Err(Notice::new(
+                    Message::EffectBlurRange,
+                    &[("maximum", &MAX_FRAME_EFFECT_BLUR_RADIUS.to_string())],
                 ));
             }
             Ok(Effect::Blur {
@@ -2423,10 +2458,12 @@ fn build_effect(state: &EditorUiState) -> Result<Effect, String> {
             })
         }
         EffectChoice::Pixelate => {
-            let block_size =
-                parse_input::<u16>(&state.effect_pixel_block_input, "pixel block size")?;
+            let block_size = parse_localized_input::<u16>(
+                &state.effect_pixel_block_input,
+                Message::EffectFieldBlockSize,
+            )?;
             if block_size == 0 {
-                return Err("pixel block size must be positive".to_owned());
+                return Err(Message::EffectBlockPositive.into());
             }
             Ok(Effect::Pixelate {
                 region: parse_effect_region(state)?,
@@ -2434,10 +2471,12 @@ fn build_effect(state: &EditorUiState) -> Result<Effect, String> {
             })
         }
         EffectChoice::Darken | EffectChoice::Lighten => {
-            let amount_percent =
-                parse_input::<u8>(&state.effect_tone_percent_input, "tone percentage")?;
+            let amount_percent = parse_localized_input::<u8>(
+                &state.effect_tone_percent_input,
+                Message::EffectFieldTonePercent,
+            )?;
             if amount_percent > 100 {
-                return Err("tone percentage must be between 0 and 100".to_owned());
+                return Err(Message::EffectToneRange.into());
             }
             let region = parse_effect_region(state)?;
             if state.effect_choice == EffectChoice::Darken {
@@ -2452,66 +2491,126 @@ fn build_effect(state: &EditorUiState) -> Result<Effect, String> {
                 })
             }
         }
-        EffectChoice::Border => {
-            let widths = EdgeWidths {
-                top: parse_input::<u16>(&state.effect_border_top_input, "border top")?,
-                right: parse_input::<u16>(&state.effect_border_right_input, "border right")?,
-                bottom: parse_input::<u16>(&state.effect_border_bottom_input, "border bottom")?,
-                left: parse_input::<u16>(&state.effect_border_left_input, "border left")?,
-            };
-            if widths == EdgeWidths::default() {
-                return Err("at least one border edge must be positive".to_owned());
-            }
-            Ok(Effect::Border {
-                widths,
-                color: parse_effect_color(state)?,
-            })
-        }
-        EffectChoice::Shadow => {
-            let blur_radius =
-                parse_input::<u16>(&state.effect_shadow_blur_input, "shadow blur radius")?;
-            if blur_radius > MAX_FRAME_EFFECT_BLUR_RADIUS {
-                return Err(format!(
-                    "shadow blur radius must be at most {MAX_FRAME_EFFECT_BLUR_RADIUS}"
-                ));
-            }
-            Ok(Effect::Shadow {
-                offset_x: parse_input::<i32>(&state.effect_shadow_offset_x_input, "shadow X")?,
-                offset_y: parse_input::<i32>(&state.effect_shadow_offset_y_input, "shadow Y")?,
-                blur_radius,
-                color: parse_effect_color(state)?,
-            })
-        }
+        EffectChoice::Border => build_legacy_border_effect(state),
+        EffectChoice::Shadow => build_legacy_shadow_effect(state),
     }
 }
 
-fn parse_effect_region(state: &EditorUiState) -> Result<PhysicalRect, String> {
-    let x = parse_input::<u32>(&state.effect_region_x_input, "effect region X")?;
-    let y = parse_input::<u32>(&state.effect_region_y_input, "effect region Y")?;
-    let width = parse_input::<u32>(&state.effect_region_width_input, "effect region width")?;
-    let height = parse_input::<u32>(&state.effect_region_height_input, "effect region height")?;
-    PhysicalRect::new(x, y, width, height)
-        .map_err(|error| format!("invalid effect region: {error}"))
+fn build_legacy_border_effect(state: &EditorUiState) -> Result<Effect, Notice> {
+    let widths = EdgeWidths {
+        top: parse_localized_input::<u16>(
+            &state.effect_border_top_input,
+            Message::EffectFieldBorderTop,
+        )?,
+        right: parse_localized_input::<u16>(
+            &state.effect_border_right_input,
+            Message::EffectFieldBorderRight,
+        )?,
+        bottom: parse_localized_input::<u16>(
+            &state.effect_border_bottom_input,
+            Message::EffectFieldBorderBottom,
+        )?,
+        left: parse_localized_input::<u16>(
+            &state.effect_border_left_input,
+            Message::EffectFieldBorderLeft,
+        )?,
+    };
+    if widths == EdgeWidths::default() {
+        return Err(Message::EffectBorderPositive.into());
+    }
+    Ok(Effect::Border {
+        widths,
+        color: parse_effect_color(state)?,
+    })
 }
 
-fn parse_effect_color(state: &EditorUiState) -> Result<Rgba, String> {
+fn build_legacy_shadow_effect(state: &EditorUiState) -> Result<Effect, Notice> {
+    let blur_radius = parse_localized_input::<u16>(
+        &state.effect_shadow_blur_input,
+        Message::EffectFieldShadowBlur,
+    )?;
+    if blur_radius > MAX_FRAME_EFFECT_BLUR_RADIUS {
+        return Err(Notice::new(
+            Message::EffectShadowBlurMaximum,
+            &[("maximum", &MAX_FRAME_EFFECT_BLUR_RADIUS.to_string())],
+        ));
+    }
+    Ok(Effect::Shadow {
+        offset_x: parse_localized_input::<i32>(
+            &state.effect_shadow_offset_x_input,
+            Message::EffectFieldShadowX,
+        )?,
+        offset_y: parse_localized_input::<i32>(
+            &state.effect_shadow_offset_y_input,
+            Message::EffectFieldShadowY,
+        )?,
+        blur_radius,
+        color: parse_effect_color(state)?,
+    })
+}
+
+fn parse_effect_region(state: &EditorUiState) -> Result<PhysicalRect, Notice> {
+    let x =
+        parse_localized_input::<u32>(&state.effect_region_x_input, Message::EffectFieldRegionX)?;
+    let y =
+        parse_localized_input::<u32>(&state.effect_region_y_input, Message::EffectFieldRegionY)?;
+    let width = parse_localized_input::<u32>(
+        &state.effect_region_width_input,
+        Message::EffectFieldRegionWidth,
+    )?;
+    let height = parse_localized_input::<u32>(
+        &state.effect_region_height_input,
+        Message::EffectFieldRegionHeight,
+    )?;
+    PhysicalRect::new(x, y, width, height).map_err(|error| match error {
+        gif_from_screen_domain::UnitError::EmptyPhysicalSize => Notice::with_messages(
+            Message::EffectInvalidRegion,
+            &[],
+            &[("error", Message::CropEmptySize)],
+        ),
+        gif_from_screen_domain::UnitError::PhysicalCoordinateOverflow => Notice::with_messages(
+            Message::EffectInvalidRegion,
+            &[],
+            &[("error", Message::CropCoordinateOverflow)],
+        ),
+        other => Notice::new(
+            Message::EffectInvalidRegion,
+            &[("error", &other.to_string())],
+        ),
+    })
+}
+
+fn parse_effect_color(state: &EditorUiState) -> Result<Rgba, Notice> {
     let color = Rgba {
-        red: parse_input::<u8>(&state.effect_color_red_input, "effect red")?,
-        green: parse_input::<u8>(&state.effect_color_green_input, "effect green")?,
-        blue: parse_input::<u8>(&state.effect_color_blue_input, "effect blue")?,
-        alpha: parse_input::<u8>(&state.effect_color_alpha_input, "effect alpha")?,
+        red: parse_localized_input::<u8>(&state.effect_color_red_input, Message::EffectFieldRed)?,
+        green: parse_localized_input::<u8>(
+            &state.effect_color_green_input,
+            Message::EffectFieldGreen,
+        )?,
+        blue: parse_localized_input::<u8>(
+            &state.effect_color_blue_input,
+            Message::EffectFieldBlue,
+        )?,
+        alpha: parse_localized_input::<u8>(
+            &state.effect_color_alpha_input,
+            Message::EffectFieldAlpha,
+        )?,
     };
     if color.alpha == 0 {
-        return Err("effect color alpha must be positive".to_owned());
+        return Err(Message::EffectAlphaPositive.into());
     }
     Ok(color)
 }
 
-fn parse_effect_index(state: &EditorUiState) -> Result<usize, String> {
-    parse_input::<usize>(&state.effect_index_input, "effect number")?
+fn parse_effect_index(state: &EditorUiState) -> Result<usize, Notice> {
+    parse_localized_input::<usize>(&state.effect_index_input, Message::EffectFieldIndex)?
         .checked_sub(1)
-        .ok_or_else(|| "effect number is 1-based and must be positive".to_owned())
+        .ok_or_else(|| Message::EffectIndexPositive.into())
 }
+
+#[cfg(test)]
+#[path = "editor_ui/effect_localization_tests.rs"]
+mod effect_localization_tests;
 
 fn show_shape_overlay_toolbar(
     ui: &mut egui::Ui,
@@ -2519,14 +2618,18 @@ fn show_shape_overlay_toolbar(
     state: &mut EditorUiState,
     now: Instant,
     results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
 ) {
     ui.group(|ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.strong("Shape overlays");
-            ui.weak("Applies to selected frames only; gaps in the selection stay unchanged.");
+            ui.strong(localizer.text(Message::EditorShapeOverlays));
+            ui.weak(localizer.text(Message::EditorSelectedOverlayScope));
         });
-        show_shape_overlay_inputs(ui, &mut state.shape_overlay);
-        if ui.button("Add shape overlay").clicked() {
+        show_shape_overlay_inputs(ui, &mut state.shape_overlay, localizer);
+        if ui
+            .button(localizer.text(Message::EditorAddShapeOverlay))
+            .clicked()
+        {
             let result =
                 build_shape_overlay(&state.shape_overlay, workspace.manifest().canvas.size)
                     .and_then(|content| {
@@ -2539,9 +2642,9 @@ fn show_shape_overlay_toolbar(
                                 state.shape_overlay.blend_mode,
                             )
                             .map(|_| ())
-                            .map_err(|error| error.to_string())
+                            .map_err(|error| Notice::from(error.to_string()))
                     });
-            record_project_result(
+            record_project_validation_result(
                 workspace,
                 state,
                 now,
@@ -2553,13 +2656,17 @@ fn show_shape_overlay_toolbar(
     });
 }
 
-fn show_shape_overlay_inputs(ui: &mut egui::Ui, state: &mut ShapeOverlayUiState) {
+fn show_shape_overlay_inputs(
+    ui: &mut egui::Ui,
+    state: &mut ShapeOverlayUiState,
+    localizer: Localizer,
+) {
     ui.horizontal_wrapped(|ui| {
-        ui.label("Name");
+        ui.label(localizer.text(Message::EditorOverlayName));
         ui.add(egui::TextEdit::singleline(&mut state.name).desired_width(120.0));
-        ui.label("Kind");
+        ui.label(localizer.text(Message::EditorOverlayKind));
         egui::ComboBox::from_id_salt("shape_overlay_kind")
-            .selected_text(shape_overlay_choice_label(state.kind))
+            .selected_text(shape_overlay_choice_label(state.kind, localizer))
             .show_ui(ui, |ui| {
                 for choice in [
                     ShapeOverlayChoice::Line,
@@ -2570,37 +2677,45 @@ fn show_shape_overlay_inputs(ui: &mut egui::Ui, state: &mut ShapeOverlayUiState)
                     ui.selectable_value(
                         &mut state.kind,
                         choice,
-                        shape_overlay_choice_label(choice),
+                        shape_overlay_choice_label(choice, localizer),
                     );
                 }
             });
         ui.label("Z");
         ui.add(egui::DragValue::new(&mut state.z_index));
-        ui.label("Track opacity");
+        ui.label(localizer.text(Message::EditorTrackOpacity));
         ui.add(egui::DragValue::new(&mut state.track_opacity).range(1..=u8::MAX));
-        ui.label("Blend");
+        ui.label(localizer.text(Message::EditorOverlayBlend));
         egui::ComboBox::from_id_salt("shape_overlay_blend")
-            .selected_text(blend_mode_label(state.blend_mode))
+            .selected_text(blend_mode_label(state.blend_mode, localizer))
             .show_ui(ui, |ui| {
                 for blend in [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen] {
-                    ui.selectable_value(&mut state.blend_mode, blend, blend_mode_label(blend));
+                    ui.selectable_value(
+                        &mut state.blend_mode,
+                        blend,
+                        blend_mode_label(blend, localizer),
+                    );
                 }
             });
     });
     ui.horizontal_wrapped(|ui| {
-        ui.label("Bounds X/Y/W/H");
+        ui.label(localizer.text(Message::EditorOverlayBounds));
         ui.add(egui::DragValue::new(&mut state.x));
         ui.add(egui::DragValue::new(&mut state.y));
         ui.add(egui::DragValue::new(&mut state.width).range(1..=u32::MAX));
         ui.add(egui::DragValue::new(&mut state.height).range(1..=u32::MAX));
-        ui.label("Stroke width");
+        ui.label(localizer.text(Message::EditorStrokeWidth));
         ui.add(egui::DragValue::new(&mut state.stroke_width));
     });
     ui.horizontal_wrapped(|ui| {
-        show_rgba_inputs(ui, "Stroke RGBA", &mut state.stroke);
-        ui.checkbox(&mut state.fill_enabled, "Fill");
+        show_rgba_inputs(
+            ui,
+            localizer.text(Message::EditorStrokeRgba),
+            &mut state.stroke,
+        );
+        ui.checkbox(&mut state.fill_enabled, localizer.text(Message::EditorFill));
         ui.add_enabled_ui(state.fill_enabled, |ui| {
-            show_rgba_inputs(ui, "Fill RGBA", &mut state.fill);
+            show_rgba_inputs(ui, localizer.text(Message::EditorFillRgba), &mut state.fill);
         });
     });
 }
@@ -2619,31 +2734,35 @@ fn show_drawing_overlay_controls(
     state: &mut EditorUiState,
     now: Instant,
     results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
 ) {
     state.drawing_overlay.reconcile(workspace);
     ui.separator();
     ui.horizontal_wrapped(|ui| {
-        ui.strong("Free drawing");
-        ui.label("Name");
+        ui.strong(localizer.text(Message::EditorFreeDrawing));
+        ui.label(localizer.text(Message::EditorOverlayName));
         ui.add(egui::TextEdit::singleline(&mut state.drawing_overlay.name).desired_width(110.0));
-        ui.label("Width");
+        ui.label(localizer.text(Message::RecorderWidth));
         ui.add(egui::DragValue::new(&mut state.drawing_overlay.width).range(1..=u16::MAX));
         show_rgba_inputs(ui, "RGBA", &mut state.drawing_overlay.color);
     });
     ui.horizontal_wrapped(|ui| {
         ui.label("Z");
         ui.add(egui::DragValue::new(&mut state.drawing_overlay.z_index));
-        ui.label("Track opacity");
+        ui.label(localizer.text(Message::EditorTrackOpacity));
         ui.add(egui::DragValue::new(&mut state.drawing_overlay.track_opacity).range(1..=u8::MAX));
-        ui.label("Blend");
+        ui.label(localizer.text(Message::EditorOverlayBlend));
         egui::ComboBox::from_id_salt("drawing_overlay_blend")
-            .selected_text(blend_mode_label(state.drawing_overlay.blend_mode))
+            .selected_text(blend_mode_label(
+                state.drawing_overlay.blend_mode,
+                localizer,
+            ))
             .show_ui(ui, |ui| {
                 for blend in [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen] {
                     ui.selectable_value(
                         &mut state.drawing_overlay.blend_mode,
                         blend,
-                        blend_mode_label(blend),
+                        blend_mode_label(blend, localizer),
                     );
                 }
             });
@@ -2652,7 +2771,7 @@ fn show_drawing_overlay_controls(
                 if ui
                     .add_enabled(
                         !workspace.selection().is_empty(),
-                        egui::Button::new("Draw one stroke on preview"),
+                        egui::Button::new(localizer.text(Message::EditorDrawStroke)),
                     )
                     .clicked()
                     && let Err(error) = state.drawing_overlay.begin_for_selection(workspace)
@@ -2661,17 +2780,30 @@ fn show_drawing_overlay_controls(
                 }
             }
             DrawingDraftPhase::Capturing => {
-                ui.strong("Drag once across the current preview.");
-                if ui.button("Cancel stroke").clicked() {
+                ui.strong(localizer.text(Message::EditorDragStroke));
+                if ui
+                    .button(localizer.text(Message::EditorCancelStroke))
+                    .clicked()
+                {
                     state.drawing_overlay.cancel();
                 }
             }
             DrawingDraftPhase::Ready => {
-                ui.label(format!("{} point(s)", state.drawing_overlay.points.len()));
-                if ui.button("Commit drawing overlay").clicked() {
+                ui.label(crate::format_message(
+                    localizer,
+                    Message::EditorDrawingPoints,
+                    &[("count", &state.drawing_overlay.points.len().to_string())],
+                ));
+                if ui
+                    .button(localizer.text(Message::EditorCommitDrawing))
+                    .clicked()
+                {
                     commit_drawing_overlay(workspace, state, now, results);
                 }
-                if ui.button("Cancel stroke").clicked() {
+                if ui
+                    .button(localizer.text(Message::EditorCancelStroke))
+                    .clicked()
+                {
                     state.drawing_overlay.cancel();
                 }
             }
@@ -2680,7 +2812,11 @@ fn show_drawing_overlay_controls(
     if state.drawing_overlay.limit_reached {
         ui.colored_label(
             ui.visuals().warn_fg_color,
-            format!("Stroke stopped at the {MAX_DRAWING_DRAFT_POINTS}-point safety limit."),
+            crate::format_message(
+                localizer,
+                Message::EditorDrawingLimit,
+                &[("limit", &MAX_DRAWING_DRAFT_POINTS.to_string())],
+            ),
         );
     }
 }
@@ -2701,12 +2837,12 @@ fn commit_drawing_overlay(
                 state.drawing_overlay.blend_mode,
             )
             .map(|_| ())
-            .map_err(|error| error.to_string())
+            .map_err(|error| Notice::from(error.to_string()))
     });
     if result.is_ok() {
         state.drawing_overlay.cancel();
     }
-    record_project_result(
+    record_project_validation_result(
         workspace,
         state,
         now,
@@ -2716,19 +2852,20 @@ fn commit_drawing_overlay(
     );
 }
 
-fn build_drawing_overlay(draft: &DrawingOverlayDraft) -> Result<OverlayContent, String> {
+fn build_drawing_overlay(draft: &DrawingOverlayDraft) -> Result<OverlayContent, Notice> {
     if draft.name.trim().is_empty() {
-        return Err("Drawing overlay name is required.".to_owned());
+        return Err(Message::EditorDrawingNameRequired.into());
     }
     if draft.width == 0 || draft.color.alpha == 0 || draft.track_opacity == 0 {
-        return Err("Drawing width, color alpha, and track opacity must be visible.".to_owned());
+        return Err(Message::EditorDrawingVisibleRequired.into());
     }
     if draft.points.is_empty() {
-        return Err("Draw at least one point on the preview before committing.".to_owned());
+        return Err(Message::EditorDrawingPointRequired.into());
     }
     if draft.points.len() > MAX_DRAWING_DRAFT_POINTS {
-        return Err(format!(
-            "Drawing contains more than {MAX_DRAWING_DRAFT_POINTS} points."
+        return Err(Notice::new(
+            Message::EditorDrawingTooManyPoints,
+            &[("limit", &MAX_DRAWING_DRAFT_POINTS.to_string())],
         ));
     }
     if draft
@@ -2736,7 +2873,7 @@ fn build_drawing_overlay(draft: &DrawingOverlayDraft) -> Result<OverlayContent, 
         .iter()
         .any(|point| point.pressure_milli > 1_000)
     {
-        return Err("Drawing pressure must stay in 0..=1000.".to_owned());
+        return Err(Message::EditorDrawingPressureRange.into());
     }
     Ok(OverlayContent::Drawing {
         points: draft.points.clone(),
@@ -2745,16 +2882,31 @@ fn build_drawing_overlay(draft: &DrawingOverlayDraft) -> Result<OverlayContent, 
     })
 }
 
+struct OverlayTrackRow {
+    number: usize,
+    id: gif_from_screen_domain::TrackId,
+    name: String,
+    kind: Option<&'static str>,
+    item_count: usize,
+    frame_owned: bool,
+    known_coverage: bool,
+    visible: bool,
+}
+
 fn show_overlay_track_list(
     ui: &mut egui::Ui,
     workspace: &mut EditorWorkspace,
     state: &mut EditorUiState,
     now: Instant,
     results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
 ) {
-    let Some(range) =
-        show_overlay_track_pagination(ui, workspace, &mut state.overlay_track_pagination)
-    else {
+    let Some(range) = show_overlay_track_pagination(
+        ui,
+        workspace,
+        &mut state.overlay_track_pagination,
+        localizer,
+    ) else {
         return;
     };
     let tracks = workspace
@@ -2765,20 +2917,18 @@ fn show_overlay_track_list(
         .enumerate()
         .skip(range.start)
         .take(range.len())
-        .map(|(index, track)| {
-            (
-                index + 1,
-                track.id,
-                track.name.clone(),
-                track
-                    .all_mark_contents()
-                    .next()
-                    .map(|(_, content)| overlay_content_label(content)),
-                track.mark_count(),
-                track.frame_cells.is_some(),
-                track.annotation.is_none() || track.annotation_scope.is_some(),
-                track.visible,
-            )
+        .map(|(index, track)| OverlayTrackRow {
+            number: index + 1,
+            id: track.id,
+            name: track.name.clone(),
+            kind: track
+                .all_mark_contents()
+                .next()
+                .map(|(_, content)| overlay_content_label(content, localizer)),
+            item_count: track.mark_count(),
+            frame_owned: track.frame_cells.is_some(),
+            known_coverage: track.annotation.is_none() || track.annotation_scope.is_some(),
+            visible: track.visible,
         })
         .collect::<Vec<_>>();
     let mut remove = None;
@@ -2792,34 +2942,16 @@ fn show_overlay_track_list(
         .max_height(ui.available_height().clamp(0.0, 360.0))
         .auto_shrink([false, true]);
     rows.show(ui, |ui| {
-        for (layer_number, track_id, name, kind, item_count, frame_owned, known_coverage, visible) in tracks {
-            ui.push_id(track_id, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(format!(
-                        "Layer {layer_number} · {name} · {} · {item_count} item(s) · {}",
-                        kind.unwrap_or("Empty"),
-                        if frame_owned { "Frame-owned" } else { "Time-anchored" },
-                    ));
-                    if ui.small_button(if visible { "Hide" } else { "Show" })
-                        .on_hover_text("Toggle this layer in previews and GIF export, keeping its artwork, assets and paint stage. Previously frozen reference pixels are unchanged; earlier artwork changes only the live region. Undo restores visibility.")
-                        .clicked() {
-                        visibility = Some((track_id, !visible));
-                    }
-                    if !frame_owned && ui.add_enabled(known_coverage, egui::Button::new("Attach to frames").small())
-                        .on_hover_text(if known_coverage {
-                            "Preserve this entire layer's current frame appearances, including hidden content. Future frame moves and copies carry its marks. Original input history is not inferred; some older input groups cannot be regenerated. Undo restores the timed layer, but the project format stays upgraded."
-                        } else {
-                            "This older annotation group did not save its original authoring coverage. Keep its timed behavior or recreate it from an explicit frame selection; visible marks alone cannot prove that coverage."
-                        }).clicked()
-                    {
-                        state.pause_preview();
-                        results.push(Ok(EditorUiAction::ConvertOverlayTrack(track_id)));
-                    }
-                    if ui.small_button("Remove track").clicked() {
-                        remove = Some(track_id);
-                    }
-                });
-            });
+        for track in tracks {
+            show_overlay_track_row(
+                ui,
+                &track,
+                state,
+                results,
+                &mut remove,
+                &mut visibility,
+                localizer,
+            );
         }
     });
     if let Some(track_id) = remove {
@@ -2848,10 +2980,82 @@ fn show_overlay_track_list(
         .clamp(workspace.manifest().timeline.overlay_tracks.len());
 }
 
+fn show_overlay_track_row(
+    ui: &mut egui::Ui,
+    track: &OverlayTrackRow,
+    state: &mut EditorUiState,
+    results: &mut Vec<EditorUiResult>,
+    remove: &mut Option<gif_from_screen_domain::TrackId>,
+    visibility: &mut Option<(gif_from_screen_domain::TrackId, bool)>,
+    localizer: Localizer,
+) {
+    ui.push_id(track.id, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(crate::format_message(
+                localizer,
+                Message::EditorLayerRow,
+                &[
+                    ("number", &track.number.to_string()),
+                    ("name", &track.name),
+                    (
+                        "kind",
+                        track
+                            .kind
+                            .unwrap_or(localizer.text(Message::EditorContentEmpty)),
+                    ),
+                    ("count", &track.item_count.to_string()),
+                    (
+                        "ownership",
+                        localizer.text(if track.frame_owned {
+                            Message::EditorFrameOwned
+                        } else {
+                            Message::EditorTimeAnchored
+                        }),
+                    ),
+                ],
+            ));
+            if ui
+                .small_button(localizer.text(if track.visible {
+                    Message::EditorHideLayer
+                } else {
+                    Message::EditorShowLayer
+                }))
+                .on_hover_text(localizer.text(Message::EditorLayerVisibilityHelp))
+                .clicked()
+            {
+                *visibility = Some((track.id, !track.visible));
+            }
+            if !track.frame_owned
+                && ui
+                    .add_enabled(
+                        track.known_coverage,
+                        egui::Button::new(localizer.text(Message::EditorAttachFrames)).small(),
+                    )
+                    .on_hover_text(localizer.text(if track.known_coverage {
+                        Message::EditorAttachFramesHelp
+                    } else {
+                        Message::EditorAttachUnknownHelp
+                    }))
+                    .clicked()
+            {
+                state.pause_preview();
+                results.push(Ok(EditorUiAction::ConvertOverlayTrack(track.id)));
+            }
+            if ui
+                .small_button(localizer.text(Message::EditorRemoveTrack))
+                .clicked()
+            {
+                *remove = Some(track.id);
+            }
+        });
+    });
+}
+
 fn show_overlay_track_pagination(
     ui: &mut egui::Ui,
     workspace: &EditorWorkspace,
     pagination: &mut OverlayTrackPagination,
+    localizer: Localizer,
 ) -> Option<Range<usize>> {
     let total = workspace.manifest().timeline.overlay_tracks.len();
     pagination.synchronize(
@@ -2867,58 +3071,73 @@ fn show_overlay_track_pagination(
     // Navigation precedes the potentially long list and wraps at large font sizes.
     ui.horizontal_wrapped(|ui| {
         if ui
-            .add_enabled(pagination.page > 0, egui::Button::new("Previous page"))
+            .add_enabled(
+                pagination.page > 0,
+                egui::Button::new(localizer.text(Message::EditorPreviousLayerPage)),
+            )
             .clicked()
         {
             pagination.page -= 1;
         }
         if ui
-            .add_enabled(pagination.page + 1 < pages, egui::Button::new("Next page"))
+            .add_enabled(
+                pagination.page + 1 < pages,
+                egui::Button::new(localizer.text(Message::EditorNextLayerPage)),
+            )
             .clicked()
         {
             pagination.page += 1;
         }
     });
     let range = pagination.range(total);
-    ui.label(format!(
-        "Layers {}–{} of {total} · Page {} / {pages}",
-        range.start + 1,
-        range.end,
-        pagination.page + 1
+    ui.label(crate::format_message(
+        localizer,
+        Message::EditorLayerPage,
+        &[
+            ("start", &(range.start + 1).to_string()),
+            ("end", &range.end.to_string()),
+            ("total", &total.to_string()),
+            ("page", &(pagination.page + 1).to_string()),
+            ("pages", &pages.to_string()),
+        ],
     ));
-    ui.small("Layer order applies within each editing stage.").on_hover_text(
-        "Earlier artwork follows later image operations. Newly added artwork is drawn after existing operations.",
-    );
+    ui.small(localizer.text(Message::EditorStageOrder))
+        .on_hover_text(localizer.text(Message::EditorStageOrderHelp));
     Some(range)
 }
 
 fn build_shape_overlay(
     state: &ShapeOverlayUiState,
     canvas: PhysicalSize,
-) -> Result<OverlayContent, String> {
+) -> Result<OverlayContent, Notice> {
     if state.name.trim().is_empty() {
-        return Err("Shape overlay name is required.".to_owned());
+        return Err(Message::EditorShapeNameRequired.into());
     }
     if state.track_opacity == 0 {
-        return Err("Shape track opacity must be greater than zero.".to_owned());
+        return Err(Message::EditorShapeOpacityRequired.into());
     }
-    let bounds = PhysicalRect::new(state.x, state.y, state.width, state.height)
-        .map_err(|error| format!("Invalid shape bounds: {error}"))?;
+    let bounds =
+        PhysicalRect::new(state.x, state.y, state.width, state.height).map_err(|error| {
+            Notice::new(
+                Message::EditorShapeBoundsInvalid,
+                &[("error", &error.to_string())],
+            )
+        })?;
     if !bounds.fits_within(canvas) {
-        return Err("Shape bounds must stay inside the rendered canvas.".to_owned());
+        return Err(Message::EditorShapeBoundsOutside.into());
     }
     let kind = shape_kind(state.kind);
     let fill = state.fill_enabled.then_some(state.fill);
     if matches!(kind, ShapeKind::Line | ShapeKind::Arrow)
         && (state.stroke_width == 0 || state.stroke.alpha == 0)
     {
-        return Err("Line and arrow overlays require a visible positive-width stroke.".to_owned());
+        return Err(Message::EditorLineStrokeRequired.into());
     }
     if matches!(kind, ShapeKind::Rectangle | ShapeKind::Ellipse)
         && (state.stroke_width == 0 || state.stroke.alpha == 0)
         && fill.is_none_or(|color| color.alpha == 0)
     {
-        return Err("Rectangle and ellipse overlays require a visible stroke or fill.".to_owned());
+        return Err(Message::EditorShapeVisibleRequired.into());
     }
     Ok(OverlayContent::Shape {
         kind,
@@ -2938,35 +3157,39 @@ const fn shape_kind(choice: ShapeOverlayChoice) -> ShapeKind {
     }
 }
 
-const fn shape_overlay_choice_label(choice: ShapeOverlayChoice) -> &'static str {
-    match choice {
-        ShapeOverlayChoice::Line => "Line",
-        ShapeOverlayChoice::Arrow => "Arrow",
-        ShapeOverlayChoice::Rectangle => "Rectangle",
-        ShapeOverlayChoice::Ellipse => "Ellipse",
-    }
+fn shape_overlay_choice_label(choice: ShapeOverlayChoice, localizer: Localizer) -> &'static str {
+    localizer.text(match choice {
+        ShapeOverlayChoice::Line => Message::EditorShapeLine,
+        ShapeOverlayChoice::Arrow => Message::EditorShapeArrow,
+        ShapeOverlayChoice::Rectangle => Message::EditorShapeRectangle,
+        ShapeOverlayChoice::Ellipse => Message::EditorShapeEllipse,
+    })
 }
 
-const fn blend_mode_label(mode: BlendMode) -> &'static str {
-    match mode {
-        BlendMode::Normal => "Normal",
-        BlendMode::Multiply => "Multiply",
-        BlendMode::Screen => "Screen",
-    }
+fn blend_mode_label(mode: BlendMode, localizer: Localizer) -> &'static str {
+    localizer.text(match mode {
+        BlendMode::Normal => Message::EditorBlendNormal,
+        BlendMode::Multiply => Message::EditorBlendMultiply,
+        BlendMode::Screen => Message::EditorBlendScreen,
+    })
 }
 
-const fn overlay_content_label(content: &OverlayContent) -> &'static str {
-    match content {
-        OverlayContent::Raster { .. } => "Raster",
-        OverlayContent::Text { .. } => "Text",
-        OverlayContent::Shape { .. } => "Shape",
-        OverlayContent::Drawing { .. } => "Drawing",
-        OverlayContent::KeyStroke { .. } => "Key stroke",
-        OverlayContent::Cursor { .. } => "Cursor",
-        OverlayContent::MouseClick { .. } => "Mouse click",
-        OverlayContent::Progress { .. } => "Progress",
-    }
+fn overlay_content_label(content: &OverlayContent, localizer: Localizer) -> &'static str {
+    localizer.text(match content {
+        OverlayContent::Raster { .. } => Message::EditorContentRaster,
+        OverlayContent::Text { .. } => Message::EditorContentText,
+        OverlayContent::Shape { .. } => Message::EditorContentShape,
+        OverlayContent::Drawing { .. } => Message::EditorContentDrawing,
+        OverlayContent::KeyStroke { .. } => Message::EditorContentKeyStroke,
+        OverlayContent::Cursor { .. } => Message::EditorContentCursor,
+        OverlayContent::MouseClick { .. } => Message::EditorContentMouseClick,
+        OverlayContent::Progress { .. } => Message::EditorContentProgress,
+    })
 }
+
+#[cfg(test)]
+#[path = "editor_ui/overlay_localization_tests.rs"]
+mod overlay_localization_tests;
 
 #[allow(
     clippy::too_many_lines,
@@ -3278,6 +3501,30 @@ where
         .map_err(|error| format!("invalid {label}: {error}"))
 }
 
+/// Keep application field names translatable without changing numeric syntax or
+/// interpreting the external parser's diagnostic as a translation key.
+fn parse_localized_input<T>(input: &str, field: Message) -> Result<T, Notice>
+where
+    T: FromStr,
+    T::Err: Display,
+{
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(Notice::with_messages(
+            Message::EditorInputRequired,
+            &[],
+            &[("field", field)],
+        ));
+    }
+    trimmed.parse().map_err(|error: T::Err| {
+        Notice::with_messages(
+            Message::EditorInputInvalid,
+            &[("error", &error.to_string())],
+            &[("field", field)],
+        )
+    })
+}
+
 fn parse_time_ms(input: &str) -> Result<TimeUs, String> {
     let milliseconds = parse_input::<u64>(input, "time in milliseconds")?;
     let microseconds = milliseconds
@@ -3336,13 +3583,31 @@ fn record_project_result<E>(
 ) where
     E: Display,
 {
+    record_project_validation_result(
+        workspace,
+        state,
+        now,
+        results,
+        operation,
+        result.map_err(|error| Notice::from(error.to_string())),
+    );
+}
+
+fn record_project_validation_result(
+    workspace: &EditorWorkspace,
+    state: &mut EditorUiState,
+    now: Instant,
+    results: &mut Vec<EditorUiResult>,
+    operation: EditorUiOperation,
+    result: Result<(), Notice>,
+) {
     match result {
         Ok(()) => {
             results.push(Ok(EditorUiAction::Project(operation)));
             state.reveal_current_frame = true;
             synchronize_playback_after_selection(workspace, state, now, results);
         }
-        Err(error) => push_failure(results, operation, error),
+        Err(error) => push_validation_failure(results, operation, error),
     }
 }
 
@@ -3375,10 +3640,15 @@ fn push_failure(
     operation: EditorUiOperation,
     error: impl Display,
 ) {
-    results.push(Err(EditorUiFailure {
-        operation,
-        message: error.to_string(),
-    }));
+    push_validation_failure(results, operation, Notice::from(error.to_string()));
+}
+
+fn push_validation_failure(
+    results: &mut Vec<EditorUiResult>,
+    operation: EditorUiOperation,
+    message: Notice,
+) {
+    results.push(Err(EditorUiFailure { operation, message }));
 }
 
 fn push_notice(
@@ -3984,7 +4254,7 @@ mod tests {
         ] {
             state.effect_choice = choice;
             let effect = build_effect(&state).unwrap();
-            assert!(!effect_choice_label(choice).is_empty());
+            assert!(!effect_choice_label(choice, crate::test_localizer()).is_empty());
             assert!(matches!(
                 (choice, effect),
                 (EffectChoice::Blur, Effect::Blur { .. })
@@ -4051,7 +4321,7 @@ mod tests {
             results,
             [Ok(EditorUiAction::Notice {
                 operation: EditorUiOperation::RepairJournal,
-                message: message.into(),
+                message,
             })]
         );
         assert!(repair_journal_notice(None).contains("already clean"));
@@ -4061,9 +4331,12 @@ mod tests {
     fn statistics_duration_formatting_is_integer_exact() {
         assert_eq!(format_duration_us(0), "0.000000 s");
         assert_eq!(format_duration_us(1_234_567), "1.234567 s");
-        assert_eq!(format_optional_duration(None), "None");
         assert_eq!(
-            format_optional_duration(Some(u64::MAX)),
+            format_optional_duration(None, crate::test_localizer()),
+            "None"
+        );
+        assert_eq!(
+            format_optional_duration(Some(u64::MAX), crate::test_localizer()),
             format_duration_us(u64::MAX)
         );
     }

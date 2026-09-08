@@ -2,22 +2,31 @@
 
 use eframe::egui;
 use gif_from_screen_domain::{ImageBorderStyle, ImageShadowStyle, Rgba};
+use gif_from_screen_localization::{Localizer, Message};
 
-pub(crate) fn show_border(ui: &mut egui::Ui, style: &mut ImageBorderStyle) {
-    ui.label("Positive edges draw inside; negative edges expand the canvas on all frames.");
+pub(crate) fn show_border(ui: &mut egui::Ui, style: &mut ImageBorderStyle, localizer: Localizer) {
+    ui.label(localizer.text(Message::ImageBorderScopeHint));
     ui.horizontal_wrapped(|ui| {
         for (label, edge) in [
-            ("Top", &mut style.widths.top_milli),
-            ("Right", &mut style.widths.right_milli),
-            ("Bottom", &mut style.widths.bottom_milli),
-            ("Left", &mut style.widths.left_milli),
+            (Message::ImageBorderTop, &mut style.widths.top_milli),
+            (Message::ImageBorderRight, &mut style.widths.right_milli),
+            (Message::ImageBorderBottom, &mut style.widths.bottom_milli),
+            (Message::ImageBorderLeft, &mut style.widths.left_milli),
         ] {
-            border_edge(ui, label, edge);
+            border_edge(ui, localizer.text(label), edge);
         }
     });
-    color_input(ui, "Border", &mut style.color);
-    color_input(ui, "Background", &mut style.background);
-    ui.weak("The reference border uses a white background. A transparent background preserves source transparency.");
+    color_input(
+        ui,
+        localizer.text(Message::ImageBorderColor),
+        &mut style.color,
+    );
+    color_input(
+        ui,
+        localizer.text(Message::ImageEffectBackground),
+        &mut style.background,
+    );
+    ui.weak(localizer.text(Message::ImageBorderBackgroundHint));
 }
 
 #[allow(
@@ -39,17 +48,41 @@ fn border_edge(ui: &mut egui::Ui, label: &str, stored: &mut i32) {
     }
 }
 
-pub(crate) fn show_shadow(ui: &mut egui::Ui, style: &mut ImageShadowStyle) {
-    ui.label("Applies to all frames. The canvas expands to keep space for the shadow.");
+pub(crate) fn show_shadow(ui: &mut egui::Ui, style: &mut ImageShadowStyle, localizer: Localizer) {
+    ui.label(localizer.text(Message::ImageShadowScopeHint));
     ui.horizontal_wrapped(|ui| {
-        hundredths(ui, "Blur", " px", &mut style.blur_radius_hundredths, 100.0);
-        hundredths(ui, "Distance", " px", &mut style.depth_hundredths, 100.0);
-        hundredths(ui, "Direction", "°", &mut style.direction_hundredths, 360.0);
-        hundredths(ui, "Opacity", "%", &mut style.opacity_basis_points, 100.0);
+        hundredths(
+            ui,
+            localizer.text(Message::ImageShadowBlur),
+            " px",
+            &mut style.blur_radius_hundredths,
+            100.0,
+        );
+        hundredths(
+            ui,
+            localizer.text(Message::ImageShadowDistance),
+            " px",
+            &mut style.depth_hundredths,
+            100.0,
+        );
+        hundredths(
+            ui,
+            localizer.text(Message::ImageShadowDirection),
+            "°",
+            &mut style.direction_hundredths,
+            360.0,
+        );
+        hundredths(
+            ui,
+            localizer.text(Message::ImageShadowOpacity),
+            "%",
+            &mut style.opacity_basis_points,
+            100.0,
+        );
     });
-    ui.weak("0° points right; 90° points up. Blur, distance, angle and opacity keep two decimal places.");
+    ui.weak(localizer.text(Message::ImageShadowAnglesHint));
     ui.horizontal(|ui| {
-        ui.label("Shadow color");
+        ui.label(localizer.text(Message::ImageShadowColor));
         let mut color = [style.color.red, style.color.green, style.color.blue];
         if ui.color_edit_button_srgb(&mut color).changed() {
             style.color = Rgba {
@@ -60,11 +93,17 @@ pub(crate) fn show_shadow(ui: &mut egui::Ui, style: &mut ImageShadowStyle) {
             };
         }
     });
-    color_input(ui, "Background", &mut style.background);
-    ui.weak(
-        "Use an opaque background to keep soft shadow edges in a GIF; GIF transparency is binary.",
+    color_input(
+        ui,
+        localizer.text(Message::ImageEffectBackground),
+        &mut style.background,
     );
+    ui.weak(localizer.text(Message::ImageShadowGifHint));
 }
+
+#[cfg(test)]
+#[path = "image_effect_ui_tests.rs"]
+mod tests;
 
 #[allow(
     clippy::cast_possible_truncation,
