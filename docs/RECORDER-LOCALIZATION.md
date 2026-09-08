@@ -89,3 +89,63 @@ descriptors remain untouched. Tests use the backend's public source factory and
 reject relabeling for other backends, unknown IDs, mismatched kinds or geometry.
 The message set now has 285 entries; these follow-up corrections are newer than
 the initial 283-message cohort above and do not rewrite its native evidence.
+
+After the follow-up, 701 desktop tests and 30 localization tests pass on Rust
+1.88/1.98; the complete Rust 1.98 workspace passes 1,635 tests with 51 explicitly
+ignored gates. Strict Rust 1.98 Clippy and formatting pass. The new tests include
+six synthetic-Portal-label identity cases and the real countdown-entry call path.
+
+### Native X11 after the fix
+
+Commit `3689ddb`, debug executable SHA-256
+`ec963746d4dbd619f7d019006128193207915fc7e06e8a81498f071b111a5eff`,
+private GNOME/Xvfb lab `/tmp/gfs-wayland-qa.rkrcoxxh` (1440 × 1000), System
+locale `zh_CN.UTF-8`/`LANGUAGE=zh`:
+
+- Actual settings and the independent recorder panel render Chinese. Confirmed
+  crop is 320 × 220 at (100,230); normal pages are hidden during recording.
+- `03-countdown-fixed.png` shows the Chinese countdown and initial-countdown
+  notice, with no formatting error. After acknowledged pause, a native border
+  drag moves the fixed-size crop to (280,230), followed by resume and stop.
+- The project stores 46 frames: 24 at the first origin and 22 at the second,
+  4,557,986 µs total, one clock `64e071c75ac74c8f9ae57b54537d718c`, revision 84.
+- GUI export and a CLI re-export after normal application close are byte-identical:
+  320 × 220, two coalesced GIF images, 4,560 ms, 3,090 bytes, SHA-256
+  `f70f2db9eaf095ffd66b2e043208814d487876c7a84f191b27409b5222eb6448`.
+  `ffprobe -min_delay 0` separately decoded/count-checked the output.
+- The lab was explicitly stopped and reports `cleanup_complete: true`; its
+  launcher exited 0. Screenshots and the interaction script remain in `logs/`.
+
+The harness initially failed to resolve a full Unicode title through xdotool's
+search API. It then used the verified owned process ID plus an ASCII title
+prefix; the application title itself is Chinese. No failed harness lookup was
+counted as a recorder action. This is an isolated software-rendered check, not
+physical mixed-DPI, GPU, multi-monitor or global-shortcut certification.
+
+### Native Wayland after the fix
+
+The same `3689ddb` executable/hash was tested in a separate owned nested GNOME
+lab `/tmp/gfs-wayland-qa.nrhi2i3h` (outer Xvfb `:100`, native Wayland app).
+`06-zh-portal-options.png` shows both virtual Portal prompts in Chinese.
+The trusted system Share dialog remains in the system's own language; it selected
+the project-authored fixture, which supplied a 692 × 509 stream.
+
+The prepared crop (50,100), 200 × 150 remained unchanged through the compact
+controller. `14-zh-countdown-one-second.png` shows the correct Chinese countdown
+and initial-countdown notice without `Unknown message argument`.
+The 3-second/10-FPS run stopped automatically into a 30-frame project, revision
+60, with 3,000,000 µs playback duration and one clock
+`3a163785ac80441ea662016c9ec51247`. Raw sample timestamps agree with capture-clock
+samples; the first 29 measured delays match adjacent samples.
+
+After normal application exit, CLI reopen/export produced a 200 × 150 GIF,
+10 encoded images, 3,000 ms, 3,210 bytes, SHA-256
+`9ca2e9679fdff84cbf70e88448f66e245967b044fd673a80270088ab6eda4910`.
+Pillow and `ffprobe -min_delay 0` agree on the encoded duration. The application
+exited 0, its project lock was removed, and the lab's eight child processes were
+confirmed gone after explicit scoped stop (`cleanup_complete: true`, launcher 0).
+The local structured evidence is `logs/zh-wayland-qa-summary.json`, SHA-256
+`e398a90a46aed71e50403d9606e0c795ce1f2b1588cccd031a3b08e87e0d7dce`.
+
+The native runs validate the stated Chinese recorder paths, not complete editor
+translation, physical desktop coverage, complex-script input or 29-language readiness.
