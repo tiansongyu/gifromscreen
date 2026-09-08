@@ -73,9 +73,10 @@ these tasks extend them rather than replace their state machines.
 2. **Precise region positioning: basic split connected.** Authoritative physical
    selection, native border and responsive control panel now have
    [ordinary/1×1/full-monitor and live-drag evidence](NATIVE-X11-SPLIT-QA-2026-09-07.md).
-   Direct numeric movement and 1 px / Shift-10 px buttons are connected; zoom never
-   becomes a selection input. Native DPI/zoom stress remains open. Add direct
-   keyboard movement and
+   Direct numeric movement, 1 px / Shift-10 px buttons and a focusable arrow-key
+   movement control are connected; zoom never becomes a selection input. Arrow
+   repeat is bounded per update, Escape releases this focus, and text fields and
+   other applications retain their keys. Native DPI/zoom stress remains open. Add
    pre-record window snapping through `RegionRetargetPlan`. Show the backend's
    accepted rectangle, coalesce movement while one request is in flight, and
    retain fixed canvas size during recording. Optional X11 cursor-follow comes

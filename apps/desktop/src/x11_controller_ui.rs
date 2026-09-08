@@ -27,6 +27,7 @@ pub(crate) fn draw(
     notice: Option<&str>,
     input_ready: bool,
 ) -> RecorderOverlayAction {
+    move_from_keyboard(context, geometry, stage);
     let mut action = RecorderOverlayAction::None;
     egui::TopBottomPanel::bottom("x11_controller_actions")
         .resizable(false)
@@ -201,6 +202,17 @@ fn show_position_buttons(ui: &mut egui::Ui, geometry: &mut RecorderGeometry, sta
         1
     };
     ui.add_enabled_ui(stage.allows_moving(), |ui| {
+        let painted = ui.add(egui::Button::new("Move with arrow keys").sense(egui::Sense::hover()));
+        let target = ui.interact(painted.rect, keyboard_move_id(), egui::Sense::click());
+        target.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Move with arrow keys"));
+        if target.clicked() { target.request_focus(); }
+        if target.has_focus() {
+            ui.memory_mut(|memory| memory.set_focus_lock_filter(keyboard_move_id(), egui::EventFilter {
+                horizontal_arrows: true, vertical_arrows: true, ..Default::default()
+            }));
+            ui.painter().rect_stroke(target.rect, 3.0, ui.visuals().selection.stroke, egui::StrokeKind::Inside);
+        }
+        target.on_hover_text("Focus this control, then use the arrow keys. Shift moves 10 physical pixels; Escape releases keyboard movement. Text fields keep their own arrow keys.");
         ui.horizontal_wrapped(|ui| {
             for (label, dx, dy) in [
                 ("X−", -step, 0),
@@ -215,6 +227,72 @@ fn show_position_buttons(ui: &mut egui::Ui, geometry: &mut RecorderGeometry, sta
         });
     });
     ui.small("Move 1 px; hold Shift for 10 px. Position is clamped to the source.");
+}
+
+fn keyboard_move_id() -> egui::Id {
+    egui::Id::new("x11-recorder-keyboard-move")
+}
+
+fn move_from_keyboard(
+    context: &egui::Context,
+    geometry: &mut RecorderGeometry,
+    stage: RecorderStage,
+) {
+    if !stage.allows_moving() || !context.memory(|memory| memory.has_focus(keyboard_move_id())) {
+        return;
+    }
+    // A click can transfer focus later in this input batch. Do not consume a
+    // field's editing keys before it has had a chance to take that focus.
+    if !context.input(|input| input.focused)
+        || context.input(|input| {
+            input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::PointerButton { pressed: true, .. }))
+        })
+    {
+        return;
+    }
+    if context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        context.memory_mut(|memory| memory.surrender_focus(keyboard_move_id()));
+        return;
+    }
+    let (mut dx, mut dy, mut count) = (0_i64, 0_i64, 0_usize);
+    context.input_mut(|input| {
+        input.events.retain(|event| {
+            let egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            else {
+                return true;
+            };
+            if modifiers.ctrl || modifiers.alt || modifiers.command || modifiers.mac_cmd {
+                return true;
+            }
+            let step = if modifiers.shift { 10 } else { 1 };
+            let delta = match key {
+                egui::Key::ArrowLeft => (-step, 0),
+                egui::Key::ArrowRight => (step, 0),
+                egui::Key::ArrowUp => (0, -step),
+                egui::Key::ArrowDown => (0, step),
+                _ => return true,
+            };
+            // Native key repeat is supported, with a bounded amount of work per UI
+            // update even if an input producer floods the event queue.
+            if count < 64 {
+                dx += delta.0;
+                dy += delta.1;
+                count += 1;
+            }
+            false
+        });
+    });
+    if count > 0 {
+        geometry.move_by(dx, dy);
+    }
 }
 
 fn apply_region_edit(
@@ -675,5 +753,123 @@ mod tests {
                 .values()
                 .all(|viewport| viewport.commands.is_empty())
         );
+    }
+
+    fn arrow(key: egui::Key, shift: bool, repeat: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat,
+            modifiers: egui::Modifiers {
+                shift,
+                ..egui::Modifiers::NONE
+            },
+        }
+    }
+
+    #[test]
+    fn focused_movement_keys_use_physical_pixels_and_preserve_canvas_across_zoom() {
+        for stage in [
+            RecorderStage::Ready,
+            RecorderStage::Countdown(2),
+            RecorderStage::Recording,
+            RecorderStage::Paused,
+        ] {
+            let mut view = View::new(420.0, 300.0, 1.0, stage);
+            let target = view.seek("Move with arrow keys").center();
+            view.click(target, false);
+            view.warm();
+            assert!(
+                view.context
+                    .memory(|memory| memory.has_focus(keyboard_move_id()))
+            );
+            let before = view.geometry.region();
+            view.frame(
+                vec![arrow(egui::Key::ArrowRight, false, false)],
+                egui::Modifiers::NONE,
+            );
+            view.context.set_zoom_factor(2.0);
+            view.warm();
+            view.frame(
+                vec![arrow(egui::Key::ArrowDown, true, true)],
+                egui::Modifiers::SHIFT,
+            );
+            assert_eq!(view.geometry.region().origin().x, before.origin().x + 1);
+            assert_eq!(view.geometry.region().origin().y, before.origin().y + 10);
+            assert_eq!(view.geometry.region().size(), before.size());
+            assert!(
+                view.context
+                    .memory(|memory| memory.has_focus(keyboard_move_id()))
+            );
+        }
+    }
+
+    #[test]
+    fn movement_keys_do_not_steal_unfocused_text_modified_or_click_batch_input() {
+        let mut view = View::new(420.0, 300.0, 1.0, RecorderStage::Ready);
+        view.warm();
+        let before = view.geometry;
+        view.frame(
+            vec![arrow(egui::Key::ArrowLeft, false, false)],
+            egui::Modifiers::NONE,
+        );
+        assert_eq!(view.geometry, before);
+        let target = view.seek("Move with arrow keys").center();
+        view.click(target, false);
+        view.warm();
+        let modified = egui::Event::Key {
+            key: egui::Key::ArrowLeft,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        };
+        view.frame(vec![modified], egui::Modifiers::CTRL);
+        assert_eq!(view.geometry, before);
+        view.frame(
+            vec![
+                egui::Event::PointerButton {
+                    pos: egui::pos2(410.0, 20.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                arrow(egui::Key::ArrowDown, false, false),
+            ],
+            egui::Modifiers::NONE,
+        );
+        assert_eq!(view.geometry, before);
+    }
+
+    #[test]
+    fn escape_releases_movement_and_a_key_flood_is_bounded() {
+        let mut view = View::new(420.0, 300.0, 1.0, RecorderStage::Ready);
+        let target = view.seek("Move with arrow keys").center();
+        view.click(target, false);
+        view.warm();
+        let before = view.geometry.region();
+        view.frame(
+            (0..1000)
+                .map(|_| arrow(egui::Key::ArrowRight, false, true))
+                .collect(),
+            egui::Modifiers::NONE,
+        );
+        assert_eq!(view.geometry.region().origin().x, before.origin().x + 64);
+        view.frame(
+            vec![arrow(egui::Key::Escape, false, false)],
+            egui::Modifiers::NONE,
+        );
+        assert!(
+            !view
+                .context
+                .memory(|memory| memory.has_focus(keyboard_move_id()))
+        );
+        let after = view.geometry;
+        view.frame(
+            vec![arrow(egui::Key::ArrowRight, false, false)],
+            egui::Modifiers::NONE,
+        );
+        assert_eq!(view.geometry, after);
     }
 }
