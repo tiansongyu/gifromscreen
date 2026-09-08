@@ -49,9 +49,16 @@ pub(crate) fn draw(
                 if let Some(notice) = notice {
                     ui.add(egui::Label::new(notice).wrap());
                 }
-                if !input_ready {
-                    ui.label("Waiting for the recording guide and capture region to be ready.");
-                }
+                // A native button claim disables Start before the root grab.
+                // Reserve exactly the same wrapped status area in both states:
+                // inserting it only when busy would move the claimed hit target.
+                ui.add_visible(
+                    !input_ready,
+                    egui::Label::new(
+                        "Waiting for the recording guide and capture region to be ready.",
+                    )
+                    .wrap(),
+                );
                 ui.separator();
                 snap.show(ui, geometry, stage);
                 show_geometry(ui, geometry, stage);

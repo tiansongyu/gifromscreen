@@ -85,9 +85,16 @@ these tasks extend them rather than replace their state machines.
    geometry, with bounded native discovery and legacy-title fallback. A
    [click-armed crosshair picker](X11-WINDOW-PICKER-QA-2026-09-08.md) now hides
    controls, highlights the target and cleans up before selection/close returns.
-   Drag-from-button activation, child-window selection, explicit partial-window
-   policy and wider WM/CSD/DPI acceptance remain open. Optional X11 cursor-follow
-   comes after those controls; Wayland source-local movement is not global tracking.
+   [Drag-from-button activation](X11-DRAG-PICKER-QA-2026-09-08.md) is now
+   implemented with an owned input child and same-connection grab handoff;
+   twelve private-Xvfb tests pass on Rust 1.98.0 and 1.88.0, including queued
+   fast release, stale-layout replay and native cleanup. Click-to-pick remains
+   available. Separate native GNOME drag/fast-release, recording, static-pixel
+   and reopened-GIF acceptance is recorded, not inferred from the earlier
+   click-picker result. Child-window selection,
+   explicit partial-window policy and wider hardware/WM/CSD/mixed-DPI acceptance
+   remain open. Optional X11 cursor-follow comes after those controls; Wayland
+   source-local movement is not global tracking.
 3. **X11 interaction sampling: desktop-wide mode connected.** One bounded XI2
    feed triggers frames without requiring sensitive metadata persistence, drops
    paused/pending input, coalesces bursts and supplies fixed 500 ms playback by

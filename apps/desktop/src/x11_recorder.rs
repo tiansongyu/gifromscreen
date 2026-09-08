@@ -453,6 +453,35 @@ fn outside(a: PhysicalRect, b: PhysicalRect) -> bool {
         || by >= ay + i64::from(a.size().height())
 }
 
+fn finish_snap_frame(
+    context: &egui::Context,
+    overlay: &mut RecorderOverlay,
+    stage: RecorderStage,
+    visible: bool,
+    mut action: RecorderOverlayAction,
+) -> RecorderOverlayAction {
+    if action == RecorderOverlayAction::Close && !overlay.snap.request_close() {
+        context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        action = RecorderOverlayAction::None;
+    }
+    if overlay.snap.close_ready() {
+        action = RecorderOverlayAction::Close;
+    }
+    overlay.snap.publish_drag_button(
+        overlay.geometry,
+        stage,
+        visible
+            && !matches!(
+                action,
+                RecorderOverlayAction::Start
+                    | RecorderOverlayAction::Resume
+                    | RecorderOverlayAction::Close
+            ),
+        context,
+    );
+    action
+}
+
 impl GifFromScreenApp {
     pub(super) fn open_recorder_overlay(&mut self, context: &egui::Context) -> Result<(), String> {
         crate::validate_settings(&self.settings)?;
@@ -552,6 +581,15 @@ impl GifFromScreenApp {
         self.pending_recorder_start = None;
         self.shortcut_tool.reset_recording_scope();
         self.recording_countdown.cancel();
+        if let Some(overlay) = &mut self.recorder_overlay
+            && !overlay.snap.request_close()
+        {
+            // Even an idle armed native handle owns an input child. Restore the
+            // ordinary main window only after its terminal cleanup receipt.
+            overlay.pending_live_start = None;
+            self.restore_main_window = false;
+            return;
+        }
         self.recorder_overlay = None;
         self.restore_main_window = true;
     }
@@ -564,6 +602,14 @@ impl GifFromScreenApp {
         let now = Instant::now();
         let before = overlay.geometry.region();
         overlay.poll_guide(stage);
+        let parent =
+            self.x11_window_id
+                .zip(overlay.controller_geometry)
+                .map(|(window_id, geometry)| crate::window_snap::DragParent {
+                    window_id,
+                    client: geometry.client,
+                });
+        overlay.snap.begin_frame(parent, context.pixels_per_point());
         overlay.snap.keyboard_control(context);
         overlay
             .snap
@@ -602,14 +648,9 @@ impl GifFromScreenApp {
                 && (overlay.pending_live_start.is_some() || self.job.is_some())
                 && !(overlay.recovering && paused && !wants_resume));
         context.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(hide_pixels));
-        let mut action = self.draw_x11_controls(context, &mut overlay, stage, paused, !hide_pixels);
-        if action == RecorderOverlayAction::Close && !overlay.snap.request_close() {
-            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            action = RecorderOverlayAction::None;
-        }
-        if overlay.snap.close_ready() {
-            action = RecorderOverlayAction::Close;
-        }
+        let action = self.draw_x11_controls(context, &mut overlay, stage, paused, !hide_pixels);
+        let action = finish_snap_frame(context, &mut overlay, stage, !hide_pixels, action);
+        self.stop_for_snap_close(&mut overlay);
         if overlay.geometry.region() != before {
             // A manual edit supersedes any still-pending snap, including a
             // move away and back while the native worker is finishing.
@@ -668,6 +709,19 @@ impl GifFromScreenApp {
             }
         } else if let Some(overlay) = &mut self.recorder_overlay {
             overlay.geometry.freeze_size();
+        }
+    }
+
+    fn stop_for_snap_close(&mut self, overlay: &mut RecorderOverlay) {
+        if !overlay.snap.is_closing() {
+            return;
+        }
+        self.pending_recorder_start = None;
+        self.recording_countdown.cancel();
+        overlay.pending_live_start = None;
+        if let Some(job) = &mut self.job {
+            job.stop_retargeting();
+            let _ = job.controller.stop();
         }
     }
 

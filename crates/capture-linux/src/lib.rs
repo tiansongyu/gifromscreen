@@ -16,7 +16,9 @@ use std::env;
 /// Desktop-file and portal identity of the `GifFromScreen` application.
 pub const APPLICATION_ID: &str = "io.github.tiansongyu.gifromscreen";
 
+mod drag_picker;
 mod recorder_guide;
+pub use drag_picker::{DragPickerButton, DragPickerRequest, DragPickerSelection, DragPickerUpdate};
 mod recorder_input;
 pub use recorder_guide::{
     ControllerGeometry, GuideAck, GuideEdge, GuidePointerEvent, GuideRequest, GuideStatus,

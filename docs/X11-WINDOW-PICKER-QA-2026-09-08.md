@@ -1,5 +1,9 @@
 # X11 crosshair window selection
 
+This is the click-armed baseline acceptance record. The subsequent
+[drag-from-button implementation and separate acceptance](X11-DRAG-PICKER-QA-2026-09-08.md)
+extends activation; the results below retain their original tested scope.
+
 ## Connected workflow and fidelity boundary
 
 Before recording, expand **Fit region to a window…**, choose Window frame,
@@ -10,10 +14,10 @@ Left-button release selects; right-button press or Escape cancels. Focus loss
 also requests cancellation. A 30-second selection watchdog is followed by
 bounded native cleanup. Cancel preserves the original selection.
 
-This is currently **click to arm, then click/release the target**, not the pinned
+This baseline uses **click to arm, then click/release the target**, not the pinned
 reference recorder's press-on-button/drag-out/release gesture. Target lookup
 selects managed/named top-level clients, not arbitrary child widgets. These are
-explicit remaining fidelity tasks, alongside partial-window clipping policy,
+fidelity differences at this baseline, alongside partial-window clipping policy,
 multiple seats/screens, broader WM/CSD and hardware/mixed-DPI acceptance. The
 overall Linux parity goal is not complete.
 

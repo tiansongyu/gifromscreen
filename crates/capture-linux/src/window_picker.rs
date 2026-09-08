@@ -24,6 +24,7 @@ use x11rb::{
 };
 
 const HOVER_INTERVAL: Duration = Duration::from_millis(40);
+pub(crate) type OwnerCheck<'a> = Option<&'a dyn Fn(&Event) -> Result<bool, String>>;
 
 pub(crate) fn run(
     display: Option<&str>,
@@ -40,6 +41,35 @@ pub(crate) fn run(
             .screen,
     );
     let connection = stream::connect(display, cancel)?;
+    run_on_connection(
+        &connection,
+        screen,
+        bounds,
+        cancel,
+        deadline,
+        display,
+        x11rb::CURRENT_TIME,
+        None,
+        None,
+        || Ok(()),
+    )
+}
+
+/// A native drag button already owns the initiating passive grab. Replacing it
+/// on this SAME connection avoids an ungrab/regrab gap and lost fast releases.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_on_connection(
+    connection: &Client<'_>,
+    screen: usize,
+    bounds: WindowSnapBounds,
+    cancel: &AtomicBool,
+    deadline: Instant,
+    display: Option<&str>,
+    time: u32,
+    activation_child: Option<Window>,
+    owner_check: OwnerCheck<'_>,
+    on_grab: impl FnOnce() -> Result<(), String>,
+) -> Result<Option<PickedWindow>, String> {
     connection.stream().begin_operation_until(deadline);
     let root = connection
         .setup()
@@ -47,7 +77,7 @@ pub(crate) fn run(
         .get(screen)
         .ok_or("The X11 screen is unavailable")?
         .root;
-    let cursor = crosshair(&connection)?;
+    let cursor = crosshair(connection)?;
     let request = connection
         .grab_pointer(
             false,
@@ -57,7 +87,7 @@ pub(crate) fn run(
             GrabMode::ASYNC,
             x11rb::NONE,
             cursor,
-            x11rb::CURRENT_TIME,
+            time,
         )
         .map_err(error)?;
     let event_floor = request.sequence_number();
@@ -68,28 +98,32 @@ pub(crate) fn run(
             reply.status
         ));
     }
-    let result = select(
-        &connection,
-        screen,
-        root,
-        event_floor,
-        bounds,
-        cancel,
-        deadline,
-        display,
-    );
+    let result = on_grab().and_then(|()| {
+        select(
+            connection,
+            screen,
+            root,
+            event_floor,
+            bounds,
+            cancel,
+            deadline,
+            display,
+            activation_child,
+            owner_check,
+        )
+    });
     connection.stream().begin_cleanup();
     let released = connection
         .ungrab_pointer(x11rb::CURRENT_TIME)
         .map_err(error)?
         .check()
         .map_err(error);
-    drop(connection); // Also releases the cursor and any grab on every error path.
+    let _ = connection.free_cursor(cursor);
     released?;
     result
 }
 
-fn crosshair(connection: &Client<'_>) -> Result<u32, String> {
+pub(super) fn crosshair(connection: &Client<'_>) -> Result<u32, String> {
     let font = connection.generate_id().map_err(error)?;
     let cursor = connection.generate_id().map_err(error)?;
     connection
@@ -133,6 +167,8 @@ fn select(
     cancel: &AtomicBool,
     deadline: Instant,
     display: Option<&str>,
+    activation_child: Option<Window>,
+    owner_check: OwnerCheck<'_>,
 ) -> Result<Option<PickedWindow>, String> {
     let atoms = Atoms::new(connection)?;
     let mut guide = RecorderGuide::start_passive(display.map(str::to_owned))?;
@@ -144,7 +180,9 @@ fn select(
         bounds,
         atoms,
         locator: Locator::default(),
-        pressed: false,
+        pressed: activation_child.is_some(),
+        activation_child,
+        owner_check,
         last_hover: None,
         shown: None,
         generation: 0,
@@ -173,6 +211,8 @@ struct Selection<'a, 'b> {
     atoms: Atoms,
     locator: Locator,
     pressed: bool,
+    activation_child: Option<Window>,
+    owner_check: OwnerCheck<'a>,
     last_hover: Option<Instant>,
     shown: Option<PhysicalRect>,
     generation: u64,
@@ -207,6 +247,13 @@ impl Selection<'_, '_> {
                 else {
                     break;
                 };
+                if let Some(check) = self.owner_check
+                    && check(&event)?
+                {
+                    return Err(
+                        "The drag handle's owner closed or changed during selection.".into(),
+                    );
+                }
                 if sequence < self.event_floor {
                     continue;
                 }
@@ -227,68 +274,78 @@ impl Selection<'_, '_> {
                             && event.detail == 1
                             && self.pressed =>
                     {
-                        // Use the release event's child/coordinates, never a later
-                        // QueryPointer position after the user has moved again.
-                        return self.target(
-                            event.child,
-                            PhysicalPosition {
-                                x: i32::from(event.root_x),
-                                y: i32::from(event.root_y),
-                            },
-                            true,
-                        );
+                        if self.activation_child.take() == Some(event.child) {
+                            // Releasing over the originating GUI branch arms
+                            // click-to-pick. Frozen input replay can report later
+                            // root coordinates, so this is intentionally a window
+                            // identity boundary, not the old small button rectangle.
+                            self.pressed = false;
+                            continue;
+                        }
+                        // Preserve the release's routed target identity. On Xorg
+                        // frozen bursts, root/event coordinates can already name
+                        // a subsequent motion although child still names the
+                        // release target. Freshly revalidate that window itself;
+                        // never pick from a later QueryPointer location.
+                        return self.target(event.child, None, true);
                     }
                     _ => {}
                 }
             }
-            if self
-                .last_hover
-                .is_none_or(|at| at.elapsed() >= HOVER_INTERVAL)
-            {
-                let pointer = self
-                    .connection
-                    .query_pointer(self.root)
-                    .map_err(error)?
-                    .reply()
-                    .map_err(error)?;
-                let candidate = if pointer.same_screen {
-                    self.target(
-                        pointer.child,
-                        PhysicalPosition {
-                            x: i32::from(pointer.root_x),
-                            y: i32::from(pointer.root_y),
-                        },
-                        false,
-                    )
-                    .ok()
-                    .flatten()
-                } else {
-                    None
-                };
-                let region = candidate.map(|candidate| candidate.region);
-                if region != self.shown {
-                    self.generation = self
-                        .generation
-                        .checked_add(1)
-                        .ok_or("Window highlight generation overflow")?;
-                    guide.request(GuideRequest {
-                        generation: self.generation,
-                        region,
-                        protected_region: None,
-                        border_width: 4,
-                    })?;
-                    self.shown = region;
-                }
-                self.last_hover = Some(Instant::now());
-            }
+            self.update_hover(guide)?;
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    fn update_hover(&mut self, guide: &mut RecorderGuide) -> Result<(), String> {
+        if self
+            .last_hover
+            .is_some_and(|at| at.elapsed() < HOVER_INTERVAL)
+        {
+            return Ok(());
+        }
+        let pointer = self
+            .connection
+            .query_pointer(self.root)
+            .map_err(error)?
+            .reply()
+            .map_err(error)?;
+        let candidate = if pointer.same_screen {
+            self.target(
+                pointer.child,
+                Some(PhysicalPosition {
+                    x: i32::from(pointer.root_x),
+                    y: i32::from(pointer.root_y),
+                }),
+                false,
+            )
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+        let region = candidate.map(|candidate| candidate.region);
+        if region != self.shown {
+            self.generation = self
+                .generation
+                .checked_add(1)
+                .ok_or("Window highlight generation overflow")?;
+            guide.request(GuideRequest {
+                generation: self.generation,
+                region,
+                protected_region: None,
+                border_width: 4,
+            })?;
+            self.shown = region;
+        }
+        self.last_hover = Some(Instant::now());
+        Ok(())
     }
 
     fn target(
         &mut self,
         child: Window,
-        position: PhysicalPosition,
+        hover_position: Option<PhysicalPosition>,
         fresh: bool,
     ) -> Result<Option<PickedWindow>, String> {
         let Some(window) = self
@@ -300,9 +357,11 @@ impl Selection<'_, '_> {
         if root_child(self.connection, window, self.root)? != child {
             return Ok(None);
         }
-        let outer = rectangle(self.connection, child, self.root, true)?;
-        if !contains(outer, position) {
-            return Ok(None);
+        if let Some(position) = hover_position {
+            let outer = rectangle(self.connection, child, self.root, true)?;
+            if !contains(outer, position) {
+                return Ok(None);
+            }
         }
         observe(
             self.connection,
