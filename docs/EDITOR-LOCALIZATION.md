@@ -76,4 +76,6 @@ global-shortcut or IME certification.
 
 Still open: Effects/Overlays/Project tool bodies, remaining preview/crop text,
 import/camera/board/automation/export dialogs, detailed errors, additional-language
-catalogs, RTL/shaping and IME. Published Preview 1 is still the earlier frozen build.
+catalogs, RTL/shaping and IME. [Native acceptance](EDITOR-LOCALIZATION-QA-2026-09-08.md)
+records actual editor and shortcut checks. [Preview 2](LINUX-PREVIEW-2-QA.md) includes
+this slice; Preview 1 remains the earlier frozen build.

@@ -5,6 +5,12 @@ selectable/persistent UI languages, default to the machine language, then improv
 the whole project README with real animated demonstrations and convenient Release
 downloads. This plan supplements, not replaces, the Linux feature/release ledger.
 
+Latest downloadable preview: [Preview 2](LINUX-PREVIEW-2-QA.md), built from
+`89021bd`, adds editor/shortcut/live-notice localization and language-layout guards.
+Its public tarball and checksum were independently downloaded and verified.
+The two existing demonstration GIFs retain their recorded-source provenance;
+they are not relabeled as new captures or as all-language/full-parity evidence.
+
 Progress on 2026-09-08: Chinese/English product READMEs now replace the audit-heavy
 entry page; the previous detail is preserved in [development status](DEVELOPMENT-STATUS.md).
 Two [actual operation GIFs](assets/README.md) show X11 pause/retarget/stop and saved

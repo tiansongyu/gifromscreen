@@ -4,11 +4,11 @@ The supported package is a native **x86_64 Linux tar.gz**, built on Ubuntu 22.04
 
 ## Download and run
 
-Download the [Linux Preview 1 tarball](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0-preview.1/gifromscreen-0.1.0-linux-x86_64.tar.gz)
-and its [SHA-256 file](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0-preview.1/gifromscreen-0.1.0-linux-x86_64.tar.gz.sha256).
+Download the [Linux Preview 2 tarball](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0-preview.2/gifromscreen-0.1.0-linux-x86_64.tar.gz)
+and its [SHA-256 file](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0-preview.2/gifromscreen-0.1.0-linux-x86_64.tar.gz.sha256).
 This is an unsigned pre-release, not a stable/full-parity release. See the
-[release notes](https://github.com/tiansongyu/gifromscreen/releases/tag/v0.1.0-preview.1)
-and [artifact acceptance record](LINUX-PREVIEW-1-QA.md).
+[release notes](https://github.com/tiansongyu/gifromscreen/releases/tag/v0.1.0-preview.2)
+and [artifact acceptance record](LINUX-PREVIEW-2-QA.md).
 
 The `Linux portable package` GitHub Actions workflow also uploads a tarball and
 its `.sha256` file for successful main-branch builds. These newer CI artifacts

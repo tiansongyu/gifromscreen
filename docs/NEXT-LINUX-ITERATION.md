@@ -28,6 +28,9 @@ The [editor/shortcut/notice slice](EDITOR-LOCALIZATION.md) adds late-rendered
 message identities, primary editor controls and language-layout gesture guards.
 Remaining tool bodies, preview/import/export forms, additional catalogs and
 non-locale ordinary-drawing mapping protection stay open.
+These primary editor/shortcut/notice changes are now downloadable in
+[Linux Preview 2](LINUX-PREVIEW-2-QA.md). Their [native acceptance](EDITOR-LOCALIZATION-QA-2026-09-08.md)
+does not close the remaining desktop/translation and frame-fidelity requirements.
 
 ## Playback timing: implemented, bounded native manual acceptance recorded
 
