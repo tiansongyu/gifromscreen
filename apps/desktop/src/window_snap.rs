@@ -3,7 +3,9 @@
 use crate::{RecorderStage, recorder_geometry::RecorderGeometry};
 use eframe::egui;
 use gif_from_screen_capture::{CaptureSource, CaptureSourceKind, PhysicalRect};
-use gif_from_screen_capture_linux::{WindowSnapBounds, query_window_snap};
+use gif_from_screen_capture_linux::{
+    WindowSnapBounds, WindowSnapCatalog, list_snap_windows, query_window_snap,
+};
 use std::{
     sync::{
         Arc,
@@ -15,6 +17,7 @@ use std::{
 
 #[derive(Default)]
 pub(crate) struct WindowSnapUi {
+    available: bool,
     candidates: Vec<CaptureSource>,
     selected: usize,
     bounds: WindowSnapBounds,
@@ -25,7 +28,12 @@ pub(crate) struct WindowSnapUi {
 struct Pending {
     geometry: RecorderGeometry,
     cancellation: Arc<AtomicBool>,
-    receiver: Receiver<Result<PhysicalRect, String>>,
+    receiver: Receiver<Result<WorkResult, String>>,
+}
+
+enum WorkResult {
+    Region(PhysicalRect),
+    Catalog(WindowSnapCatalog),
 }
 
 impl Drop for Pending {
@@ -36,13 +44,20 @@ impl Drop for Pending {
 
 impl WindowSnapUi {
     pub(crate) fn set_candidates(&mut self, sources: &[CaptureSource]) {
+        self.available = true;
+        let selected = self
+            .candidates
+            .get(self.selected)
+            .map(|source| source.id().clone());
         self.candidates = sources
             .iter()
             .filter(|source| source.kind() == CaptureSourceKind::Window)
             .take(256)
             .cloned()
             .collect();
-        self.selected = 0;
+        self.selected = selected
+            .and_then(|id| self.candidates.iter().position(|source| *source.id() == id))
+            .unwrap_or(0);
     }
 
     pub(crate) fn is_pending(&self) -> bool {
@@ -87,9 +102,16 @@ impl WindowSnapUi {
         if pending.cancellation.load(Ordering::Acquire) {
             return;
         }
-        self.notice = Some(match result.and_then(|region| geometry.snap_to(region)) {
-            Ok(()) => "Snapped to the current window bounds. This is a one-time position, not window tracking.".into(),
-            Err(error) => format!("Window snap failed; original selection kept: {error}"),
+        self.notice = Some(match result {
+            Ok(WorkResult::Region(region)) => match geometry.snap_to(region) {
+                Ok(()) => "Snapped to the current window bounds. This is a one-time position, not window tracking.".into(),
+                Err(error) => format!("Window snap failed; original selection kept: {error}"),
+            },
+            Ok(WorkResult::Catalog(catalog)) => {
+                self.set_candidates(&catalog.windows);
+                format!("Found {} windows. Selection geometry is unchanged.{}", self.candidates.len(), if catalog.truncated { " The discovery limit was reached; the list is incomplete." } else { "" })
+            }
+            Err(error) => format!("Window operation failed; selection and previous list kept: {error}"),
         });
     }
 
@@ -99,18 +121,21 @@ impl WindowSnapUi {
         geometry: &RecorderGeometry,
         stage: RecorderStage,
     ) {
-        if stage != RecorderStage::Ready || geometry.size_is_frozen() || self.candidates.is_empty()
-        {
+        if stage != RecorderStage::Ready || geometry.size_is_frozen() || !self.available {
             return;
         }
         egui::CollapsingHeader::new("Fit region to a window…").show(ui, |ui| {
             ui.label("Read the chosen window's current physical bounds. It must fit completely inside the selected screen.");
             ui.add_enabled_ui(self.pending.is_none(), |ui| {
                 egui::ComboBox::from_id_salt("snap-window-choice")
+                    .width(ui.available_width())
+                    .truncate()
                     .selected_text(self.candidates.get(self.selected).map_or("No windows discovered", |source| source.name()))
                     .show_ui(ui, |ui| {
+                        ui.set_max_width(340.0);
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                         for (index, source) in self.candidates.iter().enumerate() {
-                            ui.selectable_value(&mut self.selected, index, source.name());
+                            ui.selectable_value(&mut self.selected, index, source.name()).on_hover_text(source.name());
                         }
                     });
                 ui.horizontal_wrapped(|ui| {
@@ -118,6 +143,12 @@ impl WindowSnapUi {
                     ui.selectable_value(&mut self.bounds, WindowSnapBounds::Client, "Client area");
                     ui.selectable_value(&mut self.bounds, WindowSnapBounds::Outer, "Native bounds");
                 });
+                ui.horizontal_wrapped(|ui| {
+                if ui.button("Refresh windows").clicked()
+                    && let Err(error) = self.start_work(*geometry, |cancel| list_snap_windows(None, cancel).map(WorkResult::Catalog))
+                {
+                    self.notice = Some(error);
+                }
                 if ui.add_enabled(!self.candidates.is_empty(), egui::Button::new("Snap region")).clicked() {
                     let source = self.candidates[self.selected].clone();
                     let bounds = self.bounds;
@@ -125,15 +156,16 @@ impl WindowSnapUi {
                         self.notice = Some(error);
                     }
                 }
+                });
             });
             if self.pending.is_some() {
                 ui.spinner();
-                if ui.button("Cancel window snap").clicked() {
+                if ui.button("Cancel window operation").clicked() {
                     self.cancel();
                     self.notice = Some("Window snap cancelled; selection unchanged.".into());
                 }
             }
-            ui.small("Window frame uses validated WM borders or client-side shadow hints. Native bounds may include invisible margins. Close this controller and use Refresh to discover new or renamed windows.");
+            ui.small("Window frame uses validated WM borders or client-side shadow hints. Native bounds may include invisible margins. Refresh discovers new or renamed windows without closing this controller.");
             if let Some(notice) = &self.notice { ui.label(notice); }
         });
     }
@@ -142,6 +174,16 @@ impl WindowSnapUi {
         &mut self,
         geometry: RecorderGeometry,
         loader: impl FnOnce(&AtomicBool) -> Result<PhysicalRect, String> + Send + 'static,
+    ) -> Result<(), String> {
+        self.start_work(geometry, move |cancel| {
+            loader(cancel).map(WorkResult::Region)
+        })
+    }
+
+    fn start_work(
+        &mut self,
+        geometry: RecorderGeometry,
+        loader: impl FnOnce(&AtomicBool) -> Result<WorkResult, String> + Send + 'static,
     ) -> Result<(), String> {
         if self.pending.is_some() {
             return Err("A window snap is still finishing.".into());
@@ -160,7 +202,7 @@ impl WindowSnapUi {
             cancellation,
             receiver,
         });
-        self.notice = Some("Reading the window position…".into());
+        self.notice = Some("Reading windows…".into());
         Ok(())
     }
 }
@@ -185,6 +227,50 @@ mod tests {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    fn source(id: &str, name: &str) -> CaptureSource {
+        CaptureSource::new(
+            gif_from_screen_capture::CaptureSourceId::new(id).unwrap(),
+            name,
+            CaptureSourceKind::Window,
+            Some(PhysicalRect::new(1, 2, 3, 4).unwrap()),
+            1.0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn refresh_preserves_window_identity_and_geometry_and_recovers_an_empty_list() {
+        let mut ui = WindowSnapUi::default();
+        ui.set_candidates(&[source("one", "Old name"), source("two", "Second")]);
+        ui.selected = 1;
+        let mut geometry = geometry();
+        let before = geometry;
+        ui.start_work(geometry, |_| {
+            Ok(WorkResult::Catalog(WindowSnapCatalog {
+                windows: vec![source("two", "Renamed"), source("three", "New")],
+                truncated: false,
+            }))
+        })
+        .unwrap();
+        complete(&mut ui, &mut geometry, RecorderStage::Ready);
+        assert_eq!(geometry, before);
+        assert_eq!(ui.candidates[ui.selected].id().as_str(), "two");
+        assert_eq!(ui.candidates[ui.selected].name(), "Renamed");
+        ui.set_candidates(&[]);
+        assert!(ui.available && ui.candidates.is_empty());
+        ui.start_work(geometry, |_| {
+            Ok(WorkResult::Catalog(WindowSnapCatalog {
+                windows: vec![source("new", "Discovered later")],
+                truncated: true,
+            }))
+        })
+        .unwrap();
+        complete(&mut ui, &mut geometry, RecorderStage::Ready);
+        assert_eq!(geometry, before);
+        assert_eq!(ui.candidates[0].name(), "Discovered later");
+        assert!(ui.notice.as_ref().unwrap().contains("incomplete"));
     }
 
     #[test]

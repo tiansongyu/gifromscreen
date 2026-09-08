@@ -58,10 +58,17 @@ native border gestures, stage changes, cancellation and overlay destruction
 invalidate pending work; moving away and back cannot revive a cancelled result.
 Cancellation does not synchronously join native work on the UI thread.
 
-The initial menu retains at most 256 discovered windows. New/renamed windows
-currently require closing the controller and using Refresh on the recorder page.
+The menu retains at most 256 discovered windows. **Refresh windows** now updates
+it inside the controller, including after an initially empty list. Refresh does
+not change the selected screen or capture rectangle. Selection follows the same
+window ID when it remains present; long titles truncate in the bounded selector.
+One cancellable five-second query reads at most 1,024 WM list entries/tree nodes,
+filters hidden/helper/own windows and returns an explicit incomplete-list flag
+when a limit is reached. Without EWMH lists, the bounded fallback descends unnamed
+wrappers and stops at named/ICCCM clients instead of treating their widgets as
+independent application windows. Late refreshes share the snap cancellation gate.
 The dropdown is a working explicit selection path, not a completed replacement
-for upstream crosshair selection. A crosshair picker, in-controller refresh,
+for upstream crosshair selection. A crosshair picker,
 explicit clipping/partial-window policy, combined decoration/shadow cases and
 mixed-DPI/multiple-monitor/physical GNOME/KDE acceptance stay open.
 
@@ -121,3 +128,35 @@ test is not proof of all compositor presentation timing or physical hardware.
 The app reported exit 0 after normal close. CLI reopened the project and exported
 `window-frame.gif`: 640×457, 30 images, **3,000 ms**, 238,383 bytes, SHA-256
 `8398f5e09098d2887e55f6c6b410ddfef4ab00502703bf5849f00c8fa60b681c`.
+
+## In-controller refresh follow-up
+
+Two additional explicit private-Xvfb tests pass on Rust 1.98.0 and 1.88.0:
+tree fallback, new/renamed windows, duplicate/own/closed entries, malformed WM
+lists, bounded-list reporting, cancellation and legacy-title fallback. A desktop
+test verifies retained selection by ID, untouched capture geometry, recovery
+from an empty list and an explicit truncation notice. The full desktop suite
+now has 632 passing tests.
+
+Private GNOME lab `/tmp/gfs-wayland-qa.qa54ggn5`, 1,200-second lifetime, reproduced
+a title-type bug with its owned fixture: `xdotool set_window --name` wrote
+`_NET_WM_NAME` as STRING rather than UTF8_STRING. XGetProperty reports bytes_after
+on a type mismatch; the first implementation mistook this for an oversized title
+and refreshed to an empty list (`02-refreshed.png`, `03-refreshed-actions.png`).
+The fix ignores the wrong-typed modern property and uses the valid legacy
+`WM_NAME`, matching ordinary source discovery. These failed observations remain
+retained, not counted as successful acceptance. A separate two-instance driver
+attempt did not reach the intended controller and is also not counted.
+
+The final frozen app `extra-app-3605395`, SHA-256
+`d36a818393c185a2616f9b9539baba80146cdd3e523b21fdec5c034731dc0448`,
+ran after the earlier app instances had closed. While its recording frame stayed
+open at (0,0), 640×480, the fixture was renamed to “Window refreshed in recorder”.
+Refresh updated the selected label without changing that rectangle
+(`09-refresh-success.png`). Snap then produced (45,77), 640×457 using the renamed
+window's current frame hints (`10-snap-after-refresh.png`). Cancel restored the
+main settings with those explicit snapped coordinates (`11-cancelled-controller.png`).
+Refresh and Snap remain visible together above the fixed Start/Cancel controls.
+No recording/project was created in this follow-up; the preceding recording/GIF
+evidence remains separate. The final app reported exit 0 and the lab was explicitly
+stopped with cleanup complete.

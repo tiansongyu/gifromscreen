@@ -81,7 +81,8 @@ these tasks extend them rather than replace their state machines.
    [native move/snap/record/GIF evidence](WINDOW-SNAP-QA-2026-09-08.md).
    It changes the unfrozen physical geometry, then uses the existing guide/control
    acknowledgements before Start; live recording still retains a fixed canvas.
-   A crosshair picker, in-controller window-list refresh, explicit partial-window
+   In-controller window-list refresh now preserves the chosen window and capture
+   geometry, with bounded native discovery and legacy-title fallback. A crosshair picker, explicit partial-window
    policy and wider WM/CSD/DPI acceptance remain open. Optional X11 cursor-follow
    comes after those controls; Wayland source-local movement is not global tracking.
 3. **X11 interaction sampling: desktop-wide mode connected.** One bounded XI2

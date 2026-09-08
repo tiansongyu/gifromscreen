@@ -37,7 +37,7 @@ mod wayland;
 mod wayland_pipewire;
 mod window_snap;
 mod x11;
-pub use window_snap::{WindowSnapBounds, query_window_snap};
+pub use window_snap::{WindowSnapBounds, WindowSnapCatalog, list_snap_windows, query_window_snap};
 
 #[cfg(all(target_os = "linux", feature = "native-x11"))]
 mod x11_window;

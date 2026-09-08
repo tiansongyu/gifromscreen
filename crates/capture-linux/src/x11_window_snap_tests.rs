@@ -1,7 +1,7 @@
 //! Explicit private-display window-snap checks, never host DISPLAY.
 
 use super::cursor_edge_tests::PrivateXvfb;
-use crate::{WindowSnapBounds, query_window_snap};
+use crate::{WindowSnapBounds, list_snap_windows, query_window_snap};
 use gif_from_screen_capture::{CaptureSource, CaptureSourceId, CaptureSourceKind, PhysicalRect};
 use std::sync::atomic::{AtomicBool, Ordering};
 use x11rb::{
@@ -109,6 +109,40 @@ impl Fixture {
         )
     }
 
+    fn additional_window(&self, name: &[u8]) -> u32 {
+        let window = self.connection.generate_id().unwrap();
+        self.connection
+            .create_window(
+                0,
+                window,
+                self.root,
+                170,
+                20,
+                50,
+                40,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &CreateWindowAux::new(),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        self.connection
+            .change_property8(
+                PropMode::REPLACE,
+                window,
+                AtomEnum::WM_NAME,
+                AtomEnum::STRING,
+                name,
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        self.connection.map_window(window).unwrap().check().unwrap();
+        window
+    }
+
     fn atom(&self, name: &[u8]) -> u32 {
         self.connection
             .intern_atom(false, name)
@@ -193,6 +227,130 @@ fn private_xvfb_window_snap_reads_client_and_native_frame_without_using_extent_h
         fixture.parent
     );
     assert_ne!(fixture.root, fixture.window);
+}
+
+#[test]
+#[ignore = "starts and supervises its own private Xvfb; never uses host DISPLAY"]
+fn private_xvfb_window_refresh_finds_new_titles_and_skips_own_closed_and_duplicate_ids() {
+    let fixture = Fixture::new();
+    let refresh =
+        || list_snap_windows(Some(&fixture.server.display), &AtomicBool::new(false)).unwrap();
+    // No EWMH list: walk through the unnamed wrapper to the actual named client.
+    let initial = refresh();
+    assert_eq!(initial.windows.len(), 1);
+    assert!(!initial.truncated);
+    assert_eq!(initial.windows[0].name(), "Snap test");
+    assert_eq!(
+        initial.windows[0].geometry().unwrap(),
+        PhysicalRect::new(27, 53, 80, 60).unwrap()
+    );
+    fixture
+        .connection
+        .change_property8(
+            PropMode::REPLACE,
+            fixture.window,
+            AtomEnum::WM_NAME,
+            AtomEnum::STRING,
+            b"Renamed window",
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    assert_eq!(refresh().windows[0].name(), "Renamed window");
+    let second = fixture.additional_window(b"New window");
+    let list = fixture.atom(b"_NET_CLIENT_LIST_STACKING");
+    fixture
+        .connection
+        .change_property32(
+            PropMode::REPLACE,
+            fixture.root,
+            list,
+            AtomEnum::WINDOW,
+            &vec![fixture.window; 1025],
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    let limited = refresh();
+    assert!(limited.truncated);
+    assert_eq!(limited.windows.len(), 1);
+    fixture
+        .connection
+        .change_property32(
+            PropMode::REPLACE,
+            fixture.root,
+            list,
+            AtomEnum::WINDOW,
+            &[0, fixture.root, fixture.window, fixture.window, second],
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    let windows = refresh().windows;
+    assert_eq!(windows.len(), 2);
+    assert_eq!(windows[0].name(), "New window");
+    assert_eq!(windows[1].name(), "Renamed window");
+    fixture
+        .connection
+        .change_property32(
+            PropMode::REPLACE,
+            second,
+            fixture.atom(b"_NET_WM_PID"),
+            AtomEnum::CARDINAL,
+            &[std::process::id()],
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    assert_eq!(refresh().windows.len(), 1);
+    fixture
+        .connection
+        .destroy_window(fixture.window)
+        .unwrap()
+        .check()
+        .unwrap();
+    assert!(refresh().windows.is_empty());
+    fixture
+        .connection
+        .change_property8(
+            PropMode::REPLACE,
+            fixture.root,
+            list,
+            AtomEnum::STRING,
+            b"bad list",
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    assert!(
+        list_snap_windows(Some(&fixture.server.display), &AtomicBool::new(false))
+            .unwrap_err()
+            .contains("malformed")
+    );
+    assert!(list_snap_windows(Some(&fixture.server.display), &AtomicBool::new(true)).is_err());
+}
+
+#[test]
+#[ignore = "starts and supervises its own private Xvfb; never uses host DISPLAY"]
+fn private_xvfb_window_refresh_uses_legacy_title_when_modern_type_is_wrong() {
+    let fixture = Fixture::new();
+    fixture.atom(b"UTF8_STRING");
+    fixture
+        .connection
+        .change_property8(
+            PropMode::REPLACE,
+            fixture.window,
+            fixture.atom(b"_NET_WM_NAME"),
+            AtomEnum::STRING,
+            b"Wrong type, use legacy title",
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    let catalog =
+        list_snap_windows(Some(&fixture.server.display), &AtomicBool::new(false)).unwrap();
+    assert_eq!(catalog.windows[0].name(), "Snap test");
+    assert!(fixture.snap(WindowSnapBounds::Client).is_ok());
 }
 
 #[test]

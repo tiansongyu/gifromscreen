@@ -18,6 +18,40 @@ pub enum WindowSnapBounds {
     Outer,
 }
 
+/// Bounded, freshly inspected windows available for explicit region snapping.
+#[derive(Debug)]
+pub struct WindowSnapCatalog {
+    /// Viewable non-helper windows, excluding this recorder's own process.
+    pub windows: Vec<CaptureSource>,
+    /// More window IDs/tree nodes existed than the bounded query inspected.
+    pub truncated: bool,
+}
+
+/// Refreshes window titles and geometry without changing the selected source,
+/// recording rectangle, focus or stacking order. Run off the UI thread.
+///
+/// # Errors
+/// Returns an error on cancelled/timed-out native work, malformed WM lists or
+/// unavailable native X11 support. Closed windows during enumeration are skipped.
+pub fn list_snap_windows(
+    display: Option<&str>,
+    cancellation: &AtomicBool,
+) -> Result<WindowSnapCatalog, String> {
+    #[cfg(all(target_os = "linux", feature = "native-x11"))]
+    {
+        catalog::query(display, cancellation)
+    }
+    #[cfg(not(all(target_os = "linux", feature = "native-x11")))]
+    {
+        let _ = (display, cancellation);
+        Err("Window discovery requires a native X11 build.".into())
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "native-x11"))]
+#[path = "window_snap_catalog.rs"]
+mod catalog;
+
 /// Re-reads an enumerated window's current physical bounds on a dedicated,
 /// cancellable connection. Never moves, focuses, raises or grabs any window.
 ///
@@ -60,7 +94,7 @@ mod native {
         protocol::xproto::{Atom, AtomEnum, ConnectionExt as _, MapState, Window, WindowClass},
     };
 
-    struct Atoms {
+    pub(super) struct Atoms {
         name: Atom,
         utf8: Atom,
         pid: Atom,
@@ -68,6 +102,28 @@ mod native {
         hidden: Atom,
         frame: Atom,
         gtk_frame: Atom,
+    }
+
+    impl Atoms {
+        pub(super) fn new(connection: &Client<'_>) -> Result<Self, String> {
+            let atom = |name: &[u8]| {
+                connection
+                    .intern_atom(true, name)
+                    .map_err(error)?
+                    .reply()
+                    .map(|reply| reply.atom)
+                    .map_err(error)
+            };
+            Ok(Self {
+                name: atom(b"_NET_WM_NAME")?,
+                utf8: atom(b"UTF8_STRING")?,
+                pid: atom(b"_NET_WM_PID")?,
+                state: atom(b"_NET_WM_STATE")?,
+                hidden: atom(b"_NET_WM_STATE_HIDDEN")?,
+                frame: atom(b"_NET_FRAME_EXTENTS")?,
+                gtk_frame: atom(b"_GTK_FRAME_EXTENTS")?,
+            })
+        }
     }
 
     pub(super) fn query(
@@ -97,23 +153,7 @@ mod native {
         if window == root {
             return Err("Cannot snap to the root as a window.".into());
         }
-        let atom = |name: &[u8]| {
-            connection
-                .intern_atom(true, name)
-                .map_err(error)?
-                .reply()
-                .map(|reply| reply.atom)
-                .map_err(error)
-        };
-        let atoms = Atoms {
-            name: atom(b"_NET_WM_NAME")?,
-            utf8: atom(b"UTF8_STRING")?,
-            pid: atom(b"_NET_WM_PID")?,
-            state: atom(b"_NET_WM_STATE")?,
-            hidden: atom(b"_NET_WM_STATE_HIDDEN")?,
-            frame: atom(b"_NET_FRAME_EXTENTS")?,
-            gtk_frame: atom(b"_GTK_FRAME_EXTENTS")?,
-        };
+        let atoms = Atoms::new(&connection)?;
         let identity = inspect(&connection, window, &atoms)?;
         if identity.0 != source.name() {
             return Err(
@@ -223,7 +263,7 @@ mod native {
         })))
     }
 
-    fn inspect(
+    pub(super) fn inspect(
         connection: &Client<'_>,
         window: Window,
         atoms: &Atoms,
@@ -318,6 +358,12 @@ mod native {
             .reply()
             .map_err(error)?;
         if reply.type_ == 0 {
+            return Ok(None);
+        }
+        // XGetProperty returns bytes_after for a type mismatch without any
+        // value bytes. That is not an oversized title: ignore a wrong-typed
+        // modern property and use the legacy WM_NAME fallback.
+        if expected_type != u32::from(AtomEnum::ANY) && reply.type_ != expected_type {
             return Ok(None);
         }
         if reply.bytes_after != 0 {
