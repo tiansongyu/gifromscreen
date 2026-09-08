@@ -30,16 +30,20 @@ signature that authenticates an arbitrary third-party download.
 [tools.json](../packaging/appimage/tools.json) pins appimagetool 1.9.1 and
 type2-runtime 20251108, their upstream commits, sizes and SHA-256 values.
 `scripts/appimage_tools.py` only validates existing local files; it does not
-download, chmod, execute or update them. The builder executes the packager only
-after both tools verify, and passes the explicit `--runtime-file` so appimagetool
-cannot silently download a different runtime. See the
+download, chmod, execute or update them. The builder also requires a verified
+`--runtime-build` receipt. The original runtime pin remains a comparison
+reference, not a fallback: its extract-and-run cleanup failed. The actual payload
+runtime is built from the fixed commit plus
+[cleanup.patch](../packaging/appimage/runtime/cleanup.patch), and supplied using
+`--runtime-file`; appimagetool cannot silently download a replacement. See the
 [official packager interface](https://github.com/AppImage/appimagetool).
 
 The selected [type-2 runtime](https://github.com/AppImage/type2-runtime/tree/dd6cebedcbddde9c82f89b011e8e1d40b6e43868)
 is statically linked and does not require the user's libfuse2. That does not
 guarantee FUSE capability on every kernel/container. The local builder and
 initial smoke test use the runtime's extract-and-run path. Normal FUSE mounting
-needs separate validation; no root mount, host service replacement or system
+and extract-and-run now have separate [bounded acceptance](APPIMAGE-RUNTIME-QA-2026-09-08.md);
+broader platform acceptance remains open. No root mount, host service replacement or system
 package installation is performed by AppRun.
 
 Keep the verified tool directory private/stable through execution. Hashes do
@@ -108,10 +112,25 @@ python3 scripts/appimage_tools.py target/appimage-tools
 python3 scripts/test_appimage_tools.py
 python3 scripts/test_build_appimage.py
 python3 scripts/test_appimage_native.py
+python3 scripts/test_build_appimage_runtime.py
+python3 scripts/build_appimage_runtime.py --output-dir target/appimage-runtime
 python3 scripts/build_appimage.py target/package-first/gifromscreen-0.1.0-linux-x86_64.tar.gz \
-  --output-dir target/appimage-first --development-only
+  --runtime-build target/appimage-runtime --output-dir target/appimage-first --development-only
 python3 scripts/test_appimage.py target/appimage-first/gifromscreen-0.1.0-development-x86_64.AppImage
+python3 scripts/test_appimage.py target/appimage-first/gifromscreen-0.1.0-development-x86_64.AppImage --mode fuse
 ```
+
+The source builder additionally needs non-root Docker access and the three
+archives in [runtime/sources.json](../packaging/appimage/runtime/sources.json),
+placed in `target/runtime-sources` (or an explicit `--source-dir`). Downloads
+are not implicit: every archive is verified before use. An immutable Alpine
+base digest and actual SDK image/APK/compiler identities are recorded; APK
+repositories are not hermetically pinned. Final compilation is non-root,
+network-disabled and capability-free, with read-only source/root filesystem,
+private temporary storage and a fresh writable output directory. Retained
+source/relink materials are hash-checked on reuse, not assumed present.
+This is not yet complete corresponding-source or reproducible-compilation
+evidence; see the [measured runtime build](APPIMAGE-RUNTIME-QA-2026-09-08.md).
 
 Acceptance order:
 

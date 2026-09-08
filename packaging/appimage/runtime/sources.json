@@ -1,0 +1,22 @@
+{
+  "format_version": 1,
+  "upstream_commit": "dd6cebedcbddde9c82f89b011e8e1d40b6e43868",
+  "base_image": "alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d",
+  "archives": {
+    "type2-runtime-dd6cebed.tar.gz": {
+      "url": "https://github.com/AppImage/type2-runtime/archive/dd6cebedcbddde9c82f89b011e8e1d40b6e43868.tar.gz",
+      "bytes": 31069,
+      "sha256": "f5fec23be76e50e2445ed2d018bac49b367490fc483c62c4637e99ec705d27ba"
+    },
+    "fuse-3.15.0.tar.xz": {
+      "url": "https://github.com/libfuse/libfuse/releases/download/fuse-3.15.0/fuse-3.15.0.tar.xz",
+      "bytes": 4589124,
+      "sha256": "70589cfd5e1cff7ccd6ac91c86c01be340b227285c5e200baa284e401eea2ca0"
+    },
+    "squashfuse-0.5.2.tar.gz": {
+      "url": "https://github.com/vasi/squashfuse/archive/0.5.2.tar.gz",
+      "bytes": 75404,
+      "sha256": "db0238c5981dabbd80ee09ae15387f390091668ca060a7bc38047912491443d3"
+    }
+  }
+}

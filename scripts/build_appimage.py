@@ -16,6 +16,7 @@ import tempfile
 
 import build_portable as portable
 from appimage_tools import verify_tools
+from build_appimage_runtime import verify_runtime_build
 from portable_archive import extract_checked
 from owned_process import run as run_owned
 
@@ -96,7 +97,10 @@ def file_inventory(appdir):
 def build(arguments):
     if not arguments.development_only:
         raise ValueError("AppImage redistribution materials are not complete; only --development-only local builds are enabled")
-    tool, runtime = verify_tools(arguments.tools_dir)
+    # Keep the publisher's tool/reference-runtime pins checked, but never use
+    # the reference runtime whose extraction cleanup is known to be incomplete.
+    tool, _reference_runtime = verify_tools(arguments.tools_dir)
+    runtime, runtime_receipt = verify_runtime_build(arguments.runtime_build)
     source_hash = portable.tree_digest(["packaging", "scripts"])
     output = arguments.output_dir.absolute()
     # Reserve a fresh directory; never overwrite an existing user's package.
@@ -130,11 +134,13 @@ def build(arguments):
         "packaging_tree_sha256": source_hash,
         "native": native,
         "tools": {path.name: portable.sha256(path) for path in (tool, runtime)},
+        "runtime_build": runtime_receipt,
         "required_host_services": ["graphics loader/driver", "display server", "desktop portals", "PipeWire server for Wayland"],
         "ffmpeg_bundled": False,
     }
     portable.write_json(appdir / "BUILD-INFO.json", metadata)
     portable.write_json(appdir / "PAYLOAD.json", file_inventory(appdir))
+    staged_inventory = file_inventory(appdir)
     subprocess.run(["desktop-file-validate", str(appdir / (portable.APP_ID + ".desktop"))], check=True)
     epoch = receipt["source_date_epoch"]
     for path in [appdir, *appdir.rglob("*")]:
@@ -147,6 +153,9 @@ def build(arguments):
     tool.chmod(0o755)
     environment = os.environ.copy()
     environment.pop("NO_CLEANUP", None)
+    # VERSION makes appimagetool rewrite the desktop entry after our inventory.
+    # This builder takes its version from the verified portable receipt instead.
+    environment.pop("VERSION", None)
     environment.update(ARCH="x86_64", SOURCE_DATE_EPOCH=str(epoch))
     with tempfile.TemporaryDirectory(prefix="gfs-appimage-tool-") as tooling:
         # Concurrent builds must not share the tool runtime's extracted cache.
@@ -154,6 +163,8 @@ def build(arguments):
         run_owned([str(tool), "--appimage-extract-and-run", "--no-appstream",
                    "--runtime-file", str(runtime), str(appdir), str(artifact)],
                   env=environment, check=True, timeout=180)
+    if file_inventory(appdir) != staged_inventory:
+        raise ValueError("packager changed the verified AppDir payload")
     artifact.chmod(0o755)
     digest = portable.sha256(artifact)
     (output / (artifact.name + ".sha256")).write_text(digest + "  " + artifact.name + "\n", encoding="ascii")
@@ -165,6 +176,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path)
     parser.add_argument("--tools-dir", type=Path, default=portable.ROOT / "target/appimage-tools")
+    parser.add_argument("--runtime-build", type=Path, required=True,
+                        help="verified source build directory for the cleanup-corrected runtime")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--development-only", action="store_true")
     build(parser.parse_args())

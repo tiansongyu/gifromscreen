@@ -90,8 +90,11 @@ AppImage and Flatpak are not yet claimed as distributable deliverables. The
 [AppImage development builder](APPIMAGE-PLAN.md) now assembles an actual local
 image with checked tooling, private native dependencies and tests, but explicitly
 blocks publication while corresponding-source materials and runtime/platform
-acceptance remain incomplete. Its real extract-and-run smoke test exposed a
-runtime cleanup failure; see the [measured record](APPIMAGE-DEVELOPMENT-QA-2026-09-08.md).
+acceptance remain incomplete. Its initial smoke test exposed a runtime cleanup
+failure; a source-built fix now passes extract-and-run and FUSE cleanup plus
+same-input byte-identical repackaging. See the
+[new measured record](APPIMAGE-RUNTIME-QA-2026-09-08.md) and
+[original failure](APPIMAGE-DEVELOPMENT-QA-2026-09-08.md).
 The [Flatpak plan](FLATPAK-PLAN.md) identifies application changes for durable
 projects, folder-scoped exports, Camera Portal and X11 namespace-safe ownership;
 it does not include an unbuilt placeholder manifest. Signed releases, an in-place

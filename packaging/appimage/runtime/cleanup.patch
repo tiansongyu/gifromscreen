@@ -1,0 +1,49 @@
+diff --git a/src/runtime/runtime.c b/src/runtime/runtime.c
+index 2ebb3c8..a5542ed 100644
+--- a/src/runtime/runtime.c
++++ b/src/runtime/runtime.c
+@@ -945,7 +945,7 @@ int rm_recursive_callback(const char* path, const struct stat* stat, const int t
+         case FTW_SLN:
+             if (remove(path) != 0) {
+                 fprintf(stderr, "Failed to remove %s: %s\n", path, strerror(errno));
+-                return false;
++                return 1;
+             }
+             break;
+ 
+@@ -953,7 +953,7 @@ int rm_recursive_callback(const char* path, const struct stat* stat, const int t
+         case FTW_DP:
+             if (rmdir(path) != 0) {
+                 fprintf(stderr, "Failed to remove directory %s: %s\n", path, strerror(errno));
+-                return false;
++                return 1;
+             }
+             break;
+ 
+@@ -970,9 +970,24 @@ bool rm_recursive(const char* const path) {
+     // FTW_MOUNT: prevent deletion of files on other mounted filesystems
+     // FTW_PHYS: do not follow symlinks, but report symlinks as such; this way, the symlink targets, which might point
+     //           to locations outside path will not be deleted accidentally (attackers might abuse this)
+-    int rv = nftw(path, &rm_recursive_callback, 0, FTW_DEPTH | FTW_MOUNT | FTW_PHYS);
++    // musl treats a non-positive descriptor limit as a successful no-op.
++    // Keep traversal resources bounded and propagate errors on deeper trees.
++    int rv = nftw(path, &rm_recursive_callback, 64, FTW_DEPTH | FTW_MOUNT | FTW_PHYS);
++    if (rv != 0)
++        return false;
+ 
+-    return rv == 0;
++    // A successful traversal must actually remove its root, not merely report
++    // success without visiting it (or silently leave an incomplete subtree).
++    struct stat remaining;
++    if (lstat(path, &remaining) == 0) {
++        fprintf(stderr, "Cleanup left directory %s in place\n", path);
++        return false;
++    }
++    if (errno != ENOENT) {
++        fprintf(stderr, "Cannot confirm cleanup of %s: %s\n", path, strerror(errno));
++        return false;
++    }
++    return true;
+ }
+ 
+ void build_mount_point(char* mount_dir, const char* const argv0, const char* const temp_base, const size_t templen) {

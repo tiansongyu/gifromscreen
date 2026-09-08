@@ -316,6 +316,18 @@ class _Bundle:
             record["byte_len"] = target.stat().st_size
 
 
+def _export_provenance(record):
+    if record["role"] != "project-elf":
+        return record
+    # Internal planning/install must retain real paths for trust and mutation
+    # checks. Only exported provenance refers back to the receipt-verified
+    # portable payload, whose archive/binary hashes are recorded by the caller.
+    exported = {key: value for key, value in record.items() if key != "source_realpath"}
+    exported["source_kind"] = "verified-portable-payload"
+    exported["source"] = (Path("bin") / Path(record["target"]).name).as_posix()
+    return exported
+
+
 def bundle_native(appdir: Path) -> dict:
     """Populate a fresh private AppDir; return evidence, never a distribution approval.
 
@@ -361,7 +373,7 @@ def bundle_native(appdir: Path) -> dict:
         "schema_version": 1, "glibc_baseline": "2.35", "ld_library_path_used": False,
         "redistribution_ready": False, "corresponding_source_collected": False,
         "source_gate": "Package ownership/version and notices are recorded, but corresponding source archives, distro patches and redistribution obligations still require separate verified material.",
-        "files": sorted(plan.entries.values(), key=lambda entry: entry["target"]),
+        "files": [_export_provenance(entry) for entry in sorted(plan.entries.values(), key=lambda entry: entry["target"])],
         "packages": sorted(plan.packages.values(), key=lambda entry: entry["package"]),
         "host_libraries": sorted(plan.host | HOST_LIBRARIES),
         "configuration": {"pipewire_config": str(CLIENT_TARGET), "pipewire_modules": "usr/lib/pipewire-0.3", "spa_plugins": "usr/lib/spa-0.2", "xkb_config_root": "usr/share/X11/xkb"},

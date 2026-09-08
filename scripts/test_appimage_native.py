@@ -233,6 +233,61 @@ class MockAssembly:
 
 
 class AssemblyTests(unittest.TestCase):
+    def test_same_verified_payload_in_two_staging_roots_has_identical_exported_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = MockAssembly(Path(directory))
+            second = fixture.root / "different output with spaces" / "AppDir"
+            for name in native.BINARIES:
+                fixture.trusted.add(fixture_elf(second / "usr/bin" / name,
+                                                needed=(fixture.core.name,)).resolve())
+            with fixture.patched():
+                first_evidence = native.bundle_native(fixture.appdir)
+                second_evidence = native.bundle_native(second)
+            self.assertEqual(first_evidence, second_evidence)
+            for record in first_evidence["files"]:
+                if record["role"] == "project-elf":
+                    self.assertEqual(record["source_kind"], "verified-portable-payload")
+                    self.assertEqual(record["source"], "bin/" + Path(record["target"]).name)
+                    self.assertNotIn("source_realpath", record)
+                    self.assertEqual(record["source_sha256"],
+                                     hashlib.sha256((second / record["target"]).read_bytes()).hexdigest())
+                else:
+                    self.assertTrue(Path(record["source"]).is_absolute())
+                    self.assertEqual(record["source_realpath"], str(Path(record["source"]).resolve()))
+            library = next(record for record in first_evidence["files"]
+                           if record["target"] == "usr/lib/libpipewire-0.3.so.0")
+            self.assertEqual(library["source"], str(fixture.core))
+            self.assertEqual(library["source_realpath"], str(fixture.core.resolve()))
+            serialized = json.dumps(first_evidence, sort_keys=True)
+            self.assertNotIn(str(fixture.appdir), serialized)
+            self.assertNotIn(str(second), serialized)
+
+    def test_export_normalization_does_not_mutate_internal_project_source_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = MockAssembly(Path(directory))
+            original_install = native._Bundle.install
+            plans = []
+
+            def observed_install(plan):
+                original_install(plan)
+                plans.append(plan)
+
+            with fixture.patched(), patch.object(native._Bundle, "install", observed_install):
+                evidence = native.bundle_native(fixture.appdir)
+            self.assertEqual(len(plans), 1)
+            exported = {entry["target"]: entry for entry in evidence["files"]}
+            for name in native.BINARIES:
+                target = "usr/bin/" + name
+                record = plans[0].entries[target]
+                original = fixture.appdir / target
+                self.assertEqual(record["source"], str(original))
+                self.assertEqual(record["source_realpath"], str(original.resolve()))
+                self.assertNotIn("source_kind", record)
+                self.assertIsNot(record, exported[target])
+                self.assertEqual(exported[target]["source"], "bin/" + name)
+                for key in ("source_sha256", "patched_sha256", "target", "elf", "runpath"):
+                    self.assertEqual(exported[target][key], record[key])
+
     def test_full_mock_closure_resources_runpaths_and_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = MockAssembly(Path(directory))

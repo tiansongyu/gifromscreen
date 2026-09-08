@@ -52,6 +52,7 @@ jobs:
         run: |
           python3 scripts/test_appimage_tools.py
           python3 scripts/test_build_appimage.py
+          python3 scripts/test_build_appimage_runtime.py
           python3 scripts/test_appimage_native.py
           python3 scripts/test_owned_process.py
 

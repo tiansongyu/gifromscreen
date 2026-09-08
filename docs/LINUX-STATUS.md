@@ -142,8 +142,10 @@ The [isolated nested GNOME plan](WAYLAND-NESTED-QA-PLAN.md) has been executed; s
   AppImage now has a real local development assembler, pinned tools, native
   dependency/RUNPATH inventory and process-owned smoke harness; it is not yet
   ready for redistribution. The [first actual image test](APPIMAGE-DEVELOPMENT-QA-2026-09-08.md)
-  found extract-and-run cleanup failure. Source/license and native Wayland/FUSE
-  gates remain open. [Flatpak](FLATPAK-PLAN.md) additionally requires application
+  found extract-and-run cleanup failure. The [source-built fix](APPIMAGE-RUNTIME-QA-2026-09-08.md)
+  now passes normal FUSE/extract execution, cleanup and same-input repackaging.
+  Source/license, AppImage Wayland and broader hardware gates remain open.
+  [Flatpak](FLATPAK-PLAN.md) additionally requires application
   permission/storage changes before its package can cover existing features.
 
 ### M2 — editor parity

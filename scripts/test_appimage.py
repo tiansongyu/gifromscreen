@@ -113,6 +113,7 @@ def cli(artifact, arguments, scratch, environment):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("appimage", type=Path)
+    parser.add_argument("--mode", choices=("extract", "fuse"), default="extract")
     parser.add_argument("--evidence-dir", type=Path, help="retain logs/GIFs in a new directory instead of temporary cleanup")
     arguments = parser.parse_args()
     artifact = arguments.appimage.resolve(strict=True)
@@ -128,11 +129,14 @@ def main():
             XDG_CONFIG_HOME=str(scratch / "config"), XDG_DATA_HOME=str(scratch / "data"),
             XDG_STATE_HOME=str(scratch / "state"), XDG_CACHE_HOME=str(scratch / "cache"),
             XDG_RUNTIME_DIR=str(scratch / "runtime"), TMPDIR=str(scratch / "temp"),
-            APPIMAGE_EXTRACT_AND_RUN="1", XDG_SESSION_TYPE="x11",
+            XDG_SESSION_TYPE="x11",
             WGPU_BACKEND="gl", LIBGL_ALWAYS_SOFTWARE="1",
         )
         environment.pop("WAYLAND_DISPLAY", None)
         environment.pop("NO_CLEANUP", None)
+        environment.pop("APPIMAGE_EXTRACT_AND_RUN", None)
+        if arguments.mode == "extract":
+            environment["APPIMAGE_EXTRACT_AND_RUN"] = "1"
         version = cli(artifact, ["version"], scratch, environment)
         if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+].*)?", version):
             raise ValueError("AppImage CLI returned an invalid package version")
@@ -149,10 +153,12 @@ def main():
         desktop(artifact, scratch, environment)
         leftovers = list((scratch / "temp").iterdir())
         if leftovers:
-            raise ValueError("AppImage extraction files remained after normal exit: " + str(leftovers))
-        print(json.dumps({"version": version, "cli_gif": stream,
-                          "native_window": "normal close, exit 0", "extract_cleanup": "complete",
-                          "scope": "owned Xvfb, software GL, extract-and-run; not FUSE/Wayland hardware acceptance"}))
+            raise ValueError("AppImage runtime files remained after normal exit: " + str(leftovers))
+        report = {"version": version, "cli_gif": stream, "mode": arguments.mode,
+                  "native_window": "normal close, exit 0", "runtime_cleanup": "complete",
+                  "scope": "owned Xvfb, software GL; not Wayland/hardware acceptance"}
+        (scratch / "result.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(report))
 
 
 if __name__ == "__main__":

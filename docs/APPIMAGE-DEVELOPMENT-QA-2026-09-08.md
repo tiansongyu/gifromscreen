@@ -1,5 +1,10 @@
 # AppImage development packaging — incomplete acceptance
 
+Historical first-image record. The subsequent
+[source-built runtime correction](APPIMAGE-RUNTIME-QA-2026-09-08.md) now passes
+the unchanged cleanup requirement. The failed image/hash below is not relabeled
+as fixed, and overall distribution acceptance is still incomplete.
+
 The first real image builds and runs its desktop and CLI, but its runtime
 cleanup test **fails**. No AppImage is uploaded as a distributable artifact.
 This record does not close the [AppImage plan](APPIMAGE-PLAN.md), Flatpak gate

@@ -6,3 +6,6 @@ scripts/qa/run_wpf_reference.ps1 text eol=lf
 scripts/qa/cinemagraph_probe/** text eol=lf
 .github/workflows/cinemagraph-probe.yml text eol=lf
 packaging/licenses/upstream/dotnet-wpf-MIT.txt text eol=lf
+# Unified-diff blank context lines contain one required space. Preserve the
+# audited patch bytes instead of stripping those format markers.
+packaging/appimage/runtime/cleanup.patch text eol=lf whitespace=-blank-at-eol

@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import patch
 
 import build_appimage as builder
+import build_appimage_runtime as runtime_builder
 
 
 SOURCE_DIGEST = "a" * 64
@@ -271,6 +272,7 @@ class AppImageBuilderTests(unittest.TestCase):
 
     def arguments(self, development_only):
         return argparse.Namespace(archive=self.root / "input.tar.gz", tools_dir=self.root / "tools",
+                                  runtime_build=self.root / "runtime build",
                                   output_dir=self.root / "new output", development_only=development_only)
 
     def test_distribution_is_blocked_before_tool_verification_or_output_writes(self):
@@ -283,20 +285,25 @@ class AppImageBuilderTests(unittest.TestCase):
     def test_tool_verification_failure_does_not_execute_or_create_output(self):
         arguments = self.arguments(True)
         with patch.object(builder, "verify_tools", side_effect=ValueError("unverified tool")):
-            with patch.object(builder.subprocess, "run", side_effect=AssertionError("no execution")):
-                with self.assertRaisesRegex(ValueError, "unverified tool"):
-                    builder.build(arguments)
+            with patch.object(builder, "verify_runtime_build", side_effect=AssertionError("tools must verify first")):
+                with patch.object(builder.subprocess, "run", side_effect=AssertionError("no execution")):
+                    with self.assertRaisesRegex(ValueError, "unverified tool"):
+                        builder.build(arguments)
         self.assertFalse(arguments.output_dir.exists())
 
-    def test_mocked_development_assembly_passes_explicit_local_runtime_without_downloading(self):
+    def _mocked_development_assembly(self, mutate_payload=False):
         # This checks orchestration only: these bytes are NOT accepted by the
         # real verify_tools and the output is NOT a valid AppImage.
         arguments = self.arguments(True)
         arguments.archive.write_bytes(b"mock archive")
         tool = self.root / "mock-appimagetool"
-        runtime = self.root / "mock-runtime"
+        reference_runtime = self.root / "upstream-reference-runtime"
+        runtime = self.root / "patched-runtime"
         tool.write_bytes(b"never execute")
-        runtime.write_bytes(b"never execute")
+        reference_runtime.write_bytes(b"known upstream reference; never passed to packager")
+        runtime.write_bytes(b"mock patched runtime; never execute")
+        runtime_receipt = {"format_version": 1, "recipe_sha256": "e" * 64,
+                           "redistribution_ready": False, "synthetic_test_only": True}
         calls = []
 
         def run(command, **kwargs):
@@ -312,26 +319,126 @@ class AppImageBuilderTests(unittest.TestCase):
             self.assertEqual(kwargs["timeout"], 180)
             self.assertEqual(kwargs["env"]["ARCH"], "x86_64")
             self.assertNotIn("NO_CLEANUP", kwargs["env"])
+            self.assertNotIn("VERSION", kwargs["env"])
             self.assertTrue(Path(kwargs["env"]["TMPDIR"]).is_dir())
             Path(command[-1]).write_bytes(b"orchestration test, not a real AppImage")
+            if mutate_payload:
+                (Path(command[-2]) / "AppRun").write_text("changed by packager")
             return 0
 
         native = types.SimpleNamespace(bundle_native=lambda appdir: {"mock_only": True})
-        with patch.object(builder, "verify_tools", return_value=(tool, runtime)):
+        with patch.object(builder, "verify_tools", return_value=(tool, reference_runtime)), \
+                patch.object(builder, "verify_runtime_build", return_value=(runtime, runtime_receipt)) as verify_runtime:
             with patch.object(builder, "extract_checked", return_value=self.bundle):
                 with patch.dict("sys.modules", {"appimage_native": native}):
                     with patch.object(builder.subprocess, "run", side_effect=run):
                         with patch.object(builder, "run_owned", side_effect=run_owned):
-                            with redirect_stdout(io.StringIO()) as output:
+                            with patch.dict(os.environ, {"VERSION": "must-not-rewrite-desktop"}), \
+                                    redirect_stdout(io.StringIO()) as output:
                                 builder.build(arguments)
         result = json.loads(output.getvalue())
         self.assertFalse(result["redistribution_ready"])
         metadata = json.loads((Path(result["appdir"]) / "BUILD-INFO.json").read_text())
         self.assertTrue(metadata["development_only"])
         self.assertFalse(metadata["redistribution_ready"])
+        verify_runtime.assert_called_once_with(arguments.runtime_build)
+        self.assertEqual(metadata["runtime_build"], runtime_receipt)
+        self.assertEqual(metadata["tools"], {tool.name: builder.portable.sha256(tool),
+                                           runtime.name: builder.portable.sha256(runtime)})
+        self.assertNotIn(reference_runtime.name, metadata["tools"])
         self.assertEqual(len(calls), 2)
         self.assertEqual(Path(result["appimage"]).stat().st_mode & 0o777, 0o755)
         self.assertTrue(Path(result["appimage"] + ".sha256").is_file())
+
+    def test_mocked_development_assembly_passes_explicit_local_runtime_without_downloading(self):
+        self._mocked_development_assembly()
+
+    def test_packager_cannot_silently_change_the_inventoried_payload(self):
+        with self.assertRaisesRegex(ValueError, "packager changed the verified AppDir"):
+            self._mocked_development_assembly(mutate_payload=True)
+
+    def test_cli_requires_verified_runtime_build_argument(self):
+        command = ["build_appimage.py", "fixture.tar.gz", "--output-dir", str(self.root / "output"), "--development-only"]
+        with patch("sys.argv", command), patch.object(builder, "build") as build:
+            with redirect_stdout(io.StringIO()), patch("sys.stderr", new_callable=io.StringIO) as error:
+                with self.assertRaises(SystemExit) as result:
+                    builder.main()
+            self.assertEqual(result.exception.code, 2)
+            self.assertIn("--runtime-build", error.getvalue())
+            build.assert_not_called()
+        with patch("sys.argv", [*command, "--runtime-build", str(self.root / "verified build")]), \
+                patch.object(builder, "build") as build:
+            builder.main()
+        self.assertEqual(build.call_args.args[0].runtime_build, self.root / "verified build")
+
+    def make_runtime_build(self, arguments):
+        # These bounded synthetic bytes exercise the real receipt validator;
+        # they are not a compiled runtime and are never executed or packaged.
+        artifacts = arguments.runtime_build / "artifacts"
+        artifacts.mkdir(parents=True)
+        header = bytearray(64)
+        header[:7] = b"\x7fELF\x02\x01\x01"
+        header[8:11] = b"AI\x02"
+        header[18:20] = (62).to_bytes(2, "little")
+        (artifacts / "runtime-x86_64").write_bytes(header)
+        (artifacts / "cleanup-test.log").write_text("patched_runtime_cleanup=PASS\n")
+        materials = arguments.runtime_build / "sources"
+        materials.mkdir()
+        (materials / "source.tar.gz").write_bytes(b"synthetic retained source")
+        recipe = self.root / "runtime recipe"
+        recipe.mkdir()
+        (recipe / "cleanup.patch").write_bytes(b"synthetic patch, never applied")
+        pins = {"format_version": 1, "upstream_commit": "f" * 40, "archives": {}}
+        (recipe / "sources.json").write_text(json.dumps(pins))
+        receipt = {"format_version": 1, "recipe_sha256": SOURCE_DIGEST, "sources": pins,
+                   "patch_sha256": builder.portable.sha256(recipe / "cleanup.patch"),
+                   "source_materials": runtime_builder.inventory(materials),
+                   "artifacts": runtime_builder.inventory(artifacts)}
+        (arguments.runtime_build / runtime_builder.RECEIPT).write_text(json.dumps(receipt))
+        return recipe, receipt
+
+    def test_invalid_runtime_receipt_or_artifact_is_rejected_before_any_output_or_execution(self):
+        arguments = self.arguments(True)
+        recipe, receipt = self.make_runtime_build(arguments)
+        receipt_file = arguments.runtime_build / runtime_builder.RECEIPT
+        runtime = arguments.runtime_build / "artifacts/runtime-x86_64"
+        original_runtime = runtime.read_bytes()
+        for invalid in ("recipe", "runtime", "source-material", "cleanup"):
+            with self.subTest(invalid=invalid):
+                candidate = dict(receipt)
+                if invalid == "recipe":
+                    candidate["recipe_sha256"] = "0" * 64
+                elif invalid == "runtime":
+                    runtime.write_bytes(original_runtime + b"unexpected runtime bytes")
+                elif invalid == "source-material":
+                    (arguments.runtime_build / "sources/unlisted").write_bytes(b"unlisted")
+                else:
+                    (arguments.runtime_build / "artifacts/cleanup-test.log").write_text("patched_runtime_cleanup=FAIL\n")
+                    candidate["artifacts"] = runtime_builder.inventory(arguments.runtime_build / "artifacts")
+                receipt_file.write_text(json.dumps(candidate))
+                native = types.SimpleNamespace(bundle_native=lambda _appdir: self.fail("native must not run"))
+                with patch.object(builder, "verify_tools", return_value=(self.root / "packager", self.root / "reference-runtime")), \
+                        patch.object(runtime_builder, "RECIPE", recipe), \
+                        patch.object(builder, "extract_checked", side_effect=AssertionError("must not extract")), \
+                        patch.object(builder.subprocess, "run", side_effect=AssertionError("must not execute")), \
+                        patch.object(builder, "run_owned", side_effect=AssertionError("must not package")), \
+                        patch.dict("sys.modules", {"appimage_native": native}), self.assertRaises(ValueError):
+                    builder.build(arguments)
+                self.assertFalse(arguments.output_dir.exists())
+                runtime.write_bytes(original_runtime)
+                unlisted = arguments.runtime_build / "sources/unlisted"
+                if unlisted.exists():
+                    unlisted.unlink()
+
+    def test_missing_runtime_build_does_not_fall_back_to_reference_runtime(self):
+        arguments = self.arguments(True)
+        with patch.object(builder, "verify_tools", return_value=(self.root / "packager", self.root / "reference-runtime")), \
+                patch.object(builder, "extract_checked", side_effect=AssertionError("must not extract")), \
+                patch.object(builder.subprocess, "run", side_effect=AssertionError("must not execute")), \
+                patch.object(builder, "run_owned", side_effect=AssertionError("must not package")), \
+                self.assertRaises(FileNotFoundError):
+            builder.build(arguments)
+        self.assertFalse(arguments.output_dir.exists())
 
 
 if __name__ == "__main__":
