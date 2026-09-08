@@ -2,7 +2,7 @@
 
 **Scoped result:** ARGB-guide ordinary-region, 1×1, pause-and-retarget movement,
 and full-monitor controller-recovery profiles pass the checks below. Ordinary,
-tiny, full-monitor and recovered-full GIF exports are verified.
+tiny, moved-region, full-monitor and recovered-full GIF exports are verified.
 The first two ordinary-region recordings are retained **failed shadow cases**.
 This is not certification of every drag position, recovery race, or compositor.
 
@@ -10,9 +10,11 @@ This is not certification of every drag position, recovery race, or compositor.
 
 These are private GNOME/Mutter **X11** software-rendered desktop runs, despite
 the historical `wayland-qa`/fixture filenames. The desktop is 1440×1000. Root
-operated the native UI; independent audits read checkpointed manifests, raw
-assets, existing screenshots and GIFs without opening project write sessions.
-No audit removed a lock, replaced an old artifact, or manipulated a live desktop.
+operated the native UI; initial independent pixel audits read checkpointed
+manifests, raw assets, existing screenshots and GIFs without opening project write
+sessions. A later, explicitly authorized product recovery of two dead-owner QA
+projects is recorded below. No lock was manually deleted, no existing artifact
+was overwritten, and that recovery did not manipulate a live desktop.
 
 Run-local evidence directories, not committed fixtures:
 
@@ -20,12 +22,15 @@ Run-local evidence directories, not committed fixtures:
   `cleanup_complete=true`; its bounded session ended after 1,800 seconds.
 - **L2:** `/tmp/gfs-wayland-qa.uzs2decy`. The 3,600-second bound ended the session;
   status is `stopped`, reason `bounded acceptance lifetime ended`, cleanup true.
-  The move project retained a stale lock: this was **not** normal product closure.
+  The move project initially retained a stale lock: this was **not** normal
+  product closure. The later product recovery below preserves that distinction.
 - **L3:** `/tmp/gfs-wayland-qa.cs7u0yif`. After the successful recovery run, root
   observed normal app `Alt+F4` exit 0 and CLI export exit 0, then requested the
   lab stop. Status is `stopped`, reason `lab stop requested`, cleanup true.
 
-All three supervisors now confirm cleanup. No audit performed lock takeover.
+All three supervisors confirm cleanup. Only L1 normal2 and L2 move subsequently
+used the product's explicit stale-lock takeover path, after verifying their old
+app and supervisor processes were absent.
 
 Successive development binaries must not be conflated:
 
@@ -51,11 +56,11 @@ Requested cadence was 10 FPS; actual counts are not inferred from that setting.
 | Case | Raw project | Region / raw frames | Checked outcome | GIF |
 |---|---|---|---|---|
 | normal1 | L1 `gif-from-screen.gfsproj` | `(45,114,640,420)` / 30 | **FAIL:** perimeter shadow | `split-normal.gif`, 30 frames, 3,000 ms, 240,919 B; encoding succeeds but source pixels fail |
-| normal2 | L1 `normal2-native.gfsproj` | `(45,114,640,420)` / 30 | **FAIL:** same shadow despite zero frame-extents hint | Not verified; stale lock retained, no takeover by this audit |
+| normal2 | L1 `normal2-native.gfsproj` | `(45,114,640,420)` / 30 | **FAIL:** same shadow despite zero frame-extents hint | Product-recovered `normal2-native.gif`, 30 images, 3,000 ms, 240,342 B; source-pixel failure remains |
 | full | L1 `full-native.gfsproj` | `(0,0,1440,1000)` / 27 | **PASS within mask/boundary scope below** | `full-native.gif`, 27 frames, 3,000 ms, 5,378,415 B |
 | normal3 | L2 `normal3-native.gfsproj` | `(45,114,640,420)` / 30 | **PASS:** ARGB guide; raw perimeter 0 diff | `normal3-native.gif`, 30 images, 3,000 ms, 181,971 B |
 | tiny | L2 `tiny-native.gfsproj` | `(100,300,1,1)` / 30 | **PASS:** every raw pixel equals fixture | `tiny-native.gif`, 1 coalesced image, 3,000 ms, 68 B |
-| move | L2 `move-native.gfsproj` | `(45,114)` → `(145,164)`, fixed 640×420 / 81 | **PASS within retained-origin/pixel scope below** | Pending product recovery/export; stale lock remains |
+| move | L2 `move-native.gfsproj` | `(45,114)` → `(145,164)`, fixed 640×420 / 81 | **PASS within retained-origin/pixel scope below** | Product-recovered `move-native.gif`, 81 images, 8,000 ms, 1,379,283 B |
 | full recovery | L3 `gif-from-screen.gfsproj` | `(0,0,1440,1000)` / 54 | **PASS:** Paused → Resume → timed completion | `recovered-full.gif`, 54 images, 6,000 ms, 10,756,009 B |
 
 ## Ordinary-region pixel oracle and shadow counterexamples
@@ -188,7 +193,49 @@ The independent pixel audit retained these exact scopes and exceptions:
 
 Raw metadata has no post-capture overlays, transforms, effects or render steps;
 the journal is checkpointed and empty. The supervisor later timed out with a
-stale project lock. **No move GIF has been validated and no lock was removed.**
+stale project lock. The later product recovery and GIF validation are described
+below; they do not turn the original bounded-stop exit into a normal app closure.
+
+## Explicit product recovery of the two stale QA locks
+
+This follow-up touched only `L1/output/normal2-native.gfsproj` and
+`L2/output/move-native.gfsproj`. Before takeover, both lab statuses were `stopped`
+with `cleanup_complete=true` and reason `bounded acceptance lifetime ended`.
+The frozen child records identified the old app processes with `alive=false` and
+exit code `-15`; `/proc/PID/stat` was absent for each app and all its recorded
+app/lab/outer supervisors:
+
+| Project | Old lock/app PID | Recorded app start ticks | App / lab / outer supervisor PIDs |
+|---|---:|---:|---|
+| normal2 | 2276016 | 158155600 | 2276008 / 2262695 / 2262674 |
+| move | 2372640 | 158543438 | 2372511 / 2317345 / 2317323 |
+
+A temporary, hardcoded QA caller at `/tmp/gfs-qa-product-recovery.b85doxwO`
+first validated each manifest with the domain model and all immutable asset
+lengths/BLAKE3 identities: normal2 had 31 assets / 32,258,304 bytes; move had
+82 assets / 87,093,504 bytes. It rechecked dead-process identities immediately
+before calling the existing `ActiveProject::open(..., LockPolicy::TakeOver)`.
+The product preserved each original lock as `project.lock.stale-1`, validated
+`AssetCheck::FullDigest`, and released its new ownership lock on normal Drop.
+Revisions remained 56 and 151, journal replay was clean with zero replayed
+records, and manifest/journal bytes were unchanged. No recovery code changed a
+manifest, frame, or lock manually.
+
+The ordinary product CLI then opened each project using its unchanged
+`FailIfPresent` export path and created the previously absent GIF destination:
+
+- normal2: 30 images, all 640×420; 30 × 100 ms = 3,000 ms; 240,342 bytes.
+- move: 81 images, all 640×420; 79 × 100 ms + 20 ms + 80 ms = 8,000 ms;
+  1,379,283 bytes.
+
+Every GIF image was decoded; encoded image rectangles also cover the complete
+640×420 canvas and both loop values are zero. Both `project.lock` files were
+absent after CLI completion, both preserved locks retained their original
+bytes, and manifest/asset integrity remained unchanged. The CLI executable
+SHA-256 was `a2f056d98fdb89d4a30db8ca4593fd5168f688f91e358786121768d2d6e185bc`.
+This closes the two pending product recovery/export checks, not the original
+normal2 shadow defect, unrelated projects' locks, or broader crash-recovery and
+compositor gates. GIF quantization is not a claim of raw/PNG byte equality.
 
 ## Full-monitor restoration during recording
 
@@ -234,9 +281,13 @@ This closes this software-Mutter recovery profile, not every WM or recovery race
 | move manifest | `ffbe2212e697e5b0037b8e8f2eccf9b857cc7f77a0de6a7874a78f5d8bde8b91` |
 | full-recovery manifest | `eda9734fe4f57e43632a5a8523c69b16bba5d8e1fdafd25f7a56326a682c2b98` |
 | `split-normal.gif` | `51b4e0ab0a81ffd151b6275e85bc72242b609b9556609903a334c7bccdb1ff14` |
+| `normal2-native.gif` | `c43dac2bc0cb83b59547539b2bf43cd74a65a43ef270bf89b6b20bcec55356fb` |
 | `full-native.gif` | `259d637fbb2d6108866757ea64df4a90776c918f1b14694d9c8b0d7145aaf002` |
 | `normal3-native.gif` | `07338fb0dae6e043f0dd623b38b31bc7039f1c7736526a5784f16385c973925f` |
 | `tiny-native.gif` | `b8e6d566457afdd6c165c064a574a136c3b4c14725a2a69062d9cf2063c49852` |
+| `move-native.gif` | `01a58283206cc7ac5deedaab53d401242650e85858038579f464c0a117b616f5` |
+| L1 normal2 `project.lock.stale-1` | `db239e1c48a5eba2db4429475d0b2577424bb2ef7e86646edf856625bffc7504` |
+| L2 move `project.lock.stale-1` | `bad62d64ac272ecb8e18b7792c1c80298dbe133589696969d2920175f14c0a30` |
 | `recovered-full.gif` | `2d229a376d8a748bbc8e090b47691163c9f8d6d7a1dba6947c6714effdd9404a` |
 | L1 `10-full-active.png` | `0fcc156363331035a4381448111fa6760be6442dec4795fdd55cfcdd877b6502` |
 | L2 `02-argb-ready.png` | `e86f2206274a924b71f26fa563536b0efe5d556d67dc58e5228ca4ea35682173` |
@@ -264,6 +315,7 @@ This closes this software-Mutter recovery profile, not every WM or recovery race
   capture `R` and the current guide strips. Its cause is unproven and remains a
   separate visible UI artifact; it neither invalidates the measured raw-edge
   pass nor becomes resolved merely because the later editor covers that area.
-- Move GIF export through the product's stale-lock recovery flow is still pending;
-  supervisor cleanup did not normally close that project. The broader
-  [Linux release gates](LINUX-STATUS.md) remain separate follow-up work.
+- The two explicit dead-owner recoveries above do not establish every
+  crash/power-loss or concurrent-owner race. Supervisor cleanup was not normal
+  product closure. The broader [Linux release gates](LINUX-STATUS.md) remain
+  separate follow-up work.
