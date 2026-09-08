@@ -46,6 +46,10 @@ The [pinned shape audit](SHAPE-PARITY-2026-09-09.md) identifies Triangle, rounde
 rectangles and direct multi-object manipulation as actual remaining upstream
 features. Dormant dash properties are not mislabeled as an upstream GUI feature;
 existing Line/Arrow project semantics must remain intact.
+Native advanced-editor acceptance and the resulting inspector layout fixes are
+recorded [here](ADVANCED-EDITOR-QA-2026-09-09.md), including stopped-owner recovery
+and reopened GIF equality. This does not close the remaining shape interaction,
+language or physical desktop matrix.
 
 ## Playback timing: implemented, bounded native manual acceptance recorded
 

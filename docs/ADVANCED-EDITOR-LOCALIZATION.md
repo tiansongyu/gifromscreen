@@ -79,6 +79,9 @@ properties and groups RGBA channels. Six additional tests verify actual label/
 widget geometry, literal numeric edits, locale-independent hit IDs and reachable
 Add/Commit actions through the existing host scroll area at narrow sizes and large
 fonts. This fixes field association without changing parsing or authored values.
+The [native acceptance record](ADVANCED-EDITOR-QA-2026-09-09.md) documents the
+actual defect, corrected controls, layer visibility, signed border, checkpoint/
+compaction, stopped-owner recovery and byte-identical reopened GIFs.
 
 The remaining language/tool and physical desktop gates stay in the
 [localization plan](LOCALIZATION-PLAN.md) and [Linux ledger](LINUX-STATUS.md).
