@@ -23,10 +23,14 @@ locked while a decode is running, and stale results cannot attach themselves to
 a different target. Frame ownership, source pixels, undo and project writes are
 not changed by language switching.
 
-Verification on explicit Rust 1.98.0 and 1.88.0: watermark tests 12/12, localization
+Verification on explicit Rust 1.98.0 and 1.88.0: watermark tests 13/13, localization
 tests 42/42. New tests exercise actual egui button input, disabled empty selection,
 480×640 with enlarged UI, focused-field locking while running, en→zh→en stable
 field values/widget identities/focus, retained typed notices and literal paths.
+The follow-up layout fix gives all ten fields separate label/value rows with
+stable IDs. A real 480-pixel viewport at 1.5 UI zoom checks every field's paired
+rectangles, viewport boundaries, hover hit targets and cross-language identity.
+No extra translations or image-rendering semantics changed in that fix.
 The existing seven asynchronous snapshot, stale-anchor and durable-edit tests
 still pass. Strict Clippy and the embedded-font glyph coverage checks pass.
 This is automated evidence, not a new native desktop/GIF acceptance record.

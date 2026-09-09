@@ -116,49 +116,8 @@ pub(crate) fn show_watermark_ui(
             ui.weak(localizer.text(Message::WatermarkFormatsHint));
         });
         ui.add_enabled_ui(!running, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(localizer.text(Message::WatermarkImagePath));
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.path)
-                        .id_salt("watermark_path")
-                        .desired_width(360.0)
-                        .hint_text("/path/to/logo.png"),
-                );
-                ui.label(localizer.text(Message::EditorOverlayName));
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.name)
-                        .id_salt("watermark_name")
-                        .desired_width(110.0),
-                );
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.label("X/Y/W/H");
-                ui.add(egui::DragValue::new(&mut state.x));
-                ui.add(egui::DragValue::new(&mut state.y));
-                ui.add(egui::DragValue::new(&mut state.width));
-                ui.add(egui::DragValue::new(&mut state.height));
-                ui.weak(localizer.text(Message::WatermarkSourceSizeHint));
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.label(localizer.text(Message::WatermarkImageOpacity));
-                ui.add(egui::DragValue::new(&mut state.item_opacity).range(1..=u8::MAX));
-                ui.label(localizer.text(Message::EditorTrackOpacity));
-                ui.add(egui::DragValue::new(&mut state.track_opacity).range(1..=u8::MAX));
-                ui.label("Z");
-                ui.add(egui::DragValue::new(&mut state.z_index));
-                ui.label(localizer.text(Message::EditorOverlayBlend));
-                egui::ComboBox::from_id_salt("watermark_blend")
-                    .selected_text(blend_label(state.blend_mode, localizer))
-                    .show_ui(ui, |ui| {
-                        for blend in [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen] {
-                            ui.selectable_value(
-                                &mut state.blend_mode,
-                                blend,
-                                blend_label(blend, localizer),
-                            );
-                        }
-                    });
-            });
+            show_watermark_fields(ui, state, localizer);
+            ui.weak(localizer.text(Message::WatermarkSourceSizeHint));
         });
         if running {
             ui.horizontal(|ui| {
@@ -179,6 +138,125 @@ pub(crate) fn show_watermark_ui(
         }
     });
     action
+}
+
+fn show_watermark_fields(ui: &mut egui::Ui, state: &mut WatermarkUiState, localizer: Localizer) {
+    let value_width = watermark_value_width(ui, localizer);
+    egui::Grid::new("watermark_fields")
+        .num_columns(2)
+        .min_col_width(0.0)
+        .show(ui, |ui| {
+            show_watermark_text_fields(ui, state, value_width, localizer);
+            show_watermark_numeric_fields(ui, state, localizer);
+            ui.label(localizer.text(Message::EditorOverlayBlend));
+            egui::ComboBox::from_id_salt("watermark_blend")
+                .selected_text(blend_label(state.blend_mode, localizer))
+                .show_ui(ui, |ui| {
+                    for blend in [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen] {
+                        ui.selectable_value(
+                            &mut state.blend_mode,
+                            blend,
+                            blend_label(blend, localizer),
+                        );
+                    }
+                });
+            ui.end_row();
+        });
+}
+
+fn watermark_value_width(ui: &egui::Ui, localizer: Localizer) -> f32 {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let label_width = [
+        Message::WatermarkImagePath,
+        Message::EditorOverlayName,
+        Message::CropFieldX,
+        Message::CropFieldY,
+        Message::RecorderWidth,
+        Message::RecorderHeight,
+        Message::WatermarkImageOpacity,
+        Message::EditorTrackOpacity,
+        Message::EditorOverlayBlend,
+    ]
+    .map(|message| {
+        ui.painter()
+            .layout_no_wrap(
+                localizer.text(message).to_owned(),
+                font.clone(),
+                ui.visuals().text_color(),
+            )
+            .size()
+            .x
+    })
+    .into_iter()
+    .fold(0.0_f32, f32::max);
+    (ui.available_width() - label_width - ui.spacing().item_spacing.x).max(1.0)
+}
+
+fn show_watermark_text_fields(
+    ui: &mut egui::Ui,
+    state: &mut WatermarkUiState,
+    value_width: f32,
+    localizer: Localizer,
+) {
+    ui.label(localizer.text(Message::WatermarkImagePath));
+    ui.add(
+        egui::TextEdit::singleline(&mut state.path)
+            .id_salt("watermark_path")
+            .desired_width(value_width)
+            .hint_text("/path/to/logo.png"),
+    );
+    ui.end_row();
+    ui.label(localizer.text(Message::EditorOverlayName));
+    ui.add(
+        egui::TextEdit::singleline(&mut state.name)
+            .id_salt("watermark_name")
+            .desired_width(value_width),
+    );
+    ui.end_row();
+}
+
+fn show_watermark_numeric_fields(
+    ui: &mut egui::Ui,
+    state: &mut WatermarkUiState,
+    localizer: Localizer,
+) {
+    for (id, label, value) in [
+        ("watermark_x", Message::CropFieldX, &mut state.x),
+        ("watermark_y", Message::CropFieldY, &mut state.y),
+        ("watermark_width", Message::RecorderWidth, &mut state.width),
+        (
+            "watermark_height",
+            Message::RecorderHeight,
+            &mut state.height,
+        ),
+    ] {
+        ui.label(localizer.text(label));
+        ui.push_id(id, |ui| ui.add(egui::DragValue::new(value)));
+        ui.end_row();
+    }
+    for (id, label, value) in [
+        (
+            "watermark_item_opacity",
+            Message::WatermarkImageOpacity,
+            &mut state.item_opacity,
+        ),
+        (
+            "watermark_track_opacity",
+            Message::EditorTrackOpacity,
+            &mut state.track_opacity,
+        ),
+    ] {
+        ui.label(localizer.text(label));
+        ui.push_id(id, |ui| {
+            ui.add(egui::DragValue::new(value).range(1..=u8::MAX))
+        });
+        ui.end_row();
+    }
+    ui.label("Z");
+    ui.push_id("watermark_z", |ui| {
+        ui.add(egui::DragValue::new(&mut state.z_index))
+    });
+    ui.end_row();
 }
 
 pub(crate) fn build_raster_edit(
@@ -312,26 +390,33 @@ mod tests {
         events: Vec<egui::Event>,
     ) -> (egui::FullOutput, WatermarkUiAction) {
         let mut action = WatermarkUiAction::None;
-        let output = context.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(480.0, 640.0),
-                )),
-                events,
-                focused: true,
-                ..Default::default()
-            },
-            |context| {
-                egui::CentralPanel::default().show(context, |ui| {
-                    action = show_watermark_ui(ui, state, job, selected, language(tag));
-                });
-            },
-        );
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(480.0, 640.0) / context.zoom_factor(),
+            )),
+            events,
+            focused: true,
+            ..Default::default()
+        };
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .native_pixels_per_point = Some(1.0);
+        let output = context.run(input, |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                action = show_watermark_ui(ui, state, job, selected, language(tag));
+            });
+        });
         (output, action)
     }
 
     fn label_position(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
+        label_rect(output, label).center()
+    }
+
+    fn label_rect(output: &egui::FullOutput, label: &str) -> egui::Rect {
         output
             .shapes
             .iter()
@@ -341,7 +426,7 @@ mod tests {
                 {
                     let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
                     assert!(shape.clip_rect.contains_rect(rect), "clipped {label}");
-                    Some(rect.center())
+                    Some(rect)
                 } else {
                     None
                 }
@@ -373,6 +458,174 @@ mod tests {
             track_opacity: 234,
             z_index: -2,
             blend_mode: BlendMode::Screen,
+        }
+    }
+
+    fn paired_fields(tag: &str, state: &WatermarkUiState) -> Vec<(String, String)> {
+        let localizer = language(tag);
+        [
+            (
+                localizer.text(Message::WatermarkImagePath),
+                state.path.clone(),
+            ),
+            (
+                localizer.text(Message::EditorOverlayName),
+                state.name.clone(),
+            ),
+            (localizer.text(Message::CropFieldX), state.x.to_string()),
+            (localizer.text(Message::CropFieldY), state.y.to_string()),
+            (
+                localizer.text(Message::RecorderWidth),
+                state.width.to_string(),
+            ),
+            (
+                localizer.text(Message::RecorderHeight),
+                state.height.to_string(),
+            ),
+            (
+                localizer.text(Message::WatermarkImageOpacity),
+                state.item_opacity.to_string(),
+            ),
+            (
+                localizer.text(Message::EditorTrackOpacity),
+                state.track_opacity.to_string(),
+            ),
+            ("Z", state.z_index.to_string()),
+            (
+                localizer.text(Message::EditorOverlayBlend),
+                blend_label(state.blend_mode, localizer).into(),
+            ),
+        ]
+        .into_iter()
+        .map(|(label, value)| (label.into(), value))
+        .collect()
+    }
+
+    fn verify_field_pairs(
+        context: &egui::Context,
+        state: &mut WatermarkUiState,
+        tag: &str,
+    ) -> Vec<egui::Id> {
+        let mut ids = Vec::new();
+        let mut previous_row = 0.0;
+        for (label, value) in paired_fields(tag, state) {
+            let (output, _) = frame(
+                context,
+                state,
+                tag,
+                WatermarkDecodeJobState::Idle,
+                true,
+                vec![],
+            );
+            let label = label_rect(&output, &label);
+            let value = label_rect(&output, &value);
+            frame(
+                context,
+                state,
+                tag,
+                WatermarkDecodeJobState::Idle,
+                true,
+                vec![egui::Event::PointerMoved(value.center())],
+            );
+            let hovered: Vec<_> =
+                context.interaction_snapshot(|state| state.hovered.iter().copied().collect());
+            let response = hovered
+                .into_iter()
+                .filter_map(|id| context.read_response(id))
+                .filter(|response| {
+                    response.sense.senses_click() && response.rect.contains(value.center())
+                })
+                .min_by(|left, right| left.rect.area().total_cmp(&right.rect.area()))
+                .expect("pointer actually hits a field control");
+            assert!(
+                response.rect.right() <= 480.0 / context.zoom_factor(),
+                "input overflows viewport"
+            );
+            assert!(
+                label.right() < response.rect.left(),
+                "label and input must be separate columns"
+            );
+            assert!(
+                label.y_range().contains(response.rect.center().y)
+                    && response.rect.y_range().contains(label.center().y),
+                "label and input must share one row: {label:?} / {:?}",
+                response.rect
+            );
+            assert!(
+                label.top() >= previous_row,
+                "each label-value pair has a distinct row"
+            );
+            previous_row = response.rect.bottom();
+            ids.push(response.id);
+        }
+        ids
+    }
+
+    #[test]
+    fn watermark_grid_pairs_every_field_at_480_native_pixels_and_real_zoom() {
+        for (zoom, font_scale) in [(1.0, 1.0), (1.5, 1.0), (1.0, 1.5)] {
+            let context = context(font_scale);
+            context.set_zoom_factor(zoom);
+            let mut state = WatermarkUiState {
+                path: "用户/{path}.png".into(),
+                name: "标记{name}".into(),
+                ..settings()
+            };
+            let before = state.clone();
+            let mut previous = None;
+            for tag in ["en", "zh", "en"] {
+                for _ in 0..3 {
+                    frame(
+                        &context,
+                        &mut state,
+                        tag,
+                        WatermarkDecodeJobState::Idle,
+                        true,
+                        vec![],
+                    );
+                }
+                assert_eq!(context.pixels_per_point().to_bits(), zoom.to_bits());
+                let ids = verify_field_pairs(&context, &mut state, tag);
+                if let Some(previous) = &previous {
+                    assert_eq!(&ids, previous);
+                } else {
+                    previous = Some(ids);
+                }
+                let (output, _) = frame(
+                    &context,
+                    &mut state,
+                    tag,
+                    WatermarkDecodeJobState::Idle,
+                    true,
+                    vec![],
+                );
+                label_position(
+                    &output,
+                    language(tag).text(Message::WatermarkSourceSizeHint),
+                );
+                let position = label_position(&output, language(tag).text(Message::WatermarkAdd));
+                frame(
+                    &context,
+                    &mut state,
+                    tag,
+                    WatermarkDecodeJobState::Idle,
+                    true,
+                    pointer(position, true),
+                );
+                assert_eq!(
+                    frame(
+                        &context,
+                        &mut state,
+                        tag,
+                        WatermarkDecodeJobState::Idle,
+                        true,
+                        pointer(position, false)
+                    )
+                    .1,
+                    WatermarkUiAction::Start
+                );
+                assert_eq!(state, before);
+            }
         }
     }
 
@@ -494,7 +747,14 @@ mod tests {
 
     #[test]
     fn running_watermark_cannot_edit_focused_form_or_trigger_a_second_start() {
+        for zoom in [1.0, 1.5] {
+            verify_running_form(zoom);
+        }
+    }
+
+    fn verify_running_form(zoom: f32) {
         let context = context(1.0);
+        context.set_zoom_factor(zoom);
         let mut state = settings();
         state.name = "水印".into();
         frame(
@@ -547,7 +807,14 @@ mod tests {
 
     #[test]
     fn focused_watermark_name_remains_editable_after_language_switch() {
+        for zoom in [1.0, 1.5] {
+            verify_focused_name(zoom);
+        }
+    }
+
+    fn verify_focused_name(zoom: f32) {
         let context = context(1.0);
+        context.set_zoom_factor(zoom);
         let mut state = WatermarkUiState {
             name: "Logo".into(),
             ..settings()
