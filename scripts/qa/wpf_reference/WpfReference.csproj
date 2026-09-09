@@ -24,6 +24,7 @@
     <GetFileHash Files="$(GFS_STG_SHAPES_ROOT)/ScreenToGif/Controls/Shapes/Arrow.cs" Algorithm="SHA256">
       <Output TaskParameter="Items" ItemName="PinnedArrow" />
     </GetFileHash>
+    <Message Importance="High" Text="Pinned source bytes: @(PinnedTriangle->'%(Identity): %(FileHash)'); @(PinnedArrow->'%(Identity): %(FileHash)')" />
     <Error Condition="'%(PinnedTriangle.FileHash)' != '6C82BDBB0E92D649AA1529155424675AE44A35778204674FDCFB4C52B16FED85'" Text="Pinned Triangle.cs hash mismatch." />
     <Error Condition="'%(PinnedArrow.FileHash)' != 'B0F910590B942C9F7E2F0619CC50DB8E6E7DA411BA38A18B5063789B2BC5172B'" Text="Pinned Arrow.cs hash mismatch." />
   </Target>

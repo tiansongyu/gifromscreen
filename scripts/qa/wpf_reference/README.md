@@ -33,7 +33,10 @@ Both MSBuild and runtime verify their exact SHA-256; the source hashes are also
 bound into the output provenance under fixed virtual paths. Set
 `GFS_STG_SHAPES_ROOT` to this absolute checkout path for a local Windows run.
 The repository workflow checks it out with LF bytes and without persisted
-credentials. These ScreenToGif sources retain their upstream MS-PL license;
+credentials. Both `core.autocrlf=false` and `core.eol=lf` are scoped to this
+checkout: the upstream `* text=auto` attributes can otherwise select native
+Windows line endings. MSBuild prints the observed digests before enforcing them.
+These ScreenToGif sources retain their upstream MS-PL license;
 they are used only by this verification executable, not the Linux product.
 
 The C# generator independently executes the 96-DPI geometry and drawing order

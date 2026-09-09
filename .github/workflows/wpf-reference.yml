@@ -49,9 +49,11 @@ jobs:
       - name: Check out the exact original shape definitions
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         env:
-          GIT_CONFIG_COUNT: 1
+          GIT_CONFIG_COUNT: 2
           GIT_CONFIG_KEY_0: core.autocrlf
           GIT_CONFIG_VALUE_0: 'false'
+          GIT_CONFIG_KEY_1: core.eol
+          GIT_CONFIG_VALUE_1: lf
         with:
           repository: NickeManarin/ScreenToGif
           ref: a4d0a67c2131cd048ceec86cd40afc2f1a06f2fd
