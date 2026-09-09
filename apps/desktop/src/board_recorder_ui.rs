@@ -199,7 +199,7 @@ impl BoardRecorderTool {
                             .range(1..=256)
                             .suffix(" px"),
                     );
-                    ui.color_edit_button_srgba_unmultiplied(&mut self.color);
+                    edit_color(ui, &mut self.color);
                 });
             },
         );
@@ -243,7 +243,7 @@ impl BoardRecorderTool {
                 ui.add(egui::DragValue::new(&mut self.width).range(1..=2048).prefix("Width "));
                 ui.add(egui::DragValue::new(&mut self.height).range(1..=2048).prefix("Height "));
                 ui.checkbox(&mut self.transparent, "Transparent background");
-                ui.add_enabled_ui(!self.transparent, |ui| { ui.color_edit_button_srgba_unmultiplied(&mut self.background); });
+                ui.add_enabled_ui(!self.transparent, |ui| { edit_color(ui, &mut self.background); });
                 if ui.button("Reset canvas").clicked() && let Err(error) = self.reset_canvas() { self.notice = Some(error); }
             });
             ui.weak("Reset canvas applies size/background changes and clears the current unrecorded drawing.");
@@ -574,6 +574,17 @@ impl BoardRecorderTool {
     }
 }
 
+fn edit_color(ui: &mut egui::Ui, value: &mut [u8; 4]) -> egui::Response {
+    // The picker round-trips unmultiplied sRGBA even without an edit. Keep
+    // authored bytes, including transparent RGB, unless it reports a change.
+    let mut edited = *value;
+    let response = ui.color_edit_button_srgba_unmultiplied(&mut edited);
+    if response.changed() {
+        *value = edited;
+    }
+    response
+}
+
 fn rgba(color: [u8; 4]) -> Rgba {
     Rgba {
         red: color[0],
@@ -641,6 +652,290 @@ mod tests {
             }
             assert!(Instant::now() < deadline, "board snapshot was not written");
             thread::yield_now();
+        }
+    }
+
+    fn board_frame(
+        context: &egui::Context,
+        tool: &mut BoardRecorderTool,
+        enabled: bool,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(700.0, 650.0),
+                )),
+                events,
+                ..egui::RawInput::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    ui.add_enabled_ui(enabled, |ui| tool.show(ui));
+                });
+                if context.current_pass_index() == 0 {
+                    context.request_discard("board color redraw regression");
+                }
+            },
+        )
+    }
+
+    fn painted_text(output: &egui::FullOutput, wanted: &str) -> egui::Rect {
+        output
+            .shapes
+            .iter()
+            .find_map(|clipped| {
+                let egui::Shape::Text(text) = &clipped.shape else {
+                    return None;
+                };
+                (text.galley.text() == wanted)
+                    .then(|| text.galley.rect.translate(text.pos.to_vec2()))
+            })
+            .unwrap_or_else(|| panic!("missing real widget text {wanted}"))
+    }
+
+    fn pointer_events(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    #[test]
+    fn board_no_input_color_values_and_initial_pixels_survive_multiple_passes_and_focus() {
+        for (enabled, focus) in [(true, false), (false, false), (true, true)] {
+            for original in [[4, 5, 6, 123], [4, 5, 6, 0]] {
+                let context = egui::Context::default();
+                let mut tool = BoardRecorderTool {
+                    width: 8,
+                    height: 8,
+                    color: original,
+                    background: original,
+                    target: "Untouched board target".into(),
+                    ..BoardRecorderTool::default()
+                };
+                if focus {
+                    let output = board_frame(&context, &mut tool, true, Vec::new());
+                    let target = painted_text(&output, "Untouched board target").center();
+                    for pressed in [true, false] {
+                        board_frame(&context, &mut tool, true, pointer_events(target, pressed));
+                    }
+                    assert!(context.memory(egui::Memory::focused).is_some());
+                    tool.color = original;
+                    tool.background = original;
+                    tool.canvas = None;
+                }
+                let focused = context.memory(egui::Memory::focused);
+                let expected =
+                    BoardCanvas::new(PhysicalSize::new(8, 8).unwrap(), rgba(original)).unwrap();
+                for _ in 0..4 {
+                    board_frame(&context, &mut tool, enabled, Vec::new());
+                    assert_eq!(
+                        (tool.color, tool.background),
+                        (original, original),
+                        "enabled={enabled}, focus={focus}"
+                    );
+                    assert_eq!(tool.canvas.as_ref().unwrap().pixels(), expected.pixels());
+                    assert_eq!(
+                        tool.canvas.as_ref().unwrap().revision(),
+                        expected.revision()
+                    );
+                    assert!(tool.writer.is_none());
+                    if focus {
+                        assert_eq!(context.memory(egui::Memory::focused), focused);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transparent_disabled_background_retains_its_unapplied_color() {
+        let context = egui::Context::default();
+        let background = [4, 5, 6, 123];
+        let mut tool = BoardRecorderTool {
+            width: 8,
+            height: 8,
+            transparent: true,
+            background,
+            ..BoardRecorderTool::default()
+        };
+        for _ in 0..4 {
+            board_frame(&context, &mut tool, true, Vec::new());
+            assert_eq!(tool.background, background);
+            assert!(
+                tool.canvas
+                    .as_ref()
+                    .unwrap()
+                    .pixels()
+                    .iter()
+                    .all(|channel| *channel == 0)
+            );
+        }
+    }
+
+    fn picker_frame(
+        context: &egui::Context,
+        color: &mut [u8; 4],
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, egui::Response) {
+        let mut response = None;
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(500.0, 600.0),
+                )),
+                events,
+                ..egui::RawInput::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    response = Some(edit_color(ui, color));
+                });
+            },
+        );
+        (output, response.unwrap())
+    }
+
+    fn edit_picker_number(
+        context: &egui::Context,
+        color: &mut [u8; 4],
+        label: &str,
+        replacement: &str,
+    ) {
+        let (output, _) = picker_frame(context, color, Vec::new());
+        let position = painted_text(&output, label).center();
+        for pressed in [true, false] {
+            picker_frame(context, color, pointer_events(position, pressed));
+        }
+        let (_, response) = picker_frame(
+            context,
+            color,
+            vec![
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+                },
+                egui::Event::Text(replacement.into()),
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(
+            response.changed(),
+            "real picker edit must report and commit its change"
+        );
+    }
+
+    #[test]
+    fn real_color_picker_still_opens_and_commits_rgb_and_alpha_edits() {
+        let context = egui::Context::default();
+        context.style_mut(|style| {
+            style.visuals.numeric_color_space = egui::style::NumericColorSpace::GammaByte;
+        });
+        let mut color = [64, 128, 192, 255];
+        for _ in 0..2 {
+            picker_frame(&context, &mut color, Vec::new());
+        }
+        let button = picker_frame(&context, &mut color, Vec::new())
+            .1
+            .rect
+            .center();
+        for pressed in [true, false] {
+            picker_frame(&context, &mut color, pointer_events(button, pressed));
+        }
+        for _ in 0..2 {
+            picker_frame(&context, &mut color, Vec::new());
+        }
+        edit_picker_number(&context, &mut color, "R 64", "200");
+        assert_eq!(color, [200, 128, 192, 255]);
+        edit_picker_number(&context, &mut color, "A 255", "128");
+        assert_eq!(color[3], 128);
+        let edited = color;
+        for _ in 0..4 {
+            picker_frame(&context, &mut color, Vec::new());
+            assert_eq!(
+                color, edited,
+                "an open picker must keep its completed edit stable"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_and_recording_redraws_keep_first_background_and_later_brush_frames_exact() {
+        for brush in [BrushChoice::Pen, BrushChoice::Highlighter] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut tool = tool(directory.path(), BoardCadence::Stroke);
+            tool.width = 8;
+            tool.height = 8;
+            tool.canvas = None;
+            tool.color = [4, 5, 6, 123];
+            tool.background = [7, 11, 13, 0];
+            tool.brush = brush;
+            let context = egui::Context::default();
+            let mut expected =
+                BoardCanvas::new(PhysicalSize::new(8, 8).unwrap(), rgba(tool.background)).unwrap();
+            let blank = expected.pixels().to_vec();
+            for _ in 0..3 {
+                board_frame(&context, &mut tool, true, Vec::new());
+            }
+            assert_eq!(tool.canvas.as_ref().unwrap().pixels(), blank);
+            let start = Instant::now();
+            tool.start(start).unwrap();
+            for _ in 0..3 {
+                board_frame(&context, &mut tool, true, Vec::new());
+            }
+            assert_eq!(
+                (tool.color, tool.background),
+                ([4, 5, 6, 123], [7, 11, 13, 0])
+            );
+            let first = BoardPoint { x: 2, y: 2 };
+            let last = BoardPoint { x: 6, y: 6 };
+            let reference_brush = if brush == BrushChoice::Pen {
+                BoardBrush::Pen(rgba([4, 5, 6, 123]))
+            } else {
+                BoardBrush::Highlighter(rgba([4, 5, 6, 123]))
+            };
+            expected
+                .begin(first, reference_brush, tool.brush_width)
+                .unwrap();
+            expected.extend(last).unwrap();
+            expected.end();
+            tool.begin_stroke(first);
+            tool.extend_stroke(last);
+            tool.finish_stroke(start + Duration::from_millis(100));
+            pending_written(&mut tool, start + Duration::from_millis(100), 2);
+            assert_eq!(tool.canvas.as_ref().unwrap().pixels(), expected.pixels());
+            tool.stop(start + Duration::from_millis(200));
+            let project = saved(&mut tool);
+            let frames = &project.manifest().timeline.frames;
+            assert_eq!(
+                frames
+                    .iter()
+                    .map(|frame| frame.duration.get())
+                    .collect::<Vec<_>>(),
+                [100_000, 100_000]
+            );
+            assert_eq!(project.assets().read(frames[0].asset_id).unwrap(), blank);
+            assert_eq!(
+                project.assets().read(frames[1].asset_id).unwrap(),
+                expected.pixels()
+            );
         }
     }
 
