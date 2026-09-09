@@ -50,6 +50,11 @@ The [watermark native acceptance](WATERMARK-QA-2026-09-09.md) covers the paired
 form, retained translated validation, persisted language, narrow 150% UI,
 gapped-frame authoring and undo/redo/reopen. Only frames 1 and 3 change and the
 GUI/CLI GIFs match exactly; the isolated lab was stopped and verified clean.
+The subsequent [text/title slice](TEXT-TITLE-LOCALIZATION.md) localizes the
+application-owned Add/Replace/Title workflows and retained text/font notices.
+It also fixes a real idle color-picker byte drift. The catalog is now 848 en/zh
+messages; shared picker internals, other tools and the other 27 translations
+remain open. This is newer than the frozen Preview 3 package.
 The [pinned shape audit](SHAPE-PARITY-2026-09-09.md) identifies Triangle, rounded
 rectangles and direct multi-object manipulation as actual remaining upstream
 features. Dormant dash properties are not mislabeled as an upstream GUI feature;

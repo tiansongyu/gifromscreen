@@ -13,7 +13,7 @@ fn localizer(tag: &str) -> Localizer {
 
 #[test]
 fn initial_key_ids_are_unique_and_both_catalogs_have_every_declared_message() {
-    assert_eq!(ALL_MESSAGES.len(), 796);
+    assert_eq!(ALL_MESSAGES.len(), 848);
     let ids: BTreeSet<_> = ALL_MESSAGES.iter().map(|message| message.id()).collect();
     assert_eq!(ids.len(), ALL_MESSAGES.len());
     for tag in ["en", "zh"] {
@@ -79,6 +79,62 @@ fn watermark_dimensions_paths_and_diagnostics_have_literal_named_parameters() {
             ),
             Err(FormatError::UnknownArgument)
         );
+    }
+}
+
+#[test]
+fn saved_text_group_labels_preserve_names_counts_and_typed_validation_parameters() {
+    let name = "用户 {layer}/{name}/{count} Text";
+    for message in [
+        Message::TextSavedFrame,
+        Message::TextSavedFrames,
+        Message::TextSavedItem,
+        Message::TextSavedItems,
+    ] {
+        assert_eq!(message.parameters(), &["layer", "name", "count"]);
+        for tag in ["en", "zh"] {
+            let text = localizer(tag)
+                .format(message, &[("layer", "65"), ("name", name), ("count", "3")])
+                .unwrap();
+            assert!(text.contains(name) && text.contains("65") && text.contains('3'));
+        }
+    }
+    assert_eq!(
+        localizer("en")
+            .format(
+                Message::TextSavedFrames,
+                &[("layer", "65"), ("name", name), ("count", "3")]
+            )
+            .unwrap(),
+        format!("Layer 65 · {name} · 3 frames")
+    );
+    for tag in ["en", "zh"] {
+        for message in [Message::TextFontSizeRange, Message::TextDimensions] {
+            assert!(
+                localizer(tag)
+                    .format(message, &[("minimum", "1"), ("maximum", "512")])
+                    .unwrap()
+                    .contains("512")
+            );
+            assert_eq!(
+                localizer(tag).format(message, &[("最小值", "1"), ("maximum", "512")]),
+                Err(FormatError::UnknownArgument)
+            );
+        }
+        let raw = "Enter some text first. /用户/{error}/{path}";
+        for message in [
+            Message::TextStartFailed,
+            Message::TextSaveFailed,
+            Message::TextLoadFailed,
+            Message::TextWorkerStartFailed,
+        ] {
+            assert!(
+                localizer(tag)
+                    .format(message, &[("error", raw)])
+                    .unwrap()
+                    .contains(raw)
+            );
+        }
     }
 }
 

@@ -13,8 +13,10 @@ also include typed parameter-validation, preset and completion notices. Typed
 notices re-render at presentation time. [Advanced editor controls](ADVANCED-EDITOR-LOCALIZATION.md)
 extend this to effects, shapes/drawing/layers, project storage and statistics.
 The [image-watermark slice](WATERMARK-LOCALIZATION.md) now covers its form,
-typed validation and retained asynchronous outcomes. Text/title tool bodies,
-import forms and other detailed errors still require migration; see
+typed validation and retained asynchronous outcomes. The [text/title slice](TEXT-TITLE-LOCALIZATION.md)
+adds caption creation, saved-text editing, title insertion and typed text/font
+errors, bringing the en/zh catalog to 848 messages. Shared toolkit color-picker
+tooltips, import forms and other tool bodies still require migration; see
 [editor/notice scope](EDITOR-LOCALIZATION.md).
 The target includes the entire application-owned UI, not merely language selection.
 See [the first desktop acceptance record](LOCALIZATION-QA-2026-09-08.md).

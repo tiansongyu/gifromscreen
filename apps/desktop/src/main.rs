@@ -2271,7 +2271,7 @@ impl GifFromScreenApp {
             );
             results.extend(tool_results);
             if notice.is_some() {
-                self.notice = notice.map(Notice::from);
+                self.notice = notice;
             }
             watermark_action = action;
         };
@@ -3988,8 +3988,9 @@ impl GifFromScreenApp {
     }
 
     fn receive_text_messages(&mut self) {
-        if let Some(notice) = self.text_overlay.poll(self.editor_workspace.as_mut()) {
-            self.notice = Some(notice.into());
+        if let Some(mut notice) = self.text_overlay.poll(self.editor_workspace.as_mut()) {
+            notice.refresh(self.language_settings.localizer());
+            self.notice = Some(notice);
         }
     }
 
@@ -4104,7 +4105,7 @@ fn show_editor_inspector(
     watermark: &mut WatermarkUiState,
     watermark_job: WatermarkDecodeJobState,
     localizer: Localizer,
-) -> (Vec<EditorUiResult>, Option<String>, WatermarkUiAction) {
+) -> (Vec<EditorUiResult>, Option<Notice>, WatermarkUiAction) {
     let mut results = Vec::new();
     let mut notice = None;
     let mut action = WatermarkUiAction::None;
@@ -4119,7 +4120,7 @@ fn show_editor_inspector(
                 })
                 .inner;
             if state.overlays_selected() && state.overlay_tool == OverlayTool::Text {
-                notice = text.show(ui, workspace);
+                notice = text.show(ui, workspace, localizer);
             }
             if state.overlays_selected() && state.overlay_tool == OverlayTool::Image {
                 action = show_watermark_ui(
