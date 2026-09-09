@@ -115,6 +115,10 @@ The Rust comparator allows 4 MiB of renderer scratch independently of the
 small output surface. This changes no pixel tolerance or artifact-size limit.
 `VECTOR_LAYOUT` lines in the Windows logs report actual WPF requested, desired,
 rendered and offset geometry for diagnosing the new shape differences.
+Rotation uses the original adorner's relative `(0.5, 0.5)` transform origin,
+not a center inferred from requested Width/Height. WPF can arrange those to
+different dimensions; the diagnostic path expands Rectangle/Ellipse to actual
+cubic path geometry instead of printing their type names.
 
 Rust-only fixes may be compared with the same reference artifact while the
 definition and generator source hashes still match. Changing either requires

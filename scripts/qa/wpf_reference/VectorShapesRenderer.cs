@@ -49,7 +49,7 @@ internal static class VectorShapesRenderer
                 rendered = new[] { shape.RenderSize.Width, shape.RenderSize.Height },
                 offset = new[] { offset.X, offset.Y },
                 transformed_origin = new[] { origin.X, origin.Y },
-                geometry = shape.RenderedGeometry.ToString(CultureInfo.InvariantCulture),
+                geometry = PathGeometry.CreateFromGeometry(shape.RenderedGeometry).ToString(CultureInfo.InvariantCulture),
                 shape.SnapsToDevicePixels, shape.UseLayoutRounding,
             }));
         }
@@ -98,8 +98,10 @@ internal static class VectorShapesRenderer
         shape.StrokeThickness = definition.StrokeWidthHundredths / 100.0;
         shape.Stroke = new SolidColorBrush(definition.Stroke.ToColor());
         shape.Fill = definition.Fill is Rgba fill ? new SolidColorBrush(fill.ToColor()) : null;
-        shape.RenderTransform = new RotateTransform(definition.RotationHundredths / 100.0,
-            shape.Width / 2.0, shape.Height / 2.0);
+        // ElementAdorner uses relative RenderTransformOrigin, so rotation follows
+        // the actual arranged RenderSize, not the possibly fractional Width/Height.
+        shape.RenderTransformOrigin = new Point(0.5, 0.5);
+        shape.RenderTransform = new RotateTransform(definition.RotationHundredths / 100.0);
         return shape;
     }
 
