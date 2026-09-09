@@ -303,7 +303,7 @@ messages! {
     SnapGenerationsExhausted => ("snap-generations-exhausted", [], "Drag-handle generations exhausted; reopen the recorder.", "拖选按钮的代次编号已耗尽；请重新打开录制器。"),
     SnapInvalidScale => ("snap-invalid-scale", [], "Invalid UI pixel scale.", "界面像素缩放比例无效。"),
     SnapHitLimit => ("snap-hit-limit", [], "Visible drag button exceeds the native input-child coordinate limit.", "可见拖选按钮超出了原生输入子窗口的坐标限制。"),
-    RecorderBorderDragHint => ("recorder-border-drag-hint", [], "Drag a border to move the region; drag a corner to resize before recording. Controls are independent of the selected pixels.", "拖动边框可移动区域；录制前可拖动角点调整尺寸。控件与所选像素区域相互独立。"),
+    RecorderBorderDragHint => ("recorder-border-drag-hint", [], "Drag the large orange grip to move the recording frame. It sits outside the recording area and may switch sides near screen edges. Corners resize before recording.", "拖动醒目的橙色把手即可移动录制框。把手位于录制区外，靠近屏幕边缘时会换到其他侧边。录制前仍可拖动角点调整大小。"),
     RecorderX11WindowTitle => ("recorder-x11-window-title", [], "GifFromScreen recorder", "GifFromScreen 录制器"),
     RecorderPlacement => ("recorder-placement", [], "Recorder placement", "录制器位置"),
     RecorderPlacementUnsafe => ("recorder-placement-unsafe", [], "The window manager did not confirm a safe control position.", "窗口管理器未确认控件已位于安全位置。"),

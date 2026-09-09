@@ -4,6 +4,19 @@ Release notes describe shipped behavior. Plans, experimental APIs and unfinished
 branches are not completed features. [中文工作总结](docs/WORK-STATUS.md) ·
 [All releases](https://github.com/tiansongyu/gifromscreen/releases)
 
+## 0.1.2 — Unreleased recorder usability update
+
+- Add a prominent orange X11 recording-frame grip with a move pictogram and
+  move cursor. The whole grip moves the frame, including its corners; existing
+  thin-border corner resizing remains available before recording.
+- Scale the grip from 144×36 physical pixels with the UI (up to 400%), position
+  it on a free edge, and avoid both capture rectangles during retargeting plus
+  the owned controller. Short recordings keep a shorter side grip near the top.
+- Keep passive window-picker highlights unchanged and preserve pointer-grab
+  ownership, cleanup, pause/resume and capture-size semantics.
+- [Behavior and validation](docs/RECORDER-DRAG-HANDLE.md). Older downloads are
+  not relabeled as containing this change.
+
 ## 0.1.1 — Unreleased graphics startup fix
 
 - X11 now considers both OpenGL and Vulkan. It retains the verified GL

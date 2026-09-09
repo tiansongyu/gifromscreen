@@ -56,6 +56,8 @@ Recorded from the real X11 app, including a paused recording-frame drag. These e
 
 This release includes the [multi-object shape canvas](docs/VECTOR-SHAPE-CANVAS.md): triangles, rounded rectangles, ellipses, block arrows, multi-selection and direct move/resize/rotate. It keeps Vector v1 / project schema 8; unfinished next-generation rendering integration is not included.
 
+The 0.1.2 maintenance build on `main` adds a [prominent recording-frame drag grip](docs/RECORDER-DRAG-HANDLE.md), so moving the region no longer requires targeting a thin border. It is not included in the old v0.1.0 download.
+
 Use the [release work summary](docs/WORK-STATUS.md) as the current completion ledger. The [feature comparison](docs/FEATURE_MATRIX.md) records ScreenToGif goals and gaps; the [development archive](docs/DEVELOPMENT-STATUS.md) retains historical evidence.
 
 ## X11 and Wayland

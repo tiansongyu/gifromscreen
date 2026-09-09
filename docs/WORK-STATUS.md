@@ -2,7 +2,7 @@
 
 更新：2026-09-09。当前已公开的正式版为 **v0.1.0 · Linux x86_64**，功能实现基线为 `67f11e7`，实际发行源为 `b3cd1ff`。下载与实际包验收见[发行记录](RELEASE-0.1.0-QA.md)。
 本轮已停止扩展功能；未完成的 schema 9 / Vector v2 改动已推送至独立归档分支，不在正式发布范围内。
-发布后仅按用户反馈进行[图形启动兼容性修复](GRAPHICS-BACKEND-STARTUP.md)：`main` 的 0.1.1 构建为 X11 增加自动 Vulkan 回退，旧 v0.1.0 资产保持不变。这不代表恢复下方暂缓的功能扩展。
+发布后按用户反馈进行[图形启动兼容性修复](GRAPHICS-BACKEND-STARTUP.md)及[录制框拖动把手改善](RECORDER-DRAG-HANDLE.md)：维护构建保留自动 Vulkan 回退，0.1.2 增加醒目的大把手。旧 v0.1.0 资产保持不变；这不代表恢复下方暂缓的功能扩展。
 发布版仍使用 **工程 schema 8、VectorShape v1 作者与既有渲染契约**。
 实际下载文件、构建身份和 SHA-256 以该版本的 [Release 资产与说明](https://github.com/tiansongyu/gifromscreen/releases)为准；本清单不代替包级验收回执。
 

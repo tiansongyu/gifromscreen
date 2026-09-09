@@ -16,6 +16,9 @@ pub(super) fn validate(request: GuideRequest) -> Result<(), String> {
     if !(1..=16).contains(&request.border_width) {
         return Err("Recorder guide border must be 1–16 physical pixels.".into());
     }
+    if !(100..=400).contains(&request.handle_scale) {
+        return Err("Recorder drag handle scale must be 100–400 percent.".into());
+    }
     if let Some(region) = request.region {
         let pixels = strips(region, request.border_width)?
             .iter()
@@ -25,11 +28,84 @@ pub(super) fn validate(request: GuideRequest) -> Result<(), String> {
                 )
             })
             .ok_or_else(invalid)?;
-        if pixels > 2 * 1024 * 1024 {
+        let (handle_width, handle_height) = handle_size(request.handle_scale);
+        if pixels + u64::from(handle_width) * u64::from(handle_height) > 2 * 1024 * 1024 {
             return Err("Recorder guide border backing exceeds its bounded pixel budget.".into());
         }
     }
     Ok(())
+}
+
+fn handle_size(scale: u16) -> (u32, u32) {
+    (
+        (144 * u32::from(scale)).div_ceil(100),
+        (36 * u32::from(scale)).div_ceil(100),
+    )
+}
+
+/// Prefer the top center, then other edges/anchors without entering capture or
+/// controller pixels. If the root has no safe space, the ordinary border stays.
+#[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
+pub(super) fn drag_handle(request: GuideRequest, root_size: PhysicalSize) -> Option<Strip> {
+    let region = request.region?;
+    let root = PhysicalRect::new(0, 0, root_size.width(), root_size.height()).ok()?;
+    intersection(region, root)?;
+    let (long, short) = handle_size(request.handle_scale);
+    let left = i64::from(region.origin().x);
+    let top = i64::from(region.origin().y);
+    let right = left + i64::from(region.size().width());
+    let bottom = top + i64::from(region.size().height());
+    let border = i64::from(request.border_width);
+    for side in 0..4 {
+        let horizontal = side == 0 || side == 3;
+        let width = if horizontal { long } else { short }.min(root_size.width());
+        // A short recording near the top edge still needs a side grip that
+        // fits above its controller; do not force the full portrait length.
+        let height = if horizontal {
+            short
+        } else {
+            long.min(region.size().height().max(short))
+        }
+        .min(root_size.height());
+        for anchor in 0..3 {
+            let along = |start, end, extent| match anchor {
+                0 => (start + end - extent) / 2,
+                1 => start,
+                _ => end - extent,
+            };
+            let x = if horizontal {
+                along(left, right, i64::from(width)).clamp(0, i64::from(root_size.width() - width))
+            } else if side == 1 {
+                left - border - i64::from(width)
+            } else {
+                right + border
+            };
+            let y = if !horizontal {
+                along(top, bottom, i64::from(height))
+                    .clamp(0, i64::from(root_size.height() - height))
+            } else if side == 0 {
+                top - border - i64::from(height)
+            } else {
+                bottom + border
+            };
+            let (Ok(x), Ok(y)) = (i16::try_from(x), i16::try_from(y)) else {
+                continue;
+            };
+            let rect = PhysicalRect::new(i32::from(x), i32::from(y), width, height).ok()?;
+            if intersection(rect, root) == Some(rect)
+                && intersection(rect, region).is_none()
+                && request
+                    .handle_avoid
+                    .is_none_or(|avoid| intersection(rect, avoid).is_none())
+                && request
+                    .protected_region
+                    .is_none_or(|old| intersection(rect, old).is_none())
+            {
+                return Some(Strip { rect });
+            }
+        }
+    }
+    None
 }
 
 pub(super) fn strips(region: PhysicalRect, border: u16) -> Result<[Strip; 4], String> {

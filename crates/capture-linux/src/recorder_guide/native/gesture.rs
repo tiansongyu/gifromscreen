@@ -153,7 +153,12 @@ impl Windows<'_, '_> {
         };
         let started = Instant::now();
         self.connection.stream().begin_operation();
-        let result = self.grab(event.time, id, started, context)?;
+        let cursor = if index == HANDLE_INDEX {
+            self.handle_cursor.unwrap_or(x11rb::NONE)
+        } else {
+            x11rb::NONE
+        };
+        let result = self.grab(event.time, id, started, context, cursor)?;
         self.connection.stream().registration_complete();
         if result {
             let position = position(event.root_x, event.root_y);
@@ -174,6 +179,7 @@ impl Windows<'_, '_> {
         id: u64,
         started: Instant,
         context: &Context,
+        cursor: Cursor,
     ) -> Result<bool, String> {
         let keeper = self
             .keeper
@@ -187,7 +193,7 @@ impl Windows<'_, '_> {
                 GrabMode::ASYNC,
                 GrabMode::ASYNC,
                 x11rb::NONE,
-                x11rb::NONE,
+                cursor,
                 time,
             )
             .map_err(native_error)?;

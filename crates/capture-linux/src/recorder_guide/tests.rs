@@ -7,6 +7,8 @@ fn request(generation: u64) -> GuideRequest {
         region: Some(PhysicalRect::new(80, 60, 120, 90).unwrap()),
         protected_region: None,
         border_width: 4,
+        handle_scale: 100,
+        handle_avoid: None,
     }
 }
 
@@ -187,6 +189,113 @@ fn debug_output_does_not_disclose_capture_or_pointer_coordinates() {
         position: PhysicalPosition { x: 1234, y: 5678 },
     };
     assert!(!format!("{event:?}").contains("5678"));
+}
+
+#[test]
+fn drag_handle_is_large_scaled_and_outside_capture() {
+    let root = PhysicalSize::new(1600, 1200).unwrap();
+    for scale in [100, 177, 200, 400] {
+        let request = GuideRequest {
+            region: Some(PhysicalRect::new(500, 500, 500, 400).unwrap()),
+            handle_scale: scale,
+            ..request(1)
+        };
+        let handle = geometry::drag_handle(request, root).unwrap().rect;
+        assert_eq!(
+            handle.size().width(),
+            (144 * u32::from(scale)).div_ceil(100)
+        );
+        assert_eq!(
+            handle.size().height(),
+            (36 * u32::from(scale)).div_ceil(100)
+        );
+        assert!(geometry::intersection(handle, request.region.unwrap()).is_none());
+        assert_eq!(
+            i64::from(handle.origin().y) + i64::from(handle.size().height()),
+            496
+        );
+    }
+}
+
+#[test]
+fn drag_handle_uses_another_edge_and_avoids_the_controller_and_old_capture() {
+    let root = PhysicalSize::new(400, 300).unwrap();
+    let region = PhysicalRect::new(0, 0, 250, 120).unwrap();
+    let right_controller = PhysicalRect::new(254, 0, 146, 300).unwrap();
+    let request = GuideRequest {
+        region: Some(region),
+        handle_avoid: Some(right_controller),
+        ..request(1)
+    };
+    let handle = geometry::drag_handle(request, root).unwrap().rect;
+    assert_eq!(handle.origin().y, 124);
+    assert!(geometry::intersection(handle, right_controller).is_none());
+    assert!(geometry::intersection(handle, region).is_none());
+    let request = GuideRequest {
+        protected_region: Some(PhysicalRect::new(0, 124, 400, 176).unwrap()),
+        ..request
+    };
+    assert!(geometry::drag_handle(request, root).is_none());
+}
+
+#[test]
+fn short_top_edge_recording_keeps_a_side_grip_above_its_controller() {
+    let root = PhysicalSize::new(400, 300).unwrap();
+    let request = GuideRequest {
+        region: Some(PhysicalRect::new(0, 0, 120, 80).unwrap()),
+        handle_avoid: Some(PhysicalRect::new(0, 88, 400, 212).unwrap()),
+        ..request(1)
+    };
+    assert_eq!(
+        geometry::drag_handle(request, root).unwrap().rect,
+        PhysicalRect::new(124, 0, 36, 80).unwrap()
+    );
+}
+
+#[test]
+fn drag_handle_never_invades_capture_on_small_offscreen_or_full_root_regions() {
+    let root_size = PhysicalSize::new(400, 300).unwrap();
+    let root = PhysicalRect::new(0, 0, 400, 300).unwrap();
+    for x in [-20, 0, 1, 100, 390, 400] {
+        for y in [-20, 0, 1, 100, 290, 300] {
+            for (width, height) in [(1, 1), (10, 10), (120, 90), (400, 300)] {
+                let region = PhysicalRect::new(x, y, width, height).unwrap();
+                let request = GuideRequest {
+                    region: Some(region),
+                    ..request(1)
+                };
+                if let Some(handle) = geometry::drag_handle(request, root_size) {
+                    assert_eq!(geometry::intersection(handle.rect, root), Some(handle.rect));
+                    assert!(geometry::intersection(handle.rect, region).is_none());
+                }
+            }
+        }
+    }
+    for region in [
+        None,
+        Some(root),
+        Some(PhysicalRect::new(450, 30, 40, 40).unwrap()),
+    ] {
+        assert!(
+            geometry::drag_handle(
+                GuideRequest {
+                    region,
+                    ..request(1)
+                },
+                root_size
+            )
+            .is_none()
+        );
+    }
+    for scale in [0, 99, 401, u16::MAX] {
+        assert!(
+            geometry::validate(GuideRequest {
+                handle_scale: scale,
+                ..request(1)
+            })
+            .is_err()
+        );
+    }
 }
 
 #[test]

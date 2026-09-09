@@ -56,6 +56,8 @@ sha256sum --check SHA256SUMS
 
 本版也包含[多图形画布](docs/VECTOR-SHAPE-CANVAS.md)：三角形、圆角矩形、椭圆、块状箭头，多选、拖动、缩放和旋转。使用已验收的 Vector v1 / 工程 schema 8；未完成的新版渲染集成不包含在正式版内。
 
+`main` 的 0.1.2 维护构建新增[醒目的录制框拖动把手](docs/RECORDER-DRAG-HANDLE.md)，不必再对准细边框；它不在旧 v0.1.0 下载包中。
+
 以[发布工作总结](docs/WORK-STATUS.md)为当前完成状态入口；[功能对照](docs/FEATURE_MATRIX.md)保留 ScreenToGif 目标与差距，[开发记录](docs/DEVELOPMENT-STATUS.md)保留历史证据。
 
 ## X11 与 Wayland

@@ -11,6 +11,7 @@ use x11rb::protocol::{
 pub(super) struct ArgbVisual {
     pub(super) visual: Visualid,
     pub(super) pixel: u32,
+    pub(super) ink_pixel: u32,
 }
 
 pub(super) fn select(
@@ -40,6 +41,7 @@ pub(super) fn select(
             return Ok(ArgbVisual {
                 visual: visual.visual_id,
                 pixel,
+                ink_pixel: pixel & !(visual.red_mask | visual.green_mask | visual.blue_mask),
             });
         }
     }

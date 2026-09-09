@@ -40,6 +40,10 @@ pub struct GuideRequest {
     pub protected_region: Option<PhysicalRect>,
     /// Opaque border thickness, from 1 through 16 physical pixels.
     pub border_width: u16,
+    /// Drag-handle size as a percentage of its 144×36 physical-pixel base (100–400).
+    pub handle_scale: u16,
+    /// Owned controller bounds the handle must avoid; never changes capture pixels.
+    pub handle_avoid: Option<PhysicalRect>,
 }
 
 impl fmt::Debug for GuideRequest {
@@ -50,6 +54,7 @@ impl fmt::Debug for GuideRequest {
             .field("show", &self.region.is_some())
             .field("extra_exclusion", &self.protected_region.is_some())
             .field("border_width", &self.border_width)
+            .field("handle_scale", &self.handle_scale)
             .finish_non_exhaustive()
     }
 }
@@ -60,7 +65,7 @@ impl fmt::Debug for GuideRequest {
 pub struct GuideAck {
     /// Request applied by the dedicated worker.
     pub generation: u64,
-    /// At least one border strip is mapped; full-root capture and explicit hide return false.
+    /// At least one border/handle is mapped; full-root capture and explicit hide return false.
     pub visible: bool,
 }
 
@@ -91,6 +96,7 @@ pub enum GuideStatus {
     reason = "edge names directly describe their physical location"
 )]
 pub enum GuideEdge {
+    Move,
     Top,
     TopRight,
     Right,

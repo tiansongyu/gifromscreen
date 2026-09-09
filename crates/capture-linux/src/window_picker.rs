@@ -335,6 +335,8 @@ impl Selection<'_, '_> {
                 region,
                 protected_region: None,
                 border_width: 4,
+                handle_scale: 100,
+                handle_avoid: None,
             })?;
             self.shown = region;
         }

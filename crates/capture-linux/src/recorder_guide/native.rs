@@ -10,8 +10,8 @@ use x11rb::{
         xfixes::ConnectionExt as _,
         xproto::{
             ChangeWindowAttributesAux, Colormap, ColormapAlloc, ConfigureWindowAux,
-            ConnectionExt as _, CreateWindowAux, EventMask, Rectangle, StackMode, Window,
-            WindowClass,
+            ConnectionExt as _, CreateWindowAux, Cursor, EventMask, Gcontext, Rectangle, StackMode,
+            Window, WindowClass,
         },
     },
     wrapper::ConnectionExt as _,
@@ -26,6 +26,10 @@ use crate::shortcuts::x11::{Client, stream};
 mod argb;
 mod controller;
 mod gesture;
+mod handle;
+
+const HANDLE_INDEX: usize = 4;
+const WINDOW_COUNT: usize = 5;
 
 pub(super) fn run(
     display: Option<&str>,
@@ -83,19 +87,33 @@ pub(super) fn run(
         connection: &connection,
         root: screen.root,
         root_size,
-        ids: Vec::with_capacity(4),
+        ids: Vec::with_capacity(WINDOW_COUNT),
         keeper: None,
         colormap: None,
         current: None,
-        visible: [false; 4],
+        visible: [false; WINDOW_COUNT],
+        handle_rect: None,
+        handle_gc: None,
+        handle_cursor: None,
         event_floor: 0,
         gesture: None,
         cancel_epoch: 0,
         interactive,
     };
     owned.create_colormap(visual)?;
-    for _ in 0..4 {
+    if interactive {
+        // A missing cursor font must not prevent recording; the large grip remains.
+        let _ = owned.create_handle_cursor();
+    }
+    for _ in 0..if interactive {
+        WINDOW_COUNT
+    } else {
+        HANDLE_INDEX
+    } {
         owned.create(visual)?;
+    }
+    if interactive {
+        owned.create_handle_gc(visual.ink_pixel)?;
     }
     owned.create_keeper()?;
     context.connected();
@@ -114,7 +132,10 @@ struct Windows<'a, 'c> {
     keeper: Option<Window>,
     colormap: Option<Colormap>,
     current: Option<GuideRequest>,
-    visible: [bool; 4],
+    visible: [bool; WINDOW_COUNT],
+    handle_rect: Option<PhysicalRect>,
+    handle_gc: Option<Gcontext>,
+    handle_cursor: Option<Cursor>,
     event_floor: u64,
     gesture: Option<gesture::Gesture>,
     cancel_epoch: u64,
@@ -160,6 +181,27 @@ impl Windows<'_, '_> {
 
     fn create(&mut self, visual: argb::ArgbVisual) -> Result<(), String> {
         let id = self.connection.generate_id().map_err(native_error)?;
+        let is_handle = self.ids.len() == HANDLE_INDEX;
+        let mut attributes = CreateWindowAux::new()
+            .override_redirect(1)
+            .background_pixel(visual.pixel)
+            .border_pixel(0)
+            .colormap(
+                self.colormap
+                    .ok_or("Recorder guide colormap is unavailable.")?,
+            )
+            .event_mask(
+                EventMask::BUTTON_PRESS
+                    | EventMask::STRUCTURE_NOTIFY
+                    | if is_handle {
+                        EventMask::EXPOSURE
+                    } else {
+                        EventMask::NO_EVENT
+                    },
+            );
+        if is_handle && let Some(cursor) = self.handle_cursor {
+            attributes = attributes.cursor(cursor);
+        }
         self.connection
             .create_window(
                 32,
@@ -172,15 +214,7 @@ impl Windows<'_, '_> {
                 0,
                 WindowClass::INPUT_OUTPUT,
                 visual.visual,
-                &CreateWindowAux::new()
-                    .override_redirect(1)
-                    .background_pixel(visual.pixel)
-                    .border_pixel(0)
-                    .colormap(
-                        self.colormap
-                            .ok_or("Recorder guide colormap is unavailable.")?,
-                    )
-                    .event_mask(EventMask::BUTTON_PRESS | EventMask::STRUCTURE_NOTIFY),
+                &attributes,
             )
             .map_err(native_error)?
             .check()
@@ -200,7 +234,8 @@ impl Windows<'_, '_> {
                 .check()
                 .map_err(native_error)?;
         }
-        self.visible = [false; 4];
+        self.visible = [false; WINDOW_COUNT];
+        self.handle_rect = None;
         let region = request
             .region
             .filter(|region| !geometry::covers_root(*region, self.root_size));
@@ -222,6 +257,18 @@ impl Windows<'_, '_> {
                 });
                 self.configure(index, *strip, visible, excluded)?;
                 self.visible[index] = visible.is_some() && visible != excluded;
+            }
+            let handle = self
+                .interactive
+                .then(|| geometry::drag_handle(request, self.root_size))
+                .flatten();
+            if let Some(handle) = handle {
+                self.configure(HANDLE_INDEX, handle, Some(handle.rect), None)?;
+                self.handle_rect = Some(handle.rect);
+                self.visible[HANDLE_INDEX] = true;
+                self.paint_handle()?;
+            } else if let Some(id) = self.ids.get(HANDLE_INDEX) {
+                self.shapes(*id, None, None)?;
             }
         } else {
             for id in &self.ids {
@@ -361,6 +408,15 @@ impl Windows<'_, '_> {
             // The sequence floor filters stale POINTER coordinates only. Never
             // discard a root/lifetime failure that happened during an update.
             match &event {
+                Event::Expose(event)
+                    if self.ids.get(HANDLE_INDEX) == Some(&event.window)
+                        && event.count == 0
+                        && self.visible[HANDLE_INDEX] =>
+                {
+                    self.connection.stream().begin_operation();
+                    self.paint_handle()?;
+                    self.connection.stream().registration_complete();
+                }
                 Event::ConfigureNotify(event)
                     if event.response_type & 0x80 == 0 && event.window == self.root =>
                 {
@@ -393,6 +449,12 @@ impl Drop for Windows<'_, '_> {
         // UngrabPointer only releases this client's grab. The dedicated keeper
         // is never used without an explicit primary border press.
         let _ = self.connection.ungrab_pointer(x11rb::CURRENT_TIME);
+        if let Some(gc) = self.handle_gc {
+            let _ = self.connection.free_gc(gc);
+        }
+        if let Some(cursor) = self.handle_cursor {
+            let _ = self.connection.free_cursor(cursor);
+        }
         for id in &self.ids {
             let _ = self.connection.destroy_window(*id);
         }
@@ -440,6 +502,9 @@ fn local(rect: PhysicalRect, strip: PhysicalRect) -> Result<Rectangle, String> {
 }
 
 fn hit_edge(index: usize, point: PhysicalPosition, region: PhysicalRect) -> GuideEdge {
+    if index == HANDLE_INDEX {
+        return GuideEdge::Move;
+    }
     let corner = i64::from(region.size().width().min(region.size().height()).min(32)) / 2;
     let left = i64::from(point.x) < i64::from(region.origin().x) + corner;
     let right = i64::from(point.x)

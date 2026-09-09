@@ -171,8 +171,13 @@ impl RecorderOverlay {
             Some(self.geometry.region())
         };
         let protected_region = protected_region.filter(|protected| Some(*protected) != region);
+        let handle_avoid = self.controller_geometry.map(|geometry| geometry.outer);
+        let handle_scale = drag_handle_scale(self.last_scale);
         if self.request.is_some_and(|request| {
-            request.region == region && request.protected_region == protected_region
+            request.region == region
+                && request.protected_region == protected_region
+                && request.handle_avoid == handle_avoid
+                && request.handle_scale == handle_scale
         }) {
             return;
         }
@@ -188,6 +193,8 @@ impl RecorderOverlay {
             region,
             protected_region,
             border_width: 4,
+            handle_scale,
+            handle_avoid,
         };
         self.acknowledged = None;
         self.settle = None;
@@ -1008,6 +1015,19 @@ fn finish_change(
             Message::RecorderSnapshotsRejectedForMove,
             &[("count", &rejected.to_string())],
         ));
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "finite scale is rounded and clamped to the native 100–400 percent contract"
+)]
+fn drag_handle_scale(scale: f32) -> u16 {
+    if scale.is_finite() {
+        (scale.clamp(1.0, 4.0) * 100.0).round() as u16
+    } else {
+        100
     }
 }
 

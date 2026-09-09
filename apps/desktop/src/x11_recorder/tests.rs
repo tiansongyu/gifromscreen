@@ -17,9 +17,63 @@ use gif_from_screen_workflow::{
     RecordingFrameSinkError,
 };
 
-use super::*;
 use crate::{RecordingRetarget, recorder_shortcuts::LiveShortcutState};
 
+use super::*;
+
+#[test]
+fn large_handle_always_moves_instead_of_resizing_in_every_movable_stage() {
+    let initial = RecorderGeometry::new(
+        PhysicalRect::new(0, 0, 800, 600).unwrap(),
+        PhysicalRect::new(100, 100, 320, 240).unwrap(),
+    )
+    .unwrap();
+    let gesture = Gesture {
+        id: 1,
+        start: PhysicalPosition { x: 110, y: 75 },
+        initial,
+        edge: GuideEdge::Move,
+    };
+    for stage in [
+        RecorderStage::Ready,
+        RecorderStage::Countdown(2),
+        RecorderStage::Recording,
+        RecorderStage::Paused,
+    ] {
+        let moved = gesture_geometry(&gesture, PhysicalPosition { x: 180, y: 120 }, stage);
+        assert_eq!(
+            moved.region(),
+            PhysicalRect::new(170, 145, 320, 240).unwrap()
+        );
+    }
+}
+
+#[test]
+fn handle_scale_and_owned_controller_bounds_invalidate_the_guide_request() {
+    assert_eq!(drag_handle_scale(1.77), 177);
+    assert_eq!(drag_handle_scale(0.5), 100);
+    assert_eq!(drag_handle_scale(8.0), 400);
+    assert_eq!(drag_handle_scale(f32::NAN), 100);
+    let mut overlay = overlay(region(), false);
+    overlay.update_guide(None);
+    let first = overlay.request.unwrap();
+    overlay.last_scale = 2.0;
+    overlay.update_guide(None);
+    let scaled = overlay.request.unwrap();
+    assert_eq!(scaled.generation, first.generation + 1);
+    assert_eq!(scaled.handle_scale, 200);
+    let controller = PhysicalRect::new(300, 200, 420, 300).unwrap();
+    overlay.controller_geometry = Some(gif_from_screen_capture_linux::ControllerGeometry {
+        client: controller,
+        outer: controller,
+        viewable: true,
+    });
+    overlay.update_guide(None);
+    assert_eq!(overlay.request.unwrap().handle_avoid, Some(controller));
+    assert_eq!(overlay.request.unwrap().generation, scaled.generation + 1);
+    overlay.update_guide(None);
+    assert_eq!(overlay.request.unwrap().generation, scaled.generation + 1);
+}
 fn source() -> PhysicalRect {
     PhysicalRect::new(0, 0, 1024, 768).unwrap()
 }

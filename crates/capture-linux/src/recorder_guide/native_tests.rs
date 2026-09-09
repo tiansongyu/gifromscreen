@@ -407,7 +407,9 @@ impl Fixture {
 
     fn assert_mapped_argb_strips(&self) -> u32 {
         let strips = self.strips();
-        assert_eq!(strips.len(), 4);
+        assert_eq!(strips.len(), 5);
+        let mut thin_strips = 0;
+        let mut handles = 0;
         let mut colormap = None;
         for window in strips {
             self.assert_strip_contract(window);
@@ -417,10 +419,12 @@ impl Fixture {
                 .unwrap()
                 .reply()
                 .unwrap();
-            assert!(
-                geometry.width == 4 || geometry.height == 4,
-                "each owned window must be a thin strip, not a full-canvas surface"
-            );
+            if geometry.width == 4 || geometry.height == 4 {
+                thin_strips += 1;
+            } else {
+                assert_eq!((geometry.width, geometry.height), (144, 36));
+                handles += 1;
+            }
             let attributes = self
                 .connection
                 .get_window_attributes(window)
@@ -433,6 +437,7 @@ impl Fixture {
             }
             colormap = Some(attributes.colormap);
         }
+        assert_eq!((thin_strips, handles), (4, 1));
         colormap.unwrap()
     }
 
@@ -537,6 +542,8 @@ fn request(
         region,
         protected_region,
         border_width: 4,
+        handle_scale: 100,
+        handle_avoid: None,
     }
 }
 
@@ -695,7 +702,7 @@ fn private_xvfb_ring_preserves_capture_pixels_shapes_clickthrough_and_owned_clea
     guide.request(request(1, Some(protected), None)).unwrap();
     await_ack(&mut guide, 1, true);
     let windows = fixture.windows();
-    assert_eq!(windows.len(), 5);
+    assert_eq!(windows.len(), 6);
     fixture.keeper();
     let colormap = fixture.assert_mapped_argb_strips();
     assert_eq!(
@@ -861,6 +868,101 @@ fn private_xvfb_owned_gesture_survives_repeated_updates_hide_and_release() {
 
 #[test]
 #[ignore = "starts a supervised private Xvfb; never uses host DISPLAY"]
+fn private_xvfb_large_grip_moves_from_its_corner_and_protects_both_capture_regions() {
+    let fixture = Fixture::new();
+    let initial = region();
+    let baseline = fixture.pixels(initial);
+    let mut guide = fixture.guide();
+    guide.request(request(1, Some(initial), None)).unwrap();
+    await_ack(&mut guide, 1, true);
+    assert_eq!(
+        fixture.pixel_rgb(140, 38),
+        0,
+        "the large grip has a visible dark move glyph"
+    );
+    assert_eq!(fixture.pixel_rgb(72, 24), 0x00f2_994a);
+    fixture.motion(72, 24);
+    fixture.button(1, true);
+    let pressed = await_event(&mut guide, |event| {
+        matches!(event, GuidePointerEvent::Pressed { .. })
+    });
+    let gesture_id = pressed_id(&pressed, 1);
+    assert!(pressed.iter().any(|event| matches!(
+        event,
+        GuidePointerEvent::Pressed {
+            edge: GuideEdge::Move,
+            position: PhysicalPosition { x: 72, y: 24 },
+            ..
+        }
+    )));
+    fixture.motion(112, 49);
+    await_event(&mut guide, |event| {
+        matches!(event,
+        GuidePointerEvent::Moved { gesture_id: id, position: PhysicalPosition { x: 112, y: 49 } } if *id == gesture_id)
+    });
+    let moved = PhysicalRect::new(120, 85, 120, 90).unwrap();
+    guide
+        .request(request(2, Some(moved), Some(initial)))
+        .unwrap();
+    await_ack(&mut guide, 2, true);
+    assert_shapes_outside(&fixture, &fixture.windows(), &[initial, moved]);
+    assert_eq!(fixture.pixels(initial), baseline);
+    fixture.button(1, false);
+    await_event(&mut guide, |event| {
+        matches!(event,
+        GuidePointerEvent::Released { gesture_id: id, position: PhysicalPosition { x: 112, y: 49 } } if *id == gesture_id)
+    });
+    fixture.assert_pointer_free();
+    stop(&mut guide);
+    fixture.assert_cleanup();
+}
+
+#[test]
+#[ignore = "starts a supervised private Xvfb; never uses host DISPLAY"]
+fn private_xvfb_grip_avoids_controller_and_passive_highlights_have_no_grip() {
+    let fixture = Fixture::new();
+    let mut guide = fixture.guide();
+    let root = PhysicalRect::new(0, 0, 400, 300).unwrap();
+    guide
+        .request(GuideRequest {
+            handle_avoid: Some(root),
+            ..request(1, Some(region()), None)
+        })
+        .unwrap();
+    await_ack(&mut guide, 1, true);
+    assert_eq!(
+        fixture.pixel_rgb(140, 38),
+        0x0012_3456,
+        "no handle may cover the controller"
+    );
+    fixture.drain_events();
+    fixture.motion(140, 38);
+    fixture.button(1, true);
+    fixture.button(1, false);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if fixture.drain_events().iter().any(
+            |event| matches!(event, Event::ButtonPress(event) if event.event == fixture.underlay),
+        ) {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(guide.poll().events.is_empty());
+    stop(&mut guide);
+    fixture.assert_cleanup();
+    let mut passive = RecorderGuide::start_passive(Some(fixture.server.display.clone())).unwrap();
+    passive.request(request(1, Some(region()), None)).unwrap();
+    await_ack(&mut passive, 1, true);
+    assert_eq!(fixture.pixel_rgb(140, 38), 0x0012_3456);
+    assert_eq!(fixture.pixel_rgb(140, 58), 0x00f2_994a);
+    stop(&mut passive);
+    fixture.assert_cleanup();
+}
+
+#[test]
+#[ignore = "starts a supervised private Xvfb; never uses host DISPLAY"]
 fn private_xvfb_signed_positions_full_root_and_explicit_hide_never_cover_capture() {
     let fixture = Fixture::new();
     let mut guide = fixture.guide();
@@ -870,7 +972,7 @@ fn private_xvfb_signed_positions_full_root_and_explicit_hide_never_cover_capture
     guide.request(request(1, Some(signed), None)).unwrap();
     await_ack(&mut guide, 1, true);
     let windows = fixture.strips();
-    assert_eq!(windows.len(), 4);
+    assert_eq!(windows.len(), 5);
     assert_shapes_outside(&fixture, &windows, &[signed]);
     assert!(
         fixture.pixels(visible_capture) == baseline,
