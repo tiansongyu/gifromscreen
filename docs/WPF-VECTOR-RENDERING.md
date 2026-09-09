@@ -125,8 +125,55 @@ metering and the new bound. Reports are
 `/tmp/gfs-wpf-vector-meter250-1_98.tIeuV4/vector-candidate.json` and
 `/tmp/gfs-wpf-vector-meter250-1_88.q39Y4V/vector-candidate.json`, both SHA-256
 `90cacb08b8a46e3bd8db529c23146de8d9f31b54f0e84efc4e7d3e90112f0c9f`.
-Many small objects on a large canvas still require scale validation and spatial
-mask work; these four successful cases do not close that requirement.
+Those four cases did not close many-small-object coverage; the next step below
+measures that requirement separately.
+
+## Spatial masks without changing the sample lattice
+
+The unoptimized 250M path was first measured on 4K canvases with 32 and 256
+small filled/stroked shapes. Both stopped after 249,157,720 charged units with
+insufficient work for the next full-canvas mask; the objects were **not** all
+rendered. The original red logs remain in
+`/tmp/gfs-wpf-small-shapes.vsUszA/before-debug-*`.
+
+The regional path now limits scan rows and pixel writes, while retaining every
+original global float-to-28.4 conversion, integer crossing, winding and curve
+subdivision. It never subtracts a bounding-box origin before quantization. Only
+integer output indexing is relative. Crossings outside the X range still
+participate in winding and holes. Conservative control-point hulls plus two
+pixels of padding determine storage; clipped visuals still composite fill and
+stroke first and apply clip coverage afterwards.
+
+Under the unchanged 250M ceiling, all objects now render at full 3840×2160:
+
+| Case | Charged work | Release seconds |
+| --- | ---: | ---: |
+| 32 small shapes, mixed kinds and rotations | 17,397,424 | 0.01034 |
+| 256 small shapes, mixed kinds and rotations | 23,114,708 | 0.01872 |
+
+The two-case process takes 0.03 seconds wall time with 35,692 KiB peak RSS.
+Release binary SHA-256:
+`843f7eedd66cb1a5e6c111320b417fa56d7a865a77f51731a0fbe62de1532097`.
+The four earlier scale cases also pass: work totals 34,964,455 / 99,705,730 /
+116,899,742 / 138,656,305, with release times 0.0460 / 0.1184 / 0.1428 /
+0.1657 seconds. Complete logs remain in the same evidence directory's
+`after-release-*` files. These remain render-only observations.
+
+Full-region tests match the unchanged full Ink API's bytes, charged work and
+cancellation-check sequence. Regional reconstruction also covers negative and
+large coordinates, curves, holes, outside masks and a float-boundary case where
+translating points first would be wrong. A mixed/clipped visual canvas matches
+the old full-mask result exactly. Resource and cancellation failures never
+return partial pixels.
+
+The render crate passes 209 tests with three explicit external/scale ignores on
+each Rust toolchain. All 14 independent Windows vector comparisons stay exact:
+`/tmp/gfs-wpf-vector-regional-1_98.ckGWTu/vector-candidate.json` and
+`/tmp/gfs-wpf-vector-regional-1_88.nyXekf/vector-candidate.json` retain the same
+`90cacb08b8a46e3bd8db529c23146de8d9f31b54f0e84efc4e7d3e90112f0c9f`
+digest as before spatial optimization. Old V1, full Ink APIs and their default
+limits are unchanged. More varied scenes remain worthwhile; version-safe user
+authoring is still governed by the [V2 integration gates](WPF-VECTOR-V2-INTEGRATION.md).
 
 ## Primary references
 

@@ -6,7 +6,7 @@
 
 use std::mem::size_of;
 
-use gif_from_screen_domain::{PhysicalSize, Rgba, VectorShape};
+use gif_from_screen_domain::{PhysicalRect, PhysicalSize, Rgba, VectorShape};
 
 use super::{
     MAX_VECTOR_PREVIEW_SHAPES,
@@ -14,8 +14,10 @@ use super::{
 };
 use crate::{
     CancellationToken, InkError, InkFigure, InkLimits, InkPath, InkSegment,
-    PremultipliedRgbaSurface, RenderLimits, ink_raster::rasterize_ink_paths_measured,
-    surface::checked_byte_len, wpf_pixels,
+    PremultipliedRgbaSurface, RenderLimits,
+    ink_raster::{InkRegionMask, rasterize_ink_paths_region_measured},
+    surface::checked_byte_len,
+    wpf_pixels,
 };
 
 type Result<T> = std::result::Result<T, InkError>;
@@ -24,6 +26,9 @@ type Result<T> = std::result::Result<T, InkError>;
 // measurement (163,532,284 units). Legacy V1 and InkLimits defaults are unchanged.
 const MAX_WORK: u64 = 250_000_000;
 const PIXEL_BLOCK: usize = 1024;
+
+mod spatial;
+use spatial::{Target, bounds, intersect, union, whole};
 
 /// Renders one independently prepared WPF-style visual into PM RGBA8 bytes.
 /// Fill precedes stroke; a layout clip covers their completed result once.
@@ -104,7 +109,7 @@ fn paint_visual<C: CancellationToken + ?Sized>(
     let retained_before = budget.retained_bytes;
     // The canvas is already retained; reserve a minimum mask while preparing
     // geometry. A clipped visual's extra PM allocation is checked afterward.
-    let mut geometry_limits = budget.phase_limits(canvas.len() / 4)?;
+    let mut geometry_limits = budget.phase_limits(0)?;
     geometry_limits.max_bytes = geometry_limits
         .max_bytes
         .checked_sub(size_of::<WpfBrushPaths>())
@@ -113,16 +118,26 @@ fn paint_visual<C: CancellationToken + ?Sized>(
         .map_err(|error| budget.phase_error("brush", error))?;
     budget.charge(WorkKind::Brush, used)?;
     budget.retain(geometry_bytes(&paths, budget.cancel)?)?;
+    let mut target = Target {
+        area: whole(size),
+        pixels: canvas,
+    };
     if let Some(path) = &paths.layout_clip {
-        let mut visual = zeroed(canvas.len(), budget)?;
-        paint_primitives(shape, &paths, size, &mut visual, budget)?;
-        let coverage = mask(path, size, budget)?;
-        budget.charge_pixels(visual.len() / 4)?;
-        clip_mask(&mut visual, &coverage, budget.cancel)?;
-        budget.charge_pixels(canvas.len() / 4)?;
-        composite_visual(canvas, &visual, budget.cancel)?;
+        let ink = painted_bounds(shape, &paths, size, budget)?;
+        let clip = bounds(path, size, budget)?;
+        if let Some(area) = ink.zip(clip).and_then(|(ink, clip)| intersect(ink, clip)) {
+            let mut visual = zeroed(checked_byte_len(area.size)?, budget)?;
+            let mut local = Target {
+                area,
+                pixels: &mut visual,
+            };
+            paint_primitives(shape, &paths, size, &mut local, budget)?;
+            let coverage = mask(path, size, area, budget)?;
+            local.apply(&coverage, None, budget)?;
+            target.composite(area, &visual, budget)?;
+        }
     } else {
-        paint_primitives(shape, &paths, size, canvas, budget)?;
+        paint_primitives(shape, &paths, size, &mut target, budget)?;
     }
     drop(paths);
     // All current-object geometry, mask and optional temporary have been
@@ -132,11 +147,31 @@ fn paint_visual<C: CancellationToken + ?Sized>(
     Ok(())
 }
 
+fn painted_bounds<C: CancellationToken + ?Sized>(
+    shape: &VectorShape,
+    paths: &WpfBrushPaths,
+    size: PhysicalSize,
+    budget: &mut Budget<'_, C>,
+) -> Result<Option<PhysicalRect>> {
+    let fill = if shape.fill.is_some_and(|color| color.alpha != 0) {
+        bounds(&paths.fill, size, budget)?
+    } else {
+        None
+    };
+    let stroke = paths
+        .stroke
+        .as_ref()
+        .map(|path| bounds(path, size, budget))
+        .transpose()?
+        .flatten();
+    Ok(union(fill, stroke))
+}
+
 fn paint_primitives<C: CancellationToken + ?Sized>(
     shape: &VectorShape,
     paths: &WpfBrushPaths,
     size: PhysicalSize,
-    output: &mut [u8],
+    output: &mut Target<'_>,
     budget: &mut Budget<'_, C>,
 ) -> Result<()> {
     if let Some(color) = shape.fill.filter(|color| color.alpha != 0) {
@@ -177,32 +212,36 @@ fn paint_path<C: CancellationToken + ?Sized>(
     path: &InkPath,
     color: Rgba,
     size: PhysicalSize,
-    output: &mut [u8],
+    output: &mut Target<'_>,
     budget: &mut Budget<'_, C>,
 ) -> Result<()> {
-    let mask = mask(path, size, budget)?;
-    budget.charge_pixels(output.len() / 4)?;
-    paint_mask(output, &mask, color, budget.cancel)
+    if let Some(area) = bounds(path, size, budget)?.and_then(|area| intersect(area, output.area)) {
+        let mask = mask(path, size, area, budget)?;
+        output.apply(&mask, Some(color), budget)?;
+    }
+    Ok(())
 }
 
 fn mask<C: CancellationToken + ?Sized>(
     path: &InkPath,
     size: PhysicalSize,
+    area: PhysicalRect,
     budget: &mut Budget<'_, C>,
-) -> Result<Vec<u8>> {
+) -> Result<InkRegionMask> {
     let limits = budget.phase_limits(0)?;
     // The paths stay borrowed. The rasterizer's memory budget includes its
     // output mask, edge vectors, sort/crossing/interval arrays and row scratch;
     // all retained geometry and PM bytes have already been subtracted above.
-    let (mask, used) = rasterize_ink_paths_measured(
+    let mask = rasterize_ink_paths_region_measured(
         std::slice::from_ref(path),
         size,
+        area,
         false,
         &limits,
         budget.cancel,
     )
     .map_err(|error| budget.phase_error("raster", error))?;
-    budget.charge(WorkKind::Raster, used)?;
+    budget.charge(WorkKind::Raster, mask.work)?;
     Ok(mask)
 }
 
@@ -672,7 +711,12 @@ mod tests {
         .unwrap();
         budget.retain(geometry + 256).unwrap();
         assert!(matches!(
-            mask(&paths.fill, PhysicalSize::new(8, 8).unwrap(), &mut budget),
+            mask(
+                &paths.fill,
+                PhysicalSize::new(8, 8).unwrap(),
+                whole(PhysicalSize::new(8, 8).unwrap()),
+                &mut budget
+            ),
             Err(InkError::Limit(_))
         ));
     }
@@ -1081,6 +1125,202 @@ mod tests {
         assert!(
             rejected.is_empty(),
             "Production-size audit has real failures: {rejected:#?}"
+        );
+    }
+
+    fn small_shapes(count: usize) -> Vec<VectorShape> {
+        let kinds = [
+            VectorShapeKind::Rectangle,
+            VectorShapeKind::Ellipse,
+            VectorShapeKind::Triangle,
+            VectorShapeKind::BlockArrow,
+        ];
+        (0..count)
+            .map(|index| VectorShape {
+                kind: kinds[index % kinds.len()],
+                bounds: VectorShapeBounds {
+                    x_hundredths: i64::try_from((index % 32) * 110 + 20).unwrap() * 100,
+                    y_hundredths: i64::try_from((index / 32) * 220 + 20).unwrap() * 100,
+                    width_hundredths: 4000,
+                    height_hundredths: 2400,
+                },
+                stroke_width_hundredths: 200,
+                stroke: Rgba {
+                    red: 10,
+                    green: 20,
+                    blue: 30,
+                    alpha: 255,
+                },
+                fill: Some(Rgba {
+                    red: 70,
+                    green: 140,
+                    blue: 210,
+                    alpha: 173,
+                }),
+                rotation_hundredths: u16::try_from(index % 3).unwrap() * 1700,
+                ..VectorShape::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn full_4k_32_and_256_small_shapes_keep_every_object_without_full_masks() {
+        let size = PhysicalSize::new(3840, 2160).unwrap();
+        for count in [32, 256] {
+            let shapes = small_shapes(count);
+            let mut budget = Budget::new(RenderLimits::default(), &NeverCancel).unwrap();
+            let surface = render_canvas(&shapes, size, &mut budget).unwrap();
+            assert_eq!(surface.size(), size);
+            assert_eq!(surface.pixels().len(), 3840 * 2160 * 4);
+            for index in 0..count {
+                assert!(
+                    pixel(&surface, (index % 32) * 110 + 40, (index / 32) * 220 + 32)[3] > 0,
+                    "missing object {index}"
+                );
+            }
+            assert!(budget.usage.total() <= MAX_WORK);
+        }
+    }
+
+    fn full_canvas_reference(
+        shapes: &[VectorShape],
+        size: PhysicalSize,
+    ) -> PremultipliedRgbaSurface {
+        // Regression oracle for this spatial optimization only: the prior full
+        // masks and blend order, not independently generated Windows pixels.
+        let mut canvas = vec![0; checked_byte_len(size).unwrap()];
+        let mask_for = |path: &InkPath| {
+            crate::rasterize_ink_paths(
+                std::slice::from_ref(path),
+                size,
+                false,
+                &InkLimits::default(),
+                &NeverCancel,
+            )
+            .unwrap()
+        };
+        for shape in shapes {
+            let (paths, _) =
+                prepare_wpf_brush_paths_measured(shape, &InkLimits::default(), &NeverCancel)
+                    .unwrap();
+            let mut layer = paths.layout_clip.as_ref().map(|_| vec![0; canvas.len()]);
+            let target = layer.as_mut().unwrap_or(&mut canvas);
+            if let Some(fill) = shape.fill.filter(|c| c.alpha != 0) {
+                paint_mask(target, &mask_for(&paths.fill), fill, &NeverCancel).unwrap();
+            }
+            if let Some(stroke) = &paths.stroke {
+                paint_mask(target, &mask_for(stroke), shape.stroke, &NeverCancel).unwrap();
+            }
+            if let Some(clip) = &paths.layout_clip {
+                clip_mask(target, &mask_for(clip), &NeverCancel).unwrap();
+                composite_visual(&mut canvas, &layer.unwrap(), &NeverCancel).unwrap();
+            }
+        }
+        PremultipliedRgbaSurface::new(size, canvas).unwrap()
+    }
+
+    #[test]
+    fn regional_clipped_visual_over_existing_canvas_matches_previous_full_masks() {
+        let size = PhysicalSize::new(80, 60).unwrap();
+        let base = VectorShape {
+            bounds: VectorShapeBounds {
+                x_hundredths: 0,
+                y_hundredths: 0,
+                width_hundredths: 8000,
+                height_hundredths: 6000,
+            },
+            stroke_width_hundredths: 0,
+            fill: Some(Rgba {
+                red: 30,
+                green: 90,
+                blue: 160,
+                alpha: 173,
+            }),
+            ..VectorShape::default()
+        };
+        let clipped = VectorShape {
+            kind: VectorShapeKind::Triangle,
+            bounds: VectorShapeBounds {
+                x_hundredths: 3000,
+                y_hundredths: 2000,
+                width_hundredths: 1500,
+                height_hundredths: 1125,
+            },
+            stroke_width_hundredths: 225,
+            rotation_hundredths: 3300,
+            stroke: Rgba {
+                red: 200,
+                green: 35,
+                blue: 61,
+                alpha: 117,
+            },
+            fill: Some(Rgba {
+                red: 40,
+                green: 130,
+                blue: 210,
+                alpha: 173,
+            }),
+            ..VectorShape::default()
+        };
+        let shapes = [
+            base,
+            clipped,
+            VectorShape {
+                rotation_hundredths: 0,
+                bounds: VectorShapeBounds {
+                    x_hundredths: -3000,
+                    y_hundredths: -2000,
+                    ..clipped.bounds
+                },
+                ..clipped
+            },
+        ];
+        let expected = full_canvas_reference(&shapes, size);
+        let actual =
+            render_wpf_vector_shapes(&shapes, size, RenderLimits::default(), &NeverCancel).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            pixel(&actual, 0, 0),
+            wpf_pixels::premultiply([30, 90, 160, 173])
+        );
+    }
+
+    #[test]
+    #[ignore = "explicit 32/256-small-shape 4K audit; retain baseline failures and optimized measurements"]
+    fn inspect_many_small_4k() {
+        let size = PhysicalSize::new(3840, 2160).unwrap();
+        let mut rejected = Vec::new();
+        for count in [32, 256] {
+            let shapes = small_shapes(count);
+            let mut budget = Budget::new(RenderLimits::default(), &NeverCancel).unwrap();
+            let start = std::time::Instant::now();
+            let result = render_canvas(&shapes, size, &mut budget);
+            eprintln!(
+                "WPF_SMALL {}",
+                serde_json::json!({
+                    "width":3840,"height":2160,"objects":count,"shape_dimensions":[40,24],
+                    "debug_assertions":cfg!(debug_assertions),"executable":std::env::current_exe().unwrap(),
+                    "elapsed_seconds":start.elapsed().as_secs_f64(),"maximum_work":MAX_WORK,
+                    "brush":budget.usage.brush,"raster":budget.usage.raster,"pixels":budget.usage.pixels,
+                    "charged_total":budget.usage.total(),"error":result.as_ref().err().map(ToString::to_string),
+                    "success":result.is_ok(),"failed_phase_work_is_unreported":result.is_err(),
+                })
+            );
+            match result {
+                Ok(surface) => {
+                    assert_eq!(surface.size(), size);
+                    for index in 0..count {
+                        let x = (index % 32) * 110 + 40;
+                        let y = (index / 32) * 220 + 32;
+                        assert!(pixel(&surface, x, y)[3] > 0, "missing object {index}");
+                    }
+                }
+                Err(error) => rejected.push(format!("{count} objects: {error}")),
+            }
+        }
+        assert!(
+            rejected.is_empty(),
+            "Small-shape audit failed: {rejected:#?}"
         );
     }
 }

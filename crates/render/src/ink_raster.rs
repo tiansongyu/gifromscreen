@@ -17,6 +17,9 @@ use crate::{
 #[path = "ink_raster/hfd.rs"]
 mod hfd;
 
+mod region;
+pub(crate) use region::{InkRegionMask, rasterize_ink_paths_region_measured};
+
 type Result<T> = std::result::Result<T, InkError>;
 
 /// Fills each path using its own fill rule, then unions the resulting regions.
