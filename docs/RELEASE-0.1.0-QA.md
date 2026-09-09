@@ -96,6 +96,57 @@ Machine-readable package audit:
 The CI artifact ZIP, exact package, audit script and logs are retained in that
 private local evidence directory; these `/tmp` paths are not public downloads.
 
+## Actual packaged recording and export
+
+The exact packaged desktop above was frozen in the owned GNOME/Xvfb X11 lab
+`/tmp/gfs-wayland-qa.dt8p98s3`. No host desktop, camera or input device was used.
+The fixture's title says “Wayland QA” because it is a shared test fixture;
+this particular exercise uses **X11**. A normal 100% UI scale was used.
+
+The real UI confirms the new non-preview header in English and Chinese, an
+explicit Chinese preference saved and restored after a normal restart, and
+System resolving to Chinese under the app's Chinese locale environment. The
+final saved preference is `{"mode":"system"}`. Screenshots 01–05 preserve these
+states; this is not proof that the other 27 catalogs are translated.
+
+The actual recording workflow then hides the main editor, opens a separate
+border/controller, starts a 120×80 capture at 10 fps, pauses, moves the same-size
+region once, resumes and stops normally into the editor:
+
+| Durable source frames | Physical origin | Size | Recorded RGBA |
+| --- | --- | --- | --- |
+| 1–16 | (1060, 240) | 120×80 | (209, 56, 61, 255), flat red |
+| 17–34 | (1240, 240) | 120×80 | (30, 143, 79, 255), flat green |
+
+Revision **63** contains **34 editable frames**, duration **3,302,252 µs**.
+The long paused wall-clock interval is not included in playback. Every stored
+pixel matches its intended flat fixture color: no recording border/controller
+pixels appear in this bounded test. Frame origins confirm actual region movement,
+not only movement of the fixture. Input event collection stayed off.
+
+The Chinese GUI exports all 34 frames. After a normal WM close releases the
+project lock, the **same packaged CLI** reopens revision 63 without a lock
+override and produces a byte-identical GIF:
+
+- **319 bytes**, SHA-256
+  `dddcddc8a60977803e9dbe28d7a6d683eda998903b88013c31234b5f6cd2543a`.
+- Two decoded 120×80 images, exact red/green pixels, delays **1,500 + 1,800 ms**.
+  Identical source frames are coalesced during GIF encoding; 34 source frames
+  are not misreported as 34 encoded images. Total GIF playback is **3.300 s**.
+
+Original language/recording screenshots and root-01 through root-06 are retained
+in the lab's `logs/`; `root-02-retargeted.png` records the paused moved border,
+and `root-06-gif-complete.png` records the real export result. Project, both GIFs
+and decoded-pixel verification are in `/tmp/gfs-release-native.uzUDio`.
+`verification.json` has SHA-256
+`0ef6e1ae0a894d33d890565b5ec8c7faa0ed7ff3255c04a8d225462f7f0d9106`.
+
+Both app launches and the fixture closed normally with exit 0. The WM client
+list was empty before scoped stop; GNOME also exited 0, the lab and extra-app
+record `cleanup_complete=true`, and both live tool handles were consumed with
+exit 0. No test service is left running. This bounded case does not close the
+remaining hardware, multi-monitor, repeated-movement or Wayland matrix.
+
 ## Scope and retained unfinished work
 
 The bounded X11 checks do not qualify all physical GNOME/KDE/wlroots desktops,
