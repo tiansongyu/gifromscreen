@@ -45,7 +45,7 @@ integer HFD curve flattening and 8×8 coverage count. PM channel scaling uses
 `(channel * coverage * 4 + 128) >> 8`, not a separately rounded A8 mask followed
 by `/255` multiplication. Layout rounding and raster rounding are different.
 
-## Stroke and clip work still open
+## Candidate stroke and clip implementation
 
 Native rectangle widening has a dedicated compact path. It expands/shrinks the
 original radii before independent axis clamping; widening an already flattened
@@ -63,9 +63,37 @@ discarded an unconnected experimental intersection API after verifying this
 source path; it was never applied to saved projects or used to claim parity.
 
 The layout module exposes clip geometry without claiming how it is composited.
-Stroke preparation and bounded PM clip rendering remain independent work, to
-be exercised against the full real fixture chain and versioned before authoring.
-No release or full WPF parity is claimed by this foundation.
+Stroke preparation and bounded PM clip rendering are now implemented in a
+separate batch entrypoint. Unclipped shapes paint fill/stroke **directly onto
+the existing canvas**; only clipped visuals receive their own PM intermediate.
+Initially rendering every shape to its own bitmap produced 23 differing pixels
+in the two-shape fixture (channel differences up to 2). That failed report is
+retained at `/tmp/gfs-wpf-vector-candidate-4e28a35/vector-candidate.json`.
+
+After preserving the actual native grouping, **all 14 complete vector cases**
+from real producer run [34309842487](https://github.com/tiansongyu/gifromscreen/actions/runs/34309842487)
+match exactly on explicit Rust 1.98.0 and 1.88.0. This includes fractional
+fill/stroke, rounded-axis clamping, rotated triangle/arrow/ellipse, and all four
+extreme layout/clip cases. Their 19 input stages also match; all remaining
+non-vector artifacts are validated but are not mislabeled as candidate renders.
+The 33 compared rows have zero RGBA differences. Both independent reports share
+SHA-256 `6b42e00ecf6ff56bef686a2451318b89eecb0584bfbb0ce3e3b1912febb94301`:
+
+- `/tmp/gfs-wpf-vector-batch-4e28a35.DEd3at/vector-candidate.json`
+- `/tmp/gfs-wpf-vector-batch-msrv-4e28a35.WxiYXC/vector-candidate.json`
+
+PNG pixels and raw RGBA must agree in addition to matching their separate
+digests. A synthetic contradictory-envelope regression covers this check;
+synthetic helper data are not WPF expected pixels.
+
+The full persisted-V1 comparator remains separate and failing. This candidate
+still needs production-scale work policy, a version-safe project/editor route,
+larger/mixed-geometry cases and native acceptance before becoming the authoring
+default. Existing saved V1 bytes and pipeline behavior are unchanged. The first
+batch implementation conservatively divides a total 100M work bound between
+phases; measured brush/raster helpers now expose actual charged work for the
+next scale-validation step without changing their legacy public results.
+No release or full-project WPF parity is claimed by the 14-case result.
 
 ## Primary references
 

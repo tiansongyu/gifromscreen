@@ -490,3 +490,84 @@ fn flattened_curve_segments_are_budgeted_even_when_the_viewport_is_tiny() {
         Err(InkError::Limit(_))
     ));
 }
+
+#[test]
+fn measured_raster_preserves_pixels_and_reports_the_exact_exhaustion_boundary() {
+    let limits = InkLimits::default();
+    for paths in [
+        Vec::new(),
+        vec![rectangle(0.25, 1.75, 8.5, 11.0)],
+        vec![
+            ellipse(-2.0, -1.0, 18.0, 15.0),
+            rectangle(3.0, 4.0, 4.0, 3.0),
+        ],
+    ] {
+        for outside in [false, true] {
+            let original =
+                rasterize_ink_paths(&paths, size(16, 16), outside, &limits, &NeverCancel).unwrap();
+            let (actual, work) =
+                rasterize_ink_paths_measured(&paths, size(16, 16), outside, &limits, &NeverCancel)
+                    .unwrap();
+            assert_eq!(actual, original);
+            assert!(work > 0 && work < limits.max_work);
+            let exact = InkLimits {
+                max_work: work,
+                ..limits
+            };
+            let (again, charged) =
+                rasterize_ink_paths_measured(&paths, size(16, 16), outside, &exact, &NeverCancel)
+                    .unwrap();
+            assert_eq!(again, actual);
+            assert_eq!(charged, work);
+            let short = InkLimits {
+                max_work: work - 1,
+                ..limits
+            };
+            assert!(matches!(
+                rasterize_ink_paths_measured(&paths, size(16, 16), outside, &short, &NeverCancel),
+                Err(InkError::Limit(_))
+            ));
+        }
+    }
+}
+
+#[test]
+fn raster_meter_grows_with_performed_work_and_keeps_zero_limits_and_cancellation() {
+    let limits = InkLimits::default();
+    let (_, small) =
+        rasterize_ink_paths_measured(&[], size(4, 4), false, &limits, &NeverCancel).unwrap();
+    let (_, large) =
+        rasterize_ink_paths_measured(&[], size(8, 8), false, &limits, &NeverCancel).unwrap();
+    assert!(large > small);
+    let paths = [rectangle(1.0, 1.0, 3.0, 3.0)];
+    let (_, populated) =
+        rasterize_ink_paths_measured(&paths, size(8, 8), false, &limits, &NeverCancel).unwrap();
+    assert!(populated > large);
+    let zero = InkLimits {
+        max_work: 0,
+        ..limits
+    };
+    assert!(matches!(
+        rasterize_ink_paths_measured(&paths, size(8, 8), false, &zero, &NeverCancel),
+        Err(InkError::Limit(_))
+    ));
+    for after in [0, 5, 30] {
+        let old = CancelAfter {
+            calls: AtomicUsize::new(0),
+            after,
+        };
+        let measured = CancelAfter {
+            calls: AtomicUsize::new(0),
+            after,
+        };
+        let expected = rasterize_ink_paths(&paths, size(16, 16), false, &limits, &old);
+        let result = rasterize_ink_paths_measured(&paths, size(16, 16), false, &limits, &measured)
+            .map(|(pixels, _)| pixels);
+        assert!(matches!(result, Err(InkError::Cancelled)));
+        assert_eq!(result, expected);
+        assert_eq!(
+            old.calls.load(Ordering::Relaxed),
+            measured.calls.load(Ordering::Relaxed)
+        );
+    }
+}

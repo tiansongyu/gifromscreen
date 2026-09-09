@@ -33,6 +33,20 @@ pub fn rasterize_ink_paths<C: CancellationToken + ?Sized>(
     limits: &InkLimits,
     cancellation: &C,
 ) -> Result<Vec<u8>> {
+    rasterize_ink_paths_measured(paths, size, outside, limits, cancellation)
+        .map(|(coverage, _)| coverage)
+}
+
+/// The unchanged raster operation plus its actual accumulated budget charge.
+/// This is the existing algorithm's work units, not elapsed time or a new
+/// estimate. No extra output or geometry buffers are retained for measurement.
+pub(crate) fn rasterize_ink_paths_measured<C: CancellationToken + ?Sized>(
+    paths: &[InkPath],
+    size: PhysicalSize,
+    outside: bool,
+    limits: &InkLimits,
+    cancellation: &C,
+) -> Result<(Vec<u8>, u64)> {
     let byte_len = checked_byte_len(size)?;
     let mut budget = Budget::new(limits, cancellation, 0)?;
     prepare_work(size, &mut budget)?;
@@ -49,7 +63,7 @@ pub fn rasterize_ink_paths<C: CancellationToken + ?Sized>(
         Ok(())
     })?;
     budget.check()?;
-    Ok(output)
+    Ok((output, budget.work))
 }
 
 /// Produces a typed premultiplied snapshot of the reference outside the live

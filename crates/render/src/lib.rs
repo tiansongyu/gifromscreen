@@ -67,6 +67,7 @@ pub use renderer::{
 pub use surface::RgbaSurface;
 pub use transition::{TransitionProgress, render_transition};
 pub use vector_shape::{
-    MAX_VECTOR_PREVIEW_SHAPES, VectorShapeGeometry, vector_shape_geometry,
+    MAX_VECTOR_PREVIEW_SHAPES, VectorShapeGeometry, WpfBrushPaths, prepare_wpf_brush_paths,
+    render_wpf_vector_shape, render_wpf_vector_shapes, vector_shape_geometry,
     wpf_vector_shape_geometry,
 };

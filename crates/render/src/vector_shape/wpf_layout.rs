@@ -589,6 +589,50 @@ mod tests {
     }
 
     #[test]
+    fn hosted_extreme_layout_probes_confirm_arranged_sizes_and_actual_local_clips() {
+        use VectorShapeKind::{BlockArrow, Triangle};
+        // Windows producer 34309842487, source 4e28a35, actual
+        // VisualTreeHelper.GetClip paths in VECTOR_LAYOUT logs. Expected sizes
+        // and clip rectangles are independently observed, not computed here.
+        for (kind, width, height, stroke, render_size, clip) in [
+            (
+                Triangle,
+                1500,
+                226,
+                225,
+                [25.0, 2.0],
+                Some([0.0, 0.0, 15.0, 2.0]),
+            ),
+            (
+                Triangle,
+                100,
+                200,
+                1000,
+                [14.0, 15.0],
+                Some([0.0, 0.0, 1.0, 2.0]),
+            ),
+            (
+                BlockArrow,
+                100,
+                200,
+                1000,
+                [5.0, 5.0],
+                Some([0.0, 0.0, 1.0, 2.0]),
+            ),
+            (BlockArrow, 300, 1500, 200, [3.0, 15.0], None),
+        ] {
+            assert_eq!(
+                layout(&shape(kind, [200, 200, width, height], stroke)).unwrap(),
+                Layout {
+                    offset: [2.0, 2.0],
+                    render_size,
+                    clip
+                }
+            );
+        }
+    }
+
+    #[test]
     fn transparent_stroke_still_measures_but_zero_stroke_does_not() {
         let mut request = shape(VectorShapeKind::Triangle, [0, 0, 1500, 1125], 225);
         let opaque = layout(&request).unwrap();

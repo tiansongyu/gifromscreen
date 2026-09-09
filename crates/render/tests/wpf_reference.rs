@@ -45,6 +45,9 @@ type Result<T> = std::result::Result<T, String>;
 #[path = "wpf_reference/fill_coverage.rs"]
 mod fill_coverage;
 
+#[path = "wpf_reference/vector_candidate.rs"]
+mod vector_candidate;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Definition {
@@ -455,6 +458,9 @@ fn load_reference(
     let decoded = reader.decode().map_err(|error| error.to_string())?;
     if (decoded.width(), decoded.height()) != (reference.width, reference.height) {
         return Err("Reference PNG dimensions disagree with its raw image.".into());
+    }
+    if decoded.into_rgba8().as_raw() != &bytes {
+        return Err("Reference PNG pixels disagree with its separately hashed RGBA bytes.".into());
     }
     if let (Some(path), Some(hash)) = (
         &reference.premultiplied_file,
@@ -1225,6 +1231,22 @@ mod mechanical_tests {
         }
     }
 
+    #[test]
+    fn separately_valid_digests_cannot_hide_png_and_rgba_pixel_disagreement() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = "synthetic-inconsistent-not-wpf";
+        fs::create_dir(directory.path().join(id)).unwrap();
+        let source =
+            RgbaSurface::new(PhysicalSize::new(1, 1).unwrap(), vec![255, 0, 0, 255]).unwrap();
+        let mut reference = synthetic_reference(directory.path(), id, "input", &source);
+        let changed = [255, 1, 0, 255];
+        fs::write(directory.path().join(&reference.rgba_file), changed).unwrap();
+        reference.rgba_sha256 = sha256(&changed);
+        let mut budget = MAX_TOTAL_BYTES;
+        let error = load_reference(directory.path(), &reference, &mut budget).unwrap_err();
+        assert!(error.contains("PNG pixels disagree"), "{error}");
+    }
+
     fn synthetic_generator(repository: &Path) -> Vec<GeneratorFile> {
         let generator = repository.join("scripts/qa/wpf_reference");
         fs::create_dir_all(&generator).unwrap();
@@ -1335,6 +1357,29 @@ mod mechanical_tests {
         assert_eq!(json["reference"]["working_dpi_y"], 96.0);
     }
 
+    fn assert_invalid_reference_bindings(
+        index: &mut ReferenceIndex,
+        definition: &Definition,
+        bytes: &[u8],
+        repository: &Path,
+    ) {
+        validate_index(index, definition, bytes).unwrap();
+        let mut budget = MAX_TOTAL_BYTES;
+        validate_generator_files(index, repository, &mut budget).unwrap();
+        let duplicate_stage = index.fixtures[0].stages[0].clone();
+        index.fixtures[0].stages.push(duplicate_stage);
+        assert!(validate_index(index, definition, bytes).is_err());
+        index.fixtures[0].stages.pop();
+        index.fixtures[0].input.premultiplied_file = Some("synthetic-0/input.pbgra".into());
+        assert!(validate_index(index, definition, bytes).is_err());
+        index.fixtures[0].input.premultiplied_file = None;
+        let mut wrong_hash = index.clone();
+        wrong_hash.generator_files[0].sha256 = sha256(b"different generator");
+        assert!(validate_generator_files(&wrong_hash, repository, &mut budget).is_err());
+        wrong_hash.generator_files.pop();
+        assert!(validate_generator_files(&wrong_hash, repository, &mut budget).is_err());
+    }
+
     #[test]
     fn synthetic_comparator_integrity_checks_bind_sources_and_collect_all_stage_failures() {
         // These bytes are explicitly synthetic plumbing fixtures, never a WPF
@@ -1388,26 +1433,26 @@ mod mechanical_tests {
                 })
                 .collect(),
         };
-        validate_index(&index, &definition, &bytes).unwrap();
-        let mut budget = MAX_TOTAL_BYTES;
-        validate_generator_files(&index, &repository, &mut budget).unwrap();
-        let duplicate_stage = index.fixtures[0].stages[0].clone();
-        index.fixtures[0].stages.push(duplicate_stage);
-        assert!(validate_index(&index, &definition, &bytes).is_err());
-        index.fixtures[0].stages.pop();
-        index.fixtures[0].input.premultiplied_file = Some("synthetic-0/input.pbgra".into());
-        assert!(validate_index(&index, &definition, &bytes).is_err());
-        index.fixtures[0].input.premultiplied_file = None;
-        let mut wrong_hash = index.clone();
-        wrong_hash.generator_files[0].sha256 = sha256(b"different generator");
-        assert!(validate_generator_files(&wrong_hash, &repository, &mut budget).is_err());
-        wrong_hash.generator_files.pop();
-        assert!(validate_generator_files(&wrong_hash, &repository, &mut budget).is_err());
+        assert_invalid_reference_bindings(&mut index, &definition, &bytes, &repository);
         // An RGB difference must be reported as a pixel mismatch,
         // while an unrelated corrupt digest must not stop remaining stages.
         let changed = [255, 1, 0, 255];
         fs::write(reference.join(&index.fixtures[0].input.rgba_file), changed).unwrap();
         index.fixtures[0].input.rgba_sha256 = sha256(&changed);
+        // Make both representations agree so this remains a *pixel difference*
+        // against the input definition, not an inconsistent-envelope failure.
+        let changed_png = directory.path().join("changed-synthetic.png");
+        write_png(
+            &changed_png,
+            &RgbaSurface::new(surface.size(), changed.to_vec()).unwrap(),
+        )
+        .unwrap();
+        fs::copy(
+            &changed_png,
+            reference.join(&index.fixtures[0].input.png_file),
+        )
+        .unwrap();
+        index.fixtures[0].input.png_sha256 = sha256(&fs::read(changed_png).unwrap());
         index.fixtures[0].stages[0].rgba_sha256 = sha256(b"corrupted binding");
         write_new(
             &reference.join("index.json"),
