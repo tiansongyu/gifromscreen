@@ -3,7 +3,7 @@ use gif_from_screen_localization::Message;
 
 use super::{
     draft::{Draft, GestureKind, Handle, Point, ShapeTool},
-    geometry::{GeometryCache, handles},
+    geometry::GeometryCache,
 };
 use crate::ui_notice::Notice;
 
@@ -432,14 +432,19 @@ fn begin_at(
     budget: &mut usize,
 ) -> Result<(), Notice> {
     if draft.tool == ShapeTool::Select {
+        geometry.ensure(draft)?;
         let handle = draft.primary().and_then(|object| {
-            handles(object).into_iter().rev().find_map(|(handle, at)| {
-                (mapping
-                    .handle_position(handle, at, object.shape.rotation_hundredths)
-                    .distance(mapping.to_global.inverse() * pos)
-                    <= HANDLE_RADIUS + 2.0)
-                    .then_some(handle)
-            })
+            geometry
+                .handles(object.id)?
+                .into_iter()
+                .rev()
+                .find_map(|(handle, at)| {
+                    (mapping
+                        .handle_position(handle, at, object.shape.rotation_hundredths)
+                        .distance(mapping.to_global.inverse() * pos)
+                        <= HANDLE_RADIUS + 2.0)
+                        .then_some(handle)
+                })
         });
         if let Some(handle) = handle {
             draft.begin_handle(point, handle)?;

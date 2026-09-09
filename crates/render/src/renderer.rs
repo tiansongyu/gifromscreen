@@ -1097,9 +1097,10 @@ fn blend_pixel(surface: &mut RgbaSurface, x: u32, y: u32, source: Rgba) {
     let inverse_source_alpha = 255 - source_alpha;
     let output_alpha_numerator = source_alpha * 255 + destination_alpha * inverse_source_alpha;
     let output_alpha = (output_alpha_numerator + 127) / 255;
-    for (channel, source_channel) in destination[..3]
-        .iter_mut()
-        .zip([source.red, source.green, source.blue])
+    for (channel, source_channel) in
+        destination[..3]
+            .iter_mut()
+            .zip([source.red, source.green, source.blue])
     {
         let source_channel = u32::from(source_channel);
         let destination_channel = u32::from(*channel);

@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use gif_from_screen_render::{InkPoint, VectorShapeGeometry, vector_shape_geometry};
+use gif_from_screen_render::{
+    InkPoint, VectorShapeGeometry, VectorShapeLayout, vector_shape_geometry, vector_shape_layout,
+};
 
 use super::{
     DraftObject,
-    draft::{Draft, Handle, Point, extent, pixels},
+    draft::{Draft, Handle, Point, pixels},
     error,
 };
 use crate::ui_notice::Notice;
@@ -12,7 +14,14 @@ use crate::ui_notice::Notice;
 #[derive(Default)]
 pub(super) struct GeometryCache {
     generation: Option<u64>,
-    entries: BTreeMap<u64, (DraftObject, VectorShapeGeometry)>,
+    entries: BTreeMap<u64, CachedGeometry>,
+}
+
+#[derive(Clone)]
+struct CachedGeometry {
+    object: DraftObject,
+    geometry: VectorShapeGeometry,
+    layout: VectorShapeLayout,
 }
 
 impl GeometryCache {
@@ -27,17 +36,26 @@ impl GeometryCache {
         let mut entries = BTreeMap::new();
         for object in &draft.objects {
             let geometry = match self.entries.get(&object.id) {
-                Some((original, geometry)) if original == object => geometry.clone(),
-                _ => vector_shape_geometry(&object.shape).map_err(error)?,
+                Some(cached) if cached.object == *object => cached.clone(),
+                _ => CachedGeometry {
+                    object: *object,
+                    geometry: vector_shape_geometry(&object.shape).map_err(error)?,
+                    layout: vector_shape_layout(&object.shape).map_err(error)?,
+                },
             };
-            entries.insert(object.id, (*object, geometry));
+            entries.insert(object.id, geometry);
         }
         self.entries = entries;
         self.generation = Some(draft.generation);
         Ok(())
     }
     pub(super) fn get(&self, id: u64) -> Option<&VectorShapeGeometry> {
-        self.entries.get(&id).map(|(_, geometry)| geometry)
+        self.entries.get(&id).map(|cached| &cached.geometry)
+    }
+    pub(super) fn handles(&self, id: u64) -> Option<[(Handle, InkPoint); 9]> {
+        self.entries
+            .get(&id)
+            .map(|cached| layout_handles(cached.object, cached.layout))
     }
     pub(super) fn hit(
         &mut self,
@@ -49,7 +67,9 @@ impl GeometryCache {
         let point = ink(point);
         for object in draft.objects.iter().rev() {
             spend(budget)?;
-            if self.entries[&object.id].1.hit_test(point) {
+            // Point policy remains fill containment, including transparent fill.
+            // It is not a raster-alpha or layout-clip visibility query.
+            if self.entries[&object.id].geometry.hit_test(point) {
                 return Ok(Some(object.id));
             }
         }
@@ -68,7 +88,10 @@ impl GeometryCache {
         let mut selected = BTreeSet::new();
         for object in &draft.objects {
             spend(budget)?;
-            if self.entries[&object.id].1.intersects_rect(low, high) {
+            // Deliberate Linux policy: shared fill-contour intersection. WPF's
+            // VisualTreeHelper marquee also observes visual/stroke/clip details;
+            // this narrower policy is not advertised as that full hit-test.
+            if self.entries[&object.id].geometry.intersects_rect(low, high) {
                 selected.insert(object.id);
             }
         }
@@ -90,14 +113,18 @@ pub(super) fn ink(point: Point) -> InkPoint {
     }
 }
 
-/// Handles use the object's local layout box, transformed about its center.
+#[cfg(test)]
 pub(super) fn handles(object: DraftObject) -> [(Handle, InkPoint); 9] {
-    let bounds = object.shape.bounds;
-    let width = extent(bounds.width_hundredths);
-    let height = extent(bounds.height_hundredths);
+    layout_handles(object, vector_shape_layout(&object.shape).unwrap())
+}
+
+/// V1 retains requested geometry. V2's shared layout reports the RenderSize
+/// that WPF's base Adorner.MeasureOverride uses for the handle arrangement.
+fn layout_handles(object: DraftObject, layout: VectorShapeLayout) -> [(Handle, InkPoint); 9] {
+    let [width, height] = layout.render_size;
     let center = InkPoint {
-        x: pixels(bounds.x_hundredths) + width / 2.0,
-        y: pixels(bounds.y_hundredths) + height / 2.0,
+        x: layout.origin.x + width / 2.0,
+        y: layout.origin.y + height / 2.0,
     };
     let (sin, cos) = (f64::from(object.shape.rotation_hundredths) / 100.0)
         .to_radians()

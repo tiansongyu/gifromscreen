@@ -48,6 +48,9 @@ mod fill_coverage;
 #[path = "wpf_reference/vector_candidate.rs"]
 mod vector_candidate;
 
+#[path = "wpf_reference/vector_v1_compatibility.rs"]
+mod vector_v1_compatibility;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Definition {
@@ -557,9 +560,18 @@ impl Graph {
             }
             Operation::VectorShapes { shapes } => {
                 validate_vector_shapes(shapes)?;
+                let version = shapes[0].version;
+                if shapes.iter().any(|shape| shape.version != version) {
+                    return Err("One vector fixture operation cannot mix renderer versions".into());
+                }
+                let precision = if version == 2 {
+                    CompositePrecision::VectorCanvasPbgra8PngV2
+                } else {
+                    CompositePrecision::VectorCanvasPbgra8PngV1
+                };
                 self.append_mark_group(
                     identity,
-                    CompositePrecision::VectorCanvasPbgra8PngV1,
+                    precision,
                     shapes
                         .iter()
                         .map(|shape| OverlayContent::VectorShape { shape: *shape })
@@ -1003,7 +1015,7 @@ mod mechanical_tests {
         assert!(validate_vector_shapes(&[shape; MAX_VECTOR_SHAPES + 1]).is_err());
         assert!(
             validate_vector_shapes(&[VectorShape {
-                version: 2,
+                version: 3,
                 ..shape
             }])
             .is_err()

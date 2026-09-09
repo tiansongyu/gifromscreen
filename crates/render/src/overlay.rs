@@ -17,6 +17,9 @@ const CANCELLATION_PIXEL_INTERVAL: u32 = 1_024;
 #[path = "event_overlay.rs"]
 mod events;
 
+#[path = "vector_canvas_v2.rs"]
+mod vector_v2;
+
 #[cfg(test)]
 #[path = "stage_precision_tests.rs"]
 mod precision_tests;
@@ -381,12 +384,18 @@ fn stage_overlay_layers<'a, C: CancellationToken + ?Sized>(
                 stage_id,
             });
         }
+        vector_v2::validate_layer(
+            clip.id,
+            &layer,
+            stage.and_then(|id| stages.get(&id).copied()),
+        )?;
         if let Some(stage_id) = stage
             && matches!(
                 stages.get(&stage_id),
                 Some(
                     CompositePrecision::WpfPbgra8PngV1
                         | CompositePrecision::VectorCanvasPbgra8PngV1
+                        | CompositePrecision::VectorCanvasPbgra8PngV2
                 )
             )
         {
@@ -611,6 +620,11 @@ fn composite_vector_shape<C: CancellationToken + ?Sized>(
     cancellation: &C,
     work: &mut u64,
 ) -> Result<(), RenderError> {
+    if shape.version != gif_from_screen_domain::VECTOR_SHAPE_VERSION {
+        return Err(RenderError::InvalidVectorShape {
+            reason: "WPF vector version two requires its explicit frame-owned V2 stage".into(),
+        });
+    }
     crate::vector_shape::paint(
         shape,
         destination.size(),
@@ -675,6 +689,11 @@ pub fn render_vector_shapes_preview<C: CancellationToken + ?Sized>(
         shape
             .validate()
             .map_err(|reason| RenderError::InvalidVectorShape { reason })?;
+        if shape.version != gif_from_screen_domain::VECTOR_SHAPE_VERSION {
+            return Err(RenderError::InvalidVectorShape {
+                reason: "Vector V2 preview requires physical-stage WPF projection, not the legacy scaled rasterizer".into(),
+            });
+        }
     }
     let mut surface = RgbaSurface::try_zeroed(size)?;
     let scale = [
@@ -716,6 +735,9 @@ fn composite_stage<P: FrameAssetProvider + ?Sized, C: CancellationToken + ?Sized
 ) -> Result<(), RenderError> {
     if layers.is_empty() {
         return Ok(());
+    }
+    if precision == CompositePrecision::VectorCanvasPbgra8PngV2 {
+        return vector_v2::composite(destination, &layers, limits, cancellation);
     }
     if precision == CompositePrecision::VectorCanvasPbgra8PngV1 {
         return composite_vector_canvas(

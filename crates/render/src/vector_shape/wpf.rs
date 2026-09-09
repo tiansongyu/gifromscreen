@@ -4,7 +4,7 @@
 use gif_from_screen_domain::{VectorShape, VectorShapeKind};
 
 use super::{
-    VectorShapeGeometry, control_bounds, point, rotate, rounded_rect, vector_shape_geometry,
+    VectorShapeGeometry, control_bounds, point, requested_vector_geometry, rotate, rounded_rect,
     wpf_layout,
 };
 use crate::{InkFigure, InkPath, InkPoint, InkSegment, RenderError};
@@ -42,7 +42,7 @@ pub fn wpf_vector_shape_geometry(shape: &VectorShape) -> Result<VectorShapeGeome
             local.bounds.x_hundredths = 0;
             local.bounds.y_hundredths = 0;
             local.rotation_hundredths = 0;
-            let geometry = vector_shape_geometry(&local)?;
+            let geometry = requested_vector_geometry(&local)?;
             (geometry.outline.figures[0].clone(), geometry.nonempty_fill)
         }
     };
@@ -90,6 +90,7 @@ mod tests {
     use gif_from_screen_domain::VectorShapeBounds;
 
     use super::*;
+    use crate::vector_shape_geometry;
 
     #[test]
     fn arranged_geometry_does_not_reinterpret_or_mutate_vector_one_requests() {

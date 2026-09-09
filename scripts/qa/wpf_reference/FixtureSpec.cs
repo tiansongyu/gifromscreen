@@ -92,7 +92,7 @@ internal static class FixtureParser
         if (right < -extent || right > extent || bottom < -extent || bottom > extent)
             throw new InvalidDataException("Vector-shape checked ends exceed the declared coordinate range.");
         var fill = shape.GetProperty("fill");
-        return new VectorShapeSpec(Integer(shape, "version", 1, 1), kind, rectangle,
+        return new VectorShapeSpec(Integer(shape, "version", 1, 2), kind, rectangle,
             Integer(shape, "stroke_width_hundredths", 0, 10_000), Color(shape.GetProperty("stroke")),
             fill.ValueKind == JsonValueKind.Null ? null : Color(fill),
             Integer(shape, "corner_radius_hundredths", 0, 10_000),

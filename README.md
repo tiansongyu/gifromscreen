@@ -1,3 +1,5 @@
+> 归档：未完成的 schema 9 / Vector v2 集成。此分支不属于 v0.1.0 正式版，当前 UI 接线尚不完整，不能作为可构建或已验收版本。用户已要求暂停功能开发；保留此分支仅用于以后恢复。正式版本请使用 `main` 或 `v0.1.0` 标签。
+
 <p align="center">
   <img src="packaging/linux/io.github.tiansongyu.gifromscreen.svg" width="88" height="88" alt="GifFromScreen 图标">
 </p>

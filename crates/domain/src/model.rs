@@ -429,7 +429,7 @@ pub enum OverlayContent {
 impl OverlayContent {
     pub const fn required_schema_version(&self) -> u32 {
         match self {
-            Self::VectorShape { .. } => crate::VECTOR_SHAPE_SCHEMA_VERSION,
+            Self::VectorShape { shape } => shape.required_schema_version(),
             _ => 1,
         }
     }
@@ -939,6 +939,23 @@ impl ProjectManifest {
                 continue;
             }
             for cell in track.frame_cells.iter().flatten() {
+                let precision = cell.stage.and_then(|stage| {
+                    frame_stages
+                        .get(&cell.frame_id)
+                        .and_then(|stages| stages.get(&stage))
+                });
+                for mark in &cell.marks {
+                    if matches!(&mark.content, OverlayContent::VectorShape { shape }
+                        if shape.version == crate::WPF_VECTOR_SHAPE_VERSION)
+                        && precision != Some(&crate::CompositePrecision::VectorCanvasPbgra8PngV2)
+                    {
+                        issues.push(ValidationIssue::InvalidVectorShape {
+                            track_id: track.id,
+                            overlay_id: mark.id,
+                            reason: "Vector shape version 2 requires its owner's explicit version-two vector-canvas stage, including hidden groups.".to_owned(),
+                        });
+                    }
+                }
                 if let Some(stage) = cell.stage {
                     if self.schema_version < 3 {
                         issues.push(ValidationIssue::InvalidFrameOverlay {
@@ -958,15 +975,13 @@ impl ProjectManifest {
                             ),
                         });
                     }
-                    let precision = frame_stages
-                        .get(&cell.frame_id)
-                        .and_then(|stages| stages.get(&stage));
                     if track.blend_mode != BlendMode::Normal
                         && matches!(
                             precision,
                             Some(
                                 crate::CompositePrecision::WpfPbgra8PngV1
                                     | crate::CompositePrecision::VectorCanvasPbgra8PngV1
+                                    | crate::CompositePrecision::VectorCanvasPbgra8PngV2
                             )
                         )
                     {
@@ -986,6 +1001,17 @@ impl ProjectManifest {
                         issues.push(ValidationIssue::InvalidFrameOverlay {
                             track_id: track.id,
                             reason: format!("Vector-canvas stage {stage} accepts only frame-owned VectorShape marks, including hidden groups."),
+                        });
+                    }
+                    if precision == Some(&crate::CompositePrecision::VectorCanvasPbgra8PngV2)
+                        && cell.marks.iter().any(|mark| {
+                            !matches!(&mark.content, OverlayContent::VectorShape { shape }
+                                if shape.version == crate::WPF_VECTOR_SHAPE_VERSION)
+                        })
+                    {
+                        issues.push(ValidationIssue::InvalidFrameOverlay {
+                            track_id: track.id,
+                            reason: format!("Vector-canvas version-two stage {stage} accepts only frame-owned version-two VectorShape marks, including hidden groups."),
                         });
                     }
                 }
@@ -1013,6 +1039,16 @@ impl ProjectManifest {
                 }
             }
             for overlay in &track.items {
+                if matches!(&overlay.content, OverlayContent::VectorShape { shape }
+                    if shape.version == crate::WPF_VECTOR_SHAPE_VERSION)
+                {
+                    issues.push(ValidationIssue::InvalidVectorShape {
+                        track_id: track.id,
+                        overlay_id: overlay.id,
+                        reason: "Vector shape version 2 must be frame-owned, not time-anchored."
+                            .to_owned(),
+                    });
+                }
                 if overlay.span.end().is_none_or(|end| end > timeline_duration) {
                     issues.push(ValidationIssue::OverlayOutsideTimeline {
                         overlay_id: overlay.id,
@@ -1033,7 +1069,7 @@ impl ProjectManifest {
                             overlay_id,
                             reason: format!(
                                 "Vector shapes require schema {}.",
-                                crate::VECTOR_SHAPE_SCHEMA_VERSION
+                                content.required_schema_version()
                             ),
                         });
                     }

@@ -15,6 +15,10 @@ use crate::Rgba;
 pub const VECTOR_SHAPE_VERSION: u8 = 1;
 /// Minimum project schema which understands the new overlay content.
 pub const VECTOR_SHAPE_SCHEMA_VERSION: u32 = 8;
+/// Explicit WPF layout, brush and canvas rendering contract; never the default.
+pub const WPF_VECTOR_SHAPE_VERSION: u8 = 2;
+/// Minimum project schema for WPF vector shapes and their isolated paint stage.
+pub const WPF_VECTOR_SHAPE_SCHEMA_VERSION: u32 = 9;
 /// Twice the maximum GIF axis (65,535 pixels), allowing a full canvas of overscan.
 pub const MAX_VECTOR_SHAPE_EXTENT_HUNDREDTHS: u64 = 13_107_000;
 /// Both origin and unrotated checked end must fit this signed stage-coordinate range.
@@ -35,7 +39,7 @@ pub enum VectorShapeKind {
     BlockArrow,
 }
 
-/// Axis-aligned object layout before rotation around its center.
+/// Axis-aligned requested layout before version-specific arrangement and rotation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VectorShapeBounds {
@@ -114,7 +118,8 @@ pub struct VectorShape {
     pub fill: Option<Rgba>,
     /// Used only by Rectangle; other kinds retain this shared style value without applying it.
     pub corner_radius_hundredths: u32,
-    /// Clockwise about the bounds center, in the canonical range 0..36,000.
+    /// Clockwise in 0..36,000. Version one uses the requested bounds center;
+    /// WPF version two uses the arranged render-size center.
     pub rotation_hundredths: u16,
 }
 
@@ -139,11 +144,32 @@ impl Default for VectorShape {
 }
 
 impl VectorShape {
+    /// Creates a new WPF-version shape without changing the saved version-one default.
+    /// The owning cell must be attached to a matching WPF vector-canvas stage.
+    pub fn wpf_v2() -> Self {
+        Self {
+            version: WPF_VECTOR_SHAPE_VERSION,
+            ..Self::default()
+        }
+    }
+
+    /// Minimum schema for a supported rendering contract. Call [`Self::validate`]
+    /// separately: this metadata query does not validate unknown versions.
+    pub const fn required_schema_version(&self) -> u32 {
+        match self.version {
+            WPF_VECTOR_SHAPE_VERSION => WPF_VECTOR_SHAPE_SCHEMA_VERSION,
+            _ => VECTOR_SHAPE_SCHEMA_VERSION,
+        }
+    }
+
     /// Validates metadata only; invisible styles and zero-width strokes are intentional.
     pub fn validate(self) -> Result<(), String> {
-        if self.version != VECTOR_SHAPE_VERSION {
+        if !matches!(
+            self.version,
+            VECTOR_SHAPE_VERSION | WPF_VECTOR_SHAPE_VERSION
+        ) {
             return Err(format!(
-                "Unsupported vector shape version {}; expected {VECTOR_SHAPE_VERSION}.",
+                "Unsupported vector shape version {}; expected {VECTOR_SHAPE_VERSION} or {WPF_VECTOR_SHAPE_VERSION}.",
                 self.version
             ));
         }
@@ -198,3 +224,7 @@ fn deserialize_optional_color<'de, D: Deserializer<'de>>(
 #[cfg(test)]
 #[path = "vector_shape_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "vector_shape_v2_tests.rs"]
+mod v2_tests;

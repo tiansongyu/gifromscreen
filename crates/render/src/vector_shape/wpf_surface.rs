@@ -30,6 +30,43 @@ const PIXEL_BLOCK: usize = 1024;
 mod spatial;
 use spatial::{Target, bounds, intersect, union, whole};
 
+/// Borrowed shape metadata and one post-mark opacity, not WPF Shape.Opacity.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WpfVectorVisual<'a> {
+    pub shape: &'a VectorShape,
+    pub opacity: u8,
+}
+
+/// Preserves input z-order and applies opacity once to each completed mark.
+/// Unclipped opacity-255 marks retain direct primitive-to-canvas painting.
+/// Clipped/translucent marks use a bounded regional PM layer; zero opacity
+/// still validates metadata, object count and geometry/memory/work limits.
+pub(crate) fn render_wpf_vector_visuals<C: CancellationToken + ?Sized>(
+    visuals: &[WpfVectorVisual<'_>],
+    size: PhysicalSize,
+    limits: RenderLimits,
+    cancel: &C,
+) -> Result<PremultipliedRgbaSurface> {
+    render_wpf_vector_visuals_with_tail_work(visuals, size, limits, 0, cancel)
+}
+
+/// Reserves a caller-owned final pixel pass inside the same 250M ceiling.
+/// The reservation is not reported as work performed by this surface builder.
+/// After success the caller must perform its declared tail work (for example,
+/// final PM-over-base plus unpremultiplication); on error it discards the private
+/// output. Geometry, mask and pixel work receive only the unreserved remainder.
+pub(crate) fn render_wpf_vector_visuals_with_tail_work<C: CancellationToken + ?Sized>(
+    visuals: &[WpfVectorVisual<'_>],
+    size: PhysicalSize,
+    limits: RenderLimits,
+    trailing_pixel_visits: u64,
+    cancel: &C,
+) -> Result<PremultipliedRgbaSurface> {
+    let mut budget = Budget::new(limits, cancel)?;
+    budget.reserve_tail(trailing_pixel_visits)?;
+    render_visual_canvas(visuals.iter().copied(), size, &mut budget)
+}
+
 /// Renders one independently prepared WPF-style visual into PM RGBA8 bytes.
 /// Fill precedes stroke; a layout clip covers their completed result once.
 /// Track opacity and later canvas/stage compositing belong to the caller.
@@ -44,7 +81,15 @@ pub fn render_wpf_vector_shape<C: CancellationToken + ?Sized>(
     limits: RenderLimits,
     cancel: &C,
 ) -> Result<PremultipliedRgbaSurface> {
-    render_wpf_vector_shapes(std::slice::from_ref(shape), size, limits, cancel)
+    render_wpf_vector_visuals(
+        &[WpfVectorVisual {
+            shape,
+            opacity: 255,
+        }],
+        size,
+        limits,
+        cancel,
+    )
 }
 
 /// Renders an ordered WPF shape canvas without changing vector V1 pixels.
@@ -82,17 +127,32 @@ fn render_canvas<C: CancellationToken + ?Sized>(
     size: PhysicalSize,
     budget: &mut Budget<'_, C>,
 ) -> Result<PremultipliedRgbaSurface> {
-    if shapes.len() > MAX_VECTOR_PREVIEW_SHAPES {
+    render_visual_canvas(
+        shapes.iter().map(|shape| WpfVectorVisual {
+            shape,
+            opacity: 255,
+        }),
+        size,
+        budget,
+    )
+}
+
+fn render_visual_canvas<'a, C: CancellationToken + ?Sized>(
+    visuals: impl ExactSizeIterator<Item = WpfVectorVisual<'a>> + Clone,
+    size: PhysicalSize,
+    budget: &mut Budget<'_, C>,
+) -> Result<PremultipliedRgbaSurface> {
+    if visuals.len() > MAX_VECTOR_PREVIEW_SHAPES {
         return Err(InkError::Limit("WPF canvas object limit exceeded".into()));
     }
-    for shape in shapes {
+    for visual in visuals.clone() {
         budget.check()?;
-        shape.validate().map_err(InkError::Invalid)?;
+        visual.shape.validate().map_err(InkError::Invalid)?;
     }
     let byte_len = checked_byte_len(size)?;
     let mut output = zeroed(byte_len, budget)?;
-    for shape in shapes {
-        paint_visual(shape, size, &mut output, budget)?;
+    for visual in visuals {
+        paint_visual(visual, size, &mut output, budget)?;
     }
     budget.charge_pixels(byte_len / 4)?;
     let surface = PremultipliedRgbaSurface::new(size, output)?;
@@ -101,11 +161,12 @@ fn render_canvas<C: CancellationToken + ?Sized>(
 }
 
 fn paint_visual<C: CancellationToken + ?Sized>(
-    shape: &VectorShape,
+    visual: WpfVectorVisual<'_>,
     size: PhysicalSize,
     canvas: &mut [u8],
     budget: &mut Budget<'_, C>,
 ) -> Result<()> {
+    let shape = visual.shape;
     let retained_before = budget.retained_bytes;
     // The canvas is already retained; reserve a minimum mask while preparing
     // geometry. A clipped visual's extra PM allocation is checked afterward.
@@ -122,22 +183,10 @@ fn paint_visual<C: CancellationToken + ?Sized>(
         area: whole(size),
         pixels: canvas,
     };
-    if let Some(path) = &paths.layout_clip {
-        let ink = painted_bounds(shape, &paths, size, budget)?;
-        let clip = bounds(path, size, budget)?;
-        if let Some(area) = ink.zip(clip).and_then(|(ink, clip)| intersect(ink, clip)) {
-            let mut visual = zeroed(checked_byte_len(area.size)?, budget)?;
-            let mut local = Target {
-                area,
-                pixels: &mut visual,
-            };
-            paint_primitives(shape, &paths, size, &mut local, budget)?;
-            let coverage = mask(path, size, area, budget)?;
-            local.apply(&coverage, None, budget)?;
-            target.composite(area, &visual, budget)?;
-        }
-    } else {
+    if visual.opacity == 255 && paths.layout_clip.is_none() {
         paint_primitives(shape, &paths, size, &mut target, budget)?;
+    } else if visual.opacity != 0 {
+        paint_isolated_visual(visual, &paths, size, &mut target, budget)?;
     }
     drop(paths);
     // All current-object geometry, mask and optional temporary have been
@@ -145,6 +194,58 @@ fn paint_visual<C: CancellationToken + ?Sized>(
     budget.retained_bytes = retained_before;
     budget.check()?;
     Ok(())
+}
+
+fn paint_isolated_visual<C: CancellationToken + ?Sized>(
+    visual: WpfVectorVisual<'_>,
+    paths: &WpfBrushPaths,
+    size: PhysicalSize,
+    target: &mut Target<'_>,
+    budget: &mut Budget<'_, C>,
+) -> Result<()> {
+    let mut area = painted_bounds(visual.shape, paths, size, budget)?;
+    if let Some(clip) = &paths.layout_clip {
+        area = area
+            .zip(bounds(clip, size, budget)?)
+            .and_then(|(ink, clip)| intersect(ink, clip));
+    }
+    let Some(area) = area else {
+        return Ok(());
+    };
+    let mut pixels = zeroed(checked_byte_len(area.size)?, budget)?;
+    let mut local = Target {
+        area,
+        pixels: &mut pixels,
+    };
+    paint_primitives(visual.shape, paths, size, &mut local, budget)?;
+    if let Some(path) = &paths.layout_clip {
+        let coverage = mask(path, size, area, budget)?;
+        local.apply(&coverage, None, budget)?;
+    }
+    if visual.opacity != 255 {
+        scale_opacity(&mut pixels, visual.opacity, budget)?;
+    }
+    target.composite(area, &pixels, budget)
+}
+
+fn scale_opacity<C: CancellationToken + ?Sized>(
+    pixels: &mut [u8],
+    opacity: u8,
+    budget: &mut Budget<'_, C>,
+) -> Result<()> {
+    if !pixels.len().is_multiple_of(4) {
+        return Err(InkError::Invalid(
+            "WPF mark opacity requires whole PM RGBA pixels".into(),
+        ));
+    }
+    budget.charge_pixels(pixels.len() / 4)?;
+    for (index, channel) in pixels.iter_mut().enumerate() {
+        if index.is_multiple_of(PIXEL_BLOCK * 4) {
+            budget.check()?;
+        }
+        *channel = wpf_pixels::mul_byte(*channel, opacity);
+    }
+    budget.check()
 }
 
 fn painted_bounds<C: CancellationToken + ?Sized>(
@@ -386,6 +487,7 @@ struct Budget<'a, C: CancellationToken + ?Sized> {
     retained_bytes: usize,
     maximum_work: u64,
     usage: WorkUsage,
+    reserved_tail: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -417,6 +519,7 @@ impl<'a, C: CancellationToken + ?Sized> Budget<'a, C> {
             retained_bytes: 0,
             maximum_work: MAX_WORK,
             usage: WorkUsage::default(),
+            reserved_tail: 0,
         })
     }
 
@@ -446,11 +549,13 @@ impl<'a, C: CancellationToken + ?Sized> Budget<'a, C> {
         self.usage
             .total()
             .checked_add(work)
+            .and_then(|used| used.checked_add(self.reserved_tail))
             .filter(|n| *n <= self.maximum_work)
             .ok_or_else(|| {
                 InkError::Limit(format!(
-                    "WPF canvas aggregate work exceeded: charged {}, next {work}, limit {}",
+                    "WPF canvas aggregate work exceeded: charged {}, next {work}, reserved tail {}, limit {}",
                     self.usage.total(),
+                    self.reserved_tail,
                     self.maximum_work
                 ))
             })?;
@@ -463,6 +568,26 @@ impl<'a, C: CancellationToken + ?Sized> Budget<'a, C> {
         Ok(())
     }
 
+    fn reserve_tail(&mut self, work: u64) -> Result<()> {
+        self.check()?;
+        if self
+            .usage
+            .total()
+            .checked_add(work)
+            .is_none_or(|n| n > self.maximum_work)
+        {
+            return Err(InkError::Limit(
+                "WPF final-pass work reservation exceeds the batch ceiling".into(),
+            ));
+        }
+        self.reserved_tail = work;
+        Ok(())
+    }
+
+    fn remaining_work(&self) -> u64 {
+        self.maximum_work - self.reserved_tail - self.usage.total()
+    }
+
     fn phase_limits(&self, reserved_bytes: usize) -> Result<InkLimits> {
         self.check()?;
         let max_bytes = self
@@ -472,7 +597,7 @@ impl<'a, C: CancellationToken + ?Sized> Budget<'a, C> {
             .ok_or_else(memory_limit)?;
         Ok(InkLimits {
             max_bytes,
-            max_work: self.maximum_work - self.usage.total(),
+            max_work: self.remaining_work(),
             ..InkLimits::default()
         })
     }
@@ -480,9 +605,10 @@ impl<'a, C: CancellationToken + ?Sized> Budget<'a, C> {
     fn phase_error(&self, phase: &str, error: InkError) -> InkError {
         match error {
             InkError::Limit(reason) => InkError::Limit(format!(
-                "{reason}; {phase} phase had {} work remaining after {} charged (limit {})",
-                self.maximum_work - self.usage.total(),
+                "{reason}; {phase} phase had {} work remaining after {} charged (reserved tail {}, limit {})",
+                self.remaining_work(),
                 self.usage.total(),
+                self.reserved_tail,
                 self.maximum_work
             )),
             other => other,
@@ -1322,5 +1448,346 @@ mod tests {
             rejected.is_empty(),
             "Small-shape audit failed: {rejected:#?}"
         );
+    }
+
+    fn borrowed_render(
+        visuals: &[WpfVectorVisual<'_>],
+        size: PhysicalSize,
+    ) -> PremultipliedRgbaSurface {
+        render_wpf_vector_visuals(visuals, size, RenderLimits::default(), &NeverCancel).unwrap()
+    }
+
+    #[test]
+    fn borrowed_opaque_marks_preserve_direct_canvas_rounding() {
+        let shape = rectangle(
+            200,
+            Rgba {
+                red: 210,
+                green: 37,
+                blue: 93,
+                alpha: 17,
+            },
+            Rgba {
+                red: 41,
+                green: 199,
+                blue: 72,
+                alpha: 117,
+            },
+        );
+        let size = PhysicalSize::new(8, 8).unwrap();
+        let items = [WpfVectorVisual {
+            shape: &shape,
+            opacity: 255,
+        }; 2];
+        let expected =
+            render_wpf_vector_shapes(&[shape, shape], size, RenderLimits::default(), &NeverCancel)
+                .unwrap();
+        assert_eq!(borrowed_render(&items, size), expected);
+        assert_eq!(pixel(&expected, 2, 2), [40, 139, 55, 190]);
+        assert!(std::ptr::eq(
+            std::ptr::from_ref(items[0].shape),
+            std::ptr::from_ref(&shape)
+        ));
+    }
+
+    #[test]
+    fn post_mark_opacity_scales_completed_fill_and_stroke_once() {
+        let mut shape = rectangle(
+            200,
+            Rgba {
+                red: 255,
+                green: 0,
+                blue: 0,
+                alpha: 128,
+            },
+            Rgba {
+                red: 0,
+                green: 0,
+                blue: 255,
+                alpha: 128,
+            },
+        );
+        shape.version = gif_from_screen_domain::WPF_VECTOR_SHAPE_VERSION;
+        let original = shape;
+        let actual = borrowed_render(
+            &[WpfVectorVisual {
+                shape: &shape,
+                opacity: 128,
+            }],
+            PhysicalSize::new(8, 8).unwrap(),
+        );
+        assert_eq!(pixel(&actual, 2, 2), [32, 0, 64, 96]);
+        assert_ne!(pixel(&actual, 2, 2), [48, 0, 64, 112]);
+        assert_eq!(pixel(&actual, 3, 3), [64, 0, 0, 64]);
+        assert_eq!(pixel(&actual, 1, 1), [0, 0, 64, 64]);
+        assert_eq!(shape, original);
+    }
+
+    #[test]
+    fn clip_precedes_opacity_with_noncommutative_integer_rounding() {
+        let mut correct = [2, 0, 0, 2];
+        clip_mask(&mut correct, &[16], &NeverCancel).unwrap();
+        let mut budget = Budget::new(RenderLimits::default(), &NeverCancel).unwrap();
+        scale_opacity(&mut correct, 128, &mut budget).unwrap();
+        assert_eq!(correct, [1, 0, 0, 1]);
+        let mut reversed = [2, 0, 0, 2];
+        scale_opacity(&mut reversed, 128, &mut budget).unwrap();
+        clip_mask(&mut reversed, &[16], &NeverCancel).unwrap();
+        assert_eq!(reversed, [0; 4]);
+        let shape = VectorShape {
+            bounds: VectorShapeBounds {
+                x_hundredths: 400,
+                y_hundredths: 500,
+                width_hundredths: 1500,
+                height_hundredths: 1125,
+            },
+            kind: VectorShapeKind::Triangle,
+            stroke_width_hundredths: 225,
+            rotation_hundredths: 3300,
+            ..VectorShape::wpf_v2()
+        };
+        let size = PhysicalSize::new(32, 32).unwrap();
+        let opaque =
+            render_wpf_vector_shape(&shape, size, RenderLimits::default(), &NeverCancel).unwrap();
+        let actual = borrowed_render(
+            &[WpfVectorVisual {
+                shape: &shape,
+                opacity: 128,
+            }],
+            size,
+        );
+        let expected: Vec<_> = opaque
+            .pixels()
+            .iter()
+            .map(|v| wpf_pixels::mul_byte(*v, 128))
+            .collect();
+        assert_eq!(actual.pixels(), expected);
+    }
+
+    #[test]
+    fn each_mark_opacity_preserves_z_order_and_is_not_track_group_opacity() {
+        let red = rectangle(
+            0,
+            Rgba {
+                red: 255,
+                green: 0,
+                blue: 0,
+                alpha: 128,
+            },
+            Rgba::TRANSPARENT,
+        );
+        let blue = rectangle(
+            0,
+            Rgba {
+                red: 0,
+                green: 0,
+                blue: 255,
+                alpha: 128,
+            },
+            Rgba::TRANSPARENT,
+        );
+        let size = PhysicalSize::new(8, 8).unwrap();
+        let front_blue = borrowed_render(
+            &[
+                WpfVectorVisual {
+                    shape: &red,
+                    opacity: 128,
+                },
+                WpfVectorVisual {
+                    shape: &blue,
+                    opacity: 128,
+                },
+            ],
+            size,
+        );
+        let front_red = borrowed_render(
+            &[
+                WpfVectorVisual {
+                    shape: &blue,
+                    opacity: 128,
+                },
+                WpfVectorVisual {
+                    shape: &red,
+                    opacity: 128,
+                },
+            ],
+            size,
+        );
+        assert_eq!(pixel(&front_blue, 3, 3), [48, 0, 64, 112]);
+        assert_eq!(pixel(&front_red, 3, 3), [64, 0, 48, 112]);
+        let grouped =
+            render_wpf_vector_shapes(&[red, blue], size, RenderLimits::default(), &NeverCancel)
+                .unwrap();
+        assert_eq!(
+            pixel(&grouped, 3, 3).map(|v| wpf_pixels::mul_byte(v, 128)),
+            [32, 0, 64, 96]
+        );
+    }
+
+    #[test]
+    fn zero_opacity_still_enforces_metadata_geometry_and_object_caps() {
+        let mut shape = VectorShape::wpf_v2();
+        let size = PhysicalSize::new(8, 8).unwrap();
+        let view = WpfVectorVisual {
+            shape: &shape,
+            opacity: 0,
+        };
+        assert!(
+            borrowed_render(&[view], size)
+                .pixels()
+                .iter()
+                .all(|v| *v == 0)
+        );
+        assert!(matches!(
+            render_wpf_vector_visuals(
+                &[view; MAX_VECTOR_PREVIEW_SHAPES + 1],
+                size,
+                RenderLimits::default(),
+                &NeverCancel
+            ),
+            Err(InkError::Limit(_))
+        ));
+        assert!(matches!(
+            render_wpf_vector_visuals(
+                &[view],
+                size,
+                RenderLimits {
+                    max_surface_bytes: 256
+                },
+                &NeverCancel
+            ),
+            Err(InkError::Limit(_))
+        ));
+        shape.version = 3;
+        assert!(matches!(
+            render_wpf_vector_visuals(
+                &[WpfVectorVisual {
+                    shape: &shape,
+                    opacity: 0
+                }],
+                size,
+                RenderLimits::default(),
+                &NeverCancel
+            ),
+            Err(InkError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn opacity_temporary_and_tail_reservation_share_the_same_measured_ceiling() {
+        let shape = rectangle(
+            200,
+            Rgba {
+                red: 255,
+                green: 0,
+                blue: 0,
+                alpha: 128,
+            },
+            Rgba {
+                red: 0,
+                green: 0,
+                blue: 255,
+                alpha: 128,
+            },
+        );
+        let size = PhysicalSize::new(8, 8).unwrap();
+        let views = [WpfVectorVisual {
+            shape: &shape,
+            opacity: 128,
+        }];
+        let mut measured = Budget::new(RenderLimits::default(), &NeverCancel).unwrap();
+        let expected = render_visual_canvas(views.into_iter(), size, &mut measured).unwrap();
+        assert_eq!(measured.usage.pixels, 64 * 7);
+        let used = measured.usage.total();
+        let reservation = MAX_WORK - used;
+        assert_eq!(
+            render_wpf_vector_visuals_with_tail_work(
+                &views,
+                size,
+                RenderLimits::default(),
+                reservation,
+                &NeverCancel
+            )
+            .unwrap(),
+            expected
+        );
+        assert!(matches!(
+            render_wpf_vector_visuals_with_tail_work(
+                &views,
+                size,
+                RenderLimits::default(),
+                reservation + 1,
+                &NeverCancel
+            ),
+            Err(InkError::Limit(_))
+        ));
+        assert!(matches!(
+            render_wpf_vector_visuals_with_tail_work(
+                &views,
+                size,
+                RenderLimits::default(),
+                u64::MAX,
+                &NeverCancel
+            ),
+            Err(InkError::Limit(_))
+        ));
+        let mut reserved = Budget::new(RenderLimits::default(), &NeverCancel).unwrap();
+        reserved.reserve_tail(64).unwrap();
+        assert_eq!(
+            render_visual_canvas(views.into_iter(), size, &mut reserved).unwrap(),
+            expected
+        );
+        assert_eq!(reserved.usage, measured.usage);
+        assert_eq!(reserved.remaining_work(), MAX_WORK - used - 64);
+    }
+
+    #[test]
+    fn cancelled_opacity_path_never_returns_a_partial_visual() {
+        let shape = rectangle(
+            200,
+            Rgba {
+                red: 255,
+                green: 0,
+                blue: 0,
+                alpha: 128,
+            },
+            Rgba {
+                red: 0,
+                green: 0,
+                blue: 255,
+                alpha: 128,
+            },
+        );
+        let size = PhysicalSize::new(8, 8).unwrap();
+        let views = [WpfVectorVisual {
+            shape: &shape,
+            opacity: 128,
+        }];
+        let count = CancelAt {
+            calls: AtomicUsize::new(0),
+            limit: usize::MAX,
+        };
+        render_wpf_vector_visuals(&views, size, RenderLimits::default(), &count).unwrap();
+        let checkpoints = count.calls.load(Ordering::Relaxed);
+        assert!(checkpoints > 20 && checkpoints < 10_000);
+        for limit in 0..checkpoints {
+            let cancel = CancelAt {
+                calls: AtomicUsize::new(0),
+                limit,
+            };
+            assert!(
+                matches!(
+                    render_wpf_vector_visuals_with_tail_work(
+                        &views,
+                        size,
+                        RenderLimits::default(),
+                        64,
+                        &cancel
+                    ),
+                    Err(InkError::Cancelled)
+                ),
+                "checkpoint {limit}"
+            );
+        }
     }
 }

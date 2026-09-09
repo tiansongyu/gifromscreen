@@ -8,7 +8,7 @@ use std::{
 use gif_from_screen_domain::{
     BlendMode, CompositePrecision, EditCommand, FrameClip, FrameGeometryPlan, FrameId,
     FrameRenderStep, MAX_FRAME_RENDER_STEPS, OverlayContent, OverlayTrack, ProjectManifest,
-    TrackId, validate_frame_overlay_cells,
+    TrackId, VECTOR_SHAPE_VERSION, WPF_VECTOR_SHAPE_VERSION, validate_frame_overlay_cells,
 };
 
 use crate::{EditorError, MAX_FRAME_BUNDLE_METADATA_BYTES};
@@ -41,9 +41,11 @@ pub fn author_frame_owned_track(
 /// Authors one isolated vector canvas, without changing existing author precision.
 /// Every vector is painted into the new stage before that canvas is composited
 /// once over preceding pixels, matching the shape Apply group's PM boundary.
+/// All marks must carry one version: V1 retains the original vector stage and
+/// V2 uses its explicit new stage. Hidden marks participate in this check.
 ///
 /// # Errors
-/// Rejects empty/non-vector groups, enhanced blend modes and the same ownership,
+/// Rejects empty/non-vector/mixed-version groups, enhanced blend modes and the same ownership,
 /// stage and metadata failures as [`author_frame_owned_track`].
 pub fn author_vector_shape_track(
     project: &ProjectManifest,
@@ -61,6 +63,7 @@ pub fn author_vector_shape_track(
             "A new vector canvas requires at least one shape.",
         ));
     }
+    let mut version = None;
     for (_, content) in track.all_mark_contents() {
         let OverlayContent::VectorShape { shape } = content else {
             return Err(track_error(
@@ -71,8 +74,25 @@ pub fn author_vector_shape_track(
         shape
             .validate()
             .map_err(|reason| track_error(track.id, reason))?;
+        if version.is_some_and(|version| version != shape.version) {
+            return Err(track_error(
+                track.id,
+                "A vector canvas cannot mix shape versions.",
+            ));
+        }
+        version = Some(shape.version);
     }
-    author_with_precision(project, track, CompositePrecision::VectorCanvasPbgra8PngV1)
+    let precision = match version {
+        Some(VECTOR_SHAPE_VERSION) => CompositePrecision::VectorCanvasPbgra8PngV1,
+        Some(WPF_VECTOR_SHAPE_VERSION) => CompositePrecision::VectorCanvasPbgra8PngV2,
+        _ => {
+            return Err(track_error(
+                track.id,
+                "Unsupported vector canvas shape version.",
+            ));
+        }
+    };
+    author_with_precision(project, track, precision)
 }
 
 fn author_with_precision(

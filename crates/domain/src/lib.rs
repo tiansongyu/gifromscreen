@@ -57,4 +57,4 @@ pub use units::*;
 pub use vector_shape::*;
 
 /// Current on-disk manifest schema understood by this version of the domain.
-pub const CURRENT_SCHEMA_VERSION: u32 = 8;
+pub const CURRENT_SCHEMA_VERSION: u32 = 9;

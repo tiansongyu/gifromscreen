@@ -366,3 +366,151 @@ fn clone_budget_ignores_unrelated_tracks_but_bounds_tracks_that_must_be_sealed()
         Err(EditorError::RenderPipelineMetadataLimit)
     ));
 }
+
+fn vector_track(identity: u128, owners: &[u128], version: u8) -> OverlayTrack {
+    let mut result = track(identity, owners);
+    for cell in result.frame_cells.iter_mut().flatten() {
+        for mark in &mut cell.marks {
+            mark.content = OverlayContent::VectorShape {
+                shape: gif_from_screen_domain::VectorShape {
+                    version,
+                    ..gif_from_screen_domain::VectorShape::default()
+                },
+            };
+        }
+    }
+    result
+}
+
+#[test]
+fn vector_author_selects_explicit_version_stage_and_preserves_generic_rules() {
+    for (version, schema, precision) in [
+        (
+            VECTOR_SHAPE_VERSION,
+            8,
+            CompositePrecision::VectorCanvasPbgra8PngV1,
+        ),
+        (
+            WPF_VECTOR_SHAPE_VERSION,
+            9,
+            CompositePrecision::VectorCanvasPbgra8PngV2,
+        ),
+    ] {
+        let mut project = fixture();
+        let before = project.clone();
+        let commands =
+            author_vector_shape_track(&project, vector_track(10, &[1, 3], version)).unwrap();
+        assert!(matches!(
+            commands.last(),
+            Some(EditCommand::UpsertOverlayTrack { .. })
+        ));
+        let inverse = project
+            .apply_command(&EditCommand::Compound { commands })
+            .unwrap()
+            .inverse;
+        assert_eq!(project.schema_version, schema);
+        for index in [0, 2] {
+            assert_eq!(
+                project.timeline.frames[index].render_steps,
+                [
+                    FrameRenderStep::composite(1),
+                    FrameRenderStep::Composite {
+                        stage_id: 2,
+                        precision
+                    }
+                ]
+            );
+            assert_eq!(
+                project.timeline.frames[index].capture_clock,
+                before.timeline.frames[index].capture_clock
+            );
+            assert_eq!(
+                project.timeline.frames[index].capture_metadata,
+                before.timeline.frames[index].capture_metadata
+            );
+        }
+        assert_eq!(project.timeline.frames[1], before.timeline.frames[1]);
+        assert!(
+            project.timeline.overlay_tracks[0]
+                .frame_cells
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|cell| cell.stage == Some(2))
+        );
+        project.apply_command(&inverse).unwrap();
+        assert_eq!(project.timeline, before.timeline);
+        assert_eq!(project.schema_version, schema);
+    }
+    let mut project = fixture();
+    apply(&mut project, track(10, &[1]));
+    assert!(matches!(
+        project.timeline.frames[0].render_steps.last(),
+        Some(FrameRenderStep::Composite {
+            precision: CompositePrecision::WpfPbgra8PngV1,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn vector_author_rejects_mixed_hidden_versions_and_preanchored_owners_atomically() {
+    let project = fixture();
+    let before = serde_json::to_vec(&project).unwrap();
+    let mut mixed = vector_track(10, &[1, 3], VECTOR_SHAPE_VERSION);
+    mixed.visible = false;
+    mixed.opacity = 0;
+    mixed.frame_cells.as_mut().unwrap()[1].marks[0].content = OverlayContent::VectorShape {
+        shape: gif_from_screen_domain::VectorShape::wpf_v2(),
+    };
+    let mut anchored = vector_track(11, &[1], WPF_VECTOR_SHAPE_VERSION);
+    anchored.frame_cells.as_mut().unwrap()[0].stage = Some(1);
+    for invalid in [
+        mixed,
+        anchored,
+        vector_track(12, &[99], WPF_VECTOR_SHAPE_VERSION),
+    ] {
+        assert!(author_vector_shape_track(&project, invalid).is_err());
+        assert_eq!(serde_json::to_vec(&project).unwrap(), before);
+    }
+}
+
+#[test]
+fn vector_v2_appends_after_v1_and_resize_without_resealing_existing_marks() {
+    let mut project = fixture();
+    let first =
+        author_vector_shape_track(&project, vector_track(10, &[1], VECTOR_SHAPE_VERSION)).unwrap();
+    project
+        .apply_command(&EditCommand::Compound { commands: first })
+        .unwrap();
+    let old_track = project.timeline.overlay_tracks[0].clone();
+    let mut frame = project.timeline.frames[0].clone();
+    frame.render_steps.push(FrameRenderStep::Resize {
+        size: PhysicalSize::new(16, 8).unwrap(),
+    });
+    project
+        .apply_command(&EditCommand::ReplaceFrame {
+            frame_id: frame.id,
+            replacement: Box::new(frame),
+        })
+        .unwrap();
+    let prefix = project.timeline.frames[0].render_steps.clone();
+    let second =
+        author_vector_shape_track(&project, vector_track(11, &[1], WPF_VECTOR_SHAPE_VERSION))
+            .unwrap();
+    project
+        .apply_command(&EditCommand::Compound { commands: second })
+        .unwrap();
+    let steps = &project.timeline.frames[0].render_steps;
+    assert_eq!(&steps[..prefix.len()], prefix);
+    assert_eq!(
+        steps.last(),
+        Some(&FrameRenderStep::Composite {
+            stage_id: 3,
+            precision: CompositePrecision::VectorCanvasPbgra8PngV2
+        })
+    );
+    assert_eq!(project.timeline.overlay_tracks[0], old_track);
+    assert_eq!(stage(&project.timeline.overlay_tracks[1], 1), Some(3));
+    project.validate().unwrap();
+}

@@ -7,15 +7,17 @@ use crate::{
     model::test_fixtures::{asset, frame, manifest},
 };
 
-fn project() -> ProjectManifest {
+pub(super) fn project() -> ProjectManifest {
     let mut project = manifest();
+    // These fixtures exercise the original vector schema, not the newest writer.
+    project.schema_version = 8;
     let asset = asset(1);
     project.timeline.frames = vec![frame(1, asset.id), frame(2, asset.id)];
     project.assets.insert(asset.id, asset);
     project
 }
 
-fn track(number: u128, owned: bool, shape: VectorShape) -> OverlayTrack {
+pub(super) fn track(number: u128, owned: bool, shape: VectorShape) -> OverlayTrack {
     let content = OverlayContent::VectorShape { shape };
     let mark = OverlayId::from_u128(number + 1_000);
     OverlayTrack {
@@ -191,7 +193,7 @@ fn version_style_and_canonical_rotation_are_explicitly_bounded() {
             ..original
         },
         VectorShape {
-            version: 2,
+            version: 3,
             ..original
         },
         VectorShape {
@@ -266,7 +268,7 @@ fn new_payload_rejects_unknown_fields_and_non_integer_geometry() {
     invalid["kind"] = serde_json::json!("arrow");
     assert!(serde_json::from_value::<VectorShape>(invalid).is_err());
     let mut unsupported = serde_json::to_value(VectorShape::default()).unwrap();
-    unsupported["version"] = serde_json::json!(2);
+    unsupported["version"] = serde_json::json!(3);
     let unsupported: VectorShape = serde_json::from_value(unsupported).unwrap();
     assert!(unsupported.validate().is_err());
 }
@@ -394,7 +396,7 @@ fn validation_identifies_the_exact_track_and_mark_even_when_invisible() {
             44,
             owned,
             VectorShape {
-                version: 2,
+                version: 3,
                 ..Default::default()
             },
         ));
@@ -402,7 +404,7 @@ fn validation_identifies_the_exact_track_and_mark_even_when_invisible() {
             panic!("manifest error expected")
         };
         assert!(issues.iter().any(|issue| matches!(issue, ValidationIssue::InvalidVectorShape { track_id, overlay_id, reason }
-            if *track_id == TrackId::from_u128(44) && *overlay_id == OverlayId::from_u128(1044) && reason.contains("version 2"))));
+            if *track_id == TrackId::from_u128(44) && *overlay_id == OverlayId::from_u128(1044) && reason.contains("version 3"))));
     }
 }
 

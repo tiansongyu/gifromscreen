@@ -17,6 +17,7 @@ mod wpf_surface;
 pub(crate) use raster::{MAX_WORK, paint};
 pub use wpf::wpf_vector_shape_geometry;
 pub use wpf_brush::{WpfBrushPaths, prepare_wpf_brush_paths};
+pub(crate) use wpf_surface::{WpfVectorVisual, render_wpf_vector_visuals_with_tail_work};
 pub use wpf_surface::{render_wpf_vector_shape, render_wpf_vector_shapes};
 
 /// Maximum objects accepted by the independent editable-overlay preview.
@@ -63,6 +64,16 @@ impl VectorShapeGeometry {
 /// # Errors
 /// Rejects invalid versions, parameters and domain coordinate bounds.
 pub fn vector_shape_geometry(shape: &VectorShape) -> Result<VectorShapeGeometry, RenderError> {
+    if shape.version == gif_from_screen_domain::WPF_VECTOR_SHAPE_VERSION {
+        return wpf_vector_shape_geometry(shape);
+    }
+    requested_vector_geometry(shape)
+}
+
+// No version dispatch here: V1 geometry and the custom WPF shapes both use
+// these original requested vertices. Calling the public dispatch from the WPF
+// custom-contour builder would otherwise recurse for version two.
+fn requested_vector_geometry(shape: &VectorShape) -> Result<VectorShapeGeometry, RenderError> {
     shape.validate().map_err(invalid)?;
     let x = signed_pixels(shape.bounds.x_hundredths);
     let y = signed_pixels(shape.bounds.y_hundredths);

@@ -3,7 +3,7 @@ use gif_from_screen_render::{InkPoint, InkSegment};
 
 use super::{
     draft::{Draft, GestureKind, Handle},
-    geometry::{GeometryCache, handles, ink},
+    geometry::{GeometryCache, ink},
     input::{HANDLE_RADIUS, Mapping},
 };
 
@@ -63,8 +63,9 @@ pub(super) fn guides(
             }
         }
     }
-    if let Some(primary) = draft.primary() {
-        let positions = handles(primary);
+    if let Some(primary) = draft.primary()
+        && let Some(positions) = geometry.handles(primary.id)
+    {
         let rotation = primary.shape.rotation_hundredths;
         let top = mapping.handle_position(Handle::Top, positions[1].1, rotation);
         let rotate = mapping.handle_position(Handle::Rotate, positions[8].1, rotation);

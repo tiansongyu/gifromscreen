@@ -1,5 +1,8 @@
 //! Persistence boundaries for opt-in, irreversible project-format upgrades.
 
+#[path = "schema9_migration.rs"]
+mod schema9_migration;
+
 use std::{fs, io};
 
 use gif_from_screen_domain::{

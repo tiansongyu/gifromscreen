@@ -2,8 +2,10 @@ use std::collections::BTreeSet;
 
 use gif_from_screen_domain::{
     FrameId, PhysicalSize, Rgba, VectorShape, VectorShapeBounds, VectorShapeKind,
+    WPF_VECTOR_SHAPE_VERSION,
 };
 use gif_from_screen_localization::Message;
+use gif_from_screen_render::vector_shape_layout;
 
 use super::{MAX_VECTOR_DRAFT_OBJECTS, VectorShapeRequest, error};
 use crate::{
@@ -435,10 +437,10 @@ impl Draft {
             return Err(Message::VectorFinishGesture.into());
         }
         let primary = self.primary().ok_or(Message::VectorNoObjects)?;
-        let bounds = primary.shape.bounds;
+        let layout = vector_shape_layout(&primary.shape).map_err(error)?;
         let center = [
-            pixels(bounds.x_hundredths) + extent(bounds.width_hundredths) / 2.0,
-            pixels(bounds.y_hundredths) + extent(bounds.height_hundredths) / 2.0,
+            layout.origin.x + layout.render_size[0] / 2.0,
+            layout.origin.y + layout.render_size[1] / 2.0,
         ];
         let kind = if handle == Handle::Rotate {
             GestureKind::Rotate {
@@ -500,21 +502,12 @@ impl Draft {
             GestureKind::SelectOnly => return Ok(()),
             GestureKind::Move { start } => {
                 let canvas = self.canvas().ok_or(Message::VectorNoDraft)?;
-                let (dx, dy) = movement(
+                candidate = moved(
                     &gesture.before,
                     &self.selected,
-                    point[0] - start[0],
-                    point[1] - start[1],
+                    [point[0] - start[0], point[1] - start[1]],
                     canvas,
-                );
-                candidate.clone_from(&gesture.before);
-                for object in candidate
-                    .iter_mut()
-                    .filter(|o| self.selected.contains(&o.id))
-                {
-                    object.shape.bounds.x_hundredths += dx;
-                    object.shape.bounds.y_hundredths += dy;
-                }
+                )?;
                 candidate.sort_by_key(|o| self.selected.contains(&o.id));
             }
             GestureKind::Resize { start, handle } => {
@@ -524,7 +517,7 @@ impl Draft {
                     handle,
                     [point[0] - start[0], point[1] - start[1]],
                     self.canvas().ok_or(Message::VectorNoDraft)?,
-                );
+                )?;
             }
             GestureKind::Rotate { center, angle } => {
                 let current = (pixels(point[1]) - center[1]).atan2(pixels(point[0]) - center[0]);
@@ -543,6 +536,9 @@ impl Draft {
         }
         for object in &candidate {
             object.shape.validate().map_err(error)?;
+            if object.shape.version == WPF_VECTOR_SHAPE_VERSION {
+                vector_shape_layout(&object.shape).map_err(error)?;
+            }
         }
         if candidate != self.objects {
             self.bump()?;
@@ -648,7 +644,7 @@ fn movement(
     (dx.clamp(low[0], high[0]), dy.clamp(low[1], high[1]))
 }
 
-fn resized(
+fn legacy_resized(
     objects: &[DraftObject],
     selected: &BTreeSet<u64>,
     handle: Handle,
@@ -737,6 +733,194 @@ fn resized(
             changed
         })
         .collect()
+}
+
+fn primary(objects: &[DraftObject], selected: &BTreeSet<u64>) -> Option<DraftObject> {
+    objects
+        .iter()
+        .rev()
+        .find(|o| selected.contains(&o.id))
+        .copied()
+}
+
+fn moved(
+    objects: &[DraftObject],
+    selected: &BTreeSet<u64>,
+    delta: Point,
+    canvas: [u32; 2],
+) -> Result<Vec<DraftObject>, Notice> {
+    if let Some(primary) = primary(objects, selected)
+        && primary.shape.version == WPF_VECTOR_SHAPE_VERSION
+    {
+        if delta == [0, 0] {
+            return Ok(objects.to_vec());
+        }
+        let desired = vector_shape_layout(&primary.shape)
+            .map_err(error)?
+            .desired_size;
+        let mut changed = primary;
+        let mut origin = [
+            primary.shape.bounds.x_hundredths,
+            primary.shape.bounds.y_hundredths,
+        ];
+        // ElementAdorner move clamps against DesiredSize with its explicit
+        // one-layout-unit margin, not the larger arranged/stroked outline.
+        for axis in 0..2 {
+            origin[axis] = (origin[axis] + delta[axis]).max(-100);
+            let far = i64::from(canvas[axis]) * 100 + 100 - rounded_hundredths(desired[axis]);
+            origin[axis] = origin[axis].min(far);
+        }
+        changed.shape.bounds.x_hundredths = origin[0];
+        changed.shape.bounds.y_hundredths = origin[1];
+        return propagate_wpf(objects, selected, primary, changed, canvas);
+    }
+    let (dx, dy) = movement(objects, selected, delta[0], delta[1], canvas);
+    let mut candidate = objects.to_vec();
+    for object in candidate.iter_mut().filter(|o| selected.contains(&o.id)) {
+        object.shape.bounds.x_hundredths += dx;
+        object.shape.bounds.y_hundredths += dy;
+    }
+    Ok(candidate)
+}
+
+fn resized(
+    objects: &[DraftObject],
+    selected: &BTreeSet<u64>,
+    handle: Handle,
+    delta: Point,
+    canvas: [u32; 2],
+) -> Result<Vec<DraftObject>, Notice> {
+    let Some(primary) = primary(objects, selected) else {
+        return Ok(objects.to_vec());
+    };
+    if primary.shape.version != WPF_VECTOR_SHAPE_VERSION {
+        return Ok(legacy_resized(objects, selected, handle, delta, canvas));
+    }
+    if delta == [0, 0] {
+        return Ok(objects.to_vec());
+    }
+    let changed = wpf_resize_primary(primary, handle, delta, canvas)?;
+    propagate_wpf(objects, selected, primary, changed, canvas)
+}
+
+fn wpf_resize_primary(
+    primary: DraftObject,
+    handle: Handle,
+    delta: Point,
+    canvas: [u32; 2],
+) -> Result<DraftObject, Notice> {
+    let layout = vector_shape_layout(&primary.shape).map_err(error)?;
+    let (sin, cos) = angle(primary.shape);
+    let local = [
+        rounded_hundredths(pixels(delta[0]) * cos + pixels(delta[1]) * sin),
+        rounded_hundredths(-pixels(delta[0]) * sin + pixels(delta[1]) * cos),
+    ];
+    let near = [
+        matches!(handle, Handle::TopLeft | Handle::Left | Handle::BottomLeft),
+        matches!(handle, Handle::TopLeft | Handle::Top | Handle::TopRight),
+    ];
+    let active = [
+        !matches!(handle, Handle::Top | Handle::Bottom),
+        !matches!(handle, Handle::Left | Handle::Right),
+    ];
+    let before = primary.shape.bounds;
+    let old_origin = [before.x_hundredths, before.y_hundredths];
+    let mut origin = old_origin;
+    let mut size = [before.width_hundredths, before.height_hundredths];
+    for axis in 0..2 {
+        if !active[axis] {
+            continue;
+        }
+        let desired = rounded_hundredths(layout.desired_size[axis]);
+        let mut length = (desired
+            + if near[axis] {
+                -local[axis]
+            } else {
+                local[axis]
+            })
+        .max(1_000);
+        if near[axis] {
+            origin[axis] -= length - desired;
+            if origin[axis] < 0 {
+                length += origin[axis];
+                origin[axis] = 0;
+            }
+        }
+        // Preserve the source BottomLeft handler's extra far-X check, whose
+        // reference is the original Canvas.Left, not its newly computed Left.
+        if !near[axis] || (axis == 0 && handle == Handle::BottomLeft) {
+            length = length.min(i64::from(canvas[axis]) * 100 - old_origin[axis]);
+        }
+        size[axis] = u64::try_from(length).map_err(error)?;
+    }
+    let mut changed = primary;
+    changed.shape.bounds = VectorShapeBounds {
+        x_hundredths: origin[0],
+        y_hundredths: origin[1],
+        width_hundredths: size[0],
+        height_hundredths: size[1],
+    };
+    // Right/Bottom do not compensate the world-space opposite edge when the
+    // rotation center moves. That V1 interaction remains in legacy_resized.
+    Ok(changed)
+}
+
+fn propagate_wpf(
+    objects: &[DraftObject],
+    selected: &BTreeSet<u64>,
+    primary: DraftObject,
+    changed: DraftObject,
+    canvas: [u32; 2],
+) -> Result<Vec<DraftObject>, Notice> {
+    let old = primary.shape.bounds;
+    let new = changed.shape.bounds;
+    let size_delta = [
+        i64::try_from(new.width_hundredths).map_err(error)?
+            - i64::try_from(old.width_hundredths).map_err(error)?,
+        i64::try_from(new.height_hundredths).map_err(error)?
+            - i64::try_from(old.height_hundredths).map_err(error)?,
+    ];
+    let origin_delta = [
+        new.x_hundredths - old.x_hundredths,
+        new.y_hundredths - old.y_hundredths,
+    ];
+    let mut candidate = objects.to_vec();
+    for object in candidate.iter_mut().filter(|o| selected.contains(&o.id)) {
+        if object.id == primary.id {
+            *object = changed;
+            continue;
+        }
+        let layout = vector_shape_layout(&object.shape).map_err(error)?;
+        let bounds = object.shape.bounds;
+        let mut size = [bounds.width_hundredths, bounds.height_hundredths];
+        let mut origin = [bounds.x_hundredths, bounds.y_hundredths];
+        // Source DrawingCanvas.Adorner_Manipulated applies the primary's
+        // requested-size delta conditionally to each secondary. This is not
+        // V1's shared clamp, nor independent DesiredSize rounding per object.
+        for axis in 0..2 {
+            let actual = rounded_hundredths(layout.render_size[axis]);
+            let maximum = i64::from(canvas[axis]) * 100;
+            if size_delta[axis].abs() > 10
+                && actual + size_delta[axis] > 1_000
+                && actual + size_delta[axis] <= maximum
+            {
+                size[axis] =
+                    u64::try_from(i64::try_from(size[axis]).map_err(error)? + size_delta[axis])
+                        .map_err(error)?;
+            }
+            let position = origin[axis] + origin_delta[axis];
+            if position >= 0 && position + actual < maximum {
+                origin[axis] = position;
+            }
+        }
+        object.shape.bounds = VectorShapeBounds {
+            x_hundredths: origin[0],
+            y_hundredths: origin[1],
+            width_hundredths: size[0],
+            height_hundredths: size[1],
+        };
+    }
+    Ok(candidate)
 }
 
 fn angle(shape: VectorShape) -> (f64, f64) {
