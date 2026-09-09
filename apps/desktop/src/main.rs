@@ -29,6 +29,7 @@ mod export_job;
 #[cfg(test)]
 mod export_localization_tests;
 mod fixed_crop_session;
+mod graphics_backend;
 mod image_effect_ui;
 mod import_gif_job;
 mod import_static_image_job;
@@ -7057,25 +7058,8 @@ fn native_options() -> eframe::NativeOptions {
     let display = gif_from_screen_capture_linux::LinuxEnvironment::from_process()
         .detect()
         .display_server();
-    configure_ui_backend(&mut options, display, wgpu::Backends::from_env());
+    graphics_backend::configure(&mut options, display, wgpu::Backends::from_env());
     options
-}
-
-fn configure_ui_backend(
-    options: &mut eframe::NativeOptions,
-    display: Option<LinuxDisplayServer>,
-    requested: Option<wgpu::Backends>,
-) {
-    // The X11 ARGB/multiple-viewport path was verified with GL; the software
-    // Vulkan driver failed transparent presentation. Capture/GIF rendering is
-    // independent of this UI backend. Keep explicit diagnostic overrides.
-    let backends = requested
-        .or_else(|| (display == Some(LinuxDisplayServer::X11)).then_some(wgpu::Backends::GL));
-    if let Some(backends) = backends
-        && let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup
-    {
-        setup.instance_descriptor.backends = backends;
-    }
 }
 
 #[cfg(test)]

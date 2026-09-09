@@ -21,6 +21,8 @@
 
 当前正式版为 **v0.1.0**。无需登录 GitHub 即可下载；这是冻结当前已验收功能的首个正式版本，不代表完整复刻或零缺陷。后续测试构建与正式版分开，见 [CI Artifacts](https://github.com/tiansongyu/gifromscreen/actions/workflows/portable.yml)（需要登录，保留 30 天）。
 
+**X11 / NVIDIA 启动提示：** v0.1.0 若报 `incompatible_surface_backends: Backends(GL)`，可临时用 `WGPU_BACKEND=vulkan ./bin/gif-from-screen` 启动。`main` 的 0.1.1 修复构建已支持自动选择兼容后端；该修复不在旧的 v0.1.0 下载包中。[修复与验证](docs/GRAPHICS-BACKEND-STARTUP.md)。
+
 便携包以 **Ubuntu 22.04 / glibc 2.35** 为构建基线，包含桌面程序和命令行工具。下载压缩包与校验文件后，在同一目录运行：
 
 ```sh

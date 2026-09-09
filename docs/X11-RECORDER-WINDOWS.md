@@ -49,11 +49,14 @@ it does not silently schedule recording after a permission/selection step. Error
 are visible in the floating toolbar. Its rows are top-aligned so the status line
 does not fall below the fixed-height panel during countdown, recording or pause.
 
-X11 defaults to the GL UI backend; explicit `WGPU_BACKEND` choices are retained.
+The v0.1.0 checkpoint defaults to the GL UI backend; explicit `WGPU_BACKEND` choices are retained.
 The isolated software-Vulkan configuration failed transparent presentation, while
 GL rendered opaque normal pages and the transparent recorder correctly. Capture
 and CPU GIF rendering are independent of that UI backend. This is a tested backend
 choice, not a claim that all Vulkan drivers fail or a proven driver deadlock cause.
+The subsequent [startup compatibility fix](GRAPHICS-BACKEND-STARTUP.md) keeps GL
+preferred but enables a surface-compatible Vulkan fallback on X11. The historical
+software-Vulkan failure is retained, not generalized to NVIDIA hardware.
 
 ## Evidence boundary
 

@@ -4,6 +4,20 @@ Release notes describe shipped behavior. Plans, experimental APIs and unfinished
 branches are not completed features. [中文工作总结](docs/WORK-STATUS.md) ·
 [All releases](https://github.com/tiansongyu/gifromscreen/releases)
 
+## 0.1.1 — Unreleased graphics startup fix
+
+- X11 now considers both OpenGL and Vulkan. It retains the verified GL
+  preference but skips adapters incompatible with the actual window surface,
+  required device limits or features, allowing a compatible Vulkan adapter.
+- Explicit `WGPU_BACKEND` overrides remain strict; `WGPU_POWER_PREF` ranks
+  compatible devices within the preferred backend. Existing software adapters
+  may be selected, without downloading or installing drivers.
+- The portable desktop smoke now exercises automatic selection and checks that
+  the window stays alive, instead of forcing GL and accepting an initial window
+  which may disappear on graphics initialization failure.
+- [Cause, validation and scope](docs/GRAPHICS-BACKEND-STARTUP.md). The frozen
+  v0.1.0 assets are unchanged; this fix is not retroactively in that download.
+
 ## 0.1.0 — 2026-09-09
 
 First formal Linux x86_64 release; feature scope frozen for publication.

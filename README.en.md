@@ -21,6 +21,8 @@ Built in Rust, with recording, editing and export performed locally. An independ
 
 **v0.1.0** is the first non-prerelease release, freezing the currently verified feature set. Download without a GitHub account. It does not claim complete upstream parity or zero defects. Development builds remain separate in [CI Artifacts](https://github.com/tiansongyu/gifromscreen/actions/workflows/portable.yml), which require sign-in and expire after 30 days.
 
+**X11 / NVIDIA startup:** if v0.1.0 reports `incompatible_surface_backends: Backends(GL)`, use `WGPU_BACKEND=vulkan ./bin/gif-from-screen` as a temporary workaround. The 0.1.1 fix on `main` selects a compatible backend automatically; it is not retroactively included in the v0.1.0 download. [Fix and validation](docs/GRAPHICS-BACKEND-STARTUP.md).
+
 The portable package targets **Ubuntu 22.04 / glibc 2.35** and includes the desktop app and CLI. Download the archive and checksum into the same directory, then run:
 
 ```sh

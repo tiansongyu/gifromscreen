@@ -67,7 +67,9 @@ jobs:
         run: python3 scripts/test_portable.py target/package-first/*.tar.gz
 
       - name: Test owned display lifecycle
-        run: python3 scripts/test_owned_xvfb.py
+        run: |
+          python3 scripts/test_owned_xvfb.py
+          python3 scripts/test_smoke_portable_desktop.py
 
       - name: Launch packaged native desktop
         run: python3 scripts/smoke_portable_desktop.py --owned-xvfb target/package-first/*.tar.gz

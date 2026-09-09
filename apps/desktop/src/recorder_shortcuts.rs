@@ -599,19 +599,22 @@ mod tests {
             options.viewport.app_id.as_deref(),
             Some(gif_from_screen_capture_linux::APPLICATION_ID)
         );
-        crate::configure_ui_backend(
+        crate::graphics_backend::configure(
             &mut options,
             Some(gif_from_screen_capture_linux::LinuxDisplayServer::X11),
             None,
         );
-        assert_eq!(backends(&options), wgpu::Backends::GL);
-        crate::configure_ui_backend(
+        assert_eq!(
+            backends(&options),
+            wgpu::Backends::GL | wgpu::Backends::VULKAN
+        );
+        crate::graphics_backend::configure(
             &mut options,
             Some(gif_from_screen_capture_linux::LinuxDisplayServer::X11),
             Some(wgpu::Backends::VULKAN),
         );
         assert_eq!(backends(&options), wgpu::Backends::VULKAN);
-        crate::configure_ui_backend(
+        crate::graphics_backend::configure(
             &mut options,
             Some(gif_from_screen_capture_linux::LinuxDisplayServer::Wayland),
             None,
