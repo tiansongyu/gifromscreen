@@ -66,8 +66,11 @@ enum identities and prove that cancelled/stale work does not change the project.
 
 Strict 1.98 Clippy passes for desktop/localization with all targets and features.
 The existing whole-catalog Chinese glyph check passes in both egui font families;
-format and diff checks pass. These are automated checks, **not new native desktop
-or system-font availability acceptance**.
+format and diff checks pass. These are automated checks. Separate
+[native X11 acceptance](TEXT-TITLE-QA-2026-09-09.md) now records actual bilingual
+validation, caption editing, both title insertion positions, Undo/Redo, saved
+language and byte-identical GUI/CLI reopen exports. It covers Ubuntu/Latin text
+and Chinese UI, not every system font or complex script.
 
 The existing egui color picker remains shared toolkit UI, including its numeric
 color-space/channel identifiers and built-in tooltip text. This slice does not

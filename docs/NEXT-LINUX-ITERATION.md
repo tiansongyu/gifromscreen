@@ -55,6 +55,10 @@ application-owned Add/Replace/Title workflows and retained text/font notices.
 It also fixes a real idle color-picker byte drift. The catalog is now 848 en/zh
 messages; shared picker internals, other tools and the other 27 translations
 remain open. This is newer than the frozen Preview 3 package.
+The [native text/title acceptance](TEXT-TITLE-QA-2026-09-09.md) verifies both title
+positions, exact caption identities through editing, saved language and matching
+38-frame GUI/CLI GIFs. Its narrow-window double-scroll and crowded header were
+recorded as usability issues, not called ideal layout.
 The [pinned shape audit](SHAPE-PARITY-2026-09-09.md) identifies Triangle, rounded
 rectangles and direct multi-object manipulation as actual remaining upstream
 features. Dormant dash properties are not mislabeled as an upstream GUI feature;
@@ -78,9 +82,11 @@ relative rotation origins are now measured, not guessed. This gate and broader
 Wayland/device/localization coverage remain open.
 The next [WPF vector foundation](WPF-VECTOR-RENDERING.md) derives actual arranged
 geometry and preserves local clip metadata in a separate API. Three real
-filled-contour probes pass exactly with the existing WPF coverage kernel;
-native stroke widening and isolated-PM clipping remain open. No saved V1 pixels
-or full-project acceptance criteria are silently changed by those substep tests.
+filled-contour probes pass exactly with the existing WPF coverage kernel.
+The completed candidate brush/PM batch also matches all 14 real vector cases;
+metered 1080p/4K rendering passes separately. The [V2 integration plan](WPF-VECTOR-V2-INTEGRATION.md)
+retains the uncompleted schema/authoring/preview/persistence gates. No saved V1
+pixels or full-project acceptance criteria are silently changed by candidate tests.
 
 ## Playback timing: implemented, bounded native manual acceptance recorded
 
