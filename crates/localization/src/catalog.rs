@@ -103,7 +103,7 @@ messages! {
     SettingsReload => ("settings-reload", [], "Reload saved preferences (discard unsaved changes)", "重新读取已保存的偏好设置（丢弃未保存的更改）"),
     SettingsUnavailable => ("settings-unavailable", [], "Preferences cannot be saved in this environment.", "当前环境无法保存偏好设置。"),
     SettingsNewerChoiceKept => ("settings-newer-choice-kept", [], "Saved preferences loaded; your newer choice was kept.", "已读取保存的偏好设置，并保留了您刚刚作出的选择。"),
-    HeaderPreview => ("header-preview", [], "Linux capture preview", "Linux 录制预览版"),
+    HeaderPreview => ("header-preview", [], "Linux GIF recorder", "Linux GIF 录制工具"),
     HomeTitle => ("home-title", [], "Create an animated GIF", "创建 GIF 动画"),
     HomeDescription => ("home-description", [], "Capture, edit frame by frame, and export locally.", "录制画面、逐帧编辑并在本地导出。"),
     HomeScreenRecorder => ("home-screen-recorder", [], "Screen recorder", "屏幕录制"),

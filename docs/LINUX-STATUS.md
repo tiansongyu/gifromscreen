@@ -1,5 +1,10 @@
 # Linux implementation status
 
+Release freeze (2026-09-09): **v0.1.0** ships the scope summarized in
+[completed and deferred work](WORK-STATUS.md). Use that short summary and the
+[release notes](releases/v0.1.0.md) for the current download; entries below retain
+implementation history and version-specific evidence, not new release promises.
+
 This file is the delivery ledger for the Linux-first implementation. Checked implementation items describe the stated scope, not complete ScreenToGif parity or release certification. See [the evidence-based parity audit](PARITY-AUDIT.md) for GUI/API distinctions and platform validation gaps.
 
 ## Current iteration

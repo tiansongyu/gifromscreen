@@ -1,0 +1,76 @@
+name: Bug report / 缺陷报告
+description: Report a reproducible problem / 报告可复现的问题
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check existing issues and known limitations first. / 请先查看已有问题和已知限制。
+        Issues are public. Do not attach secrets, private recordings or unreviewed project input metadata.
+        问题内容公开可见；不要上传密码、令牌、私人录制或未经检查的工程输入元数据。
+  - type: input
+    id: version
+    attributes:
+      label: Version and source / 版本与来源
+      description: Release tag or commit; tarball, installed package or source build. Internal 0.1.0 alone may be ambiguous.
+      placeholder: v0.1.0 tar.gz / commit / BUILD-INFO.json source_revision
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: System / 系统环境
+      description: Distribution/version, desktop/window manager and architecture / 发行版版本、桌面或窗口管理器、架构
+      placeholder: Ubuntu 22.04, GNOME 42, x86_64
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Desktop backend / 桌面后端
+      options:
+        - X11
+        - Wayland
+        - Not sure / 不确定
+    validations:
+      required: true
+  - type: input
+    id: scale
+    attributes:
+      label: Scale and language / 缩放与语言
+      description: App UI zoom, display scaling, preview zoom and UI language / 应用、显示器、预览缩放及界面语言
+      placeholder: "UI 150%, display 100%, preview Fit, zh-CN"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce / 复现步骤
+      description: Minimal numbered steps and frequency; use non-private sample content / 最短步骤、出现频率及非私人示例内容
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result / 预期结果
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result / 实际结果
+      description: Include the exact error text if available / 如有错误提示，请附原文
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Optional evidence / 可选证据
+      description: Redacted logs/screenshots or a minimal synthetic project. No full private recording is needed. / 脱敏日志、截图或最小合成工程，无需上传完整私人录制。
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check / 隐私检查
+      options:
+        - label: I reviewed attachments and removed secrets and sensitive content. / 已检查附件并移除秘密与敏感内容。
+          required: true

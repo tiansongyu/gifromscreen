@@ -495,7 +495,7 @@ fn final_extra_exclusion_cleanup_ack_is_required_before_real_workflow_resume() {
     let mut overlay = overlay(old, false);
     overlay.geometry.freeze_size();
     overlay.geometry.move_by(10, 0);
-    let new = overlay.geometry.region();
+    let moved_region = overlay.geometry.region();
     let now = Instant::now();
     begin_change(&mut overlay, &job, now);
     assert!(!prepare_change(&mut overlay, Some(&mut job), native(), now));
@@ -519,7 +519,7 @@ fn final_extra_exclusion_cleanup_ack_is_required_before_real_workflow_resume() {
     }
     until(|| {
         let retarget = job.retarget.as_mut().unwrap();
-        retarget.plan.applied() == new
+        retarget.plan.applied() == moved_region
             || retarget.pending.as_mut().is_some_and(|pending| {
                 pending.status() == gif_from_screen_workflow::TargetUpdateStatus::Applied
             })
@@ -534,7 +534,7 @@ fn final_extra_exclusion_cleanup_ack_is_required_before_real_workflow_resume() {
             &mut notice,
         );
     });
-    assert_eq!(job.retarget.as_ref().unwrap().plan.applied(), new);
+    assert_eq!(job.retarget.as_ref().unwrap().plan.applied(), moved_region);
     assert_eq!(overlay.request.unwrap().protected_region, None);
     assert_eq!(overlay.request.unwrap().generation, extra_generation + 1);
     assert_eq!(overlay.acknowledged, None);
@@ -570,7 +570,7 @@ fn final_extra_exclusion_cleanup_ack_is_required_before_real_workflow_resume() {
     assert!(overlay.change.is_none());
     assert_eq!(worker.stats.lock().unwrap().resumes, 1);
     let final_generation = overlay.request.unwrap().generation;
-    overlay.update_guide(Some(new));
+    overlay.update_guide(Some(moved_region));
     assert_eq!(
         overlay.request.unwrap().generation,
         final_generation,

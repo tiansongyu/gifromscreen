@@ -1,5 +1,10 @@
 # Next Linux fidelity and usability work
 
+**Frozen on 2026-09-09.** The user requested publication of the current version,
+not continued feature expansion. This document is a historical backlog, not an
+active instruction to resume implementation. See [v0.1.0 scope and deferred
+work](WORK-STATUS.md) and the [formal release notes](releases/v0.1.0.md).
+
 This list retains specific gaps after the native GNOME recording acceptance. It does not replace the full [feature matrix](FEATURE_MATRIX.md) or [release gates](LINUX-STATUS.md).
 
 ## New user-facing priority: language, README and Releases
