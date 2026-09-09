@@ -13,7 +13,7 @@ fn localizer(tag: &str) -> Localizer {
 
 #[test]
 fn initial_key_ids_are_unique_and_both_catalogs_have_every_declared_message() {
-    assert_eq!(ALL_MESSAGES.len(), 772);
+    assert_eq!(ALL_MESSAGES.len(), 796);
     let ids: BTreeSet<_> = ALL_MESSAGES.iter().map(|message| message.id()).collect();
     assert_eq!(ids.len(), ALL_MESSAGES.len());
     for tag in ["en", "zh"] {
@@ -29,6 +29,56 @@ fn initial_key_ids_are_unique_and_both_catalogs_have_every_declared_message() {
         assert_eq!(coverage.total, ALL_MESSAGES.len());
         assert_eq!(coverage.scope, CatalogScope::InitialUiSlice);
         assert!(!coverage.entire_ui_covered);
+    }
+}
+
+#[test]
+fn watermark_dimensions_paths_and_diagnostics_have_literal_named_parameters() {
+    let path = "/home/用户/{width}/{height}/{path}.png";
+    let arguments = [("width", "20"), ("height", "10"), ("path", path)];
+    assert_eq!(
+        Message::WatermarkAdded.parameters(),
+        &["width", "height", "path"]
+    );
+    assert_eq!(
+        localizer("en")
+            .format(Message::WatermarkAdded, &arguments)
+            .unwrap(),
+        format!("Added 20×10 watermark {path} to the selected frame span.")
+    );
+    assert_eq!(
+        localizer("zh")
+            .format(Message::WatermarkAdded, &arguments)
+            .unwrap(),
+        format!("已将 20×10 水印 {path} 添加到选中帧范围。")
+    );
+    for tag in ["en", "zh"] {
+        let language = localizer(tag);
+        for message in [
+            Message::WatermarkStartFailed,
+            Message::WatermarkDecodeFailed,
+            Message::WatermarkCommitFailed,
+            Message::WatermarkInvalidDisplaySize,
+        ] {
+            let raw = "Watermark name is required. 原始错误 {error}/{path}\n";
+            assert!(
+                language
+                    .format(message, &[("error", raw)])
+                    .unwrap()
+                    .contains(raw)
+            );
+            assert_eq!(
+                language.format(message, &[("错误", raw)]),
+                Err(FormatError::UnknownArgument)
+            );
+        }
+        assert_eq!(
+            language.format(
+                Message::WatermarkAdded,
+                &[("宽度", "20"), ("height", "10"), ("path", path)]
+            ),
+            Err(FormatError::UnknownArgument)
+        );
     }
 }
 

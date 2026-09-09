@@ -12,8 +12,10 @@ now use explicit localizers. [Preview/crop and GIF export controls](PREVIEW-EXPO
 also include typed parameter-validation, preset and completion notices. Typed
 notices re-render at presentation time. [Advanced editor controls](ADVANCED-EDITOR-LOCALIZATION.md)
 extend this to effects, shapes/drawing/layers, project storage and statistics.
-Text/title and image/watermark tool bodies, import forms and detailed errors still
-require migration; see [editor/notice scope](EDITOR-LOCALIZATION.md).
+The [image-watermark slice](WATERMARK-LOCALIZATION.md) now covers its form,
+typed validation and retained asynchronous outcomes. Text/title tool bodies,
+import forms and other detailed errors still require migration; see
+[editor/notice scope](EDITOR-LOCALIZATION.md).
 The target includes the entire application-owned UI, not merely language selection.
 See [the first desktop acceptance record](LOCALIZATION-QA-2026-09-08.md).
 The [recorder integration contract](RECORDER-LOCALIZATION.md) separates automated

@@ -42,6 +42,10 @@ Subsequent main-branch work [localizes advanced editor controls](ADVANCED-EDITOR
 including typed field-label validation, effects, shape/drawing/layer management and
 project statistics/storage. Preview 3 remains unchanged; remaining tool bodies and
 all additional-language/font/IME gates are not marked complete.
+The [watermark slice](WATERMARK-LOCALIZATION.md) adds its complete form and typed
+retained decode/apply notices, keeping literal names/paths and the original
+asynchronous settings snapshot and strict target anchor. The catalog is now
+796 en/zh messages; this is not 29 complete translations or a new release.
 The [pinned shape audit](SHAPE-PARITY-2026-09-09.md) identifies Triangle, rounded
 rectangles and direct multi-object manipulation as actual remaining upstream
 features. Dormant dash properties are not mislabeled as an upstream GUI feature;

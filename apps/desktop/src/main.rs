@@ -2416,10 +2416,15 @@ impl GifFromScreenApp {
             match PendingWatermark::start(&self.watermark_ui, workspace, &mut self.watermark_job) {
                 Ok(pending) => {
                     self.pending_watermark = Some(pending);
-                    self.notice = Some("Decoding watermark in the background…".to_owned().into());
+                    self.notice = Some(Notice::localized(
+                        localizer,
+                        Message::WatermarkBackgroundDecoding,
+                        &[],
+                    ));
                 }
-                Err(error) => {
-                    self.notice = Some(format!("Could not decode watermark: {error}").into());
+                Err(mut error) => {
+                    error.refresh(localizer);
+                    self.notice = Some(error);
                 }
             }
         }
@@ -3976,39 +3981,10 @@ impl GifFromScreenApp {
         let result = self.watermark_job.take_result();
         let pending = self.pending_watermark.take();
         self.watermark_job = WatermarkDecodeJob::default();
-        self.notice = Some(match result {
-            Some(Ok(decoded)) => {
-                let source_path = decoded.source_path.clone();
-                let source_size = decoded.size;
-                match self
-                    .editor_workspace
-                    .as_mut()
-                    .ok_or_else(|| "the editor project was closed while decoding".to_owned())
-                    .and_then(|workspace| {
-                        pending
-                            .ok_or_else(|| {
-                                "the watermark authoring target was lost; retry".to_owned()
-                            })?
-                            .commit(workspace, &decoded)
-                    }) {
-                    Ok(()) => format!(
-                        "Added {}×{} watermark {} to the selected frame span.",
-                        source_size.width.get(),
-                        source_size.height.get(),
-                        source_path.display()
-                    ).into(),
-                    Err(error) => format!(
-                        "Watermark decoded but could not be added: {error}. Adjust the form and retry."
-                    ).into(),
-                }
-            }
-            Some(Err(error)) => {
-                format!("Could not decode watermark: {error}. Adjust the form and retry.").into()
-            }
-            None => "Watermark decoder finished without a result; retry safely."
-                .to_owned()
-                .into(),
-        });
+        let mut notice =
+            watermark_ui::finish_watermark(result, pending, self.editor_workspace.as_mut());
+        notice.refresh(self.language_settings.localizer());
+        self.notice = Some(notice);
     }
 
     fn receive_text_messages(&mut self) {
@@ -4151,6 +4127,7 @@ fn show_editor_inspector(
                     watermark,
                     watermark_job,
                     !workspace.selection().is_empty(),
+                    localizer,
                 );
             }
         });
