@@ -5,6 +5,14 @@ ScreenToGif parity. See [release notes](releases/v0.1.0.md) and
 [completed/deferred work](WORK-STATUS.md). This record distinguishes the exact
 shipped source from subsequent documentation-only commits.
 
+Published **2026-09-09 08:03:57 UTC / 16:03:57 Asia/Shanghai**:
+[v0.1.0](https://github.com/tiansongyu/gifromscreen/releases/tag/v0.1.0).
+GitHub release **385324170** is public, `draft=false`, `prerelease=false`, and
+returned by the repository's `releases/latest` endpoint. Its two asset IDs are
+**552290903** (tarball) and **552290906** (checksum). The annotated tag object
+`c162cc16ce607580408d385776ead82ec6d19a4a` resolves to the frozen source below.
+Preview 1, 2 and 3 were neither replaced nor edited.
+
 ## Frozen source and CI
 
 Release source: **`b3cd1ff9a9ba3ebdaebe3e590d0f52dca9bed334`**.
@@ -95,6 +103,27 @@ Machine-readable package audit:
 `874f6ef957efaed600ce30c8bc991912e084bdbe6d1b6df5c3594139fdc344ed`.
 The CI artifact ZIP, exact package, audit script and logs are retained in that
 private local evidence directory; these `/tmp` paths are not public downloads.
+
+## Public download recheck
+
+After publication, both files were downloaded separately from their public
+`releases/download/v0.1.0/` URLs into
+`/tmp/gfs-release-v010.x5i8q4VC/public`. Curl used no GitHub authentication or
+browser session, with its local configuration disabled. Both public files
+compare **byte-for-byte** with the accepted CI originals; the public sidecar
+also verifies the downloaded tarball through `sha256sum --check`.
+
+The **publicly downloaded copy** passes all **12 portable tests again**, including
+real CLI export and safe install/removal, plus a fresh owned-Xvfb visible-window
+smoke check. This is separate from inspecting an authenticated CI artifact.
+The release API's asset sizes and SHA-256 digests match the table above, and
+`releases/latest` resolves to v0.1.0. The README's formal download links are live.
+
+Chinese and English README Markdown also rendered through GitHub's API with
+the expected headings, download links and animated-image elements. The existing
+demos retain their original recorded-source provenance; they were not relabeled
+as captures of this release. Local document/anchor/image checks passed, and the
+bug-report form parses with nine unique fields.
 
 ## Actual packaged recording and export
 
