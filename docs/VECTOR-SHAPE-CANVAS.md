@@ -2,7 +2,8 @@
 
 This implements the next slice identified by the [pinned shape audit](SHAPE-PARITY-2026-09-09.md).
 It is newer than the frozen Preview 3 download. It is not a claim of full
-ScreenToGif pixel/interaction parity, native acceptance, or a new release.
+ScreenToGif pixel/interaction parity or a new release. Bounded native X11
+acceptance and the still-failing WPF gate are recorded [separately](VECTOR-SHAPE-QA-2026-09-09.md).
 
 ## Use
 
@@ -85,8 +86,8 @@ rotated handle geometry, cancellation, typed limits, atomic failures, selection
 gaps, isolated PM rounding, undo/redo and independent project reopen. These are
 not screenshots of the running Linux desktop.
 
-Before promoting this tool in a new release: run native X11/Wayland interaction
+Before promoting this tool in a new release: extend the recorded X11 checks to Wayland interaction
 at Fit/100%/200%, UI zoom/language changes, copy/Save As/reopen/GIF workflows;
-inspect the new control layout and complete the independent WPF comparisons.
+retain the new control-layout checks and complete the independent WPF comparisons.
 General platform, remaining UI localization and 27 additional-catalog gates
 remain in the [full Linux plan](NEXT-LINUX-ITERATION.md).

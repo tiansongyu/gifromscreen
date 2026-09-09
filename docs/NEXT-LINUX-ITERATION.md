@@ -57,6 +57,12 @@ movement, rotated handles, local-axis resizing and scoped keyboard/wheel input;
 one atomic frame-owned group Apply and an isolated PM canvas stage. The old
 Shape semantics remain unchanged. Automated and actual WPF/native acceptance
 are separate gates; this is not yet part of a published download.
+The [native vector acceptance](VECTOR-SHAPE-QA-2026-09-09.md) now records actual
+X11 multi-object manipulation, language/preview zoom changes, gapped Apply,
+undo/redo, Save As, independent reopen and identical GUI/CLI exports. The real
+WPF comparison remains red on five vector fixtures; arranged dimensions and
+relative rotation origins are now measured, not guessed. This gate and broader
+Wayland/device/localization coverage remain open.
 
 ## Playback timing: implemented, bounded native manual acceptance recorded
 

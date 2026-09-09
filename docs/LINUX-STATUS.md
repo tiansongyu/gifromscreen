@@ -162,6 +162,7 @@ The [isolated nested GNOME plan](WAYLAND-NESTED-QA-PLAN.md) has been executed; s
 - [x] Raster-watermark authoring with bounded background decoding.
 - [x] Bounded free-drawing authoring on the rendered preview.
 - [x] Shape overlay authoring with bounds, stroke/fill, opacity, blend mode, and z-order.
+- [x] Versioned multi-object vector canvas with triangles, rounded rectangles, closed block arrows, direct move/resize/rotate and atomic gapped-frame Apply; bounded [X11/Save As/GIF acceptance](VECTOR-SHAPE-QA-2026-09-09.md). Independent WPF pixel parity and wider desktop coverage remain open.
 - [x] Border, shadow, blur, pixelate, darken, and lighten frame effects.
 - [x] Raster watermark, shape, and pressure-drawing preview/export rendering.
 - [x] Fade and slide transitions.
