@@ -44,9 +44,10 @@ config/data/state/cache directories, no recording and no keyboard/mouse injectio
 Each successful window stayed alive for at least three seconds and its own
 window pixels were inspected. Only the newly launched test processes were
 terminated/reaped. No installed file, existing preference or user project was
-changed. Evidence: `/tmp/gfs-graphics-fix-native.YBnx9MOP`, development executable
+changed. Evidence: `/tmp/gfs-graphics-fix-native.YBnx9MOP`, early development executable
 SHA-256 `a99d88dd4eff7c3459836370e651f5d3017dffd58c242f0b1f93710b9e99432f`.
-This is startup acceptance, not a new full recording/hardware qualification.
+That probe precedes the patch-version bump; the actual 0.1.1 package is verified
+separately below. This is startup acceptance, not full recording qualification.
 
 The portable smoke defaults to `--backend auto` and requires a continuously
 visible window for one second while the process remains alive. Explicit
@@ -64,3 +65,46 @@ For the unchanged v0.1.0 package, the temporary workaround remains:
 ```sh
 WGPU_BACKEND=vulkan ./bin/gif-from-screen
 ```
+
+## Verified 0.1.1 patch package and local upgrade
+
+The actual package was built from
+[`ce65429feef775bfd69b82218d143cd54d5b3fda`](https://github.com/tiansongyu/gifromscreen/commit/ce65429feef775bfd69b82218d143cd54d5b3fda).
+[Linux CI](https://github.com/tiansongyu/gifromscreen/actions/runs/34329731608)
+and [portable CI](https://github.com/tiansongyu/gifromscreen/actions/runs/34329731622)
+passed. Local Rust 1.88.0 and 1.98.0 each pass strict workspace Clippy and
+**1,876 tests**, with **56 ignored**; the four smoke-harness regressions pass too.
+This does not turn the previously known WPF pixel differences into passes.
+
+The Ubuntu 22.04 / Rust 1.88.0 artifact has clean source/package receipts and
+GLIBC requirements no higher than 2.35. Source, packaging, lockfile and executable
+fingerprints were checked. The actual tarball passes all **12 portable tests**
+and the updated **automatic** owned-Xvfb desktop smoke locally as well as in CI.
+
+- Archive: `gifromscreen-0.1.1-linux-x86_64.tar.gz`, **27,142,357 bytes**.
+- Archive SHA-256:
+  `7ac6fcd67bec2d2b8fd60422ad319c6042c751e78cef3a7d1a1d065e059ebb4b`.
+- Desktop SHA-256:
+  `b08816eff20a4f2f6b0b0fc379ab4d7d9ada853d3051b51e22484fd98d8a114b`.
+- CLI SHA-256:
+  `c6a8ed55185eae699c7a796cc1fa1cd29efb066a618bc73dd71a5f701b5392ad`.
+
+The **packaged executable**, not only the development binary, repeats the actual
+hardware/software startup probes above. Automatic mode selects NVIDIA Vulkan on
+the reported workstation and Mesa GL on the owned Xvfb. The expected forced-GL
+failure remains reproducible, proving the explicit restriction is still honored.
+
+A verified copy and archive/checksum were placed beside the old version under
+`/home/ubuntu/Videos/gifromscreen-0.1.1-linux-x86_64`. The existing user installation
+at `/home/ubuntu/.local` was verified against the old package's ownership manifest
+before replacing its **575 registered application files** through the checked
+installer. The desktop menu and executable links now resolve to 0.1.1. Existing
+preferences have the same hash, and the original Videos/0.1.0 package is intact
+for rollback. No user projects or unlisted files were removed. The installed
+desktop executable also starts automatically on NVIDIA Vulkan without an override;
+its own rendered window was inspected and its test process cleaned up.
+
+Evidence is retained in `/tmp/gfs-graphics-011-package.rW0gXVQi`, including
+`verification.json`, actual package probes, `local-upgrade.json` and
+`installed/results.json`. This is a local/CI patch build; the v0.1.0 GitHub Release
+assets and tag have not been replaced, and no separate v0.1.1 Release is claimed.
