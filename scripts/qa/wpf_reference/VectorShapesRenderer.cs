@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -33,6 +35,24 @@ internal static class VectorShapesRenderer
         canvas.Measure(new Size(size.Width, size.Height));
         canvas.Arrange(new Rect(0, 0, size.Width, size.Height));
         canvas.UpdateLayout();
+        foreach (Shape shape in canvas.Children)
+        {
+            var origin = shape.TransformToAncestor(canvas).Transform(new Point(0, 0));
+            var offset = VisualTreeHelper.GetOffset(shape);
+            // Bounded diagnostics from actual arranged WPF objects, not Rust.
+            // The supervisor retains this log alongside the pixel artifacts.
+            Console.WriteLine("VECTOR_LAYOUT " + JsonSerializer.Serialize(new
+            {
+                kind = shape.GetType().Name,
+                requested = new[] { Canvas.GetLeft(shape), Canvas.GetTop(shape), shape.Width, shape.Height },
+                desired = new[] { shape.DesiredSize.Width, shape.DesiredSize.Height },
+                rendered = new[] { shape.RenderSize.Width, shape.RenderSize.Height },
+                offset = new[] { offset.X, offset.Y },
+                transformed_origin = new[] { origin.X, origin.Y },
+                geometry = shape.RenderedGeometry.ToString(CultureInfo.InvariantCulture),
+                shape.SnapsToDevicePixels, shape.UseLayoutRounding,
+            }));
+        }
 
         // ImageMethods.GetScaledRender, in the explicitly measured scale=1,
         // dpi=96 space. Preserve its VisualBrush and bounds-clamping path;

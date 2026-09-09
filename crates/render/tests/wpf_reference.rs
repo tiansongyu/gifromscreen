@@ -23,6 +23,9 @@ use sha2::{Digest, Sha256};
 const MAX_SPEC_BYTES: usize = 64 * 1024;
 const MAX_INDEX_BYTES: usize = 256 * 1024;
 const MAX_SURFACE_BYTES: usize = 256 * 256 * 4;
+// Geometry/stroker scratch is separate from the 256x256 output envelope. A
+// small ellipse legitimately needs more than one surface's bytes to rasterize.
+const MAX_RENDER_WORKING_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PNG_BYTES: usize = MAX_SURFACE_BYTES + 64 * 1024;
 const MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 const FIXTURE_COUNT: usize = 11;
@@ -609,7 +612,7 @@ impl Graph {
                 .ok_or_else(|| std::io::Error::other("Unknown fixture asset.").into())
         };
         let image = CpuRenderer::with_limits(RenderLimits {
-            max_surface_bytes: MAX_SURFACE_BYTES,
+            max_surface_bytes: MAX_RENDER_WORKING_BYTES,
         })
         .render_clip_with_overlays(
             &self.frame,

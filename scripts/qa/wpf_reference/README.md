@@ -110,6 +110,12 @@ as an ordinary offline unit test. Separate mechanical unit tests use clearly
 synthetic envelopes to test parsing, unsafe paths, hashes and mismatch reporting;
 their success is **not** evidence of WPF pixel equivalence.
 
+The Rust comparator allows 4 MiB of renderer scratch independently of the
+256×256 / RGBA artifact envelope; a curve stroker needs more memory than one
+small output surface. This changes no pixel tolerance or artifact-size limit.
+`VECTOR_LAYOUT` lines in the Windows logs report actual WPF requested, desired,
+rendered and offset geometry for diagnosing the new shape differences.
+
 Rust-only fixes may be compared with the same reference artifact while the
 definition and generator source hashes still match. Changing either requires
 a fresh Windows generation; editing an index/hash to bypass this is not a valid
