@@ -22,6 +22,7 @@ mod drawing_preview;
 mod editor_canvas;
 mod editor_export_presets;
 mod editor_preview;
+mod editor_shell_layout;
 mod editor_ui;
 mod editor_workspace;
 mod export_job;
@@ -44,6 +45,9 @@ mod retarget;
 mod shortcut_ui;
 mod static_sequence_ui;
 mod text_overlay_ui;
+
+#[cfg(test)]
+mod editor_shell_layout_tests;
 mod thumbnail_cache;
 mod ui_notice;
 mod vector_shapes;
@@ -1220,42 +1224,31 @@ impl GifFromScreenApp {
     fn show_app_header(&mut self, context: &egui::Context) {
         let localizer = self.language_settings.localizer();
         egui::TopBottomPanel::top("app_header").show(context, |ui| {
-            ui.horizontal(|ui| {
-                let back_enabled = self.watermark_job.state() != WatermarkDecodeJobState::Running
-                    && !self.source_workers_active()
-                    && can_navigate_back(
-                        self.view,
-                        self.open_project_job.state(),
-                        self.import_gif_job.state(),
-                        self.import_image_job.state(),
-                        self.import_sequence_job.state(),
-                        self.blank_project_job.state(),
-                    );
-                if self.view != AppView::Landing
-                    && ui
-                        .add_enabled(
-                            back_enabled,
-                            egui::Button::new(localizer.text(Message::BackToHome)),
-                        )
-                        .clicked()
-                {
-                    if self.view == AppView::Editor {
-                        self.editor_ui_state.pause_preview();
-                    }
-                    if self.view == AppView::ScreenRecorder && self.wayland_prepare_job.is_active()
-                    {
-                        let _ = self.wayland_prepare_job.cancel();
-                        self.wayland_frozen_preview = None;
-                    }
-                    self.view = AppView::Landing;
+            let back_enabled = self.watermark_job.state() != WatermarkDecodeJobState::Running
+                && !self.source_workers_active()
+                && can_navigate_back(
+                    self.view,
+                    self.open_project_job.state(),
+                    self.import_gif_job.state(),
+                    self.import_image_job.state(),
+                    self.import_sequence_job.state(),
+                    self.blank_project_job.state(),
+                );
+            if editor_shell_layout::header(
+                ui,
+                (self.view != AppView::Landing).then_some(back_enabled),
+                localizer,
+                |ui| self.language_settings.show_button(ui),
+            ) {
+                if self.view == AppView::Editor {
+                    self.editor_ui_state.pause_preview();
                 }
-                ui.heading(APP_NAME);
-                ui.separator();
-                ui.label(localizer.text(Message::HeaderPreview));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    self.language_settings.show_button(ui);
-                });
-            });
+                if self.view == AppView::ScreenRecorder && self.wayland_prepare_job.is_active() {
+                    let _ = self.wayland_prepare_job.cancel();
+                    self.wayland_frozen_preview = None;
+                }
+                self.view = AppView::Landing;
+            }
         });
     }
 
@@ -2248,6 +2241,7 @@ impl GifFromScreenApp {
             .inner;
         let mut watermark_action = WatermarkUiAction::None;
         let mut vector_intent = vector_shapes::Intent::None;
+        let layout = editor_shell_layout::InspectorLayout::for_width(ui.available_width());
         let mut inspector = |ui: &mut egui::Ui,
                              workspace: &mut EditorWorkspace,
                              state: &mut EditorUiState,
@@ -2265,9 +2259,9 @@ impl GifFromScreenApp {
                 workspace,
                 state,
                 &mut self.text_overlay,
-                &mut self.watermark_ui,
-                self.watermark_job.state(),
+                (&mut self.watermark_ui, self.watermark_job.state()),
                 localizer,
+                layout,
             );
             results.extend(tool_results);
             if notice.is_some() {
@@ -2275,8 +2269,8 @@ impl GifFromScreenApp {
             }
             watermark_action = action;
         };
-        if ui.available_width() >= 900.0 {
-            ui.columns(2, |columns| {
+        ui.columns(layout.columns(), |columns| {
+            if layout == editor_shell_layout::InspectorLayout::SideBySide {
                 inspector(
                     &mut columns[0],
                     workspace,
@@ -2292,25 +2286,26 @@ impl GifFromScreenApp {
                     cine_input_enabled,
                     localizer,
                 );
-            });
-        } else {
-            show_editor_preview_panel(
-                ui,
-                workspace,
-                &mut self.editor_preview_cache,
-                &mut self.editor_ui_state,
-                (&mut self.motion_tools, &mut self.vector_shapes),
-                cine_input_enabled,
-                localizer,
-            );
-            ui.separator();
-            inspector(
-                ui,
-                workspace,
-                &mut self.editor_ui_state,
-                &mut self.vector_shapes,
-            );
-        }
+            } else {
+                let ui = &mut columns[0];
+                show_editor_preview_panel(
+                    ui,
+                    workspace,
+                    &mut self.editor_preview_cache,
+                    &mut self.editor_ui_state,
+                    (&mut self.motion_tools, &mut self.vector_shapes),
+                    cine_input_enabled,
+                    localizer,
+                );
+                ui.separator();
+                inspector(
+                    ui,
+                    workspace,
+                    &mut self.editor_ui_state,
+                    &mut self.vector_shapes,
+                );
+            }
+        });
         self.handle_vector_intent(vector_intent, cine_input_enabled, localizer);
         self.handle_editor_actions(results, watermark_action, cine_input_enabled, localizer);
     }
@@ -4102,36 +4097,32 @@ fn show_editor_inspector(
     workspace: &mut EditorWorkspace,
     state: &mut EditorUiState,
     text: &mut TextOverlayTool,
-    watermark: &mut WatermarkUiState,
-    watermark_job: WatermarkDecodeJobState,
+    (watermark, watermark_job): (&mut WatermarkUiState, WatermarkDecodeJobState),
     localizer: Localizer,
+    layout: editor_shell_layout::InspectorLayout,
 ) -> (Vec<EditorUiResult>, Option<Notice>, WatermarkUiAction) {
     let mut results = Vec::new();
     let mut notice = None;
     let mut action = WatermarkUiAction::None;
-    egui::ScrollArea::vertical()
-        .id_salt("editor-inspector")
-        .max_height(380.0)
-        .auto_shrink([false, true])
-        .show(ui, |ui| {
-            results = ui
-                .add_enabled_ui(watermark_job != WatermarkDecodeJobState::Running, |ui| {
-                    show_editor_tool_panel(ui, workspace, state, localizer)
-                })
-                .inner;
-            if state.overlays_selected() && state.overlay_tool == OverlayTool::Text {
-                notice = text.show(ui, workspace, localizer);
-            }
-            if state.overlays_selected() && state.overlay_tool == OverlayTool::Image {
-                action = show_watermark_ui(
-                    ui,
-                    watermark,
-                    watermark_job,
-                    !workspace.selection().is_empty(),
-                    localizer,
-                );
-            }
-        });
+    editor_shell_layout::inspector(ui, layout, |ui| {
+        results = ui
+            .add_enabled_ui(watermark_job != WatermarkDecodeJobState::Running, |ui| {
+                show_editor_tool_panel(ui, workspace, state, localizer)
+            })
+            .inner;
+        if state.overlays_selected() && state.overlay_tool == OverlayTool::Text {
+            notice = text.show(ui, workspace, localizer);
+        }
+        if state.overlays_selected() && state.overlay_tool == OverlayTool::Image {
+            action = show_watermark_ui(
+                ui,
+                watermark,
+                watermark_job,
+                !workspace.selection().is_empty(),
+                localizer,
+            );
+        }
+    });
     (results, notice, action)
 }
 
