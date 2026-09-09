@@ -95,7 +95,7 @@ internal static class Limits
 {
     internal const int MaxDefinitionBytes = 64 * 1024;
     internal const int MaxDimension = 256;
-    internal const int FixtureCount = 11;
+    internal const int FixtureCount = 15;
     internal const int MaxShapes = 16;
     internal const long MaxOutputBytes = 16 * 1024 * 1024;
     private const long MaxWorkingSet = 512L * 1024 * 1024;

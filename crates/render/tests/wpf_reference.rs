@@ -28,7 +28,7 @@ const MAX_SURFACE_BYTES: usize = 256 * 256 * 4;
 const MAX_RENDER_WORKING_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PNG_BYTES: usize = MAX_SURFACE_BYTES + 64 * 1024;
 const MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
-const FIXTURE_COUNT: usize = 11;
+const FIXTURE_COUNT: usize = 15;
 const MAX_VECTOR_SHAPES: usize = 16;
 const UPSTREAM_SOURCES: [(&str, &str); 2] = [
     (
@@ -966,6 +966,10 @@ mod mechanical_tests {
             "vector-triangle-rotated",
             "vector-block-arrow",
             "vector-ellipse-fraction",
+            "coverage-triangle",
+            "coverage-fractional-triangle",
+            "coverage-ellipse",
+            "coverage-triangle-stroke",
         ];
         assert_eq!(
             definition
