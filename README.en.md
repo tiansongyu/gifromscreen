@@ -46,6 +46,11 @@ Recorded from the running X11 app, including a paused recording-frame drag; not 
 
 See the [Linux feature ledger](docs/LINUX-STATUS.md) for current scope and the [development archive](docs/DEVELOPMENT-STATUS.md) for detailed history and evidence links.
 
+Newer main also includes a [multi-object shape canvas](docs/VECTOR-SHAPE-CANVAS.md)
+with triangles, rounded rectangles, block arrows and direct move/resize/rotate.
+Native acceptance and WPF pixel comparison are still in progress; this is not
+included in the Preview 3 download.
+
 ## X11 and Wayland
 
 | | X11 | Wayland |

@@ -56,6 +56,11 @@ impl Error for UnitError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ValidationIssue {
+    InvalidVectorShape {
+        track_id: TrackId,
+        overlay_id: OverlayId,
+        reason: String,
+    },
     InvalidPremultipliedSnapshot {
         asset_id: AssetId,
         reason: String,

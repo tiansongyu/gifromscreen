@@ -56,6 +56,12 @@ impl std::fmt::Display for UnsupportedEffect {
 /// Errors produced by the deterministic CPU renderer.
 #[derive(Debug, Error)]
 pub enum RenderError {
+    /// A versioned vector shape or its bounded geometry is invalid.
+    #[error("invalid vector shape: {reason}")]
+    InvalidVectorShape {
+        /// Parameter, coordinate, or bounded-computation failure.
+        reason: String,
+    },
     /// A typed clipped reference was unavailable; never substitute ordinary straight pixels.
     #[error("could not load Cinemagraph snapshot {asset_id}: {source}")]
     CinemagraphSnapshotLoad {

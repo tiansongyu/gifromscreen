@@ -51,6 +51,13 @@ recorded [here](ADVANCED-EDITOR-QA-2026-09-09.md), including stopped-owner recov
 and reopened GIF equality. This does not close the remaining shape interaction,
 language or physical desktop matrix.
 
+Main now adds a [versioned multi-object shape canvas](VECTOR-SHAPE-CANVAS.md):
+triangles, rounded rectangles and the distinct block arrow; direct selection,
+movement, rotated handles, local-axis resizing and scoped keyboard/wheel input;
+one atomic frame-owned group Apply and an isolated PM canvas stage. The old
+Shape semantics remain unchanged. Automated and actual WPF/native acceptance
+are separate gates; this is not yet part of a published download.
+
 ## Playback timing: implemented, bounded native manual acceptance recorded
 
 `PlaybackTiming::Measured` and `PlaybackTiming::Fixed(Duration)` now separate GIF playback from sampling cadence in the workflow. Fixed mode assigns one final delay to each retained frame, including the last; omitted unchanged samples and delivery gaps do not accumulate fixed delay. Raw active capture timestamps and input events remain unchanged. Status distinguishes observed source-sample span from GIF playback duration. The pinned upstream evidence, save-failure exception and measured-mode interval-assignment difference are recorded in [Capture playback timing](CAPTURE-PLAYBACK-TIMING.md).

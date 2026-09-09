@@ -50,7 +50,7 @@ pub use frame_selection::{
 pub use frame_transition::{
     FrameTransitionSettings, remove_transition_after, set_transition_after,
 };
-pub use paint_stage::author_frame_owned_track;
+pub use paint_stage::{author_frame_owned_track, author_vector_shape_track};
 pub use selection::{TimelineSelection, TimelineSelectionError};
 pub use statistics::{
     CurrentFrameStatistics, EditorStatistics, EditorStatisticsError, project_statistics,

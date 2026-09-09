@@ -43,6 +43,10 @@ pub(crate) use text::{TextOverlayDraft, TitleFrameRequest};
 #[path = "editor_overlay_authoring.rs"]
 mod overlay_authoring;
 
+#[path = "editor_vector_shapes.rs"]
+mod vector_shapes;
+pub(crate) use vector_shapes::VectorShapeRequest;
+
 #[cfg(test)]
 #[path = "editor_pipeline_tests.rs"]
 mod pipeline_tests;

@@ -7,8 +7,8 @@ use std::{
 
 use gif_from_screen_domain::{
     BlendMode, CompositePrecision, EditCommand, FrameClip, FrameGeometryPlan, FrameId,
-    FrameRenderStep, MAX_FRAME_RENDER_STEPS, OverlayTrack, ProjectManifest, TrackId,
-    validate_frame_overlay_cells,
+    FrameRenderStep, MAX_FRAME_RENDER_STEPS, OverlayContent, OverlayTrack, ProjectManifest,
+    TrackId, validate_frame_overlay_cells,
 };
 
 use crate::{EditorError, MAX_FRAME_BUNDLE_METADATA_BYTES};
@@ -28,7 +28,57 @@ use crate::{EditorError, MAX_FRAME_BUNDLE_METADATA_BYTES};
 /// prepared command metadata. No project state is changed on failure.
 pub fn author_frame_owned_track(
     project: &ProjectManifest,
+    track: OverlayTrack,
+) -> Result<Vec<EditCommand>, EditorError> {
+    let precision = if track.blend_mode == BlendMode::Normal {
+        CompositePrecision::WpfPbgra8PngV1
+    } else {
+        CompositePrecision::LegacyStraightRgba8
+    };
+    author_with_precision(project, track, precision)
+}
+
+/// Authors one isolated vector canvas, without changing existing author precision.
+/// Every vector is painted into the new stage before that canvas is composited
+/// once over preceding pixels, matching the shape Apply group's PM boundary.
+///
+/// # Errors
+/// Rejects empty/non-vector groups, enhanced blend modes and the same ownership,
+/// stage and metadata failures as [`author_frame_owned_track`].
+pub fn author_vector_shape_track(
+    project: &ProjectManifest,
+    track: OverlayTrack,
+) -> Result<Vec<EditCommand>, EditorError> {
+    if track.blend_mode != BlendMode::Normal {
+        return Err(track_error(
+            track.id,
+            "A vector canvas requires normal composition.",
+        ));
+    }
+    if track.all_mark_contents().next().is_none() {
+        return Err(track_error(
+            track.id,
+            "A new vector canvas requires at least one shape.",
+        ));
+    }
+    for (_, content) in track.all_mark_contents() {
+        let OverlayContent::VectorShape { shape } = content else {
+            return Err(track_error(
+                track.id,
+                "A vector canvas can only contain vector shapes.",
+            ));
+        };
+        shape
+            .validate()
+            .map_err(|reason| track_error(track.id, reason))?;
+    }
+    author_with_precision(project, track, CompositePrecision::VectorCanvasPbgra8PngV1)
+}
+
+fn author_with_precision(
+    project: &ProjectManifest,
     mut track: OverlayTrack,
+    precision: CompositePrecision,
 ) -> Result<Vec<EditCommand>, EditorError> {
     project.validate()?;
     let track_id = track.id;
@@ -74,11 +124,6 @@ pub fn author_frame_owned_track(
         .map(|cell| cell.frame_id)
         .collect();
     bound_source_metadata(project, &track, &owners, &tail_owners)?;
-    let precision = if track.blend_mode == BlendMode::Normal {
-        CompositePrecision::WpfPbgra8PngV1
-    } else {
-        CompositePrecision::LegacyStraightRgba8
-    };
     let mut commands = Vec::new();
     let mut sealed = BTreeMap::new();
     let mut authored = BTreeMap::new();

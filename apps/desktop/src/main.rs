@@ -46,6 +46,7 @@ mod static_sequence_ui;
 mod text_overlay_ui;
 mod thumbnail_cache;
 mod ui_notice;
+mod vector_shapes;
 mod video_import_ui;
 mod watermark_decode_job;
 mod watermark_ui;
@@ -859,6 +860,7 @@ struct GifFromScreenApp {
     editor_workspace: Option<EditorWorkspace>,
     editor_ui_state: EditorUiState,
     drawing_input: drawing_preview::InputBoundary,
+    vector_shapes: vector_shapes::VectorShapes,
     editor_preview_cache: EditorPreviewCache,
     editor_export_settings: EditorExportSettings,
     export_job: ExportJob,
@@ -922,6 +924,7 @@ impl Default for GifFromScreenApp {
             editor_workspace: None,
             editor_ui_state: EditorUiState::default(),
             drawing_input: drawing_preview::InputBoundary::default(),
+            vector_shapes: vector_shapes::VectorShapes::default(),
             editor_preview_cache: EditorPreviewCache::new(),
             editor_export_settings: EditorExportSettings::default(),
             export_job: ExportJob::default(),
@@ -947,9 +950,10 @@ impl eframe::App for GifFromScreenApp {
         self.drawing_input.filter(
             context,
             input,
-            enabled,
+            enabled && !self.vector_shapes.is_active(),
             &mut self.editor_ui_state.drawing_overlay,
         );
+        self.vector_shapes.filter_raw_input(context, input, enabled);
     }
 
     fn update(&mut self, context: &egui::Context, frame: &mut eframe::Frame) {
@@ -985,6 +989,7 @@ impl eframe::App for GifFromScreenApp {
         self.restore_main_window_if_requested(context);
         if self.recorder_overlay.is_some() || self.wayland_crop_controller.is_some() {
             drawing_preview::invalidate(context, &mut self.editor_ui_state.drawing_overlay);
+            self.vector_shapes.invalidate(context);
         }
         if self.recorder_overlay.is_some() {
             self.show_recorder_overlay(context);
@@ -1015,6 +1020,7 @@ impl eframe::App for GifFromScreenApp {
             || self.auto_tasks.is_loading()
             || self.source_catalog_job.state() == CaptureSourceJobState::Loading
             || self.wayland_prepare_job.is_active()
+            || self.vector_shapes.has_pending_work()
         {
             context.request_repaint_after(Duration::from_millis(33));
         }
@@ -1078,6 +1084,7 @@ impl GifFromScreenApp {
         });
         if !editor_visible {
             drawing_preview::invalidate(context, &mut self.editor_ui_state.drawing_overlay);
+            self.vector_shapes.invalidate(context);
         }
     }
 
@@ -1100,6 +1107,8 @@ impl GifFromScreenApp {
         }
         self.ui_language = language;
         self.editor_ui_state.cancel_layout_gestures();
+        // New object drafts retain confirmed geometry; only a layout-sensitive
+        // in-flight gesture is rolled back by the preview mapping check.
         // A translation can change the preview's position within the window.
         // Discard only unfinished screen-space gestures, not confirmed source
         // rectangles or capture settings. Native X11 guide geometry is separate.
@@ -1251,6 +1260,7 @@ impl GifFromScreenApp {
     }
 
     fn receive_background_messages(&mut self, context: &egui::Context) {
+        self.vector_shapes.poll(context);
         self.receive_capture_source_result();
         self.receive_wayland_prepare_messages(context);
         self.receive_job_messages();
@@ -1341,6 +1351,7 @@ impl GifFromScreenApp {
                 || self.auto_tasks.is_loading()
                 || self.shortcut_tool.is_active()
                 || self.language_settings.is_active()
+                || self.vector_shapes.has_pending_work()
                 || self.job.is_some())
         {
             self.video_import.cancel();
@@ -1351,6 +1362,7 @@ impl GifFromScreenApp {
             self.annotation_tools.cancel();
             self.auto_tasks.cancel();
             self.shortcut_tool.shutdown();
+            self.vector_shapes.shutdown();
             if let Some(job) = &mut self.job {
                 job.stop_retargeting();
                 let _ = job.controller.stop();
@@ -1362,6 +1374,7 @@ impl GifFromScreenApp {
             && !self.source_workers_active()
             && !self.auto_tasks.is_loading()
             && self.job.is_none()
+            && !self.vector_shapes.has_pending_work()
         {
             self.project_library.shutdown();
             if self.project_library.is_active()
@@ -2099,16 +2112,19 @@ impl GifFromScreenApp {
     fn show_editor(&mut self, ui: &mut egui::Ui) {
         if self.auto_tasks.is_running() {
             drawing_preview::invalidate(ui.ctx(), &mut self.editor_ui_state.drawing_overlay);
+            self.vector_shapes.invalidate(ui.ctx());
             self.auto_tasks.show_running(ui);
             return;
         }
         if self.annotation_tools.is_running() {
             drawing_preview::invalidate(ui.ctx(), &mut self.editor_ui_state.drawing_overlay);
+            self.vector_shapes.invalidate(ui.ctx());
             self.annotation_tools.show_running(ui);
             return;
         }
         if self.motion_tools.is_running() {
             drawing_preview::invalidate(ui.ctx(), &mut self.editor_ui_state.drawing_overlay);
+            self.vector_shapes.invalidate(ui.ctx());
             self.motion_tools.show_running(ui);
             return;
         }
@@ -2118,6 +2134,12 @@ impl GifFromScreenApp {
     fn show_editor_contents(&mut self, ui: &mut egui::Ui) {
         let localizer = self.language_settings.localizer();
         self.show_editor_work_area(ui);
+        if self.vector_shapes.is_active() {
+            if let Some(notice) = &self.notice {
+                ui.label(notice.render(localizer));
+            }
+            return;
+        }
         let motion_enabled = !self.source_workers_active()
             && !self.text_overlay.is_running()
             && self.watermark_job.state() == WatermarkDecodeJobState::Idle
@@ -2206,8 +2228,13 @@ impl GifFromScreenApp {
         let Some(workspace) = &mut self.editor_workspace else {
             ui.label("No active editor project.");
             drawing_preview::invalidate(ui.ctx(), &mut self.editor_ui_state.drawing_overlay);
+            self.vector_shapes.invalidate(ui.ctx());
             return;
         };
+        self.vector_shapes.reconcile(workspace);
+        if self.vector_shapes.is_active() {
+            self.editor_ui_state.pause_preview();
+        }
         self.motion_tools.reconcile_cinemagraph(workspace);
         if self.motion_tools.cinemagraph_editing() {
             self.editor_ui_state.pause_preview();
@@ -2220,32 +2247,48 @@ impl GifFromScreenApp {
             })
             .inner;
         let mut watermark_action = WatermarkUiAction::None;
-        let mut inspector =
-            |ui: &mut egui::Ui, workspace: &mut EditorWorkspace, state: &mut EditorUiState| {
-                let (tool_results, notice, action) = show_editor_inspector(
-                    ui,
-                    workspace,
-                    state,
-                    &mut self.text_overlay,
-                    &mut self.watermark_ui,
-                    self.watermark_job.state(),
-                    localizer,
-                );
-                results.extend(tool_results);
-                if notice.is_some() {
-                    self.notice = notice.map(Notice::from);
-                }
-                watermark_action = action;
-            };
+        let mut vector_intent = vector_shapes::Intent::None;
+        let mut inspector = |ui: &mut egui::Ui,
+                             workspace: &mut EditorWorkspace,
+                             state: &mut EditorUiState,
+                             vector: &mut vector_shapes::VectorShapes| {
+            if vector.is_active() {
+                vector_intent = ui
+                    .add_enabled_ui(cine_input_enabled, |ui| {
+                        vector.show_controls(ui, workspace, localizer)
+                    })
+                    .inner;
+                return;
+            }
+            let (tool_results, notice, action) = show_editor_inspector(
+                ui,
+                workspace,
+                state,
+                &mut self.text_overlay,
+                &mut self.watermark_ui,
+                self.watermark_job.state(),
+                localizer,
+            );
+            results.extend(tool_results);
+            if notice.is_some() {
+                self.notice = notice.map(Notice::from);
+            }
+            watermark_action = action;
+        };
         if ui.available_width() >= 900.0 {
             ui.columns(2, |columns| {
-                inspector(&mut columns[0], workspace, &mut self.editor_ui_state);
+                inspector(
+                    &mut columns[0],
+                    workspace,
+                    &mut self.editor_ui_state,
+                    &mut self.vector_shapes,
+                );
                 show_editor_preview_panel(
                     &mut columns[1],
                     workspace,
                     &mut self.editor_preview_cache,
                     &mut self.editor_ui_state,
-                    &mut self.motion_tools,
+                    (&mut self.motion_tools, &mut self.vector_shapes),
                     cine_input_enabled,
                     localizer,
                 );
@@ -2256,14 +2299,98 @@ impl GifFromScreenApp {
                 workspace,
                 &mut self.editor_preview_cache,
                 &mut self.editor_ui_state,
-                &mut self.motion_tools,
+                (&mut self.motion_tools, &mut self.vector_shapes),
                 cine_input_enabled,
                 localizer,
             );
             ui.separator();
-            inspector(ui, workspace, &mut self.editor_ui_state);
+            inspector(
+                ui,
+                workspace,
+                &mut self.editor_ui_state,
+                &mut self.vector_shapes,
+            );
         }
+        self.handle_vector_intent(vector_intent, cine_input_enabled, localizer);
+        self.handle_editor_actions(results, watermark_action, cine_input_enabled, localizer);
+    }
+
+    fn handle_vector_intent(
+        &mut self,
+        vector_intent: vector_shapes::Intent,
+        cine_input_enabled: bool,
+        localizer: Localizer,
+    ) {
+        let Some(workspace) = &mut self.editor_workspace else {
+            return;
+        };
+        match vector_intent {
+            vector_shapes::Intent::Apply(request) if cine_input_enabled => {
+                let result = self
+                    .vector_shapes
+                    .validate_apply(workspace, &request)
+                    .and_then(|()| {
+                        workspace.apply_vector_shapes(&request).map_err(|error| {
+                            Notice::new(
+                                Message::VectorOperationFailed,
+                                &[("error", &error.to_string())],
+                            )
+                        })
+                    });
+                match result {
+                    Ok(_) => {
+                        self.vector_shapes.close();
+                        self.notice =
+                            Some(Notice::localized(localizer, Message::VectorApplied, &[]));
+                    }
+                    Err(mut error) => {
+                        error.refresh(localizer);
+                        self.notice = Some(error);
+                    }
+                }
+            }
+            vector_shapes::Intent::Restart if cine_input_enabled => {
+                if let Err(mut error) = begin_vector_canvas(
+                    workspace,
+                    &mut self.editor_ui_state,
+                    &mut self.vector_shapes,
+                    true,
+                ) {
+                    error.refresh(localizer);
+                    self.notice = Some(error);
+                }
+            }
+            vector_shapes::Intent::Close => self.vector_shapes.close(),
+            _ => {}
+        }
+    }
+
+    fn handle_editor_actions(
+        &mut self,
+        results: Vec<editor_ui::EditorUiResult>,
+        watermark_action: WatermarkUiAction,
+        cine_input_enabled: bool,
+        localizer: Localizer,
+    ) {
+        let Some(workspace) = &mut self.editor_workspace else {
+            return;
+        };
         for result in results {
+            if matches!(result, Ok(EditorUiAction::OpenVectorCanvas)) {
+                if cine_input_enabled
+                    && !self.motion_tools.cinemagraph_editing()
+                    && let Err(mut error) = begin_vector_canvas(
+                        workspace,
+                        &mut self.editor_ui_state,
+                        &mut self.vector_shapes,
+                        false,
+                    )
+                {
+                    error.refresh(localizer);
+                    self.notice = Some(error);
+                }
+                continue;
+            }
             if let Ok(EditorUiAction::ConvertOverlayTrack(track_id)) = &result {
                 match self
                     .annotation_tools
@@ -4040,12 +4167,44 @@ fn show_editor_scroll_area<R>(
         .show(ui, contents)
 }
 
+fn begin_vector_canvas(
+    workspace: &EditorWorkspace,
+    state: &mut EditorUiState,
+    vector: &mut vector_shapes::VectorShapes,
+    restart: bool,
+) -> Result<(), Notice> {
+    let frame_id = workspace
+        .selection()
+        .current()
+        .ok_or(Message::VectorNeedFrames)?;
+    let frame = workspace
+        .manifest()
+        .timeline
+        .frames
+        .iter()
+        .find(|frame| frame.id == frame_id)
+        .ok_or(Message::VectorNeedFrames)?;
+    let size = annotation_engine::authoring_stage_size(workspace.manifest(), frame, None)
+        .map_err(|error| Notice::new(Message::VectorOperationFailed, &[("error", &error)]))?;
+    if restart {
+        vector.restart(workspace, frame_id, [size.width.get(), size.height.get()])?;
+    } else {
+        vector.begin(workspace, frame_id, [size.width.get(), size.height.get()])?;
+    }
+    state.pause_preview();
+    state.canvas.crop.cancel_gesture();
+    if state.drawing_overlay.phase == DrawingDraftPhase::Capturing {
+        state.drawing_overlay.cancel();
+    }
+    Ok(())
+}
+
 fn show_editor_preview_panel(
     ui: &mut egui::Ui,
     workspace: &mut EditorWorkspace,
     cache: &mut EditorPreviewCache,
     state: &mut EditorUiState,
-    motion: &mut MotionTools,
+    (motion, vector): (&mut MotionTools, &mut vector_shapes::VectorShapes),
     cine_input_enabled: bool,
     localizer: Localizer,
 ) {
@@ -4053,10 +4212,11 @@ fn show_editor_preview_panel(
     state.canvas.reconcile(workspace);
     motion.reconcile_cinemagraph(workspace);
     let cine_reference = motion.cinemagraph_reference();
+    let vector_reference = vector.reference_frame();
     if cine_reference.is_some() || state.drawing_overlay.phase == DrawingDraftPhase::Capturing {
         state.canvas.crop.cancel();
     }
-    let transition = if cine_reference.is_some() {
+    let transition = if cine_reference.is_some() || vector_reference.is_some() {
         None
     } else {
         state.preview_transition(workspace)
@@ -4064,7 +4224,9 @@ fn show_editor_preview_panel(
     if transition.is_some() || state.playback.is_some() {
         state.canvas.crop.cancel();
     }
-    ui.heading(if cine_reference.is_some() {
+    ui.heading(if vector_reference.is_some() {
+        localizer.text(Message::VectorShapesTitle)
+    } else if cine_reference.is_some() {
         localizer.text(Message::PreviewCinemagraphReference)
     } else if transition.is_some() {
         localizer.text(Message::PreviewTransitionTitle)
@@ -4074,11 +4236,16 @@ fn show_editor_preview_panel(
     state.canvas.show_zoom(ui, localizer);
     if show_preview_asset_issues(ui, workspace, localizer) {
         drawing_preview::invalidate(ui.ctx(), &mut state.drawing_overlay);
+        vector.invalidate(ui.ctx());
         return;
     }
-    let Some(frame_id) = cine_reference.or_else(|| workspace.selection().current()) else {
+    let Some(frame_id) = vector_reference
+        .or(cine_reference)
+        .or_else(|| workspace.selection().current())
+    else {
         ui.label(localizer.text(Message::PreviewSelectFrame));
         drawing_preview::invalidate(ui.ctx(), &mut state.drawing_overlay);
+        vector.invalidate(ui.ctx());
         return;
     };
     let preview = if state.canvas.zoom == editor_canvas::PreviewZoom::Fit {
@@ -4102,7 +4269,7 @@ fn show_editor_preview_panel(
             ui,
             workspace,
             state,
-            motion,
+            (motion, vector),
             &preview,
             EditorPreviewTarget {
                 frame_id,
@@ -4114,6 +4281,7 @@ fn show_editor_preview_panel(
         ),
         Err(error) => {
             drawing_preview::invalidate(ui.ctx(), &mut state.drawing_overlay);
+            vector.invalidate(ui.ctx());
             ui.colored_label(
                 ui.visuals().error_fg_color,
                 format_message(
@@ -4141,7 +4309,7 @@ fn draw_editor_preview(
     ui: &mut egui::Ui,
     workspace: &mut EditorWorkspace,
     state: &mut EditorUiState,
-    motion: &mut MotionTools,
+    (motion, vector): (&mut MotionTools, &mut vector_shapes::VectorShapes),
     preview: &editor_preview::EditorPreview,
     target: EditorPreviewTarget,
     localizer: Localizer,
@@ -4152,7 +4320,7 @@ fn draw_editor_preview(
         workspace,
         target.frame_id,
         preview.rendered_size,
-        editable && target.input_enabled && !target.cinemagraph,
+        editable && target.input_enabled && !target.cinemagraph && !vector.is_active(),
         localizer,
     );
     if crop.started {
@@ -4170,6 +4338,7 @@ fn draw_editor_preview(
         && target.input_enabled
         && !target.cinemagraph
         && !motion.cinemagraph_editing()
+        && !vector.is_active()
         && !crop_active;
     if !drawing_enabled {
         drawing_preview::invalidate(ui.ctx(), &mut state.drawing_overlay);
@@ -4177,6 +4346,7 @@ fn draw_editor_preview(
     let sense = if (target.cinemagraph && target.input_enabled)
         || (crop_active && editable)
         || (drawing_enabled && state.drawing_overlay.phase == DrawingDraftPhase::Capturing)
+        || (vector.is_active() && editable && target.input_enabled)
     {
         egui::Sense::click_and_drag()
     } else {
@@ -4186,8 +4356,16 @@ fn draw_editor_preview(
         ui,
         preview,
         sense,
-        editable && target.input_enabled,
+        editable && target.input_enabled && !vector.is_active(),
         |ui, response| {
+            vector.show_preview(
+                ui,
+                response,
+                preview.rendered_size,
+                preview.preview_size,
+                editable && target.input_enabled && !target.cinemagraph,
+                localizer,
+            );
             if target.cinemagraph {
                 motion.show_cinemagraph_preview(
                     ui,
@@ -4216,6 +4394,7 @@ fn draw_editor_preview(
     );
     if let Err(error) = shown {
         drawing_preview::invalidate(ui.ctx(), &mut state.drawing_overlay);
+        vector.invalidate(ui.ctx());
         ui.colored_label(ui.visuals().error_fg_color, error.render(localizer));
     }
     if let Some(step) = target.transition {

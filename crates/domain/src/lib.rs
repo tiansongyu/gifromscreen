@@ -28,6 +28,7 @@ mod premultiplied_snapshot;
 mod progress_fraction;
 mod task_run;
 mod units;
+mod vector_shape;
 
 pub use annotation_options::*;
 pub use annotation_scope::*;
@@ -53,6 +54,7 @@ pub use premultiplied_snapshot::*;
 pub use progress_fraction::ProgressFraction;
 pub use task_run::*;
 pub use units::*;
+pub use vector_shape::*;
 
 /// Current on-disk manifest schema understood by this version of the domain.
-pub const CURRENT_SCHEMA_VERSION: u32 = 7;
+pub const CURRENT_SCHEMA_VERSION: u32 = 8;

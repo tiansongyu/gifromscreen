@@ -659,6 +659,8 @@ pub(crate) enum EditorUiOperation {
 /// Successful state change emitted by [`show_editor_ui`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum EditorUiAction {
+    /// Open a separate object draft; no project command is performed by this action.
+    OpenVectorCanvas,
     /// The host queues this full-layer conversion in its exclusive background worker.
     ConvertOverlayTrack(gif_from_screen_domain::TrackId),
     Selection(EditorUiOperation),
@@ -2628,6 +2630,15 @@ fn show_shape_overlay_toolbar(
     results: &mut Vec<EditorUiResult>,
     localizer: Localizer,
 ) {
+    if ui
+        .add_enabled(
+            !state.canvas.crop.active() && state.playback.is_none(),
+            egui::Button::new(localizer.text(Message::VectorOpen)),
+        )
+        .clicked()
+    {
+        results.push(Ok(EditorUiAction::OpenVectorCanvas));
+    }
     ui.group(|ui| {
         ui.horizontal_wrapped(|ui| {
             ui.strong(localizer.text(Message::EditorShapeOverlays));
@@ -3240,6 +3251,7 @@ fn overlay_content_label(content: &OverlayContent, localizer: Localizer) -> &'st
         OverlayContent::Raster { .. } => Message::EditorContentRaster,
         OverlayContent::Text { .. } => Message::EditorContentText,
         OverlayContent::Shape { .. } => Message::EditorContentShape,
+        OverlayContent::VectorShape { .. } => Message::VectorShapesTitle,
         OverlayContent::Drawing { .. } => Message::EditorContentDrawing,
         OverlayContent::KeyStroke { .. } => Message::EditorContentKeyStroke,
         OverlayContent::Cursor { .. } => Message::EditorContentCursor,

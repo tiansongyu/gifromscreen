@@ -19,6 +19,9 @@ pub enum CompositePrecision {
     #[default]
     LegacyStraightRgba8,
     WpfPbgra8PngV1,
+    /// Isolate vector marks on a transparent PM canvas before one source-over
+    /// onto the frame. Never infer this grouping from existing mark contents.
+    VectorCanvasPbgra8PngV1,
 }
 
 impl CompositePrecision {
@@ -78,6 +81,10 @@ impl FrameRenderStep {
 
     pub const fn required_schema_version(&self) -> u32 {
         match self {
+            Self::Composite {
+                precision: CompositePrecision::VectorCanvasPbgra8PngV1,
+                ..
+            } => 8,
             Self::CinemagraphOverlay { .. } => 7,
             Self::FreezeRegion { .. } => 6,
             Self::Composite {
@@ -123,7 +130,8 @@ pub fn validate_frame_render_steps(steps: &[FrameRenderStep]) -> Result<(), Stri
     if matches!(
         steps.first(),
         Some(FrameRenderStep::Composite {
-            precision: CompositePrecision::WpfPbgra8PngV1,
+            precision: CompositePrecision::WpfPbgra8PngV1
+                | CompositePrecision::VectorCanvasPbgra8PngV1,
             ..
         })
     ) {

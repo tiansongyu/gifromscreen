@@ -41,6 +41,7 @@ mod premultiplied;
 mod renderer;
 mod surface;
 mod transition;
+mod vector_shape;
 mod wpf_pixels;
 
 #[cfg(test)]
@@ -57,6 +58,7 @@ pub use ink_raster::{clip_ink_reference, rasterize_ink_paths};
 pub use overlay::{
     OverlayRenderPlan, RasterOverlayAsset, active_raster_overlay_assets,
     active_raster_overlay_assets_for_frame, freeze_timed_overlay_content,
+    render_vector_shapes_preview,
 };
 pub use premultiplied::{PremultipliedRgbaSurface, PremultipliedSnapshotError};
 pub use renderer::{
@@ -64,3 +66,4 @@ pub use renderer::{
 };
 pub use surface::RgbaSurface;
 pub use transition::{TransitionProgress, render_transition};
+pub use vector_shape::{MAX_VECTOR_PREVIEW_SHAPES, VectorShapeGeometry, vector_shape_geometry};

@@ -390,6 +390,8 @@ pub enum OverlayContent {
         stroke: Rgba,
         fill: Option<Rgba>,
     },
+    /// Explicit new geometry; existing `Shape` is never reinterpreted as this renderer.
+    VectorShape { shape: crate::VectorShape },
     Drawing {
         points: Vec<StrokePoint>,
         width: u16,
@@ -425,6 +427,13 @@ pub enum OverlayContent {
 }
 
 impl OverlayContent {
+    pub const fn required_schema_version(&self) -> u32 {
+        match self {
+            Self::VectorShape { .. } => crate::VECTOR_SHAPE_SCHEMA_VERSION,
+            _ => 1,
+        }
+    }
+
     pub const fn referenced_asset(&self) -> Option<AssetId> {
         match self {
             Self::Raster { asset_id, .. } => Some(*asset_id),
@@ -492,7 +501,7 @@ pub struct OverlayTrack {
 
 impl OverlayTrack {
     pub fn required_schema_version(&self) -> u32 {
-        if self
+        let representation: u32 = if self
             .frame_cells
             .iter()
             .flatten()
@@ -503,7 +512,13 @@ impl OverlayTrack {
             2
         } else {
             1
-        }
+        };
+        representation.max(
+            self.all_mark_contents()
+                .map(|(_, content)| content.required_schema_version())
+                .max()
+                .unwrap_or(1),
+        )
     }
 
     /// Includes hidden and zero-opacity content, for persistence and asset ownership checks.
@@ -943,17 +958,34 @@ impl ProjectManifest {
                             ),
                         });
                     }
+                    let precision = frame_stages
+                        .get(&cell.frame_id)
+                        .and_then(|stages| stages.get(&stage));
                     if track.blend_mode != BlendMode::Normal
-                        && frame_stages
-                            .get(&cell.frame_id)
-                            .and_then(|stages| stages.get(&stage))
-                            == Some(&crate::CompositePrecision::WpfPbgra8PngV1)
+                        && matches!(
+                            precision,
+                            Some(
+                                crate::CompositePrecision::WpfPbgra8PngV1
+                                    | crate::CompositePrecision::VectorCanvasPbgra8PngV1
+                            )
+                        )
                     {
                         issues.push(ValidationIssue::InvalidFrameOverlay {
                             track_id: track.id,
                             reason:
                                 "WPF paint stages require Normal blending, including hidden groups."
                                     .to_owned(),
+                        });
+                    }
+                    if precision == Some(&crate::CompositePrecision::VectorCanvasPbgra8PngV1)
+                        && cell
+                            .marks
+                            .iter()
+                            .any(|mark| !matches!(mark.content, OverlayContent::VectorShape { .. }))
+                    {
+                        issues.push(ValidationIssue::InvalidFrameOverlay {
+                            track_id: track.id,
+                            reason: format!("Vector-canvas stage {stage} accepts only frame-owned VectorShape marks, including hidden groups."),
                         });
                     }
                 }
@@ -993,6 +1025,25 @@ impl ProjectManifest {
                 }
                 if !overlay_ids.insert(overlay_id) {
                     issues.push(ValidationIssue::DuplicateOverlayId { overlay_id });
+                }
+                if let OverlayContent::VectorShape { shape } = content {
+                    if self.schema_version < content.required_schema_version() {
+                        issues.push(ValidationIssue::InvalidVectorShape {
+                            track_id: track.id,
+                            overlay_id,
+                            reason: format!(
+                                "Vector shapes require schema {}.",
+                                crate::VECTOR_SHAPE_SCHEMA_VERSION
+                            ),
+                        });
+                    }
+                    if let Err(reason) = shape.validate() {
+                        issues.push(ValidationIssue::InvalidVectorShape {
+                            track_id: track.id,
+                            overlay_id,
+                            reason,
+                        });
+                    }
                 }
                 if let Some(asset_id) = content.referenced_asset() {
                     match self.assets.get(&asset_id) {

@@ -60,18 +60,24 @@ pub(super) fn validate_repeated_content(
     content: &OverlayContent,
     count: usize,
 ) -> Result<(), EditorWorkspaceError> {
-    let mut counter = MetadataCounter::default();
-    serde_json::to_writer(&mut counter, content).map_err(|_| budget_error())?;
+    let content_bytes = json_metadata_bytes(content)?;
     // Reserve ownership/mark IDs and canonical whole-frame scope overhead,
     // in addition to the dynamically sized text or drawing payload.
-    let required = counter
-        .0
+    let required = content_bytes
         .checked_add(512)
         .and_then(|bytes| bytes.checked_mul(count));
     if required.is_none_or(|bytes| bytes > MAX_FRAME_BUNDLE_METADATA_BYTES) {
         return Err(budget_error());
     }
     Ok(())
+}
+
+pub(super) fn json_metadata_bytes(
+    value: &impl serde::Serialize,
+) -> Result<usize, EditorWorkspaceError> {
+    let mut counter = MetadataCounter::default();
+    serde_json::to_writer(&mut counter, value).map_err(|_| budget_error())?;
+    Ok(counter.0)
 }
 
 fn budget_error() -> EditorWorkspaceError {

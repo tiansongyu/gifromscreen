@@ -382,7 +382,13 @@ fn stage_overlay_layers<'a, C: CancellationToken + ?Sized>(
             });
         }
         if let Some(stage_id) = stage
-            && stages.get(&stage_id) == Some(&CompositePrecision::WpfPbgra8PngV1)
+            && matches!(
+                stages.get(&stage_id),
+                Some(
+                    CompositePrecision::WpfPbgra8PngV1
+                        | CompositePrecision::VectorCanvasPbgra8PngV1
+                )
+            )
         {
             if layer.blend_mode != PaintBlend::Legacy(BlendMode::Normal) {
                 return Err(RenderError::InvalidRenderSteps {
@@ -390,6 +396,17 @@ fn stage_overlay_layers<'a, C: CancellationToken + ?Sized>(
                     reason: format!(
                         "WPF paint stage {stage_id} requires Normal blend for overlay {}.",
                         layer.id
+                    ),
+                });
+            }
+            if stages.get(&stage_id) == Some(&CompositePrecision::VectorCanvasPbgra8PngV1)
+                && (layer.span.is_some()
+                    || !matches!(layer.content, OverlayContent::VectorShape { .. }))
+            {
+                return Err(RenderError::InvalidRenderSteps {
+                    frame_id: clip.id,
+                    reason: format!(
+                        "Vector canvas stage {stage_id} requires frame-owned vector shapes."
                     ),
                 });
             }
@@ -484,6 +501,7 @@ where
     P: FrameAssetProvider + ?Sized,
     C: CancellationToken + ?Sized,
 {
+    let mut vector_work = crate::vector_shape::MAX_WORK;
     for layer in layers {
         check_cancelled(cancellation)?;
         match layer.content {
@@ -545,6 +563,15 @@ where
                 layer.blend_mode,
                 cancellation,
             )?,
+            OverlayContent::VectorShape { shape } => composite_vector_shape(
+                destination,
+                shape,
+                layer.track_opacity,
+                layer.blend_mode,
+                limits,
+                cancellation,
+                &mut vector_work,
+            )?,
             OverlayContent::Drawing {
                 points,
                 width,
@@ -575,6 +602,109 @@ where
     Ok(())
 }
 
+fn composite_vector_shape<C: CancellationToken + ?Sized>(
+    destination: &mut RgbaSurface,
+    shape: &gif_from_screen_domain::VectorShape,
+    track_opacity: u8,
+    blend_mode: PaintBlend,
+    limits: RenderLimits,
+    cancellation: &C,
+    work: &mut u64,
+) -> Result<(), RenderError> {
+    crate::vector_shape::paint(
+        shape,
+        destination.size(),
+        [1.0, 1.0],
+        limits,
+        cancellation,
+        work,
+        |x, y, premultiplied| {
+            let offset = destination.byte_offset(x, y);
+            blend_vector_pixel(
+                &mut destination.pixels_mut()[offset..offset + 4],
+                premultiplied,
+                track_opacity,
+                blend_mode,
+            );
+        },
+    )
+}
+
+/// Rasterizes at most 256 editable vector objects onto a transparent RGBA overlay.
+/// Uses the same geometry, fill/stroke coverage and premultiplied compositor as
+/// saved objects. `canvas` is the physical authoring space; `output` is only the
+/// requested preview texture size and never changes persisted values. Objects
+/// share one PNG-compatible precision boundary, in slice order.
+///
+/// # Errors
+/// Rejects zero dimensions, invalid shapes, output/working-memory or work limits,
+/// excessive object counts and cancellation before returning any preview.
+pub fn render_vector_shapes_preview<C: CancellationToken + ?Sized>(
+    shapes: &[gif_from_screen_domain::VectorShape],
+    canvas: [u32; 2],
+    output: [u32; 2],
+    limits: RenderLimits,
+    cancellation: &C,
+) -> Result<RgbaSurface, RenderError> {
+    check_cancelled(cancellation)?;
+    if shapes.len() > crate::MAX_VECTOR_PREVIEW_SHAPES {
+        return Err(RenderError::InvalidVectorShape {
+            reason: "preview exceeds the 256-object bound".into(),
+        });
+    }
+    if canvas.contains(&0) {
+        return Err(SurfaceError::EmptyDimensions {
+            width: canvas[0],
+            height: canvas[1],
+        }
+        .into());
+    }
+    let size =
+        PhysicalSize::new(output[0], output[1]).map_err(|_| SurfaceError::EmptyDimensions {
+            width: output[0],
+            height: output[1],
+        })?;
+    let bytes = checked_byte_len(size)?;
+    if bytes > limits.max_surface_bytes {
+        return Err(RenderError::SurfaceLimitExceeded {
+            requested: bytes,
+            limit: limits.max_surface_bytes,
+        });
+    }
+    for shape in shapes {
+        shape
+            .validate()
+            .map_err(|reason| RenderError::InvalidVectorShape { reason })?;
+    }
+    let mut surface = RgbaSurface::try_zeroed(size)?;
+    let scale = [
+        f64::from(output[0]) / f64::from(canvas[0]),
+        f64::from(output[1]) / f64::from(canvas[1]),
+    ];
+    let mut vector_work = crate::vector_shape::MAX_WORK;
+    for shape in shapes {
+        crate::vector_shape::paint(
+            shape,
+            size,
+            scale,
+            limits,
+            cancellation,
+            &mut vector_work,
+            |x, y, premultiplied| {
+                let offset = surface.byte_offset(x, y);
+                blend_vector_pixel(
+                    &mut surface.pixels_mut()[offset..offset + 4],
+                    premultiplied,
+                    255,
+                    PaintBlend::WpfSourceOver,
+                );
+            },
+        )?;
+    }
+    convert_surface_precision(&mut surface, crate::wpf_pixels::unpremultiply, cancellation)?;
+    Ok(surface)
+}
+
 fn composite_stage<P: FrameAssetProvider + ?Sized, C: CancellationToken + ?Sized>(
     destination: &mut RgbaSurface,
     layers: Vec<OverlayLayer<'_>>,
@@ -586,6 +716,16 @@ fn composite_stage<P: FrameAssetProvider + ?Sized, C: CancellationToken + ?Sized
 ) -> Result<(), RenderError> {
     if layers.is_empty() {
         return Ok(());
+    }
+    if precision == CompositePrecision::VectorCanvasPbgra8PngV1 {
+        return composite_vector_canvas(
+            destination,
+            layers,
+            sample_time,
+            provider,
+            limits,
+            cancellation,
+        );
     }
     if precision == CompositePrecision::WpfPbgra8PngV1 {
         convert_surface_precision(destination, crate::wpf_pixels::premultiply, cancellation)?;
@@ -602,6 +742,55 @@ fn composite_stage<P: FrameAssetProvider + ?Sized, C: CancellationToken + ?Sized
         convert_surface_precision(destination, crate::wpf_pixels::unpremultiply, cancellation)?;
     }
     Ok(())
+}
+
+fn composite_vector_canvas<P: FrameAssetProvider + ?Sized, C: CancellationToken + ?Sized>(
+    destination: &mut RgbaSurface,
+    layers: Vec<OverlayLayer<'_>>,
+    sample_time: TimeUs,
+    provider: &P,
+    limits: RenderLimits,
+    cancellation: &C,
+) -> Result<(), RenderError> {
+    check_cancelled(cancellation)?;
+    let bytes = checked_byte_len(destination.size())?;
+    let working = limits.max_surface_bytes.checked_sub(bytes).ok_or(
+        RenderError::EffectWorkingMemoryLimitExceeded {
+            effect: "vector canvas",
+            requested: bytes,
+            limit: limits.max_surface_bytes,
+        },
+    )?;
+    // This explicit new stage isolates the complete canvas before source-over.
+    // Never infer the boundary from whichever marks happen to be visible.
+    let mut canvas = RgbaSurface::try_zeroed(destination.size())?;
+    composite_overlay_layers(
+        &mut canvas,
+        layers,
+        sample_time,
+        provider,
+        RenderLimits {
+            max_surface_bytes: working,
+        },
+        cancellation,
+    )?;
+    for (index, (pixel, source)) in destination
+        .pixels_mut()
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(canvas.pixels().as_chunks::<4>().0)
+        .enumerate()
+    {
+        if index.is_multiple_of(CANCELLATION_PIXEL_INTERVAL as usize) {
+            check_cancelled(cancellation)?;
+        }
+        *pixel = crate::wpf_pixels::unpremultiply(crate::wpf_pixels::over(
+            *source,
+            crate::wpf_pixels::premultiply(*pixel),
+        ));
+    }
+    check_cancelled(cancellation)
 }
 
 fn convert_surface_precision<C: CancellationToken + ?Sized>(
@@ -731,6 +920,11 @@ fn validate_overlay_content(
     content: &OverlayContent,
     timed: bool,
 ) -> Result<(), RenderError> {
+    if let OverlayContent::VectorShape { shape } = content {
+        shape
+            .validate()
+            .map_err(|reason| RenderError::InvalidVectorShape { reason })?;
+    }
     if !timed && matches!(content, OverlayContent::Progress { style: None, .. }) {
         return Err(RenderError::InvalidOverlayGeometry {
             overlay_id: id,
@@ -756,6 +950,7 @@ fn validate_overlay_content(
             }
             | OverlayContent::Progress { style: Some(_), .. }
             | OverlayContent::Shape { .. }
+            | OverlayContent::VectorShape { .. }
             | OverlayContent::Drawing { .. }
     ) {
         return Err(unsupported_overlay(id, content));
@@ -772,6 +967,7 @@ fn unsupported_overlay(overlay_id: OverlayId, content: &OverlayContent) -> Rende
         OverlayContent::Progress { .. } => "progress",
         OverlayContent::Raster { .. } => "raster",
         OverlayContent::Shape { .. } => "shape",
+        OverlayContent::VectorShape { .. } => "vector shape",
         OverlayContent::Drawing { .. } => "drawing",
     };
     RenderError::UnsupportedOverlay { overlay_id, kind }
@@ -1316,6 +1512,33 @@ fn paint_pixel(
         track_opacity,
         blend_mode,
     );
+}
+
+fn blend_vector_pixel(
+    destination: &mut [u8],
+    source: [u8; 4],
+    track_opacity: u8,
+    blend_mode: PaintBlend,
+) {
+    match blend_mode {
+        PaintBlend::Legacy(mode) => {
+            let straight = crate::wpf_pixels::unpremultiply(source);
+            blend_legacy_pixel(destination, &straight, 255, track_opacity, mode);
+        }
+        PaintBlend::WpfSourceOver => {
+            let source = source.map(|channel| crate::wpf_pixels::mul_byte(channel, track_opacity));
+            let output = crate::wpf_pixels::over(
+                source,
+                [
+                    destination[0],
+                    destination[1],
+                    destination[2],
+                    destination[3],
+                ],
+            );
+            destination.copy_from_slice(&output);
+        }
+    }
 }
 
 fn blend_pixel(

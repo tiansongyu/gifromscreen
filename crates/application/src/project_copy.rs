@@ -597,7 +597,11 @@ mod tests {
         .unwrap();
         let copied = ActiveProject::open(&report.path, LockPolicy::FailIfPresent).unwrap();
         assert!(copied.asset_issues.is_empty());
-        assert_eq!(copied.project.manifest().schema_version, 7);
+        assert!(before.schema_version >= 7);
+        assert_eq!(
+            copied.project.manifest().schema_version,
+            before.schema_version
+        );
         assert_ne!(copied.project.manifest().project_id, before.project_id);
         assert_eq!(copied.project.manifest().assets, before.assets);
         assert_eq!(copied.project.manifest().timeline, before.timeline);
