@@ -87,13 +87,46 @@ digests. A synthetic contradictory-envelope regression covers this check;
 synthetic helper data are not WPF expected pixels.
 
 The full persisted-V1 comparator remains separate and failing. This candidate
-still needs production-scale work policy, a version-safe project/editor route,
+still needs broader production-scale coverage, a version-safe project/editor route,
 larger/mixed-geometry cases and native acceptance before becoming the authoring
 default. Existing saved V1 bytes and pipeline behavior are unchanged. The first
-batch implementation conservatively divides a total 100M work bound between
-phases; measured brush/raster helpers now expose actual charged work for the
-next scale-validation step without changing their legacy public results.
+batch implementation conservatively divided a total 100M work bound between
+phases. The next implementation consumes actual charged brush/raster/pixel work
+across the whole batch and uses an explicit **250M** bound. Legacy V1 and Ink
+default bounds remain 100M; there is no per-object multiplication of the new
+batch allowance.
 No release or full-project WPF parity is claimed by the 14-case result.
+
+## Measured normal-size cases
+
+The old 100M policy was measured before changing it: a 4K filled rectangle
+barely fit, while a normal 4K rectangle with a 4px stroke exhausted its remaining
+allowance. No resolution, shape, mask or expected pixel was changed to pass.
+A test-only 500M measurement established the complete cost; the explicit new
+250M default then passed all four cases in debug and release:
+
+| Pure-render case | Charged work | Release seconds |
+| --- | ---: | ---: |
+| 1920×1080, two filled/stroked shapes | 41,181,530 | 0.05573 |
+| 3840×2160, one full filled rectangle | 99,705,713 | 0.11936 |
+| 3840×2160, full filled/stroked rectangle | 116,899,717 | 0.14437 |
+| 3840×2160, rectangle + centered ellipse | 163,532,284 | 0.20790 |
+
+Explicit Rust 1.98.0 release render-test binary:
+`f3a20a2361494e6e7cdcc2c525e997baa4a2525cdaf195d87966ee33415333b9`.
+The four-case process took 0.53 seconds wall time and 45,560 KiB peak RSS.
+Evidence is under `/tmp/gfs-wpf-scale-500m.y1mRA9/`; separate old-100M failure,
+test-only-500M measurement and formal-default-250M logs are retained.
+These are **pure-render measurements**, not GIF encoding, recording FPS or an
+isolated whole-application performance guarantee.
+
+Both toolchains retain all 14 real candidate comparisons exactly after actual
+metering and the new bound. Reports are
+`/tmp/gfs-wpf-vector-meter250-1_98.tIeuV4/vector-candidate.json` and
+`/tmp/gfs-wpf-vector-meter250-1_88.q39Y4V/vector-candidate.json`, both SHA-256
+`90cacb08b8a46e3bd8db529c23146de8d9f31b54f0e84efc4e7d3e90112f0c9f`.
+Many small objects on a large canvas still require scale validation and spatial
+mask work; these four successful cases do not close that requirement.
 
 ## Primary references
 

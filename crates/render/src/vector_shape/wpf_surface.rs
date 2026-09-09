@@ -10,18 +10,19 @@ use gif_from_screen_domain::{PhysicalSize, Rgba, VectorShape};
 
 use super::{
     MAX_VECTOR_PREVIEW_SHAPES,
-    wpf_brush::{WpfBrushPaths, prepare_wpf_brush_paths},
+    wpf_brush::{WpfBrushPaths, prepare_wpf_brush_paths_measured},
 };
 use crate::{
     CancellationToken, InkError, InkFigure, InkLimits, InkPath, InkSegment,
-    PremultipliedRgbaSurface, RenderLimits, rasterize_ink_paths, surface::checked_byte_len,
-    wpf_pixels,
+    PremultipliedRgbaSurface, RenderLimits, ink_raster::rasterize_ink_paths_measured,
+    surface::checked_byte_len, wpf_pixels,
 };
 
 type Result<T> = std::result::Result<T, InkError>;
 
-const PHASE_WORK: u64 = 20_000_000;
-const MAX_WORK: u64 = 100_000_000;
+// Candidate-only measured batch policy, chosen after real 4K two-shape
+// measurement (163,532,284 units). Legacy V1 and InkLimits defaults are unchanged.
+const MAX_WORK: u64 = 250_000_000;
 const PIXEL_BLOCK: usize = 1024;
 
 /// Renders one independently prepared WPF-style visual into PM RGBA8 bytes.
@@ -49,12 +50,14 @@ pub fn render_wpf_vector_shape<C: CancellationToken + ?Sized>(
 ///
 /// Here `max_surface_bytes` bounds the entire working set: output, actual owned
 /// geometry capacities, any clipped-visual PM temporary, and the current mask
-/// and raster-scanner allocations. The entire batch has one 100M work ceiling.
-/// At most 20M pixel visits are reserved, then remaining work is divided among
-/// four possible phases per object (prepare/fill/stroke/clip). Raster phases
-/// retain their own subscan/edge charges. Unused reservations are not measured
-/// or recycled: a complex single phase can be rejected despite spare actual
-/// aggregate work. This is not the production 1080p/4K authoring policy.
+/// and raster-scanner allocations. The entire batch has one 250M work ceiling.
+/// Geometry and raster phases receive the remaining batch allowance and return
+/// their actually charged work. Only executed initialization, paint, clip,
+/// composition and validation pixel passes are charged here. There is no
+/// per-object quota or independently reset allowance; raster subscan/edge costs
+/// remain part of the shared ceiling.
+/// This is a render-only resource policy, not a GIF encoding or capture-FPS
+/// promise. The measured 1080p/4K cases do not cover every object-count/scale mix.
 ///
 /// # Errors
 /// Rejects invalid/unsupported brush geometry, work or aggregate-memory limits,
@@ -66,6 +69,14 @@ pub fn render_wpf_vector_shapes<C: CancellationToken + ?Sized>(
     cancel: &C,
 ) -> Result<PremultipliedRgbaSurface> {
     let mut budget = Budget::new(limits, cancel)?;
+    render_canvas(shapes, size, &mut budget)
+}
+
+fn render_canvas<C: CancellationToken + ?Sized>(
+    shapes: &[VectorShape],
+    size: PhysicalSize,
+    budget: &mut Budget<'_, C>,
+) -> Result<PremultipliedRgbaSurface> {
     if shapes.len() > MAX_VECTOR_PREVIEW_SHAPES {
         return Err(InkError::Limit("WPF canvas object limit exceeded".into()));
     }
@@ -74,12 +85,11 @@ pub fn render_wpf_vector_shapes<C: CancellationToken + ?Sized>(
         shape.validate().map_err(InkError::Invalid)?;
     }
     let byte_len = checked_byte_len(size)?;
-    budget.reserve_batch(byte_len / 4, shapes.len())?;
-    let mut output = zeroed(byte_len, &mut budget)?;
+    let mut output = zeroed(byte_len, budget)?;
     for shape in shapes {
-        paint_visual(shape, size, &mut output, &mut budget)?;
+        paint_visual(shape, size, &mut output, budget)?;
     }
-    budget.check()?;
+    budget.charge_pixels(byte_len / 4)?;
     let surface = PremultipliedRgbaSurface::new(size, output)?;
     budget.check()?;
     Ok(surface)
@@ -99,13 +109,17 @@ fn paint_visual<C: CancellationToken + ?Sized>(
         .max_bytes
         .checked_sub(size_of::<WpfBrushPaths>())
         .ok_or_else(memory_limit)?;
-    let paths = prepare_wpf_brush_paths(shape, &geometry_limits, budget.cancel)?;
+    let (paths, used) = prepare_wpf_brush_paths_measured(shape, &geometry_limits, budget.cancel)
+        .map_err(|error| budget.phase_error("brush", error))?;
+    budget.charge(WorkKind::Brush, used)?;
     budget.retain(geometry_bytes(&paths, budget.cancel)?)?;
     if let Some(path) = &paths.layout_clip {
         let mut visual = zeroed(canvas.len(), budget)?;
         paint_primitives(shape, &paths, size, &mut visual, budget)?;
         let coverage = mask(path, size, budget)?;
+        budget.charge_pixels(visual.len() / 4)?;
         clip_mask(&mut visual, &coverage, budget.cancel)?;
+        budget.charge_pixels(canvas.len() / 4)?;
         composite_visual(canvas, &visual, budget.cancel)?;
     } else {
         paint_primitives(shape, &paths, size, canvas, budget)?;
@@ -167,6 +181,7 @@ fn paint_path<C: CancellationToken + ?Sized>(
     budget: &mut Budget<'_, C>,
 ) -> Result<()> {
     let mask = mask(path, size, budget)?;
+    budget.charge_pixels(output.len() / 4)?;
     paint_mask(output, &mask, color, budget.cancel)
 }
 
@@ -179,13 +194,16 @@ fn mask<C: CancellationToken + ?Sized>(
     // The paths stay borrowed. The rasterizer's memory budget includes its
     // output mask, edge vectors, sort/crossing/interval arrays and row scratch;
     // all retained geometry and PM bytes have already been subtracted above.
-    rasterize_ink_paths(
+    let (mask, used) = rasterize_ink_paths_measured(
         std::slice::from_ref(path),
         size,
         false,
         &limits,
         budget.cancel,
     )
+    .map_err(|error| budget.phase_error("raster", error))?;
+    budget.charge(WorkKind::Raster, used)?;
+    Ok(mask)
 }
 
 fn paint_mask<C: CancellationToken + ?Sized>(
@@ -291,6 +309,7 @@ fn zeroed<C: CancellationToken + ?Sized>(
     length: usize,
     budget: &mut Budget<'_, C>,
 ) -> Result<Vec<u8>> {
+    budget.charge_pixels(length / 4)?;
     budget.retain(length)?;
     let mut bytes = Vec::new();
     bytes
@@ -326,8 +345,28 @@ struct Budget<'a, C: CancellationToken + ?Sized> {
     cancel: &'a C,
     max_bytes: usize,
     retained_bytes: usize,
-    reserved_work: u64,
-    phase_work: u64,
+    maximum_work: u64,
+    usage: WorkUsage,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WorkUsage {
+    brush: u64,
+    raster: u64,
+    pixels: u64,
+}
+
+impl WorkUsage {
+    fn total(self) -> u64 {
+        self.brush + self.raster + self.pixels
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WorkKind {
+    Brush,
+    Raster,
+    Pixels,
 }
 
 impl<'a, C: CancellationToken + ?Sized> Budget<'a, C> {
@@ -337,8 +376,8 @@ impl<'a, C: CancellationToken + ?Sized> Budget<'a, C> {
             cancel,
             max_bytes: limits.max_surface_bytes,
             retained_bytes: 0,
-            reserved_work: 0,
-            phase_work: PHASE_WORK,
+            maximum_work: MAX_WORK,
+            usage: WorkUsage::default(),
         })
     }
 
@@ -356,40 +395,37 @@ impl<'a, C: CancellationToken + ?Sized> Budget<'a, C> {
         Ok(())
     }
 
-    fn reserve_batch(&mut self, pixels: usize, objects: usize) -> Result<()> {
-        // Shared initialization+validation; per object at most fill, stroke,
-        // temporary initialization, clip and over-canvas. Four channels form
-        // one pixel visit. No independent 100M allowance per object.
-        let visits = u64::try_from(objects)
-            .ok()
-            .and_then(|n| n.checked_mul(5))
-            .and_then(|n| n.checked_add(2))
-            .ok_or_else(memory_limit)?;
-        let work = u64::try_from(pixels)
-            .ok()
-            .and_then(|n| n.checked_mul(visits))
-            .filter(|n| *n <= PHASE_WORK)
-            .ok_or_else(|| InkError::Limit("WPF visual pixel-work reservation exceeded".into()))?;
-        self.reserve_work(work)?;
-        let phases = u64::try_from(objects).map_err(|_| memory_limit())? * 4;
-        self.phase_work = (MAX_WORK - work).checked_div(phases).unwrap_or(0);
-        Ok(())
+    fn charge_pixels(&mut self, pixels: usize) -> Result<()> {
+        self.charge(
+            WorkKind::Pixels,
+            u64::try_from(pixels).map_err(|_| memory_limit())?,
+        )
     }
 
-    fn reserve_work(&mut self, work: u64) -> Result<()> {
+    fn charge(&mut self, kind: WorkKind, work: u64) -> Result<()> {
         self.check()?;
-        self.reserved_work = self
-            .reserved_work
+        self.usage
+            .total()
             .checked_add(work)
-            .filter(|n| *n <= MAX_WORK)
+            .filter(|n| *n <= self.maximum_work)
             .ok_or_else(|| {
-                InkError::Limit("WPF visual aggregate work reservation exceeded".into())
+                InkError::Limit(format!(
+                    "WPF canvas aggregate work exceeded: charged {}, next {work}, limit {}",
+                    self.usage.total(),
+                    self.maximum_work
+                ))
             })?;
+        let counter = match kind {
+            WorkKind::Brush => &mut self.usage.brush,
+            WorkKind::Raster => &mut self.usage.raster,
+            WorkKind::Pixels => &mut self.usage.pixels,
+        };
+        *counter += work;
         Ok(())
     }
 
-    fn phase_limits(&mut self, reserved_bytes: usize) -> Result<InkLimits> {
-        self.reserve_work(self.phase_work)?;
+    fn phase_limits(&self, reserved_bytes: usize) -> Result<InkLimits> {
+        self.check()?;
         let max_bytes = self
             .max_bytes
             .checked_sub(self.retained_bytes)
@@ -397,9 +433,21 @@ impl<'a, C: CancellationToken + ?Sized> Budget<'a, C> {
             .ok_or_else(memory_limit)?;
         Ok(InkLimits {
             max_bytes,
-            max_work: self.phase_work,
+            max_work: self.maximum_work - self.usage.total(),
             ..InkLimits::default()
         })
+    }
+
+    fn phase_error(&self, phase: &str, error: InkError) -> InkError {
+        match error {
+            InkError::Limit(reason) => InkError::Limit(format!(
+                "{reason}; {phase} phase had {} work remaining after {} charged (limit {})",
+                self.maximum_work - self.usage.total(),
+                self.usage.total(),
+                self.maximum_work
+            )),
+            other => other,
+        }
     }
 }
 
@@ -580,19 +628,22 @@ mod tests {
         );
         assert!(matches!(result, Err(InkError::Limit(_))));
         let mut budget = Budget::new(RenderLimits::default(), &NeverCancel).unwrap();
-        budget.reserve_batch(1_000_000, 2).unwrap();
-        for _ in 0..8 {
-            assert_eq!(budget.phase_limits(0).unwrap().max_work, 11_000_000);
-        }
-        assert!(matches!(budget.phase_limits(0), Err(InkError::Limit(_))));
-        assert_eq!(budget.reserved_work, MAX_WORK);
-        let result = render_wpf_vector_shape(
-            &shape,
-            PhysicalSize::new(4001, 1000).unwrap(),
-            RenderLimits::default(),
-            &NeverCancel,
+        budget.charge_pixels(1_000_000).unwrap();
+        assert_eq!(
+            budget.phase_limits(0).unwrap().max_work,
+            MAX_WORK - 1_000_000
         );
-        assert!(matches!(result, Err(InkError::Limit(_))));
+        budget.charge(WorkKind::Brush, 123).unwrap();
+        assert_eq!(
+            budget.phase_limits(0).unwrap().max_work,
+            MAX_WORK - 1_000_123
+        );
+        budget
+            .charge(WorkKind::Raster, MAX_WORK - 1_000_123)
+            .unwrap();
+        assert_eq!(budget.phase_limits(0).unwrap().max_work, 0);
+        assert!(matches!(budget.charge_pixels(1), Err(InkError::Limit(_))));
+        assert_eq!(budget.usage.total(), MAX_WORK);
     }
 
     #[test]
@@ -607,7 +658,8 @@ mod tests {
             },
             Rgba::TRANSPARENT,
         );
-        let paths = prepare_wpf_brush_paths(&shape, &InkLimits::default(), &NeverCancel).unwrap();
+        let (paths, _) =
+            prepare_wpf_brush_paths_measured(&shape, &InkLimits::default(), &NeverCancel).unwrap();
         let geometry = geometry_bytes(&paths, &NeverCancel).unwrap();
         // There is room for all retained metadata, the 8x8 PM output and C64
         // mask, but deliberately none for even the first scanner edge vector.
@@ -862,5 +914,173 @@ mod tests {
             render_wpf_vector_shapes(&shapes, size, RenderLimits::default(), &NeverCancel),
             Err(InkError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn measured_batch_charge_is_exact_and_one_less_is_rejected() {
+        let shape = rectangle(
+            200,
+            Rgba {
+                red: 210,
+                green: 37,
+                blue: 93,
+                alpha: 17,
+            },
+            Rgba {
+                red: 41,
+                green: 199,
+                blue: 72,
+                alpha: 117,
+            },
+        );
+        let shapes = [shape, shape];
+        let size = PhysicalSize::new(8, 8).unwrap();
+        let mut budget = Budget::new(RenderLimits::default(), &NeverCancel).unwrap();
+        let expected = render_canvas(&shapes, size, &mut budget).unwrap();
+        let used = budget.usage;
+        assert!(used.brush > 0 && used.raster > 0 && used.pixels > 0);
+        assert_eq!(used.pixels, 64 * 6); // init + four primitives + validation
+        let mut exact = Budget::new(RenderLimits::default(), &NeverCancel).unwrap();
+        exact.maximum_work = used.total();
+        assert_eq!(render_canvas(&shapes, size, &mut exact).unwrap(), expected);
+        assert_eq!(exact.usage, used);
+        let mut short = Budget::new(RenderLimits::default(), &NeverCancel).unwrap();
+        short.maximum_work = used.total() - 1;
+        assert!(matches!(
+            render_canvas(&shapes, size, &mut short),
+            Err(InkError::Limit(_))
+        ));
+    }
+
+    fn scale_shapes(size: PhysicalSize, stroke: u32, second: bool) -> Vec<VectorShape> {
+        let mut shape = rectangle(
+            stroke,
+            Rgba {
+                red: 40,
+                green: 90,
+                blue: 160,
+                alpha: 255,
+            },
+            Rgba {
+                red: 10,
+                green: 20,
+                blue: 30,
+                alpha: 255,
+            },
+        );
+        shape.bounds = VectorShapeBounds {
+            x_hundredths: 0,
+            y_hundredths: 0,
+            width_hundredths: u64::from(size.width.get()) * 100,
+            height_hundredths: u64::from(size.height.get()) * 100,
+        };
+        let mut shapes = vec![shape];
+        if second {
+            shape.kind = VectorShapeKind::Ellipse;
+            shape.bounds.x_hundredths = i64::from(size.width.get()) * 25;
+            shape.bounds.y_hundredths = i64::from(size.height.get()) * 25;
+            shape.bounds.width_hundredths /= 2;
+            shape.bounds.height_hundredths /= 2;
+            shape.stroke_width_hundredths = 400;
+            shape.fill = Some(Rgba {
+                red: 220,
+                green: 70,
+                blue: 30,
+                alpha: 173,
+            });
+            shapes.push(shape);
+        }
+        shapes
+    }
+
+    #[test]
+    fn full_1080p_two_filled_and_stroked_shapes_render_at_requested_size() {
+        let size = PhysicalSize::new(1920, 1080).unwrap();
+        let shapes = scale_shapes(size, 400, true);
+        let mut budget = Budget::new(RenderLimits::default(), &NeverCancel).unwrap();
+        let surface = render_canvas(&shapes, size, &mut budget).unwrap();
+        assert_eq!(surface.size(), size);
+        assert_eq!(surface.pixels().len(), 1920 * 1080 * 4);
+        assert_eq!(pixel(&surface, 0, 0), [10, 20, 30, 255]);
+        assert_eq!(pixel(&surface, 200, 200), [40, 90, 160, 255]);
+        assert_ne!(pixel(&surface, 960, 540), [40, 90, 160, 255]);
+        assert!(budget.usage.total() <= MAX_WORK);
+    }
+
+    #[test]
+    fn full_4k_two_filled_and_stroked_shapes_use_the_candidate_batch_policy() {
+        let size = PhysicalSize::new(3840, 2160).unwrap();
+        let shapes = scale_shapes(size, 400, true);
+        let mut budget = Budget::new(RenderLimits::default(), &NeverCancel).unwrap();
+        let surface = render_canvas(&shapes, size, &mut budget).unwrap();
+        assert_eq!(surface.size(), size);
+        assert_eq!(surface.pixels().len(), 3840 * 2160 * 4);
+        assert_eq!(pixel(&surface, 0, 0), [10, 20, 30, 255]);
+        assert_eq!(pixel(&surface, 200, 200), [40, 90, 160, 255]);
+        assert_ne!(pixel(&surface, 1920, 1080), [40, 90, 160, 255]);
+        assert!(budget.usage.total() <= MAX_WORK);
+        assert_eq!(InkLimits::default().max_work, 100_000_000);
+    }
+
+    #[test]
+    #[ignore = "explicit debug/release production-size audit; prints actual charges and preserves failures"]
+    fn inspect_production_scale() {
+        inspect_scale(MAX_WORK);
+    }
+
+    #[test]
+    #[ignore = "test-only authorized 500M measurement; does not change production default or fixtures"]
+    fn inspect_production_scale_500m() {
+        inspect_scale(500_000_000);
+    }
+
+    fn inspect_scale(maximum_work: u64) {
+        let mut rejected = Vec::new();
+        for (name, width, height, stroke, second) in [
+            ("1080p-two-filled-stroked", 1920, 1080, 400, true),
+            ("4k-one-full-fill", 3840, 2160, 0, false),
+            ("4k-one-full-fill-stroke", 3840, 2160, 400, false),
+            ("4k-two-filled-stroked", 3840, 2160, 400, true),
+        ] {
+            let size = PhysicalSize::new(width, height).unwrap();
+            let shapes = scale_shapes(size, stroke, second);
+            let mut budget = Budget::new(RenderLimits::default(), &NeverCancel).unwrap();
+            budget.maximum_work = maximum_work;
+            let started = std::time::Instant::now();
+            let result = render_canvas(&shapes, size, &mut budget);
+            let elapsed = started.elapsed();
+            eprintln!(
+                "WPF_SCALE {}",
+                serde_json::json!({
+                    "case":name,"width":width,"height":height,"objects":shapes.len(),
+                    "debug_assertions":cfg!(debug_assertions),"architecture":std::env::consts::ARCH,
+                    "executable":std::env::current_exe().unwrap(),
+                "elapsed_seconds":elapsed.as_secs_f64(),"maximum_work":maximum_work,
+                    "charged_brush":budget.usage.brush,"charged_raster":budget.usage.raster,
+                    "charged_pixels":budget.usage.pixels,"charged_total":budget.usage.total(),
+                "remaining_work":maximum_work-budget.usage.total(),
+                    "success":result.is_ok(),"error":result.as_ref().err().map(ToString::to_string),
+                    "failed_phase_work_is_unreported":result.is_err(),
+                })
+            );
+            match result {
+                Ok(surface) => {
+                    assert_eq!(surface.size(), size);
+                    assert_eq!(
+                        pixel(&surface, 0, 0),
+                        if stroke == 0 {
+                            [40, 90, 160, 255]
+                        } else {
+                            [10, 20, 30, 255]
+                        }
+                    );
+                }
+                Err(error) => rejected.push(format!("{name}: {error}")),
+            }
+        }
+        assert!(
+            rejected.is_empty(),
+            "Production-size audit has real failures: {rejected:#?}"
+        );
     }
 }
