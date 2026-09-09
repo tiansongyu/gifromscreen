@@ -33,7 +33,11 @@ rectangles, viewport boundaries, hover hit targets and cross-language identity.
 No extra translations or image-rendering semantics changed in that fix.
 The existing seven asynchronous snapshot, stale-anchor and durable-edit tests
 still pass. Strict Clippy and the embedded-font glyph coverage checks pass.
-This is automated evidence, not a new native desktop/GIF acceptance record.
+Those tests are automated evidence. Separate [native X11 acceptance](WATERMARK-QA-2026-09-09.md)
+now confirms retained bilingual notices, literal names/paths, narrow-window
+150% interaction, gapped Apply, undo/redo, saved language and identical GUI/CLI
+reopen exports. That native build has a 680-pixel minimum width; the 480-pixel
+egui test is not mislabeled as a real 480-pixel OS window.
 
 System-default locale detection, saved overrides and explicit English fallback
 are unchanged. Text/title forms, imports, other tool bodies and full translated
