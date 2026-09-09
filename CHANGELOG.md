@@ -36,7 +36,8 @@ unsigned packages, and no published AppImage, Flatpak or macOS version.
 ## Earlier previews
 
 Development previews remain available as historical artifacts, not the current
-download recommendation:
+download recommendation. The dates below use GitHub's UTC publication dates;
+QA records may also show the following day in Asia/Shanghai:
 
 - [Preview 3](https://github.com/tiansongyu/gifromscreen/releases/tag/v0.1.0-preview.3)
   — 2026-09-08.

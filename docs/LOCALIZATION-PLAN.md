@@ -1,5 +1,11 @@
 # Localization implementation and acceptance plan
 
+Frozen for **v0.1.0** on 2026-09-09: System + 29 saved choices, 848 English /
+Simplified Chinese messages, and explicit English fallback for the other 27
+targets. Remaining translation work is deferred, not completed. See the
+[release work summary](WORK-STATUS.md) for the current scope; the sections below
+retain implementation details and future acceptance requirements.
+
 Status: advanced editor language slice added on main, 2026-09-09. The
 `gif-from-screen-localization` crate provides the registry, validated preference
 wire format, injected-system-locale negotiation and an initial English/Simplified

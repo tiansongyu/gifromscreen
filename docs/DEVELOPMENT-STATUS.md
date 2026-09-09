@@ -1,6 +1,6 @@
 # 开发状态与验收记录（README 归档）
 
-本文保留 2026-09-08 README 原有的详细功能和验收记录，供追溯使用；它不是最新发布承诺。面向使用者的介绍见 [中文 README](../README.md) / [English README](../README.en.md)，当前交付状态见 [Linux 状态表](LINUX-STATUS.md)，后续工作见 [迭代路线](NEXT-LINUX-ITERATION.md)。
+本文保留 2026-09-08 README 原有的详细功能和验收记录，供追溯使用；它不是最新发布承诺。面向使用者的介绍见 [中文 README](../README.md) / [English README](../README.en.md)，v0.1.0 当前交付与暂缓事项见[发布工作总结](WORK-STATUS.md)。本轮已停止扩展功能，下方内容和[迭代路线](NEXT-LINUX-ITERATION.md)作为历史与后续备忘保留。
 
 GifFromScreen 是一个使用 Rust 实现的本地 GIF 录制与逐帧编辑工具。当前先完成 Linux 版本；Linux 稳定交付后再讨论 macOS adapter。
 
@@ -92,4 +92,3 @@ cargo test -p gif-from-screen-capture-linux --lib --no-default-features --featur
 ```
 
 视频输入需要可用的 `ffmpeg` 和 `ffprobe`。例如 Ubuntu/Debian 可安装系统 `ffmpeg` 包；没有该依赖时，屏幕录制、图片/GIF 编辑与内置 GIF 导出仍可使用。Linux 版仍处于持续开发与验收阶段，尚未宣称完整一比一复刻或零缺陷。
-

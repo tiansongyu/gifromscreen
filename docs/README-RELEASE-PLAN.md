@@ -1,5 +1,11 @@
 # README, demonstrations and downloadable releases
 
+Publication freeze, 2026-09-09: the current release is
+[v0.1.0](releases/v0.1.0.md), with [artifact acceptance](RELEASE-0.1.0-QA.md).
+This page retains the earlier plan and preview history; it is not an instruction
+to continue expanding features. Current completed/deferred scope is in the
+[work summary](WORK-STATUS.md).
+
 User request recorded on 2026-09-08: after the ongoing Linux work, add complete
 selectable/persistent UI languages, default to the machine language, then improve
 the whole project README with real animated demonstrations and convenient Release
