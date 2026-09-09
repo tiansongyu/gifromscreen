@@ -1097,12 +1097,15 @@ fn blend_pixel(surface: &mut RgbaSurface, x: u32, y: u32, source: Rgba) {
     let inverse_source_alpha = 255 - source_alpha;
     let output_alpha_numerator = source_alpha * 255 + destination_alpha * inverse_source_alpha;
     let output_alpha = (output_alpha_numerator + 127) / 255;
-    for channel in 0..3 {
-        let source_channel = u32::from([source.red, source.green, source.blue][channel]);
-        let destination_channel = u32::from(destination[channel]);
+    for (channel, source_channel) in destination[..3]
+        .iter_mut()
+        .zip([source.red, source.green, source.blue])
+    {
+        let source_channel = u32::from(source_channel);
+        let destination_channel = u32::from(*channel);
         let premultiplied_numerator = source_channel * source_alpha * 255
             + destination_channel * destination_alpha * inverse_source_alpha;
-        destination[channel] = u8::try_from(
+        *channel = u8::try_from(
             (premultiplied_numerator + output_alpha_numerator / 2) / output_alpha_numerator,
         )
         .expect("source-over color remains in u8 range");
