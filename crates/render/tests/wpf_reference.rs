@@ -12,7 +12,7 @@ use gif_from_screen_domain::{
     AssetId, BlendMode, CaptureBinding, CaptureMetadata, ClipTransform, CompositePrecision,
     DurationUs, FrameClip, FrameId, FrameOverlayCell, FrameOverlayMark, FrameRenderStep,
     ImageBorderStyle, ImageShadowStyle, OverlayContent, OverlayId, OverlayTrack, PhysicalPoint,
-    PhysicalPx, PhysicalSize, TimeUs, TrackId,
+    PhysicalPx, PhysicalSize, TimeUs, TrackId, VectorShape,
 };
 use gif_from_screen_render::{
     AssetProviderError, CpuRenderer, NeverCancel, RenderLimits, RgbaSurface,
@@ -25,6 +25,18 @@ const MAX_INDEX_BYTES: usize = 256 * 1024;
 const MAX_SURFACE_BYTES: usize = 256 * 256 * 4;
 const MAX_PNG_BYTES: usize = MAX_SURFACE_BYTES + 64 * 1024;
 const MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+const FIXTURE_COUNT: usize = 11;
+const MAX_VECTOR_SHAPES: usize = 16;
+const UPSTREAM_SOURCES: [(&str, &str); 2] = [
+    (
+        "upstream/ScreenToGif/a4d0a67c2131cd048ceec86cd40afc2f1a06f2fd/ScreenToGif/Controls/Shapes/Triangle.cs",
+        "6c82bdbb0e92d649aa1529155424675ae44a35778204674fdcfb4c52b16fed85",
+    ),
+    (
+        "upstream/ScreenToGif/a4d0a67c2131cd048ceec86cd40afc2f1a06f2fd/ScreenToGif/Controls/Shapes/Arrow.cs",
+        "b0f910590b942c9f7e2f0619cc50db8e6e7da411ba38a18b5063789b2bc5172b",
+    ),
+];
 type Result<T> = std::result::Result<T, String>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,6 +68,7 @@ enum Operation {
     ImageShadow { style: ImageShadowStyle },
     ImageBorder { style: ImageBorderStyle },
     Overlay { x: u32, y: u32, image: Image },
+    VectorShapes { shapes: Vec<VectorShape> },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -170,9 +183,11 @@ fn parse_definition(bytes: &[u8]) -> Result<Definition> {
         serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
     if definition.format_version != 1
         || definition.fixtures.is_empty()
-        || definition.fixtures.len() > 5
+        || definition.fixtures.len() > FIXTURE_COUNT
     {
-        return Err("Unsupported definition version or fixture count (1..=5).".into());
+        return Err(format!(
+            "Unsupported definition version or fixture count (1..={FIXTURE_COUNT})."
+        ));
     }
     let mut ids = BTreeSet::new();
     for fixture in &definition.fixtures {
@@ -193,10 +208,21 @@ fn parse_definition(bytes: &[u8]) -> Result<Definition> {
                         return Err("Overlay position exceeds the bounded fixture canvas.".into());
                     }
                 }
+                Operation::VectorShapes { shapes } => validate_vector_shapes(shapes)?,
             }
         }
     }
     Ok(definition)
+}
+
+fn validate_vector_shapes(shapes: &[VectorShape]) -> Result<()> {
+    if !(1..=MAX_VECTOR_SHAPES).contains(&shapes.len()) {
+        return Err("Vector-shape operations require 1..=16 objects.".into());
+    }
+    for shape in shapes {
+        shape.validate()?;
+    }
+    Ok(())
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -361,6 +387,7 @@ fn validate_generator_files(
             expected.insert(format!("{relative}/{name}"));
         }
     }
+    expected.extend(UPSTREAM_SOURCES.iter().map(|(path, _)| (*path).to_owned()));
     if expected.len() > 64
         || expected.len() != index.generator_files.len()
         || !expected.contains(&format!("{relative}/WpfReference.csproj"))
@@ -378,8 +405,19 @@ fn validate_generator_files(
         if !expected.contains(&binding.path) || !supplied.insert(&binding.path) {
             return Err("Generator source file set differs from this checkout.".into());
         }
-        let bytes = read_bounded(&safe_file(&repository, &binding.path)?, 512 * 1024, budget)?;
-        verify_hash(&bytes, &binding.sha256)?;
+        if let Some((_, expected_hash)) = UPSTREAM_SOURCES
+            .iter()
+            .find(|(path, _)| *path == binding.path)
+        {
+            // These two exact virtual paths are compiled and byte-verified by
+            // the trusted Windows producer. Linux need not download Ms-PL sources.
+            if binding.sha256 != *expected_hash {
+                return Err("Pinned upstream shape source digest does not match.".into());
+            }
+        } else {
+            let bytes = read_bounded(&safe_file(&repository, &binding.path)?, 512 * 1024, budget)?;
+            verify_hash(&bytes, &binding.sha256)?;
+        }
     }
     Ok(())
 }
@@ -481,55 +519,86 @@ impl Graph {
                     Operation::ImageBorder { style } => {
                         FrameRenderStep::ImageBorder { style: *style }
                     }
-                    Operation::Overlay { .. } => unreachable!(),
+                    Operation::Overlay { .. } | Operation::VectorShapes { .. } => unreachable!(),
                 });
             }
             Operation::Overlay { x, y, image } => {
-                if self.frame.render_steps.is_empty() {
-                    self.frame.render_steps.push(FrameRenderStep::composite(1));
-                }
-                self.frame.render_steps.push(FrameRenderStep::Composite {
-                    stage_id: identity,
-                    precision: CompositePrecision::WpfPbgra8PngV1,
-                });
                 let mut digest = [0; 32];
                 digest[..4].copy_from_slice(&identity.to_le_bytes());
                 let asset_id = AssetId::from_digest(digest);
                 let surface = image.surface()?;
                 let size = surface.size();
                 self.assets.insert(asset_id, surface);
-                let mut cell = FrameOverlayCell::whole(
-                    self.frame.id,
-                    1,
-                    vec![FrameOverlayMark {
-                        id: OverlayId::from_u128(u128::from(identity)),
-                        z_index: 0,
-                        content: OverlayContent::Raster {
-                            asset_id,
-                            position: PhysicalPoint {
-                                x: PhysicalPx::new(*x),
-                                y: PhysicalPx::new(*y),
-                            },
-                            size,
-                            opacity: 255,
+                self.append_mark_group(
+                    identity,
+                    CompositePrecision::WpfPbgra8PngV1,
+                    vec![OverlayContent::Raster {
+                        asset_id,
+                        position: PhysicalPoint {
+                            x: PhysicalPx::new(*x),
+                            y: PhysicalPx::new(*y),
                         },
+                        size,
+                        opacity: 255,
                     }],
                 );
-                cell.stage = Some(identity);
-                self.tracks.push(OverlayTrack {
-                    id: TrackId::from_u128(u128::from(identity)),
-                    name: format!("Fixture overlay {identity}"),
-                    visible: true,
-                    opacity: 255,
-                    blend_mode: BlendMode::Normal,
-                    items: Vec::new(),
-                    annotation: None,
-                    annotation_scope: None,
-                    frame_cells: Some(vec![cell]),
-                });
+            }
+            Operation::VectorShapes { shapes } => {
+                validate_vector_shapes(shapes)?;
+                self.append_mark_group(
+                    identity,
+                    CompositePrecision::VectorCanvasPbgra8PngV1,
+                    shapes
+                        .iter()
+                        .map(|shape| OverlayContent::VectorShape { shape: *shape })
+                        .collect(),
+                );
             }
         }
         Ok(())
+    }
+
+    fn append_mark_group(
+        &mut self,
+        identity: u32,
+        precision: CompositePrecision,
+        contents: Vec<OverlayContent>,
+    ) {
+        if self.frame.render_steps.is_empty() {
+            self.frame.render_steps.push(FrameRenderStep::composite(1));
+        }
+        self.frame.render_steps.push(FrameRenderStep::Composite {
+            stage_id: identity,
+            precision,
+        });
+        let mut cell = FrameOverlayCell::whole(
+            self.frame.id,
+            1,
+            contents
+                .into_iter()
+                .enumerate()
+                .map(|(index, content)| FrameOverlayMark {
+                    id: OverlayId::from_u128(
+                        u128::from(identity)
+                            | (u128::try_from(index).expect("bounded mark index") << 64),
+                    ),
+                    z_index: i32::try_from(index).expect("bounded mark order"),
+                    content,
+                })
+                .collect(),
+        );
+        cell.stage = Some(identity);
+        self.tracks.push(OverlayTrack {
+            id: TrackId::from_u128(u128::from(identity)),
+            name: format!("Fixture overlay {identity}"),
+            visible: true,
+            opacity: 255,
+            blend_mode: BlendMode::Normal,
+            items: Vec::new(),
+            annotation: None,
+            annotation_scope: None,
+            frame_cells: Some(vec![cell]),
+        });
     }
 
     fn render(&self) -> Result<RgbaSurface> {
@@ -781,8 +850,10 @@ fn compare(
     };
     let result = (|| {
         let definition = parse_definition(definition_bytes)?;
-        if definition.fixtures.len() != 5 {
-            return Err("External conformance definition must contain all five fixtures.".into());
+        if definition.fixtures.len() != FIXTURE_COUNT {
+            return Err(format!(
+                "External conformance definition must contain all {FIXTURE_COUNT} fixtures."
+            ));
         }
         let mut budget = MAX_TOTAL_BYTES;
         let index_bytes = read_bounded(
@@ -875,6 +946,49 @@ fn compare_windows_wpf_reference() -> Result<()> {
 #[cfg(test)]
 mod mechanical_tests {
     use super::*;
+
+    #[test]
+    fn committed_inputs_include_all_old_and_new_shapes_without_truncation() {
+        let bytes = include_bytes!("../../../scripts/qa/wpf_reference/fixtures.json");
+        let definition = parse_definition(bytes).unwrap();
+        let expected = [
+            "inner-border-alpha",
+            "mixed-outer-border",
+            "hard-shadow-negative",
+            "gaussian-radius-two",
+            "ordered-fractional-chain",
+            "vector-square-fill",
+            "vector-rounded-fraction",
+            "vector-rounded-axis-clamp",
+            "vector-triangle-rotated",
+            "vector-block-arrow",
+            "vector-ellipse-fraction",
+        ];
+        assert_eq!(
+            definition
+                .fixtures
+                .iter()
+                .map(|f| f.id.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for fixture in &definition.fixtures[5..] {
+            assert!(
+                matches!(&fixture.operations[..], [Operation::VectorShapes { shapes }]
+                if !shapes.is_empty() && shapes.len() <= MAX_VECTOR_SHAPES)
+            );
+        }
+        let shape = VectorShape::default();
+        assert!(validate_vector_shapes(&[]).is_err());
+        assert!(validate_vector_shapes(&[shape; MAX_VECTOR_SHAPES + 1]).is_err());
+        assert!(
+            validate_vector_shapes(&[VectorShape {
+                version: 2,
+                ..shape
+            }])
+            .is_err()
+        );
+    }
 
     fn definition() -> Definition {
         Definition {
@@ -1100,7 +1214,7 @@ mod mechanical_tests {
     fn synthetic_generator(repository: &Path) -> Vec<GeneratorFile> {
         let generator = repository.join("scripts/qa/wpf_reference");
         fs::create_dir_all(&generator).unwrap();
-        ["Program.cs", "WpfReference.csproj", "global.json"]
+        let mut files: Vec<_> = ["Program.cs", "WpfReference.csproj", "global.json"]
             .into_iter()
             .map(|name| {
                 write_new(&generator.join(name), b"synthetic comparator test only").unwrap();
@@ -1109,7 +1223,12 @@ mod mechanical_tests {
                     sha256: sha256(b"synthetic comparator test only"),
                 }
             })
-            .collect()
+            .collect();
+        files.extend(UPSTREAM_SOURCES.iter().map(|(path, sha256)| GeneratorFile {
+            path: (*path).into(),
+            sha256: (*sha256).into(),
+        }));
+        files
     }
 
     #[test]
@@ -1218,7 +1337,7 @@ mod mechanical_tests {
         };
         let definition = Definition {
             format_version: 1,
-            fixtures: (0..5)
+            fixtures: (0..FIXTURE_COUNT)
                 .map(|number| Fixture {
                     id: format!("synthetic-{number}"),
                     source: source.clone(),
@@ -1286,7 +1405,10 @@ mod mechanical_tests {
         let report: serde_json::Value =
             serde_json::from_slice(&fs::read(output.join("report.json")).unwrap()).unwrap();
         assert_eq!(report["passed"], false);
-        assert_eq!(report["stages"].as_array().unwrap().len(), 10);
+        assert_eq!(
+            report["stages"].as_array().unwrap().len(),
+            FIXTURE_COUNT * 2
+        );
         assert_eq!(report["stages"][0]["difference"]["mismatch_channels"], 1);
         assert!(
             report["stages"][1]["error"]
@@ -1294,7 +1416,10 @@ mod mechanical_tests {
                 .unwrap()
                 .contains("SHA-256")
         );
-        assert_eq!(report["stages"][9]["difference"]["mismatch_pixels"], 0);
+        assert_eq!(
+            report["stages"][FIXTURE_COUNT * 2 - 1]["difference"]["mismatch_pixels"],
+            0
+        );
         assert!(output.join("synthetic-0-stage-00-actual.png").is_file());
         assert!(output.join("synthetic-0-stage-00-diff.png").is_file());
     }

@@ -13,10 +13,28 @@ from Rust output or weakens a tolerance automatically.
 ## Protocol
 
 `fixtures.json` is the shared **input definition**, not expected image data.
-It contains exactly five named fixtures, each with explicit RGBA8 source pixels
+It contains exactly eleven named fixtures, each with explicit RGBA8 source pixels
 and 1–8 ordered operations. Every input and output is limited to 256×256. The
 operations use the domain's persisted border/shadow styles; bitmap overlays
 are fixed pixel arrays, avoiding platform-dependent font shapes.
+
+Six vector fixtures additionally exercise fill-only rectangles, subpixel rounded
+corners and strokes, independent axis radius clamping, a rotated triangle, the
+original closed block arrow, and a rotated ellipse. Each vector operation holds
+1–16 shapes and renders the **whole transparent canvas to one PBGRA bitmap**
+before compositing onto the input. There is no intermediate PNG between the
+shapes or between that canvas and the input: only the final Apply is PNG/WIC.
+Pixel snapping and inherited layout rounding are explicitly enabled, as in
+the pinned DrawingCanvas style and Editor window.
+
+Rectangle/Ellipse use the real WPF classes. Triangle/Arrow compile unchanged
+from a separate checkout at `a4d0a67c2131cd048ceec86cd40afc2f1a06f2fd`.
+Both MSBuild and runtime verify their exact SHA-256; the source hashes are also
+bound into the output provenance under fixed virtual paths. Set
+`GFS_STG_SHAPES_ROOT` to this absolute checkout path for a local Windows run.
+The repository workflow checks it out with LF bytes and without persisted
+credentials. These ScreenToGif sources retain their upstream MS-PL license;
+they are used only by this verification executable, not the Linux product.
 
 The C# generator independently executes the 96-DPI geometry and drawing order
 from pinned ScreenToGif `a4d0a67`. Its input is saved to PNG and decoded by WIC;
@@ -98,5 +116,7 @@ primary contract. Do not replace a real reference with a self-generated golden.
 
 These first five fixtures cover inner-border alpha, mixed outer borders,
 negative hard shadows, radius-two Gaussian behavior and a fractional ordered
-overlay/effect chain. They do not certify every WPF parameter, fractional DPI,
+overlay/effect chain. The additional vector fixtures are a new strict fidelity
+gate, not a claim that the Rust antialiaser already matches WPF. Mechanical
+envelope tests alone cannot close this gate. These fixtures do not certify every WPF parameter, fractional DPI,
 font shaping, hardware rendering, native capture, or complete ScreenToGif parity.

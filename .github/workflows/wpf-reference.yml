@@ -35,6 +35,8 @@ jobs:
   reference:
     runs-on: windows-latest
     timeout-minutes: 15
+    env:
+      GFS_STG_SHAPES_ROOT: ${{ github.workspace }}/stg-shapes-reference
     steps:
       - name: Check out the exact requested revision
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -44,6 +46,21 @@ jobs:
         uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
           dotnet-version: 9.0.x
+      - name: Check out the exact original shape definitions
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        env:
+          GIT_CONFIG_COUNT: 1
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: 'false'
+        with:
+          repository: NickeManarin/ScreenToGif
+          ref: a4d0a67c2131cd048ceec86cd40afc2f1a06f2fd
+          path: stg-shapes-reference
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /ScreenToGif/Controls/Shapes/Triangle.cs
+            /ScreenToGif/Controls/Shapes/Arrow.cs
       - name: Inspect the actual SDK and desktop runtime
         working-directory: scripts/qa/wpf_reference
         run: |

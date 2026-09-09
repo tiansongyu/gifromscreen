@@ -27,6 +27,7 @@ internal static class WpfRenderer
         BorderOperation border => BorderLayout.Create(input, border.Style).Output,
         ShadowOperation shadow => ShadowLayout.Create(input, shadow.Style).Output,
         OverlayOperation => Limits.Size(input.Width, input.Height),
+        VectorShapesOperation => Limits.Size(input.Width, input.Height),
         _ => throw new InvalidDataException("Unsupported operation."),
     };
 
@@ -38,6 +39,7 @@ internal static class WpfRenderer
             BorderOperation border => ApplyBorder(input, border.Style),
             ShadowOperation shadow => ApplyShadow(input, shadow.Style),
             OverlayOperation overlay => ApplyOverlay(input, overlay),
+            VectorShapesOperation shapes => VectorShapesRenderer.Apply(input, shapes),
             _ => throw new InvalidDataException("Unsupported operation."),
         };
     }

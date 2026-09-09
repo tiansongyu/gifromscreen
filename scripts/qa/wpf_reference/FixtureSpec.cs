@@ -10,6 +10,11 @@ internal abstract record Operation;
 internal sealed record BorderOperation(BorderStyle Style) : Operation;
 internal sealed record ShadowOperation(ShadowStyle Style) : Operation;
 internal sealed record OverlayOperation(int X, int Y, ImageSpec Image) : Operation;
+internal sealed record VectorShapesOperation(IReadOnlyList<VectorShapeSpec> Shapes) : Operation;
+internal enum VectorKind { Rectangle, Ellipse, Triangle, BlockArrow }
+internal readonly record struct VectorBounds(long XHundredths, long YHundredths, long WidthHundredths, long HeightHundredths);
+internal sealed record VectorShapeSpec(int Version, VectorKind Kind, VectorBounds Bounds,
+    int StrokeWidthHundredths, Rgba Stroke, Rgba? Fill, int CornerRadiusHundredths, int RotationHundredths);
 internal readonly record struct Rgba(byte Red, byte Green, byte Blue, byte Alpha)
 {
     internal Color ToColor() => Color.FromArgb(Alpha, Red, Green, Blue);
@@ -27,7 +32,7 @@ internal static class FixtureParser
         var root = Object(document.RootElement, "format_version", "fixtures");
         if (Integer(root, "format_version", 1, 1) != 1)
             throw new InvalidDataException("Unsupported definition format.");
-        var array = Array(root.GetProperty("fixtures"), 5, 5);
+        var array = Array(root.GetProperty("fixtures"), Limits.FixtureCount, Limits.FixtureCount);
         var ids = new HashSet<string>(StringComparer.Ordinal);
         var fixtures = new List<Fixture>();
         foreach (var entry in array.EnumerateArray())
@@ -57,12 +62,42 @@ internal static class FixtureParser
             "image_border" => new BorderOperation(Border(Object(element, "kind", "style").GetProperty("style"))),
             "image_shadow" => new ShadowOperation(Shadow(Object(element, "kind", "style").GetProperty("style"))),
             "overlay" => Overlay(Object(element, "kind", "x", "y", "image")),
+            "vector_shapes" => new VectorShapesOperation(Array(Object(element, "kind", "shapes").GetProperty("shapes"), 1, Limits.MaxShapes)
+                .EnumerateArray().Select(VectorShape).ToList()),
             _ => throw new InvalidDataException("Unknown operation kind; no executable or external-image operations are permitted."),
         };
     }
 
     private static OverlayOperation Overlay(JsonElement element) => new(
         Integer(element, "x", 0, Limits.MaxDimension), Integer(element, "y", 0, Limits.MaxDimension), Image(element.GetProperty("image")));
+
+    private static VectorShapeSpec VectorShape(JsonElement element)
+    {
+        var shape = Object(element, "version", "kind", "bounds", "stroke_width_hundredths", "stroke", "fill", "corner_radius_hundredths", "rotation_hundredths");
+        var kind = shape.GetProperty("kind").GetString() switch
+        {
+            "rectangle" => VectorKind.Rectangle,
+            "ellipse" => VectorKind.Ellipse,
+            "triangle" => VectorKind.Triangle,
+            "block_arrow" => VectorKind.BlockArrow,
+            _ => throw new InvalidDataException("Unsupported vector-shape kind."),
+        };
+        var bounds = Object(shape.GetProperty("bounds"), "x_hundredths", "y_hundredths", "width_hundredths", "height_hundredths");
+        const int extent = 13_107_000; // Same declared twice-GIF-axis metadata bound.
+        var rectangle = new VectorBounds(Integer(bounds, "x_hundredths", -extent, extent),
+            Integer(bounds, "y_hundredths", -extent, extent),
+            Integer(bounds, "width_hundredths", 1, extent), Integer(bounds, "height_hundredths", 1, extent));
+        var right = checked(rectangle.XHundredths + rectangle.WidthHundredths);
+        var bottom = checked(rectangle.YHundredths + rectangle.HeightHundredths);
+        if (right < -extent || right > extent || bottom < -extent || bottom > extent)
+            throw new InvalidDataException("Vector-shape checked ends exceed the declared coordinate range.");
+        var fill = shape.GetProperty("fill");
+        return new VectorShapeSpec(Integer(shape, "version", 1, 1), kind, rectangle,
+            Integer(shape, "stroke_width_hundredths", 0, 10_000), Color(shape.GetProperty("stroke")),
+            fill.ValueKind == JsonValueKind.Null ? null : Color(fill),
+            Integer(shape, "corner_radius_hundredths", 0, 10_000),
+            Integer(shape, "rotation_hundredths", 0, 35_999));
+    }
 
     private static ImageSpec Image(JsonElement element)
     {

@@ -9,5 +9,22 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <Deterministic>true</Deterministic>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="*.cs" />
+    <Compile Include="$(GFS_STG_SHAPES_ROOT)/ScreenToGif/Controls/Shapes/Triangle.cs" Link="Upstream/Triangle.cs" />
+    <Compile Include="$(GFS_STG_SHAPES_ROOT)/ScreenToGif/Controls/Shapes/Arrow.cs" Link="Upstream/Arrow.cs" />
+  </ItemGroup>
+  <Target Name="RequirePinnedShapeSources" BeforeTargets="CoreCompile">
+    <Error Condition="'$(GFS_STG_SHAPES_ROOT)' == ''" Text="GFS_STG_SHAPES_ROOT must point to the pinned ScreenToGif checkout." />
+    <GetFileHash Files="$(GFS_STG_SHAPES_ROOT)/ScreenToGif/Controls/Shapes/Triangle.cs" Algorithm="SHA256">
+      <Output TaskParameter="Items" ItemName="PinnedTriangle" />
+    </GetFileHash>
+    <GetFileHash Files="$(GFS_STG_SHAPES_ROOT)/ScreenToGif/Controls/Shapes/Arrow.cs" Algorithm="SHA256">
+      <Output TaskParameter="Items" ItemName="PinnedArrow" />
+    </GetFileHash>
+    <Error Condition="'%(PinnedTriangle.FileHash)' != '6C82BDBB0E92D649AA1529155424675AE44A35778204674FDCFB4C52B16FED85'" Text="Pinned Triangle.cs hash mismatch." />
+    <Error Condition="'%(PinnedArrow.FileHash)' != 'B0F910590B942C9F7E2F0619CC50DB8E6E7DA411BA38A18B5063789B2BC5172B'" Text="Pinned Arrow.cs hash mismatch." />
+  </Target>
 </Project>

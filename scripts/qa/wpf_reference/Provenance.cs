@@ -19,7 +19,8 @@ internal static class Provenance
         names.Add("WpfReference.csproj");
         names.Add("global.json");
         return names.Select(name => new GeneratorFile($"scripts/qa/wpf_reference/{name}",
-            Hashing.File(Path.Combine(definitionDirectory, name), 256 * 1024))).ToList();
+            Hashing.File(Path.Combine(definitionDirectory, name), 256 * 1024)))
+            .Concat(UpstreamShapes.Verify()).ToList();
     }
 
     internal static object Capture()
@@ -56,6 +57,7 @@ internal static class Provenance
             captured_at_utc = DateTimeOffset.UtcNow.ToString("O"),
             peak_working_set_bytes = process.PeakWorkingSet64,
             source_contract = "ScreenToGif a4d0a67c2131cd048ceec86cd40afc2f1a06f2fd, Editor BorderAsync/ShadowAsync, physical-pixel 96-DPI measurement space",
+            vector_shape_contract = "Real WPF Rectangle/Ellipse and pinned ScreenToGif Triangle/Arrow; transparent clipped Canvas, GetScaledRender VisualBrush PM snapshot, OverlayAsync DrawImage then final PNG/WIC. No intermediate shape PNG. 96 DPI only; no adorner/selection pixels.",
             runtime_contract = "Actual installed .NET 9 WPF RenderTargetBitmap + PNG/WIC; not simulated Rust pixels",
             dpi_policy = "Raw PNG/WIC decoded DPI and pixels are retained as artifacts. Before the next operation, only working DPI metadata is reset to 96; pixel dimensions, format, palette and native-format bytes are asserted unchanged. Decode accepts only 96, adjacent integer PNG densities 3779/3780 pixels per metre, or their native single-precision readbacks, within 1e-9 DPI. This isolates physical-pixel 96-DPI arithmetic; it does not validate ScreenToGif's unnormalized fractional-DPI/mixed-DIP behavior.",
         };
