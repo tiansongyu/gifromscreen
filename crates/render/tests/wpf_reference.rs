@@ -28,7 +28,7 @@ const MAX_SURFACE_BYTES: usize = 256 * 256 * 4;
 const MAX_RENDER_WORKING_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PNG_BYTES: usize = MAX_SURFACE_BYTES + 64 * 1024;
 const MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
-const FIXTURE_COUNT: usize = 15;
+const FIXTURE_COUNT: usize = 19;
 const MAX_VECTOR_SHAPES: usize = 16;
 const UPSTREAM_SOURCES: [(&str, &str); 2] = [
     (
@@ -41,6 +41,9 @@ const UPSTREAM_SOURCES: [(&str, &str); 2] = [
     ),
 ];
 type Result<T> = std::result::Result<T, String>;
+
+#[path = "wpf_reference/fill_coverage.rs"]
+mod fill_coverage;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -970,6 +973,10 @@ mod mechanical_tests {
             "coverage-fractional-triangle",
             "coverage-ellipse",
             "coverage-triangle-stroke",
+            "layout-thin-triangle",
+            "layout-inverted-triangle",
+            "layout-inverted-arrow",
+            "layout-narrow-arrow",
         ];
         assert_eq!(
             definition

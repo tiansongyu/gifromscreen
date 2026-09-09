@@ -50,6 +50,8 @@ internal static class VectorShapesRenderer
                 offset = new[] { offset.X, offset.Y },
                 transformed_origin = new[] { origin.X, origin.Y },
                 geometry = PathGeometry.CreateFromGeometry(shape.RenderedGeometry).ToString(CultureInfo.InvariantCulture),
+                layout_clip = VisualTreeHelper.GetClip(shape) is Geometry clip
+                    ? PathGeometry.CreateFromGeometry(clip).ToString(CultureInfo.InvariantCulture) : null,
                 shape.SnapsToDevicePixels, shape.UseLayoutRounding,
             }));
         }
@@ -58,6 +60,7 @@ internal static class VectorShapesRenderer
         // dpi=96 space. Preserve its VisualBrush and bounds-clamping path;
         // do not replace the PM intermediate with a PNG/WIC round trip.
         var bounds = VisualTreeHelper.GetDescendantBounds(canvas);
+        Console.WriteLine("VECTOR_CANVAS_BOUNDS " + bounds.ToString(CultureInfo.InvariantCulture));
         if (bounds.IsEmpty) bounds = new Rect(0, 0, canvas.ActualWidth, canvas.ActualHeight);
         bounds.Width = Math.Min(bounds.Width, size.Width);
         bounds.Height = Math.Min(bounds.Height, size.Height);

@@ -10,7 +10,10 @@ use crate::{InkFigure, InkFillRule, InkPath, InkPoint, InkSegment, RenderError};
 
 mod hit;
 mod raster;
+mod wpf;
+mod wpf_layout;
 pub(crate) use raster::{MAX_WORK, paint};
+pub use wpf::wpf_vector_shape_geometry;
 
 /// Maximum objects accepted by the independent editable-overlay preview.
 pub const MAX_VECTOR_PREVIEW_SHAPES: usize = 256;

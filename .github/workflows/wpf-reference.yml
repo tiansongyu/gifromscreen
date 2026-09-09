@@ -137,3 +137,21 @@ jobs:
           path: ${{ runner.temp }}/gfs-wpf-comparison/
           if-no-files-found: warn
           retention-days: 7
+      - name: Independently compare filled-contour coverage only
+        if: always() && !cancelled()
+        env:
+          GFS_WPF_REFERENCE_DIR: ${{ runner.temp }}/gfs-wpf-downloaded-reference
+          GFS_WPF_COMPARE_DIR: ${{ runner.temp }}/gfs-wpf-fill-comparison
+        run: >-
+          timeout --signal=TERM --kill-after=10s 120s
+          cargo test --locked -p gif-from-screen-render --test wpf_reference
+          fill_coverage::compare_windows_wpf_fill_coverage
+          -- --ignored --exact --nocapture --test-threads=1
+      - name: Preserve the separate fill-only diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: wpf-fill-coverage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gfs-wpf-fill-comparison/
+          if-no-files-found: warn
+          retention-days: 7

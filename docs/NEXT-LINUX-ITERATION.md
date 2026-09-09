@@ -67,6 +67,11 @@ undo/redo, Save As, independent reopen and identical GUI/CLI exports. The real
 WPF comparison remains red on five vector fixtures; arranged dimensions and
 relative rotation origins are now measured, not guessed. This gate and broader
 Wayland/device/localization coverage remain open.
+The next [WPF vector foundation](WPF-VECTOR-RENDERING.md) derives actual arranged
+geometry and preserves local clip metadata in a separate API. Three real
+filled-contour probes pass exactly with the existing WPF coverage kernel;
+native stroke widening and isolated-PM clipping remain open. No saved V1 pixels
+or full-project acceptance criteria are silently changed by those substep tests.
 
 ## Playback timing: implemented, bounded native manual acceptance recorded
 

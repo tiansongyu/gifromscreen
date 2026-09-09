@@ -13,7 +13,7 @@ from Rust output or weakens a tolerance automatically.
 ## Protocol
 
 `fixtures.json` is the shared **input definition**, not expected image data.
-It contains exactly fifteen named fixtures, each with explicit RGBA8 source pixels
+It contains exactly nineteen named fixtures, each with explicit RGBA8 source pixels
 and 1–8 ordered operations. Every input and output is limited to 256×256. The
 operations use the domain's persisted border/shadow styles; bitmap overlays
 are fixed pixel arrays, avoiding platform-dependent font shapes.
@@ -32,6 +32,11 @@ triangles, fractional triangle vertices, an ellipse and a stroked-only triangle.
 Their alpha is the real WPF coverage result, avoiding inversion of mixed fill,
 stroke and background colors. They keep the 16×16 canvas and do not replace any
 of the earlier eleven input definitions or weaken strict channel comparisons.
+
+Four more edge-layout probes exercise a very flat triangle, triangle/arrow
+dimensions smaller than the stroke, and a narrow arrow. Logs include each
+actual VisualTreeHelper clip and the canvas descendant bounds. These probes
+distinguish arranged geometry from what remains visible after automatic clipping.
 
 Rectangle/Ellipse use the real WPF classes. Triangle/Arrow compile unchanged
 from a separate checkout at `a4d0a67c2131cd048ceec86cd40afc2f1a06f2fd`.
