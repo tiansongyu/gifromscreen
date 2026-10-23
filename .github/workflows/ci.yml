@@ -33,9 +33,10 @@ jobs:
             xvfb \
             xauth
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install the release and minimum supported Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
+          toolchain: 1.88.0 # Keep aligned with rust-toolchain.toml and build_portable.py.
           components: clippy,rustfmt
 
       - name: Cache Rust build artifacts
@@ -45,10 +46,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Lint
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Test
-        run: cargo test --workspace --all-targets --all-features
+        run: cargo test --locked --workspace --all-targets --all-features
 
   native-capture-ubuntu-22:
     runs-on: ubuntu-22.04
@@ -73,9 +74,10 @@ jobs:
             xvfb \
             xauth
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install the release and minimum supported Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
+          toolchain: 1.88.0 # Keep aligned with rust-toolchain.toml and build_portable.py.
           components: clippy
 
       - name: Cache native capture build artifacts

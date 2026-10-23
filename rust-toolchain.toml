@@ -1,5 +1,6 @@
 [toolchain]
-channel = "stable"
+# Match the release builder and CI; upgrade deliberately after validating MSRV.
+channel = "1.88.0"
 components = ["clippy", "rustfmt"]
 profile = "minimal"
 
