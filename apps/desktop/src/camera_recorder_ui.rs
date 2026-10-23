@@ -22,6 +22,7 @@ pub(crate) struct CameraRecorderUi {
     height: u32,
     fps: u32,
     target: String,
+    settings_open: bool,
     control: Option<CameraControl>,
     task: BackgroundTask<Option<ActiveProject>, CameraCaptureProgress>,
     texture: Option<egui::TextureHandle>,
@@ -42,6 +43,7 @@ impl Default for CameraRecorderUi {
             height: 480,
             fps: 15,
             target: String::new(),
+            settings_open: false,
             control: None,
             task: BackgroundTask::default(),
             texture: None,
@@ -60,6 +62,10 @@ impl Drop for CameraRecorderUi {
 impl CameraRecorderUi {
     pub(crate) fn is_active(&self) -> bool {
         self.task.is_running()
+    }
+
+    pub(crate) fn has_preview(&self) -> bool {
+        self.is_active() && (self.texture.is_some() || self.task.progress().is_some())
     }
 
     /// Only an explicit Discard action calls this method.
@@ -105,30 +111,63 @@ impl CameraRecorderUi {
     }
 
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Camera recorder");
-        ui.label("Preview your camera, then record only the moments you want in your GIF.");
-        ui.weak(
-            "The camera stays off until you choose Preview or Record. Audio is never captured.",
-        );
-        ui.add_space(12.0);
-        self.show_configuration(ui);
-        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("Camera recorder");
+            ui.toggle_value(&mut self.settings_open, "Settings");
+        });
         self.show_controls(ui);
-        if let Some(progress) = self.task.progress() {
+        let progress = if self.is_active() {
+            self.task.progress()
+        } else {
+            None
+        };
+        let details_height = if progress.is_some() {
+            ui.available_height() * 0.45
+        } else {
+            ui.available_height()
+        };
+        egui::ScrollArea::vertical()
+            .id_salt("camera-details")
+            .max_height(details_height.max(1.0))
+            .auto_shrink([false, true])
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: false,
+                ..egui::scroll_area::ScrollSource::ALL
+            })
+            .show(ui, |ui| self.show_details(ui, progress.as_ref()));
+        if let Some(progress) = progress {
             self.show_preview(ui, &progress);
-            if let Some(recording) = progress.recording {
-                ui.label(format!(
-                    "{} saved frames · {}.{:02} seconds · {} frames skipped under load",
-                    recording.frames,
-                    recording.duration_us / 1_000_000,
-                    (recording.duration_us % 1_000_000) / 10_000,
-                    progress.dropped_frames
-                ));
-                if recording.limit_reached {
-                    ui.weak("The safety limit was reached. Saving captured frames…");
+        }
+        if self.is_active() {
+            ui.ctx().request_repaint_after(Duration::from_millis(33));
+        }
+    }
+
+    fn show_details(&mut self, ui: &mut egui::Ui, progress: Option<&CameraCaptureProgress>) {
+        self.show_configuration(ui);
+        if let Some(control) = &self.control {
+            ui.weak(match control.phase() {
+                CameraPhase::Preview => "Preview only — no frames are being saved.",
+                CameraPhase::Recording => "Recording — stop to open the editor.",
+                CameraPhase::Paused => {
+                    "Paused — preview is live; paused time is excluded from the GIF."
                 }
+                CameraPhase::Finishing => "Saving frames and releasing the camera…",
+                CameraPhase::Discarding => "Discarding this recording and releasing the camera…",
+            });
+        }
+        if let Some(recording) = progress.and_then(|progress| progress.recording) {
+            ui.label(format!(
+                "{} saved frames · {}.{:02} seconds · {} frames skipped under load",
+                recording.frames,
+                recording.duration_us / 1_000_000,
+                (recording.duration_us % 1_000_000) / 10_000,
+                progress.map_or(0, |progress| progress.dropped_frames)
+            ));
+            if recording.limit_reached {
+                ui.weak("The safety limit was reached. Saving captured frames…");
             }
-        } else if self.is_active() {
+        } else if progress.is_none() && self.is_active() {
             ui.horizontal_wrapped(|ui| {
                 ui.spinner();
                 ui.label("Opening camera…");
@@ -136,9 +175,6 @@ impl CameraRecorderUi {
         }
         if let Some(notice) = &self.notice {
             ui.label(notice);
-        }
-        if self.is_active() {
-            ui.ctx().request_repaint_after(Duration::from_millis(33));
         }
     }
 
@@ -160,19 +196,21 @@ impl CameraRecorderUi {
                     }
                 }
             });
-            ui.horizontal_wrapped(|ui| {
-                ui.add(egui::DragValue::new(&mut self.width).range(1..=4096).prefix("Width "));
-                ui.add(egui::DragValue::new(&mut self.height).range(1..=4096).prefix("Height "));
-                ui.add(egui::DragValue::new(&mut self.fps).range(1..=60).suffix(" fps"));
-            });
-            ui.vertical(|ui| {
+            if self.settings_open {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(egui::DragValue::new(&mut self.width).range(1..=4096).prefix("Width "));
+                    ui.add(egui::DragValue::new(&mut self.height).range(1..=4096).prefix("Height "));
+                    ui.add(egui::DragValue::new(&mut self.fps).range(1..=60).suffix(" fps"));
+                });
                 ui.label("New project");
-                ui.add(egui::TextEdit::singleline(&mut self.target).desired_width(430.0).hint_text("Leave empty for a new camera recording in this folder"));
-            });
-            ui.weak("Choose a mode supported by the camera. Up to 10,000 frames / 2 GiB of raw pixels; existing projects are never replaced.");
+                ui.add(egui::TextEdit::singleline(&mut self.target).desired_width(ui.available_width()).hint_text("Leave empty for a new camera recording in this folder"));
+                ui.weak("Choose a mode supported by the camera. Up to 10,000 frames / 2 GiB of raw pixels; existing projects are never replaced. Audio is not captured.");
+            }
         });
         if self.devices.is_empty() {
-            ui.label("No Linux camera was found. Connect a V4L2 camera, then choose Refresh.");
+            ui.weak("Connect a V4L2 camera, then choose Refresh.");
+        } else if !self.is_active() {
+            ui.weak("The camera stays off until you choose Preview camera or Record.");
         }
     }
 
@@ -234,22 +272,11 @@ impl CameraRecorderUi {
                 }
             }
         });
-        ui.weak(match phase {
-            CameraPhase::Preview => "Preview only — no frames are being saved.",
-            CameraPhase::Recording => {
-                "Recording — pause whenever you need; stop to open the editor."
-            }
-            CameraPhase::Paused => {
-                "Paused — preview is live; paused time is excluded from the GIF."
-            }
-            CameraPhase::Finishing => "Saving frames and releasing the camera…",
-            CameraPhase::Discarding => "Discarding this recording and releasing the camera…",
-        });
     }
 
     fn show_preview(&mut self, ui: &mut egui::Ui, progress: &CameraCaptureProgress) {
         let frame = &progress.preview;
-        if frame.sequence != self.texture_sequence {
+        if self.texture.is_none() || frame.sequence != self.texture_sequence {
             let image = egui::ColorImage::from_rgba_unmultiplied(
                 [
                     frame.size.width.get() as usize,
@@ -273,10 +300,11 @@ impl CameraRecorderUi {
                 f32::from(u16::try_from(frame.size.width.get()).unwrap_or(u16::MAX)),
                 f32::from(u16::try_from(frame.size.height.get()).unwrap_or(u16::MAX)),
             );
-            let scale = (ui.available_width().min(720.0) / size.x)
-                .min(480.0 / size.y)
-                .min(1.0);
-            ui.image((texture.id(), size * scale));
+            let available = ui.available_size();
+            let size = fit_preview(size, available);
+            if size.x > 0.0 && size.y > 0.0 {
+                ui.image((texture.id(), size));
+            }
         }
     }
 
@@ -348,9 +376,288 @@ impl CameraRecorderUi {
     }
 }
 
+/// Fill the available media area while preserving the entire camera frame.
+fn fit_preview(native: egui::Vec2, available: egui::Vec2) -> egui::Vec2 {
+    let width = available.x.max(0.0);
+    let height = if available.y.is_finite() {
+        available.y.max(0.0)
+    } else {
+        native.y * width / native.x
+    };
+    native * (width / native.x).min(height / native.y)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn preview(sequence: u64) -> CameraCaptureProgress {
+        CameraCaptureProgress {
+            preview: gif_from_screen_application::CameraPreviewFrame {
+                sequence,
+                size: PhysicalSize::new(160, 90).unwrap(),
+                pixels: vec![255; 160 * 90 * 4].into(),
+            },
+            recording: None,
+            dropped_frames: 0,
+        }
+    }
+
+    fn main_page_frame(
+        app: &mut crate::GifFromScreenApp,
+        viewport: egui::Rect,
+        zoom: f32,
+    ) -> egui::FullOutput {
+        let context = egui::Context::default();
+        crate::appearance::configure(&context);
+        crate::preferences::fonts::install(&context);
+        context.set_zoom_factor(zoom);
+        context.style_mut(|style| style.animation_time = 0.0);
+        let frame = || {
+            let mut input = egui::RawInput {
+                screen_rect: Some(viewport),
+                ..Default::default()
+            };
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .native_pixels_per_point = Some(1.0);
+            input
+        };
+        let _ = context.run(frame(), |context| app.show_main_view(context));
+        context.run(frame(), |context| app.show_main_view(context))
+    }
+
+    #[test]
+    fn main_camera_page_keeps_live_controls_visible_and_fills_the_media_viewport() {
+        for settings_open in [false, true] {
+            for phase in [
+                CameraPhase::Preview,
+                CameraPhase::Recording,
+                CameraPhase::Paused,
+            ] {
+                let mut app = crate::GifFromScreenApp::default();
+                app.view = crate::AppView::CameraRecorder;
+                app.camera_recorder.settings_open = settings_open;
+                app.camera_recorder.notice = None;
+                let control = CameraControl::default();
+                if phase != CameraPhase::Preview {
+                    control.record().unwrap();
+                }
+                if phase == CameraPhase::Paused {
+                    control.pause().unwrap();
+                }
+                app.camera_recorder.control = Some(control);
+                let (release, wait) = std::sync::mpsc::channel();
+                app.camera_recorder
+                    .task
+                    .start("synthetic-camera-layout", move |context| {
+                        context.report(preview(0));
+                        let _ = wait.recv_timeout(Duration::from_secs(10));
+                        Ok(None)
+                    })
+                    .unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !app.camera_recorder.has_preview() {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                for (native_size, zoom) in [
+                    (egui::vec2(400.0, 320.0), 1.0),
+                    (egui::vec2(640.0, 480.0), 1.0),
+                    (egui::vec2(960.0, 720.0), 1.5),
+                    (egui::vec2(1280.0, 960.0), 2.0),
+                    (egui::vec2(1920.0, 1080.0), 1.0),
+                ] {
+                    let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, native_size / zoom);
+                    let output = main_page_frame(&mut app, viewport, zoom);
+                    let labels: &[&str] = match phase {
+                        CameraPhase::Preview => &["Start recording", "Close preview"],
+                        CameraPhase::Recording => &["Pause", "Stop & edit", "Discard"],
+                        CameraPhase::Paused => &["Resume", "Stop & edit", "Discard"],
+                        _ => unreachable!(),
+                    };
+                    for label in labels {
+                        let shape = output.shapes.iter().find(|shape| matches!(
+                            &shape.shape, egui::Shape::Text(text) if text.galley.text() == *label
+                        )).unwrap_or_else(|| panic!("missing camera control {label}"));
+                        let egui::Shape::Text(text) = &shape.shape else {
+                            unreachable!()
+                        };
+                        let bounds = text.galley.rect.translate(text.pos.to_vec2());
+                        assert!(
+                            viewport.contains_rect(bounds),
+                            "{label} outside {viewport:?}: {bounds:?}"
+                        );
+                        assert!(
+                            shape.clip_rect.contains_rect(bounds),
+                            "{label} clipped: {bounds:?}"
+                        );
+                    }
+                    let texture = app.camera_recorder.texture.as_ref().unwrap().id();
+                    let bounds = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Rect(rect)
+                                if rect
+                                    .brush
+                                    .as_ref()
+                                    .is_some_and(|brush| brush.fill_texture_id == texture) =>
+                            {
+                                Some(rect.rect)
+                            }
+                            _ => None,
+                        })
+                        .expect("main route must paint the camera frame");
+                    assert!(
+                        viewport.shrink(7.0).contains_rect(bounds),
+                        "preview escaped {viewport:?}: {bounds:?}"
+                    );
+                    assert!((bounds.width() / bounds.height() - 160.0 / 90.0).abs() < 0.001);
+                    assert!(
+                        (bounds.right() - (viewport.right() - 8.0)).abs() < 1.5
+                            || (bounds.bottom() - (viewport.bottom() - 8.0)).abs() < 1.5,
+                        "main camera route left unused media space: {bounds:?} in {viewport:?}"
+                    );
+                }
+                release.send(()).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn first_sequence_zero_uploads_and_preview_fills_the_available_axis() {
+        for (native_viewport, zoom) in [
+            (egui::vec2(400.0, 240.0), 1.0),
+            (egui::vec2(1280.0, 800.0), 1.25),
+            (egui::vec2(1920.0, 1080.0), 2.0),
+        ] {
+            let context = egui::Context::default();
+            context.set_zoom_factor(zoom);
+            let mut camera = CameraRecorderUi::default();
+            let mut available = egui::Rect::NOTHING;
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        native_viewport / zoom,
+                    )),
+                    ..egui::RawInput::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        available = ui.available_rect_before_wrap();
+                        camera.show_preview(ui, &preview(0));
+                    });
+                },
+            );
+            let texture = camera
+                .texture
+                .as_ref()
+                .expect("sequence zero must upload")
+                .id();
+            let bounds = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Mesh(mesh) if mesh.texture_id == texture => {
+                        Some(mesh.calc_bounds())
+                    }
+                    egui::Shape::Rect(rect)
+                        if rect
+                            .brush
+                            .as_ref()
+                            .is_some_and(|brush| brush.fill_texture_id == texture) =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .expect("camera preview image is painted");
+            assert!(available.expand(0.5).contains_rect(bounds));
+            assert!((bounds.width() / bounds.height() - 160.0 / 90.0).abs() < 0.001);
+            assert!(
+                (bounds.width() - available.width()).abs() < 0.5
+                    || (bounds.height() - available.height()).abs() < 0.5
+            );
+            assert!(
+                bounds.width() > 160.0,
+                "preview must scale up with the window"
+            );
+        }
+    }
+
+    #[test]
+    fn no_camera_page_is_content_sized_and_does_not_allocate_a_fake_preview() {
+        let context = egui::Context::default();
+        crate::appearance::configure(&context);
+        let mut camera = CameraRecorderUi::default();
+        camera.devices.clear();
+        camera.notice = None;
+        let mut used = egui::Vec2::ZERO;
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(960.0, 680.0),
+                )),
+                ..egui::RawInput::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    let start = ui.cursor().min;
+                    camera.show(ui);
+                    used = ui.cursor().min - start;
+                });
+            },
+        );
+        assert!(
+            used.y < 200.0,
+            "empty camera page unexpectedly reserved a large media area: {used:?}"
+        );
+        assert!(camera.texture.is_none());
+        assert!(!camera.has_preview());
+    }
+
+    #[test]
+    fn closing_preview_does_not_resurrect_the_completed_workers_last_frame() {
+        let (release, wait) = std::sync::mpsc::channel();
+        let mut camera = CameraRecorderUi::default();
+        camera
+            .task
+            .start("camera-layout-fixture", move |context| {
+                context.report(preview(0));
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(None)
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !camera.has_preview() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        release.send(()).unwrap();
+        while camera.is_active() {
+            assert!(camera.poll().is_none());
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(
+            camera.task.progress().is_some(),
+            "the generic task intentionally retains progress"
+        );
+        assert!(!camera.has_preview());
+        let context = egui::Context::default();
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| camera.show(ui));
+        });
+        assert!(
+            camera.texture.is_none(),
+            "a closed camera must remain closed on the next repaint"
+        );
+    }
 
     #[test]
     fn no_device_cannot_start_or_create_a_worker() {

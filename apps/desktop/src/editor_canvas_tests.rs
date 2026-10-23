@@ -261,11 +261,11 @@ fn exact_zoom_keeps_actual_image_extent_and_clips_scrolling_without_new_texture(
     frame(&context, &mut canvas, &preview, viewport, Vec::new());
     let (output, image) = frame(&context, &mut canvas, &preview, viewport, Vec::new());
     assert_eq!(image.size(), egui::vec2(1600.0, 1200.0));
-    assert!(canvas.viewport.unwrap().height() <= CANVAS_HEIGHT);
+    assert!(canvas.viewport.unwrap().bottom() <= viewport.y - 80.0);
     for shape in output.shapes.iter().filter(
         |shape| matches!(&shape.shape, egui::Shape::Mesh(mesh) if mesh.texture_id == texture),
     ) {
-        assert!(shape.clip_rect.height() <= CANVAS_HEIGHT);
+        assert!(shape.clip_rect.bottom() <= viewport.y - 80.0);
     }
     canvas.scroll_offset = egui::vec2(120.0, 90.0);
     let (_, moved) = frame(&context, &mut canvas, &preview, viewport, Vec::new());

@@ -22,6 +22,56 @@ use crate::{RecordingRetarget, recorder_shortcuts::LiveShortcutState};
 use super::*;
 
 #[test]
+fn measured_controller_size_converts_ui_points_once_and_clamps_to_workarea() {
+    let content = egui::vec2(641.25, 187.25);
+    let area = PhysicalSize::new(3840, 2160).unwrap();
+    for (scale, expected) in [
+        (1.0, (642, 188)),
+        (1.25, (802, 235)),
+        (1.5, (962, 281)),
+        (2.0, (1283, 375)),
+    ] {
+        let size = panel_size(area, scale, content);
+        assert_eq!((size.width(), size.height()), expected);
+    }
+    let size = panel_size(PhysicalSize::new(320, 240).unwrap(), 2.0, content);
+    assert_eq!((size.width(), size.height()), (320, 240));
+}
+
+#[test]
+fn expanded_controls_fit_outside_default_region_on_1024_by_768_without_changing_roi() {
+    let area = PhysicalRect::new(0, 0, 1024, 768).unwrap();
+    let region = PhysicalRect::new(192, 144, 640, 480).unwrap();
+    let preferred = PhysicalSize::new(560, 420).unwrap();
+    let minimum = PhysicalSize::new(320, 90).unwrap();
+    let size = fit_panel_size(region, preferred, minimum, &[area], 3);
+    assert_eq!(size, PhysicalSize::new(560, 141).unwrap());
+    assert!(matches!(
+        place_controls(region, size, &[area], 3),
+        ControlPlacement::Visible { .. }
+    ));
+    assert_eq!(region, PhysicalRect::new(192, 144, 640, 480).unwrap());
+    let full_height_region = PhysicalRect::new(400, 0, 624, 768).unwrap();
+    assert_eq!(
+        fit_panel_size(full_height_region, preferred, minimum, &[area], 3),
+        PhysicalSize::new(397, 420).unwrap()
+    );
+    let unconstrained = PhysicalRect::new(0, 0, 3840, 2160).unwrap();
+    assert_eq!(
+        fit_panel_size(region, preferred, minimum, &[unconstrained], 3),
+        preferred
+    );
+    assert_eq!(
+        fit_panel_size(area, preferred, minimum, &[area], 3),
+        preferred
+    );
+    assert_eq!(
+        place_controls(area, preferred, &[area], 3),
+        ControlPlacement::Hidden
+    );
+}
+
+#[test]
 fn large_handle_always_moves_instead_of_resizing_in_every_movable_stage() {
     let initial = RecorderGeometry::new(
         PhysicalRect::new(0, 0, 800, 600).unwrap(),
@@ -81,7 +131,7 @@ fn region() -> PhysicalRect {
     PhysicalRect::new(100, 100, 100, 80).unwrap()
 }
 fn native() -> NativeWindow {
-    let rect = PhysicalRect::new(400, 400, 480, 40).unwrap();
+    let rect = PhysicalRect::new(300, 400, 640, 96).unwrap();
     NativeWindow {
         outer: Some(rect),
         client: Some(rect),
@@ -129,14 +179,14 @@ fn frame_events<R>(
     events: Vec<egui::Event>,
     mut draw: impl FnMut(&egui::Context) -> R,
 ) -> (egui::FullOutput, R) {
-    let size = egui::vec2(480.0, 40.0);
+    let size = egui::vec2(640.0, 96.0);
     let mut input = egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
         events,
         ..Default::default()
     };
     let viewport = input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
-    let rect = egui::Rect::from_min_size(egui::pos2(400.0, 400.0), size);
+    let rect = egui::Rect::from_min_size(egui::pos2(300.0, 400.0), size);
     viewport.inner_rect = Some(rect);
     viewport.outer_rect = Some(rect);
     viewport.maximized = Some(false);

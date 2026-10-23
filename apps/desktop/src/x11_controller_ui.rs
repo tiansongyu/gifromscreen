@@ -35,6 +35,8 @@ pub(crate) fn draw(
     let mut expanded = context
         .data(|data| data.get_temp::<bool>(settings_id))
         .unwrap_or(false);
+    let preferred_width = preferred_width(context, geometry, stage, settings, localizer);
+    let mut minimum_height = 40.0;
     let panel = egui::CentralPanel::default()
         .frame(
             egui::Frame::new()
@@ -49,81 +51,166 @@ pub(crate) fn draw(
                 )),
         )
         .show(context, |ui| {
-            ui.vertical(|ui| {
-                let separate_actions = ui.available_width() < 480.0
-                    || ui.text_style_height(&egui::TextStyle::Body) > 20.0;
-                if separate_actions {
-                    ui.horizontal_wrapped(|ui| {
-                        action = primary_controls(
-                            ui,
-                            stage,
-                            settings.cadence == RecordingCadenceChoice::Manual,
-                            input_ready,
-                            localizer,
-                        );
-                    });
-                }
-                ui.horizontal_wrapped(|ui| {
-                    show_metrics(
-                        ui,
-                        geometry,
-                        stage,
-                        settings,
-                        &mut expanded,
-                        separate_actions,
-                        localizer,
-                    );
-                    if !separate_actions {
-                        action = primary_controls(
-                            ui,
-                            stage,
-                            settings.cadence == RecordingCadenceChoice::Manual,
-                            input_ready,
-                            localizer,
-                        );
+            let mut hidden_options_height = 0.0;
+            let response = ui
+                .vertical(|ui| {
+                    let separate_actions = ui.available_width() < 480.0
+                        || ui.text_style_height(&egui::TextStyle::Body) > 20.0;
+                    if separate_actions {
+                        ui.horizontal_wrapped(|ui| {
+                            action = primary_controls(
+                                ui,
+                                stage,
+                                settings.cadence == RecordingCadenceChoice::Manual,
+                                input_ready,
+                                localizer,
+                            );
+                        });
                     }
-                });
-                if stage != RecorderStage::Ready && !(expanded && separate_actions) {
-                    ui.horizontal_wrapped(|ui| show_status(ui, stage, progress, localizer));
-                }
-                if let Some(notice) = notice.filter(|text| !text.trim().is_empty()) {
-                    egui::ScrollArea::vertical()
-                        .id_salt("recorder-notice")
-                        .max_height(32.0)
-                        .show(ui, |ui| {
-                            ui.add(egui::Label::new(notice).truncate())
-                                .on_hover_text(notice)
-                        });
-                }
-                if expanded {
-                    ui.separator();
-                    egui::ScrollArea::vertical()
-                        .max_height(ui.available_height().clamp(40.0, 280.0))
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            snap.show(ui, geometry, stage, localizer);
-                            show_geometry(ui, geometry, stage, localizer);
-                            ui.separator();
-                            show_timing(ui, settings, stage, localizer);
-                        });
-                }
-            })
-            .response
-            .rect
-            .height()
-                + 12.0
+                    ui.horizontal_wrapped(|ui| {
+                        show_metrics(
+                            ui,
+                            geometry,
+                            stage,
+                            settings,
+                            &mut expanded,
+                            separate_actions,
+                            localizer,
+                        );
+                        if !separate_actions {
+                            action = primary_controls(
+                                ui,
+                                stage,
+                                settings.cadence == RecordingCadenceChoice::Manual,
+                                input_ready,
+                                localizer,
+                            );
+                        }
+                    });
+                    if stage != RecorderStage::Ready && !(expanded && separate_actions) {
+                        ui.horizontal_wrapped(|ui| show_status(ui, stage, progress, localizer));
+                    }
+                    // Keep the complete primary rows pinned when the monitor
+                    // only has room for a scrolling portion of the options.
+                    minimum_height = ui.min_size().y + 14.0 + if expanded { 48.0 } else { 0.0 };
+                    if !expanded {
+                        hidden_options_height += show_notice(ui, notice);
+                    }
+                    if expanded {
+                        ui.separator();
+                        let options = egui::ScrollArea::vertical()
+                            .id_salt("recorder-options-body")
+                            .max_height(ui.available_height().max(40.0))
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                let _ = show_notice(ui, notice);
+                                snap.show(ui, geometry, stage, localizer);
+                                show_geometry(ui, geometry, stage, localizer);
+                                ui.separator();
+                                show_timing(ui, settings, stage, localizer);
+                            });
+                        // Request the complete contents, not only the currently
+                        // clipped viewport. Otherwise a short native window never
+                        // learns that expanded controls need additional height.
+                        hidden_options_height +=
+                            (options.content_size.y - options.inner_rect.height()).max(0.0);
+                    }
+                })
+                .response;
+            response.rect.height() + hidden_options_height + 14.0
         });
-    context.data_mut(|data| {
-        data.insert_temp(settings_id, expanded);
-        data.insert_temp(
-            egui::Id::new("recorder-panel-height"),
-            panel.inner.max(40.0),
-        );
-    });
+    publish_size(
+        context,
+        settings_id,
+        expanded,
+        preferred_width,
+        panel.inner,
+        minimum_height,
+    );
     if context.input(|input| input.viewport().close_requested()) {
         action = RecorderOverlayAction::Close;
     }
     action
+}
+
+fn publish_size(
+    context: &egui::Context,
+    settings_id: egui::Id,
+    expanded: bool,
+    width: f32,
+    height: f32,
+    minimum_height: f32,
+) {
+    context.data_mut(|data| {
+        data.insert_temp(settings_id, expanded);
+        data.insert_temp(egui::Id::new("recorder-panel-height"), height.max(40.0));
+        data.insert_temp(
+            egui::Id::new("recorder-panel-size"),
+            egui::vec2(width, height.max(40.0)),
+        );
+        data.insert_temp(
+            egui::Id::new("recorder-panel-minimum-size"),
+            egui::vec2(320.0, minimum_height.max(40.0)),
+        );
+    });
+}
+
+fn show_notice(ui: &mut egui::Ui, notice: Option<&str>) -> f32 {
+    let Some(notice) = notice.filter(|text| !text.trim().is_empty()) else {
+        return 0.0;
+    };
+    let output = egui::ScrollArea::vertical()
+        .id_salt("recorder-notice")
+        .max_height(ui.available_height().clamp(40.0, 120.0))
+        .auto_shrink([false, true])
+        .show(ui, |ui| ui.add(egui::Label::new(notice).wrap()));
+    (output.content_size.y.min(120.0) - output.inner_rect.height()).max(0.0)
+}
+
+fn preferred_width(
+    context: &egui::Context,
+    geometry: &RecorderGeometry,
+    stage: RecorderStage,
+    settings: &RecordingSettings,
+    localizer: Localizer,
+) -> f32 {
+    // The sizing pass uses copies and a disabled, invisible UI. It measures the
+    // actual translated buttons, fields and font metrics without issuing any
+    // recording intent or changing the physical selection.
+    let mut measured = egui::Ui::new(
+        context.clone(),
+        egui::Id::new("recorder-natural-toolbar-width"),
+        egui::UiBuilder::new()
+            .max_rect(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(10_000.0, 10_000.0),
+            ))
+            .invisible()
+            .sizing_pass(),
+    );
+    measured.disable();
+    let mut geometry = *geometry;
+    let mut settings = settings.clone();
+    let mut expanded = false;
+    measured.horizontal(|ui| {
+        show_metrics(
+            ui,
+            &mut geometry,
+            stage,
+            &mut settings,
+            &mut expanded,
+            false,
+            localizer,
+        );
+        let _ = primary_controls(
+            ui,
+            stage,
+            settings.cadence == RecordingCadenceChoice::Manual,
+            false,
+            localizer,
+        );
+    });
+    (measured.min_size().x + 14.0).clamp(560.0, 960.0)
 }
 
 fn show_metrics(
@@ -149,6 +236,7 @@ fn show_metrics(
         stage == RecorderStage::Ready,
         egui::DragValue::new(&mut settings.fps)
             .range(1..=240)
+            .clamp_existing_to_range(false)
             .speed(1.0),
     );
     ui.label("fps");
@@ -182,10 +270,23 @@ fn show_metrics(
     ui.separator();
 }
 
-pub(crate) fn panel_height(context: &egui::Context) -> f32 {
+#[cfg(test)]
+fn panel_height(context: &egui::Context) -> f32 {
     context
         .data(|data| data.get_temp::<f32>(egui::Id::new("recorder-panel-height")))
         .unwrap_or(40.0)
+}
+
+pub(crate) fn panel_size(context: &egui::Context) -> egui::Vec2 {
+    context
+        .data(|data| data.get_temp::<egui::Vec2>(egui::Id::new("recorder-panel-size")))
+        .unwrap_or(egui::vec2(640.0, 96.0))
+}
+
+pub(crate) fn panel_minimum_size(context: &egui::Context) -> egui::Vec2 {
+    context
+        .data(|data| data.get_temp::<egui::Vec2>(egui::Id::new("recorder-panel-minimum-size")))
+        .unwrap_or(egui::vec2(320.0, 96.0))
 }
 
 fn primary_controls(
@@ -425,6 +526,12 @@ fn show_timing(
     let mut duration = settings.duration_ms;
     ui.strong(localizer.text(Message::RecorderTiming));
     ui.add_enabled_ui(ready, |ui| {
+        ui.label(localizer.text(Message::RecorderFramesPerSecond));
+        ui.add(
+            egui::DragValue::new(&mut settings.fps)
+                .range(1..=240)
+                .clamp_existing_to_range(false),
+        );
         ui.label(localizer.text(Message::RecorderCountdownSeconds));
         if ui
             .add(
@@ -583,19 +690,14 @@ mod tests {
                         self.viewport,
                         self.localizer.text(Message::HomeOptions),
                     ) {
-                        let id = self
+                        let expanded = self
                             .context
-                            .memory(|memory| {
-                                memory
-                                    .data
-                                    .get_temp::<bool>(egui::Id::new("test-details-open"))
+                            .data(|data| {
+                                data.get_temp::<bool>(egui::Id::new("recorder-options-expanded"))
                             })
                             .unwrap_or(false);
-                        if !id {
+                        if !expanded {
                             self.click(rect.center(), false);
-                            self.context.data_mut(|data| {
-                                data.insert_temp(egui::Id::new("test-details-open"), true);
-                            });
                         }
                     }
                 }
@@ -887,6 +989,95 @@ mod tests {
     }
 
     #[test]
+    fn notices_wrap_without_elision_and_request_readable_height() {
+        for tag in ["en", "zh"] {
+            let mut view = View::new(640.0, 700.0, 1.0, RecorderStage::Ready);
+            crate::preferences::fonts::install(&view.context);
+            view.localizer =
+                Localizer::new(gif_from_screen_localization::find_language(tag).unwrap());
+            view.notice = view
+                .localizer
+                .text(Message::RecorderNoControlSpace)
+                .repeat(2);
+            let output = view.warm();
+            let text = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == view.notice => Some(text),
+                    _ => None,
+                })
+                .expect("the full recorder notice is painted");
+            assert!(
+                !text.galley.elided,
+                "{tag}: recorder notice was silently truncated"
+            );
+            assert!(text.galley.rows.len() > 1, "{tag}: notice must wrap");
+            assert!(panel_size(&view.context).y > 40.0);
+        }
+    }
+
+    #[test]
+    fn expanded_panel_measures_full_content_before_native_resize() {
+        for tag in ["en", "zh"] {
+            for font_scale in [1.0, 2.0] {
+                let mut view = View::new(960.0, 140.0, font_scale, RecorderStage::Ready);
+                crate::preferences::fonts::install(&view.context);
+                view.localizer =
+                    Localizer::new(gif_from_screen_localization::find_language(tag).unwrap());
+                view.notice.clear();
+                view.context.data_mut(|data| {
+                    data.insert_temp(egui::Id::new("recorder-options-expanded"), true);
+                });
+                view.warm();
+                let required = panel_size(&view.context);
+                assert!(
+                    required.y > 140.0,
+                    "{tag} {font_scale}: small window concealed natural body height"
+                );
+                view.viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, required);
+                let output = view.warm();
+                assert!(
+                    visible_text(
+                        &output,
+                        view.viewport,
+                        view.localizer.text(Message::RecorderFramesPerSecond)
+                    )
+                    .is_some(),
+                    "{tag} {font_scale}: expanded settings concealed the FPS field"
+                );
+                assert!(
+                    visible_text(
+                        &output,
+                        view.viewport,
+                        view.localizer.text(Message::RecorderManualStopHint)
+                    )
+                    .is_some(),
+                    "{tag} {font_scale}: final timing hint needs scrolling despite full measured height"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn controller_width_tracks_font_content_instead_of_capture_width() {
+        let mut normal = View::new(1600.0, 700.0, 1.0, RecorderStage::Recording);
+        normal.notice.clear();
+        normal.warm();
+        let normal_width = panel_size(&normal.context).x;
+        normal
+            .geometry
+            .resize(PhysicalSize::new(2400, 420).unwrap())
+            .unwrap();
+        normal.warm();
+        assert!(panel_size(&normal.context).x < 1000.0);
+        let mut large = View::new(1600.0, 700.0, 2.0, RecorderStage::Recording);
+        large.notice.clear();
+        large.warm();
+        assert!(panel_size(&large.context).x > normal_width);
+    }
+
+    #[test]
     fn controller_requested_height_grows_and_shrinks_with_settings() {
         let mut view = View::new(360.0, 600.0, 1.0, RecorderStage::Ready);
         view.notice.clear();
@@ -903,6 +1094,39 @@ mod tests {
         view.click(header.center(), false);
         view.warm();
         assert!((panel_height(&view.context) - compact).abs() < 0.01);
+    }
+
+    #[test]
+    fn expanded_options_scroll_in_the_141_pixel_budget_below_a_default_roi() {
+        for tag in ["en", "zh"] {
+            let mut view = View::new(560.0, 141.0, 1.0, RecorderStage::Ready);
+            crate::preferences::fonts::install(&view.context);
+            view.localizer =
+                Localizer::new(gif_from_screen_localization::find_language(tag).unwrap());
+            view.notice.clear();
+            view.context.data_mut(|data| {
+                data.insert_temp(egui::Id::new("recorder-options-expanded"), true);
+            });
+            let before = view.geometry;
+            let first = view.warm();
+            let start = visible_text(
+                &first,
+                view.viewport,
+                view.localizer.text(Message::RecorderStart),
+            )
+            .unwrap();
+            assert!(panel_minimum_size(&view.context).y <= 141.0);
+            view.seek(view.localizer.text(Message::RecorderManualStopHint));
+            assert_eq!(
+                visible_text(
+                    &view.warm(),
+                    view.viewport,
+                    view.localizer.text(Message::RecorderStart)
+                ),
+                Some(start)
+            );
+            assert_eq!(view.geometry, before);
+        }
     }
 
     #[test]

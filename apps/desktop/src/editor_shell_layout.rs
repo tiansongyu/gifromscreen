@@ -3,6 +3,71 @@
 use eframe::egui;
 use gif_from_screen_localization::{Localizer, Message};
 
+#[derive(Clone, Copy)]
+struct TimelineMeasure {
+    width: f32,
+    row_height: f32,
+    height: f32,
+}
+
+pub(crate) fn set_page_scroll(context: &egui::Context, offset: f32) {
+    context.data_mut(|data| data.insert_temp(egui::Id::new("editor-page-offset"), offset));
+}
+
+fn page_scroll(ui: &egui::Ui) -> f32 {
+    ui.ctx()
+        .data(|data| data.get_temp::<f32>(egui::Id::new("editor-page-offset")))
+        .unwrap_or(0.0)
+}
+
+pub(crate) fn remember_timeline(ui: &egui::Ui, height: f32) {
+    if height.is_finite() && height > 0.0 {
+        let measure = TimelineMeasure {
+            width: ui.ctx().available_rect().width(),
+            row_height: ui.text_style_height(&egui::TextStyle::Body),
+            height,
+        };
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(egui::Id::new("editor-timeline-height"), measure));
+    }
+}
+
+fn timeline_height(ui: &egui::Ui) -> f32 {
+    let row_height = ui.text_style_height(&egui::TextStyle::Body);
+    if let Some(measure) = ui
+        .ctx()
+        .data(|data| data.get_temp::<TimelineMeasure>(egui::Id::new("editor-timeline-height")))
+        && (measure.width - ui.ctx().available_rect().width()).abs() < 0.5
+        && (measure.row_height - row_height).abs() < 0.1
+    {
+        return measure.height + ui.spacing().item_spacing.y;
+    }
+    // Filmstrip, scrollbar, frame margins and wrapped playback controls. The
+    // following frame uses actual measured height rather than a fixed reserve.
+    let controls = ui
+        .spacing()
+        .interact_size
+        .y
+        .max(row_height + ui.spacing().button_padding.y * 2.0);
+    let rows = if ui.ctx().available_rect().width() < 600.0 * (row_height / 14.0).max(1.0) {
+        2.0
+    } else {
+        1.0
+    };
+    94.0 + rows * (controls + ui.spacing().item_spacing.y)
+}
+
+pub(crate) fn available_work_height(ui: &egui::Ui) -> f32 {
+    // The page's scroll offset is excluded: scrolling must not make the image
+    // grow and push its footer away at the same rate as the user scrolls.
+    (ui.ctx().screen_rect().bottom()
+        - 8.0
+        - ui.cursor().top()
+        - page_scroll(ui)
+        - timeline_height(ui))
+    .max(100.0)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InspectorLayout {
     SideBySide,
@@ -38,16 +103,14 @@ pub(crate) fn work_area<R>(
     width = width.clamp(240.0, (available * 0.45).max(240.0));
     let gap = 12.0;
     let origin = ui.cursor().min;
+    let bottom = (origin.y + available_work_height(ui)).min(ui.max_rect().bottom());
     let mut columns: Vec<_> = [
         (origin.x + available - width, width),
         (origin.x, available - width - gap),
     ]
     .into_iter()
     .map(|(x, width)| {
-        let rect = egui::Rect::from_min_max(
-            egui::pos2(x, origin.y),
-            egui::pos2(x + width, ui.max_rect().bottom()),
-        );
+        let rect = egui::Rect::from_min_max(egui::pos2(x, origin.y), egui::pos2(x + width, bottom));
         let mut child = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(rect)
@@ -100,7 +163,7 @@ pub(crate) fn inspector<R>(
         InspectorLayout::SideBySide => {
             egui::ScrollArea::vertical()
                 .id_salt("editor-inspector")
-                .max_height(380.0)
+                .max_height(ui.available_height().max(100.0))
                 .auto_shrink([false, true])
                 .show(ui, contents)
                 .inner

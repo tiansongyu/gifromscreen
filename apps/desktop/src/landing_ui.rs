@@ -201,13 +201,38 @@ pub(crate) fn draw_icon(
 pub(crate) const INITIAL_WINDOW_SIZE: egui::Vec2 = egui::vec2(520.0, 190.0);
 pub(crate) const MINIMUM_WINDOW_SIZE: egui::Vec2 = egui::vec2(440.0, 180.0);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowProfile {
+    Home,
+    Form,
+    CameraSetup,
+    CameraPreview,
+    EmptyEditor,
+    Workbench,
+}
+
+impl WindowProfile {
+    fn default_size(self, zoom: f32) -> egui::Vec2 {
+        match self {
+            Self::Home => INITIAL_WINDOW_SIZE,
+            // Compact entries need only their toolbar and short setup form.
+            // Apply UI zoom once on entry; manual native sizes stay independent.
+            Self::CameraSetup => egui::vec2(640.0, 190.0 * zoom),
+            Self::EmptyEditor => egui::vec2(640.0, 210.0 * zoom),
+            Self::CameraPreview => egui::vec2(800.0, 700.0),
+            Self::Form | Self::Workbench => egui::vec2(960.0, 680.0),
+        }
+    }
+}
+
 /// The launcher owns its size independently of the editor and recorder. Store
 /// native logical units so changing UI zoom cannot accumulate size inflation.
 pub(crate) struct WindowSizing {
     home_size: egui::Vec2,
     home_maximized: Option<bool>,
-    on_home: bool,
+    profile: WindowProfile,
     restore: Option<crate::wayland_controller_layout::GeometryTransition>,
+    camera_expansion: Option<(egui::Vec2, egui::Vec2)>,
 }
 
 impl Default for WindowSizing {
@@ -215,31 +240,78 @@ impl Default for WindowSizing {
         Self {
             home_size: INITIAL_WINDOW_SIZE,
             home_maximized: Some(false),
-            on_home: true,
+            profile: WindowProfile::Home,
             restore: None,
+            camera_expansion: None,
         }
     }
 }
 
 impl WindowSizing {
-    pub(crate) fn update(&mut self, context: &egui::Context, on_home: bool) {
+    pub(crate) fn update(&mut self, context: &egui::Context, profile: WindowProfile) {
         let zoom = context.zoom_factor();
         let (size, maximized) =
             context.input(|input| (input.screen_rect.size() * zoom, input.viewport().maximized));
-        if on_home != self.on_home {
-            self.on_home = on_home;
+        if profile != self.profile {
+            let previous = std::mem::replace(&mut self.profile, profile);
             self.restore = None;
-            if on_home {
+            let camera_setup = if profile == WindowProfile::CameraSetup
+                && previous == WindowProfile::CameraPreview
+            {
+                self.camera_expansion.take().and_then(|(setup, expanded)| {
+                    // Respect a manual resize during preview. Also replace an
+                    // expansion that has not reached the window system yet.
+                    let unchanged = |target: egui::Vec2| (size - target).abs().max_elem() <= 1.0;
+                    (unchanged(expanded) || unchanged(setup)).then_some(setup)
+                })
+            } else {
+                None
+            };
+            if !matches!(
+                profile,
+                WindowProfile::CameraSetup | WindowProfile::CameraPreview
+            ) {
+                self.camera_expansion = None;
+            }
+            if profile == WindowProfile::Home {
                 self.restore = Some(crate::wayland_controller_layout::GeometryTransition::new(
                     self.home_size,
                     MINIMUM_WINDOW_SIZE.min(self.home_size),
                     self.home_maximized,
                     std::time::Instant::now(),
                 ));
-            } else if maximized != Some(true) && size.y < 360.0 {
-                context.send_viewport_cmd(egui::ViewportCommand::InnerSize(
-                    size.max(egui::vec2(960.0, 680.0)) / zoom,
-                ));
+            } else if maximized != Some(true) {
+                let target = if let Some(setup) = camera_setup {
+                    Some(setup)
+                } else if profile == WindowProfile::CameraPreview {
+                    let expanded = size.max(profile.default_size(zoom));
+                    if expanded != size {
+                        let setup = if previous == WindowProfile::CameraSetup {
+                            size
+                        } else {
+                            size.max(WindowProfile::CameraSetup.default_size(zoom))
+                        };
+                        self.camera_expansion = Some((setup, expanded));
+                    }
+                    Some(expanded)
+                } else if (previous == WindowProfile::Home && size.y < 360.0)
+                    || (profile == WindowProfile::Workbench
+                        && matches!(
+                            previous,
+                            WindowProfile::EmptyEditor
+                                | WindowProfile::CameraSetup
+                                | WindowProfile::CameraPreview
+                        ))
+                {
+                    Some(size.max(profile.default_size(zoom)))
+                } else {
+                    None
+                };
+                if let Some(target) = target
+                    && (target != size || camera_setup.is_some())
+                {
+                    context.send_viewport_cmd(egui::ViewportCommand::InnerSize(target / zoom));
+                }
             }
         }
         if let Some(restore) = &mut self.restore {
@@ -252,7 +324,7 @@ impl WindowSizing {
             } else {
                 context.request_repaint_after(std::time::Duration::from_millis(16));
             }
-        } else if on_home {
+        } else if profile == WindowProfile::Home {
             // Do not save an editor/recorder size while a native resize is still
             // pending. Normal manual resizing on the home page remains allowed.
             if maximized != Some(true) {

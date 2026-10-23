@@ -15,7 +15,7 @@ pub(super) fn compact_size(available: Vec2) -> Vec2 {
             preferred
         }
     };
-    vec2(fit(available.x, 720.0), fit(available.y, 480.0))
+    vec2(fit(available.x, 920.0), fit(available.y, 620.0))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,7 +44,7 @@ pub(super) struct GeometryUpdate {
 impl GeometryTransition {
     pub fn compact(available: Vec2, now: Instant) -> Self {
         let target = compact_size(available);
-        Self::new(target, target.min(vec2(320.0, 240.0)), None, now)
+        Self::new(target, target.min(vec2(640.0, 420.0)), None, now)
     }
 
     pub fn restore(size: Vec2, maximized: Option<bool>, now: Instant) -> Self {

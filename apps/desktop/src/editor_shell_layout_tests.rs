@@ -11,6 +11,7 @@ fn language(tag: &str) -> Localizer {
 
 fn context(zoom: f32) -> egui::Context {
     let context = egui::Context::default();
+    crate::appearance::configure(&context);
     crate::preferences::fonts::install(&context);
     context.set_zoom_factor(zoom);
     context.style_mut(|style| style.animation_time = 0.0);
@@ -287,7 +288,87 @@ fn preview_rect(output: &egui::FullOutput) -> egui::Rect {
 }
 
 #[test]
-fn real_editor_preserves_wide_columns_and_font_focus_across_stacked_resize_and_language() {
+fn frame_workspace_grows_with_the_window_and_keeps_its_timeline_visible() {
+    for (size, zoom, tag) in [
+        (egui::vec2(960.0, 680.0), 1.0, "en"),
+        (egui::vec2(1366.0, 900.0), 1.0, "zh"),
+        (egui::vec2(1920.0, 1080.0), 1.0, "en"),
+        (egui::vec2(1280.0, 900.0), 1.5, "zh"),
+    ] {
+        let (_directory, mut app) = app_fixture();
+        let context = context(zoom);
+        app.language_settings = crate::preferences::LanguageSettings::with_language(
+            gif_from_screen_localization::LanguagePreference::explicit(tag).unwrap(),
+        );
+        app.sync_ui_language(language(tag));
+        // Prime the real asset synchronously; the layout under test still goes
+        // through the production presentation request and complete app shell.
+        let workspace = app.editor_workspace.as_ref().unwrap();
+        app.editor_preview_cache
+            .preview(
+                workspace.active_project(),
+                workspace.selection().current().unwrap(),
+                &context,
+                crate::EDITOR_PREVIEW_MAX_SIZE,
+            )
+            .unwrap();
+        for _ in 0..5 {
+            app_frame(&context, &mut app, size, vec![]);
+        }
+        let output = app_frame(&context, &mut app, size, vec![]);
+        let image = preview_rect(&output);
+        let footer =
+            visible_text(&output, language(tag).text(Message::EditorJump)).unwrap_or_else(|| {
+                panic!("{size:?}/{zoom}/{tag}: timeline navigation must be visible")
+            });
+        let screen = size / zoom;
+        assert!(
+            image.height() > screen.y * if zoom > 1.0 { 0.27 } else { 0.38 },
+            "{size:?}/{zoom}: {image:?}"
+        );
+        assert!(footer.top() > image.bottom());
+        assert!(
+            screen.y - footer.bottom() < 100.0,
+            "unused bottom space: {footer:?}"
+        );
+        assert!(
+            text_rect(
+                &output,
+                language(tag).text(Message::EditorAdvancedSelection)
+            )
+            .bottom()
+                < image.top()
+        );
+    }
+}
+
+#[test]
+fn page_scrolling_does_not_enlarge_the_editor_canvas_and_push_controls_away() {
+    let context = context(1.0);
+    let mut heights = Vec::new();
+    for offset in [0.0, 80.0, 240.0] {
+        let _ = context.run(
+            input(&context, egui::vec2(1000.0, 800.0), vec![]),
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    editor_shell_layout::set_page_scroll(context, offset);
+                    let mut rect = ui.available_rect_before_wrap();
+                    rect.min.y -= offset;
+                    let child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                    heights.push(editor_shell_layout::available_work_height(&child));
+                });
+            },
+        );
+    }
+    assert!(
+        heights
+            .iter()
+            .all(|height| (*height - heights[0]).abs() < 0.5)
+    );
+}
+
+#[test]
+fn real_editor_uses_full_width_for_frames_and_preserves_tool_focus_across_resize_and_language() {
     let (_directory, mut app) = app_fixture();
     let context = context(1.0);
     let wide = egui::vec2(1280.0, 900.0);
@@ -301,8 +382,12 @@ fn real_editor_preserves_wide_columns_and_font_focus_across_stacked_resize_and_l
             &output,
             language("en").text(Message::EditorAdvancedSelection)
         )
-        .left()
-            > image.right()
+        .bottom()
+            < image.top()
+    );
+    assert!(
+        image.height() > 360.0,
+        "image still has a fixed height cap: {image:?}"
     );
     let tab = text_rect(&output, language("en").text(Message::EditorOverlaysTab));
     click_app(&context, &mut app, wide, tab.center());
@@ -390,6 +475,9 @@ fn actual_header_navigation_and_language_button_keep_background_job_gates() {
         app_frame(&context, &mut app, size, vec![]);
     }
     let output = app_frame(&context, &mut app, size, vec![]);
+    let clear = text_rect(&output, language("en").text(Message::EditorClearSelection));
+    click_app(&context, &mut app, size, clear.center());
+    assert_eq!(app.editor_workspace.as_ref().unwrap().selection().len(), 1);
     let back = text_rect(&output, language("en").text(Message::BackToHome));
     click_app(&context, &mut app, size, back.center());
     assert_eq!(app.view, crate::AppView::Editor);

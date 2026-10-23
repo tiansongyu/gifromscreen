@@ -81,6 +81,7 @@ pub(crate) struct BoardRecorderTool {
     cadence: BoardCadence,
     fps: u32,
     target: String,
+    settings_open: bool,
     canvas: Option<BoardCanvas>,
     texture: Option<egui::TextureHandle>,
     texture_revision: Option<u64>,
@@ -109,6 +110,7 @@ impl Default for BoardRecorderTool {
             cadence: BoardCadence::Fps,
             fps: 10,
             target: String::new(),
+            settings_open: false,
             canvas: None,
             texture: None,
             texture_revision: None,
@@ -182,18 +184,45 @@ impl BoardRecorderTool {
     }
 
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Drawing board");
-        ui.label("Record a sketch, explanation or step-by-step drawing as a GIF.");
-        self.show_configuration(ui);
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("Drawing board");
+            ui.toggle_value(&mut self.settings_open, "Canvas settings");
+        });
         self.show_controls(ui);
-        ui.separator();
+        self.show_brushes(ui);
+        egui::ScrollArea::vertical()
+            .id_salt("board-tools")
+            .max_height((ui.available_height() * 0.45).max(1.0))
+            .auto_shrink([false, true])
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: false,
+                ..egui::scroll_area::ScrollSource::ALL
+            })
+            .show(ui, |ui| {
+                if self.settings_open {
+                    self.show_configuration(ui);
+                }
+                self.show_status(ui);
+            });
+        if self.canvas.is_none()
+            && let Err(error) = self.reset_canvas()
+        {
+            self.notice = Some(error);
+        }
+        self.show_canvas(ui);
+    }
+
+    fn show_brushes(&mut self, ui: &mut egui::Ui) {
         ui.add_enabled_ui(
             matches!(self.phase, Phase::Idle | Phase::Recording) && self.pending.is_none(),
             |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.selectable_value(&mut self.brush, BrushChoice::Pen, "Pen");
-                    ui.selectable_value(&mut self.brush, BrushChoice::Highlighter, "Highlighter");
-                    ui.selectable_value(&mut self.brush, BrushChoice::Eraser, "Eraser");
+                    ui.selectable_value(&mut self.brush, BrushChoice::Pen, "Pen")
+                        .on_hover_text("Round hard-edged brush");
+                    ui.selectable_value(&mut self.brush, BrushChoice::Highlighter, "Highlighter")
+                        .on_hover_text("25% maximum opacity per stroke");
+                    ui.selectable_value(&mut self.brush, BrushChoice::Eraser, "Eraser")
+                        .on_hover_text("Restore the canvas background");
                     ui.add(
                         egui::DragValue::new(&mut self.brush_width)
                             .range(1..=256)
@@ -203,13 +232,9 @@ impl BoardRecorderTool {
                 });
             },
         );
-        ui.weak("Round hard-edged brush · highlighter has 25% maximum opacity per stroke · eraser restores the canvas background.");
-        if self.canvas.is_none()
-            && let Err(error) = self.reset_canvas()
-        {
-            self.notice = Some(error);
-        }
-        self.show_canvas(ui);
+    }
+
+    fn show_status(&self, ui: &mut egui::Ui) {
         if self.is_active() {
             let elapsed = self
                 .clock
@@ -228,7 +253,7 @@ impl BoardRecorderTool {
                 self.skipped
             ));
             if self.pending.is_some() {
-                ui.weak("Saving this drawing step… Drawing resumes when the bounded writer queue is ready.");
+                ui.weak("Saving this drawing step… Drawing resumes when the writer is ready.");
             }
             ui.ctx().request_repaint_after(Duration::from_millis(16));
         }
@@ -252,7 +277,7 @@ impl BoardRecorderTool {
                 ui.add_enabled(self.cadence == BoardCadence::Fps, egui::DragValue::new(&mut self.fps).range(1..=60).suffix(" fps"));
                 ui.selectable_value(&mut self.cadence, BoardCadence::Stroke, "Each completed stroke");
             });
-            ui.vertical(|ui| { ui.label("New project"); ui.add(egui::TextEdit::singleline(&mut self.target).desired_width(430.0).hint_text("Leave empty for a unique board project in the current folder")); });
+            ui.vertical(|ui| { ui.label("New project"); ui.add(egui::TextEdit::singleline(&mut self.target).desired_width(ui.available_width()).hint_text("Leave empty for a unique board project in the current folder")); });
         });
     }
 
@@ -502,10 +527,11 @@ impl BoardRecorderTool {
             f32::from(u16::try_from(canvas.size().width.get()).unwrap_or(2048)),
             f32::from(u16::try_from(canvas.size().height.get()).unwrap_or(2048)),
         );
-        let scale = (ui.available_width() / native.x)
-            .min((ui.available_height() - 70.0).max(100.0) / native.y)
-            .min(1.0);
-        let display = native * scale;
+        let available = ui.available_size();
+        let display = fitted_canvas_size(native, available);
+        if display.x <= 0.0 || display.y <= 0.0 {
+            return;
+        }
         let response = ui.add(
             egui::Image::new((texture.id(), display))
                 .sense(egui::Sense::click_and_drag())
@@ -574,6 +600,17 @@ impl BoardRecorderTool {
     }
 }
 
+/// The board is the workspace: scale up as well as down, without changing pixels.
+fn fitted_canvas_size(native: egui::Vec2, available: egui::Vec2) -> egui::Vec2 {
+    let width = available.x.max(0.0);
+    let height = if available.y.is_finite() {
+        available.y.max(0.0)
+    } else {
+        native.y * width / native.x
+    };
+    native * (width / native.x).min(height / native.y)
+}
+
 fn edit_color(ui: &mut egui::Ui, value: &mut [u8; 4]) -> egui::Response {
     // The picker round-trips unmultiplied sRGBA even without an edit. Keep
     // authored bytes, including transparent RGB, unless it reports a change.
@@ -630,6 +667,213 @@ mod tests {
         };
         tool.reset_canvas().unwrap();
         tool
+    }
+
+    #[test]
+    fn main_board_page_keeps_primary_tools_visible_and_fills_the_media_viewport() {
+        for settings_open in [false, true] {
+            for phase in [Phase::Idle, Phase::Recording, Phase::Paused] {
+                for (native_size, zoom) in [
+                    (egui::vec2(400.0, 320.0), 1.0),
+                    (egui::vec2(640.0, 480.0), 1.0),
+                    (egui::vec2(960.0, 720.0), 1.5),
+                    (egui::vec2(1280.0, 960.0), 2.0),
+                    (egui::vec2(1920.0, 1080.0), 1.0),
+                ] {
+                    let context = egui::Context::default();
+                    crate::appearance::configure(&context);
+                    crate::preferences::fonts::install(&context);
+                    context.set_zoom_factor(zoom);
+                    context.style_mut(|style| style.animation_time = 0.0);
+                    let mut app = crate::GifFromScreenApp::default();
+                    app.view = crate::AppView::BoardRecorder;
+                    app.board_recorder.settings_open = settings_open;
+                    // Exercise control layout without creating a disk recorder.
+                    app.board_recorder.phase = phase;
+                    let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, native_size / zoom);
+                    let frame = || {
+                        let mut input = egui::RawInput {
+                            screen_rect: Some(viewport),
+                            ..Default::default()
+                        };
+                        input
+                            .viewports
+                            .get_mut(&egui::ViewportId::ROOT)
+                            .unwrap()
+                            .native_pixels_per_point = Some(1.0);
+                        input
+                    };
+                    let _ = context.run(frame(), |context| app.show_main_view(context));
+                    let output = context.run(frame(), |context| app.show_main_view(context));
+                    let controls: &[&str] = match phase {
+                        Phase::Idle => &["Start recording", "Pen", "Highlighter", "Eraser"],
+                        Phase::Recording => &[
+                            "Pause",
+                            "Stop and edit",
+                            "Discard recording",
+                            "Pen",
+                            "Highlighter",
+                            "Eraser",
+                        ],
+                        Phase::Paused => &[
+                            "Continue",
+                            "Stop and edit",
+                            "Discard recording",
+                            "Pen",
+                            "Highlighter",
+                            "Eraser",
+                        ],
+                        _ => unreachable!(),
+                    };
+                    for label in controls {
+                        let shape = output.shapes.iter().find(|shape| matches!(
+                            &shape.shape, egui::Shape::Text(text) if text.galley.text() == *label
+                        )).unwrap_or_else(|| panic!("missing board control {label}"));
+                        let egui::Shape::Text(text) = &shape.shape else {
+                            unreachable!()
+                        };
+                        let bounds = text.galley.rect.translate(text.pos.to_vec2());
+                        assert!(
+                            viewport.contains_rect(bounds),
+                            "{label} outside {viewport:?}: {bounds:?}"
+                        );
+                        assert!(
+                            shape.clip_rect.contains_rect(bounds),
+                            "{label} clipped: {bounds:?}"
+                        );
+                    }
+                    let texture = app.board_recorder.texture.as_ref().unwrap().id();
+                    let bounds = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Rect(rect)
+                                if rect
+                                    .brush
+                                    .as_ref()
+                                    .is_some_and(|brush| brush.fill_texture_id == texture) =>
+                            {
+                                Some(rect.rect)
+                            }
+                            _ => None,
+                        })
+                        .expect("main route must paint the board canvas");
+                    assert!(
+                        viewport.shrink(7.0).contains_rect(bounds),
+                        "canvas escaped {viewport:?}: {bounds:?}"
+                    );
+                    assert!((bounds.width() / bounds.height() - 640.0 / 360.0).abs() < 0.001);
+                    assert!(
+                        (bounds.right() - (viewport.right() - 8.0)).abs() < 1.5
+                            || (bounds.bottom() - (viewport.bottom() - 8.0)).abs() < 1.5,
+                        "main board route left unused media space: {bounds:?} in {viewport:?}"
+                    );
+                    assert!(app.board_recorder.writer.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn board_canvas_scales_up_without_cropping_at_different_window_sizes_and_zoom() {
+        for (viewport, zoom) in [
+            (egui::vec2(400.0, 240.0), 1.0),
+            (egui::vec2(1280.0, 800.0), 1.25),
+            (egui::vec2(1920.0, 1080.0), 2.0),
+        ] {
+            let context = egui::Context::default();
+            context.set_zoom_factor(zoom);
+            let mut board = BoardRecorderTool {
+                width: 160,
+                height: 90,
+                ..BoardRecorderTool::default()
+            };
+            board.reset_canvas().unwrap();
+            let original = board.canvas.as_ref().unwrap().pixels().to_vec();
+            let mut available = egui::Rect::NOTHING;
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport / zoom)),
+                    ..egui::RawInput::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        available = ui.available_rect_before_wrap();
+                        board.show_canvas(ui);
+                    });
+                },
+            );
+            let texture = board.texture.as_ref().unwrap().id();
+            let bounds = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Mesh(mesh) if mesh.texture_id == texture => {
+                        Some(mesh.calc_bounds())
+                    }
+                    egui::Shape::Rect(rect)
+                        if rect
+                            .brush
+                            .as_ref()
+                            .is_some_and(|brush| brush.fill_texture_id == texture) =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .expect("board texture is painted");
+            assert!(available.expand(0.5).contains_rect(bounds));
+            assert!((bounds.width() / bounds.height() - 160.0 / 90.0).abs() < 0.001);
+            assert!(
+                (bounds.width() - available.width()).abs() < 0.5
+                    || (bounds.height() - available.height()).abs() < 0.5
+            );
+            assert!(bounds.width() > 160.0);
+            assert_eq!(board.canvas.as_ref().unwrap().pixels(), original);
+        }
+    }
+
+    #[test]
+    fn first_board_page_creates_a_visible_canvas_without_starting_recording() {
+        let context = egui::Context::default();
+        crate::appearance::configure(&context);
+        let mut board = BoardRecorderTool::default();
+        let output = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(960.0, 680.0),
+                )),
+                ..egui::RawInput::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| board.show(ui));
+            },
+        );
+        let texture = board.texture.as_ref().unwrap().id();
+        let bounds = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Mesh(mesh) if mesh.texture_id == texture => Some(mesh.calc_bounds()),
+                egui::Shape::Rect(rect)
+                    if rect
+                        .brush
+                        .as_ref()
+                        .is_some_and(|brush| brush.fill_texture_id == texture) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            bounds.width() > 850.0,
+            "default board should occupy the working width: {bounds:?}"
+        );
+        assert!(board.canvas.is_some());
+        assert!(board.writer.is_none());
+        assert!(matches!(board.phase, Phase::Idle));
     }
 
     fn saved(tool: &mut BoardRecorderTool) -> ActiveProject {
@@ -718,6 +962,7 @@ mod tests {
                     color: original,
                     background: original,
                     target: "Untouched board target".into(),
+                    settings_open: true,
                     ..BoardRecorderTool::default()
                 };
                 if focus {
@@ -764,6 +1009,7 @@ mod tests {
             height: 8,
             transparent: true,
             background,
+            settings_open: true,
             ..BoardRecorderTool::default()
         };
         for _ in 0..4 {

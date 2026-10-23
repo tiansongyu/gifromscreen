@@ -18,7 +18,7 @@ use gif_from_screen_localization::Message;
 use crate::{
     GifFromScreenApp, MainWindowRestore, MainWindowSnapshot, RecorderOverlayAction, RecorderStage,
     RecordingJob, apply_overlay_region,
-    recorder_geometry::RecorderGeometry,
+    recorder_geometry::{ControlPlacement, RecorderGeometry, place_controls},
     x11_controller_window::{ControllerWindow, NativeWindow, WindowRequest, WindowState},
 };
 
@@ -376,9 +376,14 @@ impl RecorderOverlay {
         let size = panel_size(
             area.size(),
             scale,
-            crate::x11_controller_ui::panel_height(context),
-            self.geometry.region().size().width(),
+            crate::x11_controller_ui::panel_size(context),
         );
+        let minimum = panel_size(
+            area.size(),
+            scale,
+            crate::x11_controller_ui::panel_minimum_size(context),
+        );
+        let size = fit_panel_size(self.geometry.region(), size, minimum, &self.workareas, 3);
         let update = self.window.advance(
             native,
             WindowRequest {
@@ -462,20 +467,67 @@ impl RecorderOverlay {
     clippy::cast_precision_loss,
     reason = "finite physical panel budgets are clamped to nonempty u32 source dimensions"
 )]
-fn panel_size(area: PhysicalSize, scale: f32, height: f32, region_width: u32) -> PhysicalSize {
+fn panel_size(area: PhysicalSize, scale: f32, content: egui::Vec2) -> PhysicalSize {
     let scale = if scale.is_finite() && scale > 0.0 {
         scale
     } else {
         1.0
     };
     PhysicalSize::new(
-        (region_width as f32)
-            .max(480.0 * scale)
-            .round()
-            .clamp(1.0, area.width() as f32) as u32,
-        (height * scale).round().clamp(1.0, area.height() as f32) as u32,
+        (content.x * scale).ceil().clamp(1.0, area.width() as f32) as u32,
+        (content.y * scale).ceil().clamp(1.0, area.height() as f32) as u32,
     )
     .unwrap()
+}
+
+/// Preserve the primary rows and let the options scroll in the space actually
+/// available outside capture. A full-size ROI can still require Hidden; fitting
+/// controls never changes or overlaps that authoritative capture rectangle.
+fn fit_panel_size(
+    region: PhysicalRect,
+    preferred: PhysicalSize,
+    minimum: PhysicalSize,
+    workareas: &[PhysicalRect],
+    gap: u32,
+) -> PhysicalSize {
+    let fits = |width, height| {
+        matches!(
+            place_controls(
+                region,
+                PhysicalSize::new(width, height).unwrap(),
+                workareas,
+                gap,
+            ),
+            ControlPlacement::Visible { .. }
+        )
+    };
+    if fits(preferred.width(), preferred.height()) {
+        return preferred;
+    }
+    let minimum_width = minimum.width().min(preferred.width());
+    let minimum_height = minimum.height().min(preferred.height());
+    if !fits(minimum_width, minimum_height) {
+        return preferred;
+    }
+    let width = largest_fitting(minimum_width, preferred.width(), |width| {
+        fits(width, minimum_height)
+    });
+    let height = largest_fitting(minimum_height, preferred.height(), |height| {
+        fits(width, height)
+    });
+    PhysicalSize::new(width, height).unwrap()
+}
+
+fn largest_fitting(mut low: u32, mut high: u32, fits: impl Fn(u32) -> bool) -> u32 {
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if fits(middle) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    low
 }
 
 #[allow(

@@ -1080,8 +1080,18 @@ impl GifFromScreenApp {
             && self.main_window_snapshot.is_none()
             && !self.restore_main_window
         {
-            self.window_sizing
-                .update(context, self.view == AppView::Landing);
+            use landing_ui::WindowProfile;
+            let profile = match self.view {
+                AppView::Landing => WindowProfile::Home,
+                AppView::CameraRecorder if self.camera_recorder.has_preview() => {
+                    WindowProfile::CameraPreview
+                }
+                AppView::CameraRecorder => WindowProfile::CameraSetup,
+                AppView::Editor if self.editor_workspace.is_none() => WindowProfile::EmptyEditor,
+                AppView::Editor | AppView::BoardRecorder => WindowProfile::Workbench,
+                _ => WindowProfile::Form,
+            };
+            self.window_sizing.update(context, profile);
         }
     }
 
@@ -1098,9 +1108,7 @@ impl GifFromScreenApp {
             | AppView::ImportImage
             | AppView::ImportImageSequence
             | AppView::ImportVideo
-            | AppView::NewBlankAnimation
-            | AppView::CameraRecorder
-            | AppView::BoardRecorder => {
+            | AppView::NewBlankAnimation => {
                 egui::ScrollArea::vertical()
                     .id_salt(format!("form-page-{:?}", self.view))
                     .auto_shrink([false, false])
@@ -1115,11 +1123,11 @@ impl GifFromScreenApp {
                         AppView::ImportImageSequence => self.show_import_sequence(ui),
                         AppView::ImportVideo => self.video_import.show(ui),
                         AppView::NewBlankAnimation => self.show_blank_project(ui),
-                        AppView::CameraRecorder => self.camera_recorder.show(ui),
-                        AppView::BoardRecorder => self.board_recorder.show(ui),
                         _ => unreachable!(),
                     });
             }
+            AppView::CameraRecorder => self.camera_recorder.show(ui),
+            AppView::BoardRecorder => self.board_recorder.show(ui),
             AppView::ScreenRecorder
                 if self.wayland_prepare_job.is_active()
                     || self.wayland_frozen_preview.is_some() =>
@@ -2142,23 +2150,27 @@ impl GifFromScreenApp {
     fn show_editor(&mut self, ui: &mut egui::Ui) {
         if self.editor_workspace.is_none() {
             let localizer = self.language_settings.localizer();
-            ui.add_space(28.0);
-            ui.heading(localizer.text(Message::EditorEmptyTitle));
-            ui.add_space(12.0);
-            for (view, label) in [
-                (AppView::OpenProject, Message::HomeOpenProject),
-                (AppView::ImportGif, Message::HomeImportGif),
-                (AppView::ImportImage, Message::HomeImportImage),
-                (AppView::NewBlankAnimation, Message::HomeNewAnimation),
-            ] {
-                if ui.button(localizer.text(label)).clicked() {
-                    self.open_landing_view(view);
-                }
-            }
-            ui.separator();
-            if let Some(path) = self.project_library.show_recent(ui, localizer) {
-                self.open_library_project(&path);
-            }
+            egui::ScrollArea::vertical()
+                .id_salt("empty-editor")
+                .show(ui, |ui| {
+                    ui.heading(localizer.text(Message::EditorEmptyTitle));
+                    ui.horizontal_wrapped(|ui| {
+                        for (view, label) in [
+                            (AppView::OpenProject, Message::HomeOpenProject),
+                            (AppView::ImportGif, Message::HomeImportGif),
+                            (AppView::ImportImage, Message::HomeImportImage),
+                            (AppView::NewBlankAnimation, Message::HomeNewAnimation),
+                        ] {
+                            if ui.button(localizer.text(label)).clicked() {
+                                self.open_landing_view(view);
+                            }
+                        }
+                    });
+                    ui.separator();
+                    if let Some(path) = self.project_library.show_recent(ui, localizer) {
+                        self.open_library_project(&path);
+                    }
+                });
             return;
         }
         if self.auto_tasks.is_running() {
@@ -2304,14 +2316,30 @@ impl GifFromScreenApp {
             self.editor_ui_state.drawing_overlay.cancel();
         }
         let watermark_running = self.watermark_job.state() == WatermarkDecodeJobState::Running;
+        let inline_frames_allowed =
+            !self.vector_shapes.is_active() && !self.motion_tools.cinemagraph_editing();
         let mut results = ui
             .add_enabled_ui(!watermark_running, |ui| {
-                show_editor_chrome(ui, workspace, &mut self.editor_ui_state, localizer)
+                if inline_frames_allowed {
+                    editor_ui::show_compact_editor_chrome(
+                        ui,
+                        workspace,
+                        &mut self.editor_ui_state,
+                        localizer,
+                    )
+                } else {
+                    show_editor_chrome(ui, workspace, &mut self.editor_ui_state, localizer)
+                }
             })
             .inner;
+        let inline_frames = self.editor_ui_state.frame_tools_selected() && inline_frames_allowed;
         let mut watermark_action = WatermarkUiAction::None;
         let mut vector_intent = vector_shapes::Intent::None;
         let layout = editor_shell_layout::InspectorLayout::for_width(ui.available_width());
+        self.editor_ui_state.canvas.limit_height(
+            (!inline_frames && layout == editor_shell_layout::InspectorLayout::Stacked)
+                .then(|| ui.ctx().screen_rect().height() * 0.42),
+        );
         let mut inspector = |ui: &mut egui::Ui,
                              workspace: &mut EditorWorkspace,
                              state: &mut EditorUiState,
@@ -2339,49 +2367,63 @@ impl GifFromScreenApp {
             }
             watermark_action = action;
         };
-        editor_shell_layout::work_area(ui, layout, |columns| {
-            if layout == editor_shell_layout::InspectorLayout::SideBySide {
-                inspector(
-                    &mut columns[0],
-                    workspace,
-                    &mut self.editor_ui_state,
-                    &mut self.vector_shapes,
-                );
-                show_editor_preview_panel(
-                    &mut columns[1],
-                    workspace,
-                    &mut self.editor_preview_cache,
-                    &mut self.editor_ui_state,
-                    (&mut self.motion_tools, &mut self.vector_shapes),
-                    cine_input_enabled,
-                    localizer,
-                );
-            } else {
-                let ui = &mut columns[0];
-                show_editor_preview_panel(
-                    ui,
-                    workspace,
-                    &mut self.editor_preview_cache,
-                    &mut self.editor_ui_state,
-                    (&mut self.motion_tools, &mut self.vector_shapes),
-                    cine_input_enabled,
-                    localizer,
-                );
-                ui.separator();
-                inspector(
-                    ui,
-                    workspace,
-                    &mut self.editor_ui_state,
-                    &mut self.vector_shapes,
-                );
-            }
-        });
+        if inline_frames {
+            show_editor_preview_panel(
+                ui,
+                workspace,
+                &mut self.editor_preview_cache,
+                &mut self.editor_ui_state,
+                (&mut self.motion_tools, &mut self.vector_shapes),
+                cine_input_enabled,
+                localizer,
+            );
+        } else {
+            editor_shell_layout::work_area(ui, layout, |columns| {
+                if layout == editor_shell_layout::InspectorLayout::SideBySide {
+                    inspector(
+                        &mut columns[0],
+                        workspace,
+                        &mut self.editor_ui_state,
+                        &mut self.vector_shapes,
+                    );
+                    show_editor_preview_panel(
+                        &mut columns[1],
+                        workspace,
+                        &mut self.editor_preview_cache,
+                        &mut self.editor_ui_state,
+                        (&mut self.motion_tools, &mut self.vector_shapes),
+                        cine_input_enabled,
+                        localizer,
+                    );
+                } else {
+                    let ui = &mut columns[0];
+                    show_editor_preview_panel(
+                        ui,
+                        workspace,
+                        &mut self.editor_preview_cache,
+                        &mut self.editor_ui_state,
+                        (&mut self.motion_tools, &mut self.vector_shapes),
+                        cine_input_enabled,
+                        localizer,
+                    );
+                    ui.separator();
+                    inspector(
+                        ui,
+                        workspace,
+                        &mut self.editor_ui_state,
+                        &mut self.vector_shapes,
+                    );
+                }
+            });
+        }
+        let timeline_top = ui.cursor().top();
         results.extend(editor_ui::show_editor_timeline(
             ui,
             workspace,
             &mut self.editor_ui_state,
             localizer,
         ));
+        editor_shell_layout::remember_timeline(ui, ui.cursor().top() - timeline_top);
         self.handle_vector_intent(vector_intent, cine_input_enabled, localizer);
         self.handle_editor_actions(results, watermark_action, cine_input_enabled, localizer);
     }
@@ -4289,7 +4331,10 @@ fn show_editor_scroll_area<R>(
     egui::ScrollArea::vertical()
         .id_salt("editor_page_vertical_scroll")
         .auto_shrink([false, false])
-        .show(ui, contents)
+        .show_viewport(ui, |ui, viewport| {
+            editor_shell_layout::set_page_scroll(ui.ctx(), viewport.min.y);
+            contents(ui)
+        })
 }
 
 fn begin_vector_canvas(
@@ -5166,7 +5211,10 @@ fn wayland_window_snapshot(context: &egui::Context) -> MainWindowSnapshot {
         maximized: input.viewport().maximized,
         restore: MainWindowRestore::Wayland {
             pending: Some(wayland_controller_layout::GeometryTransition::compact(
-                input.screen_rect.size() * zoom_factor,
+                input
+                    .viewport()
+                    .monitor_size
+                    .map_or(egui::vec2(920.0, 620.0), |size| size * zoom_factor),
                 Instant::now(),
             )),
             restoring: false,

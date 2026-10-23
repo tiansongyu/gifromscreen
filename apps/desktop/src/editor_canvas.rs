@@ -9,8 +9,6 @@ use crate::{editor_preview::EditorPreview, editor_workspace::EditorWorkspace, ui
 mod crop;
 pub(crate) use crop::DirectCropDraft;
 
-const CANVAS_HEIGHT: f32 = 360.0;
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum PreviewZoom {
     #[default]
@@ -62,9 +60,13 @@ pub(crate) struct EditorCanvasState {
     scroll_offset: egui::Vec2,
     viewport: Option<egui::Rect>,
     panning: bool,
+    height_limit: Option<f32>,
 }
 
 impl EditorCanvasState {
+    pub(crate) fn limit_height(&mut self, height: Option<f32>) {
+        self.height_limit = height;
+    }
     pub(crate) fn reconcile(&mut self, workspace: &EditorWorkspace) {
         self.crop.reconcile(workspace);
     }
@@ -118,6 +120,7 @@ impl EditorCanvasState {
             preview.rendered_size,
             self.zoom,
             self.scroll_offset,
+            self.height_limit,
             egui::scroll_area::ScrollSource {
                 drag: false,
                 ..egui::scroll_area::ScrollSource::ALL
@@ -168,14 +171,14 @@ impl EditorCanvasState {
     ) -> Result<R, Notice> {
         self.cancel_layout_gestures();
         self.viewport = None;
-        // Allocate exactly the same natural scroll content as the real image,
-        // including centering and scrollbar geometry. The maximum viewport
-        // height alone differs for short landscape frames.
+        // Allocate the same viewport and natural scroll content as the real
+        // image, including centering and scrollbar geometry.
         let output = preview_viewport(
             ui,
             rendered_size,
             self.zoom,
             self.scroll_offset,
+            self.height_limit,
             egui::scroll_area::ScrollSource::NONE,
             |ui, size| ui.allocate_exact_size(size, egui::Sense::hover()).0,
         )?;
@@ -218,10 +221,11 @@ fn preview_viewport<R>(
     rendered_size: [u32; 2],
     zoom: PreviewZoom,
     scroll_offset: egui::Vec2,
+    height_limit: Option<f32>,
     scroll_source: egui::scroll_area::ScrollSource,
     contents: impl FnOnce(&mut egui::Ui, egui::Vec2) -> R,
 ) -> Result<egui::scroll_area::ScrollAreaOutput<R>, Notice> {
-    let available = preview_viewport_size(ui);
+    let available = preview_viewport_size(ui, height_limit);
     let size = zoom.extent(rendered_size, available, ui.ctx().pixels_per_point())?;
     ui.painter().rect_filled(
         egui::Rect::from_min_size(ui.cursor().min, available),
@@ -231,7 +235,7 @@ fn preview_viewport<R>(
     Ok(egui::ScrollArea::both()
         .id_salt("editor-image-viewport")
         .max_height(available.y)
-        .auto_shrink([false, true])
+        .auto_shrink([false, false])
         .scroll_source(scroll_source)
         .scroll_offset(scroll_offset)
         .show(ui, |ui| {
@@ -247,10 +251,9 @@ fn preview_viewport<R>(
         }))
 }
 
-fn preview_viewport_size(ui: &egui::Ui) -> egui::Vec2 {
-    // Leave room for the filmstrip and playback controls below every state.
-    let height =
-        (ui.ctx().screen_rect().bottom() - ui.cursor().top() - 150.0).clamp(100.0, CANVAS_HEIGHT);
+fn preview_viewport_size(ui: &egui::Ui, height_limit: Option<f32>) -> egui::Vec2 {
+    let available = crate::editor_shell_layout::available_work_height(ui);
+    let height = height_limit.map_or(available, |limit| available.min(limit.max(100.0)));
     egui::vec2(ui.available_width().max(1.0), height)
 }
 

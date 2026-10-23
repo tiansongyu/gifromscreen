@@ -709,6 +709,25 @@ pub(crate) fn show_editor_chrome(
     state: &mut EditorUiState,
     localizer: Localizer,
 ) -> Vec<EditorUiResult> {
+    show_editor_chrome_layout(ui, workspace, state, localizer, false)
+}
+
+pub(crate) fn show_compact_editor_chrome(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    localizer: Localizer,
+) -> Vec<EditorUiResult> {
+    show_editor_chrome_layout(ui, workspace, state, localizer, true)
+}
+
+fn show_editor_chrome_layout(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    localizer: Localizer,
+    compact_frames: bool,
+) -> Vec<EditorUiResult> {
     let now = Instant::now();
     let mut results = Vec::new();
     advance_playback(ui.ctx(), workspace, state, now, &mut results);
@@ -722,7 +741,15 @@ pub(crate) fn show_editor_chrome(
     });
     ui.separator();
     if state.active_tool == EditorToolTab::Frames {
-        show_edit_toolbar(ui, workspace, state, now, &mut results, localizer);
+        show_edit_toolbar(
+            ui,
+            workspace,
+            state,
+            now,
+            &mut results,
+            localizer,
+            compact_frames,
+        );
         ui.separator();
     }
     schedule_playback_repaint(ui.ctx(), state, now);
@@ -756,6 +783,9 @@ impl EditorUiState {
     }
     pub(crate) fn project_tools_selected(&self) -> bool {
         self.active_tool == EditorToolTab::Project
+    }
+    pub(crate) fn frame_tools_selected(&self) -> bool {
+        self.active_tool == EditorToolTab::Frames
     }
 }
 
@@ -883,97 +913,105 @@ fn show_clipboard_history(
     )
     .id_salt("editor-clipboard-history")
     .show(ui, |ui| {
-        if entry_count == 0 {
-            ui.weak(localizer.text(Message::EditorClipboardEmpty));
-            return;
-        }
-
-        let selected = workspace.selected_clipboard_id();
-        let entries = workspace
-            .clipboard_history_entries()
-            .rev()
-            .map(|entry| (entry.id(), entry.frame_count(), entry.total_duration_us()))
-            .collect::<Vec<_>>();
-        let mut action = None;
-        for (id, frames, duration_us) in entries {
-            ui.horizontal(|ui| {
-                let duration = duration_us.map_or_else(
-                    || localizer.text(Message::EditorDurationOverflow).to_owned(),
-                    format_duration_us,
-                );
-                if ui
-                    .selectable_label(
-                        selected == Some(id),
-                        crate::format_message(
-                            localizer,
-                            Message::EditorClipboardEntry,
-                            &[
-                                ("id", &id.get().to_string()),
-                                ("frames", &frames.to_string()),
-                                ("duration", &duration),
-                            ],
-                        ),
-                    )
-                    .on_hover_text(localizer.text(Message::EditorUseClipboardSnapshot))
-                    .clicked()
-                {
-                    action = Some(ClipboardHistoryUiAction::Select(id));
-                }
-                if ui
-                    .small_button(localizer.text(Message::EditorRemoveClipboardEntry))
-                    .clicked()
-                {
-                    action = Some(ClipboardHistoryUiAction::Remove(id));
-                }
-            });
-        }
-        if ui
-            .button(localizer.text(Message::EditorClearClipboardHistory))
-            .clicked()
-        {
-            action = Some(ClipboardHistoryUiAction::Clear);
-        }
-
-        match action {
-            Some(ClipboardHistoryUiAction::Select(id)) => {
-                if workspace.select_clipboard_entry(id) {
-                    let frames = workspace.clipboard_len();
-                    results.push(Ok(EditorUiAction::Clipboard {
-                        operation: EditorUiOperation::SelectClipboardEntry,
-                        frames,
-                    }));
-                } else {
-                    push_failure(
-                        results,
-                        EditorUiOperation::SelectClipboardEntry,
-                        localizer.text(Message::EditorClipboardSelectChanged),
-                    );
-                }
-            }
-            Some(ClipboardHistoryUiAction::Remove(id)) => {
-                match workspace.remove_clipboard_entry(id) {
-                    Some(frames) => results.push(Ok(EditorUiAction::Clipboard {
-                        operation: EditorUiOperation::RemoveClipboardEntry,
-                        frames,
-                    })),
-                    None => push_failure(
-                        results,
-                        EditorUiOperation::RemoveClipboardEntry,
-                        localizer.text(Message::EditorClipboardRemoveChanged),
-                    ),
-                }
-            }
-            Some(ClipboardHistoryUiAction::Clear) => {
-                workspace.clear_clipboard_history();
-                push_notice(
-                    results,
-                    EditorUiOperation::ClearClipboardHistory,
-                    Notice::localized(localizer, Message::EditorClipboardHistoryCleared, &[]),
-                );
-            }
-            None => {}
-        }
+        show_clipboard_history_contents(ui, workspace, results, localizer);
     });
+}
+
+fn show_clipboard_history_contents(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
+) {
+    let entry_count = workspace.clipboard_history_len();
+    if entry_count == 0 {
+        ui.weak(localizer.text(Message::EditorClipboardEmpty));
+        return;
+    }
+
+    let selected = workspace.selected_clipboard_id();
+    let entries = workspace
+        .clipboard_history_entries()
+        .rev()
+        .map(|entry| (entry.id(), entry.frame_count(), entry.total_duration_us()))
+        .collect::<Vec<_>>();
+    let mut action = None;
+    for (id, frames, duration_us) in entries {
+        ui.horizontal(|ui| {
+            let duration = duration_us.map_or_else(
+                || localizer.text(Message::EditorDurationOverflow).to_owned(),
+                format_duration_us,
+            );
+            if ui
+                .selectable_label(
+                    selected == Some(id),
+                    crate::format_message(
+                        localizer,
+                        Message::EditorClipboardEntry,
+                        &[
+                            ("id", &id.get().to_string()),
+                            ("frames", &frames.to_string()),
+                            ("duration", &duration),
+                        ],
+                    ),
+                )
+                .on_hover_text(localizer.text(Message::EditorUseClipboardSnapshot))
+                .clicked()
+            {
+                action = Some(ClipboardHistoryUiAction::Select(id));
+            }
+            if ui
+                .small_button(localizer.text(Message::EditorRemoveClipboardEntry))
+                .clicked()
+            {
+                action = Some(ClipboardHistoryUiAction::Remove(id));
+            }
+        });
+    }
+    if ui
+        .button(localizer.text(Message::EditorClearClipboardHistory))
+        .clicked()
+    {
+        action = Some(ClipboardHistoryUiAction::Clear);
+    }
+
+    match action {
+        Some(ClipboardHistoryUiAction::Select(id)) => {
+            if workspace.select_clipboard_entry(id) {
+                let frames = workspace.clipboard_len();
+                results.push(Ok(EditorUiAction::Clipboard {
+                    operation: EditorUiOperation::SelectClipboardEntry,
+                    frames,
+                }));
+            } else {
+                push_failure(
+                    results,
+                    EditorUiOperation::SelectClipboardEntry,
+                    localizer.text(Message::EditorClipboardSelectChanged),
+                );
+            }
+        }
+        Some(ClipboardHistoryUiAction::Remove(id)) => match workspace.remove_clipboard_entry(id) {
+            Some(frames) => results.push(Ok(EditorUiAction::Clipboard {
+                operation: EditorUiOperation::RemoveClipboardEntry,
+                frames,
+            })),
+            None => push_failure(
+                results,
+                EditorUiOperation::RemoveClipboardEntry,
+                localizer.text(Message::EditorClipboardRemoveChanged),
+            ),
+        },
+        Some(ClipboardHistoryUiAction::Clear) => {
+            workspace.clear_clipboard_history();
+            push_notice(
+                results,
+                EditorUiOperation::ClearClipboardHistory,
+                Notice::localized(localizer, Message::EditorClipboardHistoryCleared, &[]),
+            );
+        }
+        None => {}
+    }
 }
 
 fn show_project_storage_toolbar(
@@ -1295,57 +1333,100 @@ fn show_selection_toolbar(
     localizer: Localizer,
 ) {
     ui.horizontal_wrapped(|ui| {
-        ui.label(localizer.text(Message::EditorSelect));
-        if ui
-            .button(localizer.text(Message::EditorSelectAll))
-            .clicked()
-        {
-            workspace.select_all();
-            selection_succeeded(workspace, state, now, results, EditorUiOperation::SelectAll);
-        }
-        if ui
-            .button(localizer.text(Message::EditorInvertSelection))
-            .clicked()
-        {
-            workspace.invert_selection();
-            selection_succeeded(
-                workspace,
-                state,
-                now,
-                results,
-                EditorUiOperation::InvertSelection,
-            );
-        }
-        if ui
-            .button(localizer.text(Message::EditorClearSelection))
-            .clicked()
-        {
-            workspace.clear_selection();
-            selection_succeeded(
-                workspace,
-                state,
-                now,
-                results,
-                EditorUiOperation::ClearSelection,
-            );
-        }
+        show_selection_buttons(ui, workspace, state, now, results, localizer);
     });
     crate::appearance::section(ui, localizer.text(Message::EditorAdvancedSelection))
         .id_salt("advanced-frame-selection")
         .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(localizer.text(Message::EditorExpression));
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.frame_expression).desired_width(180.0),
-                );
-                if ui
-                    .button(localizer.text(Message::EditorApplySelection))
-                    .clicked()
-                {
-                    apply_frame_expression(workspace, state, now, results);
-                }
-            });
+            show_frame_expression(ui, workspace, state, now, results, localizer);
         });
+}
+
+fn show_selection_buttons(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    now: Instant,
+    results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
+) {
+    ui.label(localizer.text(Message::EditorSelect));
+    if ui
+        .button(localizer.text(Message::EditorSelectAll))
+        .clicked()
+    {
+        workspace.select_all();
+        selection_succeeded(workspace, state, now, results, EditorUiOperation::SelectAll);
+    }
+    if ui
+        .button(localizer.text(Message::EditorInvertSelection))
+        .clicked()
+    {
+        workspace.invert_selection();
+        selection_succeeded(
+            workspace,
+            state,
+            now,
+            results,
+            EditorUiOperation::InvertSelection,
+        );
+    }
+    if ui
+        .button(localizer.text(Message::EditorClearSelection))
+        .clicked()
+    {
+        workspace.clear_selection();
+        selection_succeeded(
+            workspace,
+            state,
+            now,
+            results,
+            EditorUiOperation::ClearSelection,
+        );
+    }
+}
+
+fn show_frame_expression(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    now: Instant,
+    results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(localizer.text(Message::EditorExpression));
+        ui.add(egui::TextEdit::singleline(&mut state.frame_expression).desired_width(180.0));
+        if ui
+            .button(localizer.text(Message::EditorApplySelection))
+            .clicked()
+        {
+            apply_frame_expression(workspace, state, now, results);
+        }
+    });
+}
+
+/// Frame selection is a compact toolbar, leaving the full width to the image.
+fn show_compact_frame_tools(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    now: Instant,
+    results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
+) {
+    show_selection_buttons(ui, workspace, state, now, results, localizer);
+    ui.menu_button(localizer.text(Message::EditorAdvancedSelection), |ui| {
+        show_frame_expression(ui, workspace, state, now, results, localizer);
+    });
+    let history = crate::format_message(
+        localizer,
+        Message::EditorClipboardHistory,
+        &[("count", &workspace.clipboard_history_len().to_string())],
+    );
+    ui.menu_button(history, |ui| {
+        show_clipboard_history_contents(ui, workspace, results, localizer);
+    });
 }
 
 fn show_time_range_toolbar(
@@ -1484,6 +1565,7 @@ fn show_edit_toolbar(
     now: Instant,
     results: &mut Vec<EditorUiResult>,
     localizer: Localizer,
+    compact_frames: bool,
 ) {
     ui.horizontal_wrapped(|ui| {
         show_clipboard_edit_buttons(ui, workspace, state, now, results, localizer);
@@ -1501,6 +1583,10 @@ fn show_edit_toolbar(
         ui.menu_button(localizer.text(Message::EditorMoreOperations), |ui| {
             show_more_edit_buttons(ui, workspace, state, now, results, localizer);
         });
+        if compact_frames {
+            ui.separator();
+            show_compact_frame_tools(ui, workspace, state, now, results, localizer);
+        }
     });
 }
 

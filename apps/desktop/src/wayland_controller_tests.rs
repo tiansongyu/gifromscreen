@@ -49,7 +49,7 @@ fn geometry_frame(
 fn compact_geometry_is_bounded_and_waits_for_the_unmaximize_configuration() {
     use super::wayland_controller_layout::{GeometryTransition, compact_size};
     for (available, expected) in [
-        (egui::vec2(1280.0, 720.0), egui::vec2(720.0, 480.0)),
+        (egui::vec2(1280.0, 720.0), egui::vec2(920.0, 620.0)),
         (egui::vec2(640.0, 360.0), egui::vec2(640.0, 360.0)),
         (egui::vec2(280.0, 200.0), egui::vec2(280.0, 200.0)),
     ] {
@@ -57,13 +57,13 @@ fn compact_geometry_is_bounded_and_waits_for_the_unmaximize_configuration() {
     }
     let now = Instant::now();
     let original = egui::vec2(1280.0, 720.0);
-    let compact = egui::vec2(720.0, 480.0);
+    let compact = egui::vec2(920.0, 620.0);
     let mut transition = GeometryTransition::compact(original, now);
     let first = transition.advance(original, Some(true), 1.0, now);
     assert_eq!(
         first.commands,
         [
-            egui::ViewportCommand::MinInnerSize(egui::vec2(320.0, 240.0)),
+            egui::ViewportCommand::MinInnerSize(egui::vec2(640.0, 420.0)),
             egui::ViewportCommand::Maximized(false)
         ]
     );
@@ -84,18 +84,53 @@ fn compact_geometry_is_bounded_and_waits_for_the_unmaximize_configuration() {
 }
 
 #[test]
+fn home_size_does_not_constrain_controller_and_returns_after_close() {
+    let home = egui::vec2(520.0, 244.0);
+    for (monitor, expected) in [
+        (None, egui::vec2(920.0, 620.0)),
+        (Some(egui::vec2(1920.0, 1080.0)), egui::vec2(920.0, 620.0)),
+        (Some(egui::vec2(800.0, 600.0)), egui::vec2(800.0, 600.0)),
+    ] {
+        let (context, mut app) = preparation_fixture(1.0);
+        let mut input = geometry_input(home, Some(false));
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .monitor_size = monitor;
+        let output = context.run(input, |context| {
+            app.enter_wayland_crop_controller(context).unwrap();
+        });
+        assert_eq!(app.main_window_snapshot.as_ref().unwrap().size, home);
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::InnerSize(expected)),
+            "{monitor:?}: recorder inherited the launcher's small dimensions"
+        );
+        let _ = geometry_frame(&context, &mut app, expected, Some(false));
+        app.close_wayland_crop_controller();
+        let commands = geometry_frame(&context, &mut app, expected, Some(false));
+        assert!(commands.contains(&egui::ViewportCommand::InnerSize(home)));
+        let _ = geometry_frame(&context, &mut app, home, Some(false));
+        assert!(app.main_window_snapshot.is_none());
+        assert!(!app.restore_main_window);
+    }
+}
+
+#[test]
 fn pending_geometry_uses_stable_native_logical_units_across_ui_zoom_changes() {
     use super::wayland_controller_layout::GeometryTransition;
     let now = Instant::now();
     let original = egui::vec2(1040.0, 760.0);
-    let compact = egui::vec2(720.0, 480.0);
+    let compact = egui::vec2(920.0, 620.0);
     let mut entry = GeometryTransition::compact(original, now);
     let first = entry.advance(original, Some(true), 2.0, now);
     assert!(
         first
             .commands
             .contains(&egui::ViewportCommand::MinInnerSize(egui::vec2(
-                160.0, 120.0
+                320.0, 210.0
             )))
     );
     let resized = entry.advance(original, Some(false), 1.5, now + Duration::from_millis(10));
@@ -191,7 +226,7 @@ fn restoration_timeout_releases_the_pending_request_without_blocking_the_editor(
     let context = egui::Context::default();
     let mut app = GifFromScreenApp::default();
     let original = egui::vec2(1040.0, 760.0);
-    let compact = egui::vec2(720.0, 480.0);
+    let compact = egui::vec2(920.0, 620.0);
     app.view = AppView::Editor;
     app.restore_main_window = true;
     app.main_window_snapshot = Some(MainWindowSnapshot {
@@ -227,7 +262,7 @@ fn exiting_at_each_compact_phase_restores_original_geometry_without_late_shrink(
 
 fn check_exit_during_compact(acknowledged_frames: u8, maximized: Option<bool>) {
     let original = egui::vec2(1040.0, 760.0);
-    let compact = egui::vec2(720.0, 480.0);
+    let compact = egui::vec2(920.0, 620.0);
     let (context, mut app) = preparation_fixture(1.0);
     let _ = context.run(geometry_input(original, maximized), |context| {
         app.enter_wayland_crop_controller(context).unwrap();
@@ -267,7 +302,7 @@ fn check_exit_during_compact(acknowledged_frames: u8, maximized: Option<bool>) {
 #[test]
 fn completed_compact_transition_does_not_override_manual_window_resizing() {
     let original = egui::vec2(1040.0, 760.0);
-    let compact = egui::vec2(720.0, 480.0);
+    let compact = egui::vec2(920.0, 620.0);
     let (context, mut app) = preparation_fixture(1.0);
     let _ = context.run(geometry_input(original, Some(false)), |context| {
         app.enter_wayland_crop_controller(context).unwrap();
@@ -279,7 +314,7 @@ fn completed_compact_transition_does_not_override_manual_window_resizing() {
 #[test]
 fn a_new_controller_during_restoration_keeps_the_original_launcher_snapshot() {
     let original = egui::vec2(1040.0, 760.0);
-    let compact = egui::vec2(720.0, 480.0);
+    let compact = egui::vec2(920.0, 620.0);
     let (context, mut app) = preparation_fixture(1.0);
     let _ = context.run(geometry_input(original, Some(true)), |context| {
         app.enter_wayland_crop_controller(context).unwrap();
@@ -848,7 +883,7 @@ fn wayland_handoff_accepts_local_extent_when_desktop_window_positions_are_privat
         }
     ));
     let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
-    assert!(commands.contains(&egui::ViewportCommand::InnerSize(egui::vec2(720.0, 480.0))));
+    assert!(commands.contains(&egui::ViewportCommand::InnerSize(egui::vec2(920.0, 620.0))));
     assert!(
         output.viewport_output[&egui::ViewportId::ROOT]
             .commands
