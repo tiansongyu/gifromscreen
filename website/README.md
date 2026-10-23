@@ -16,11 +16,12 @@ Pushing website changes to `main` runs `.github/workflows/pages.yml`, which
 publishes only `target/site` through GitHub Actions. GitHub Pages must use the
 **GitHub Actions** build source in the repository settings.
 
-`record-preview.webp` and `editor-preview.webp` are stills from frames 110 and 197
-of the committed `docs/assets/record-and-retarget.gif`. They show the earlier
-X11 interface, as labeled on the site. See [recording provenance](../docs/assets/README.md).
-`export-demo.gif` is synthetic content generated with
-`gif-from-screen-cli demo`; `export-poster.webp` is its first frame.
+`record-preview.webp` and `editor-preview.webp` are native v0.1.6 screenshots
+from the same owned Xvfb session as `docs/assets/workflow-v016.gif`.
+The recorder still includes the demo desktop; the editor still is cropped to
+the application window. `export-demo.gif` is the actual GIF exported in that
+session, and `export-poster.webp` is its first frame. The motion study is original
+illustrative content. See [recording provenance and regeneration](../docs/assets/workflow-v016.md).
 Animation starts only after an explicit Play action and stops when hidden.
 
 The installation command downloads `scripts/gifromscreen-installer.sh` from the

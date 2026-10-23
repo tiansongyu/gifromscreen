@@ -33,7 +33,7 @@ def main():
     for name in ("index.html", "styles.css", "app.js"):
         shutil.copyfile(ROOT / "website" / name, destination / name)
     shutil.copytree(ROOT / "website/assets", destination / "assets", dirs_exist_ok=True)
-    shutil.copyfile(ROOT / "docs/assets/record-and-retarget.gif", destination / "assets/record-and-retarget.gif")
+    shutil.copyfile(ROOT / "docs/assets/workflow-v016.gif", destination / "assets/workflow-v016.gif")
     shutil.copyfile(ROOT / "packaging/linux/io.github.tiansongyu.gifromscreen.svg", destination / "assets/icon.svg")
     (destination / ".nojekyll").touch()
     references = References()

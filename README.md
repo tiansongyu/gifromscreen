@@ -9,9 +9,9 @@
 
 [Website](https://tiansongyu.github.io/gifromscreen/) · [Feature coverage](docs/FEATURE_MATRIX.md) · [Installation](docs/PACKAGING.md) · [Contributing](CONTRIBUTING.md) · [Releases](https://github.com/tiansongyu/gifromscreen/releases)
 
-[![GifFromScreen — record, pause, move the capture region and open the editor](docs/assets/record-and-retarget.gif)](https://tiansongyu.github.io/gifromscreen/)
+[![GifFromScreen v0.1.6 — open the recorder, capture motion, preview frames and export a GIF](docs/assets/workflow-v016.gif)](https://tiansongyu.github.io/gifromscreen/)
 
-Recorded from the real X11 app. The animation shows an earlier interface. See the current [launcher, recorder and editor](docs/DESKTOP-INTERFACE.md).
+Recorded in **v0.1.6 on Linux/X11**: launch → record → preview → export. The animation uses original demo artwork and the real application UI. [Recording details](docs/assets/workflow-v016.md) · [Interface guide](docs/DESKTOP-INTERFACE.md).
 
 ## Install
 
@@ -43,7 +43,7 @@ If v0.1.0 fails on X11/NVIDIA with `incompatible_surface_backends: Backends(GL)`
 
 ## Run from source
 
-Install Git, [Rust through rustup](https://rustup.rs/) (1.88 or newer) and native build tools. On Ubuntu 22.04 or newer:
+Install Git, [Rust through rustup](https://rustup.rs/) and native build tools. The repository pins **Rust 1.88.0** to match release builds and CI. On Ubuntu 22.04 or newer:
 
 ```sh
 sudo apt-get update

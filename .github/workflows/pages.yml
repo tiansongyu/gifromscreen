@@ -6,7 +6,7 @@ on:
     paths:
       - 'website/**'
       - 'scripts/build_website.py'
-      - 'docs/assets/record-and-retarget.gif'
+      - 'docs/assets/workflow-v016.gif'
       - 'packaging/linux/io.github.tiansongyu.gifromscreen.svg'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
