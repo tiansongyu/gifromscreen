@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Record your Linux desktop, edit every frame and export a GIF. GifFromScreen is a local desktop recorder and editor built in Rust.">
+  <meta name="theme-color" content="#0a0e17">
+  <meta property="og:title" content="GifFromScreen — Your screen. A GIF worth sharing.">
+  <meta property="og:description" content="A screen recorder and frame editor for Linux. Built in Rust. Everything stays local.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://tiansongyu.github.io/gifromscreen/">
+  <meta property="og:image" content="https://tiansongyu.github.io/gifromscreen/assets/editor-preview.webp">
+  <link rel="canonical" href="https://tiansongyu.github.io/gifromscreen/">
+  <link rel="icon" href="assets/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+  <title>GifFromScreen — Your screen. A GIF worth sharing.</title>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header wrap">
+    <a class="wordmark" href="#" aria-label="GifFromScreen home"><img src="assets/icon.svg" alt="" width="28" height="28">GifFromScreen</a>
+    <nav aria-label="Main navigation"><a href="#workflow">Explore</a><a href="#install">Install</a><a href="https://github.com/tiansongyu/gifromscreen">GitHub <span aria-hidden="true">↗</span></a></nav>
+  </header>
+  <main id="main">
+    <section class="hero wrap" aria-labelledby="hero-title">
+      <h1 id="hero-title">Your screen.<br>A GIF worth sharing.</h1>
+      <p>A screen recorder. A frame editor. Built in Rust.<br>Capture, edit and export, right on your Linux desktop.</p>
+      <div class="hero-actions"><a class="button primary" href="#install">Get GifFromScreen <span aria-hidden="true">↓</span></a><a class="text-link" href="#workflow">See it in action <span aria-hidden="true">↘</span></a></div>
+      <p class="platforms">Linux x86_64 <span aria-hidden="true">·</span> X11 &amp; Wayland <span aria-hidden="true">·</span> Local processing</p>
+      <figure class="hero-product">
+        <div class="product-bar"><span><i class="record-dot" aria-hidden="true"></i>GifFromScreen</span><span>Record. Edit. Export.</span></div>
+        <img src="assets/editor-preview.webp" width="864" height="600" alt="GifFromScreen's native Linux editor with a frame timeline and a selected frame preview" fetchpriority="high">
+        <figcaption>Real app. Real frames. <span>Earlier X11 interface shown.</span></figcaption>
+      </figure>
+    </section>
+    <section class="workflow section wrap" id="workflow" aria-labelledby="workflow-title">
+      <div class="section-heading"><h2 id="workflow-title">Keep the moment.<br>Make every frame count.</h2><p>From a quick explanation to a tiny tutorial.<br>One workflow, from capture to GIF.</p></div>
+      <div class="workflow-tabs" role="tablist" aria-label="Recording workflow">
+        <button id="tab-record" type="button" role="tab" aria-selected="true" aria-controls="workflow-panel" data-view="record"><span class="step">1</span><span>Record<small>Choose your region. Capture your screen.</small></span></button>
+        <button id="tab-edit" type="button" role="tab" aria-selected="false" aria-controls="workflow-panel" tabindex="-1" data-view="edit"><span class="step">2</span><span>Edit<small>Trim the timeline. Add the details.</small></span></button>
+        <button id="tab-export" type="button" role="tab" aria-selected="false" aria-controls="workflow-panel" tabindex="-1" data-view="export"><span class="step">3</span><span>Export<small>Set the timing. Save your GIF.</small></span></button>
+      </div>
+      <div class="demo-panel" id="workflow-panel" role="tabpanel" aria-labelledby="tab-record" tabindex="0">
+        <div class="demo-stage"><img id="workflow-image" src="assets/record-preview.webp" width="864" height="600" alt="X11 recording region and separate recorder controls" loading="lazy"></div>
+        <div class="demo-description"><div><h3 id="view-title">Capture just what you need.</h3><p id="view-description">Resize before recording. Pause, move your region and pick up where you left off. Keep the controls outside your capture.</p></div><button id="play-demo" class="button secondary" type="button" aria-pressed="false">Play real recording</button></div>
+      </div>
+      <p class="demo-note" id="demo-note" aria-live="polite">Actual X11 app footage from an earlier interface. <a href="https://github.com/tiansongyu/gifromscreen/blob/main/docs/assets/README.md">Recording details</a></p>
+    </section>
+    <section class="features section" aria-labelledby="features-title">
+      <div class="wrap"><h2 id="features-title">Small animation.<br>Room for the details.</h2>
+        <div class="feature-grid">
+          <article><h3>A timeline you can shape.</h3><p>Select, reorder, cut and duplicate frames. Adjust delays, remove duplicates or make a Yoyo loop. Undo and redo as you go.</p></article>
+          <article><h3>Give your point some clarity.</h3><p>Add captions, arrows, shapes and watermarks. Crop, resize, rotate and add transitions. Keep annotations in editable layers.</p></article>
+          <article><h3>Pick up where you left off.</h3><p>Save a .gfsproj project and return later. Incremental recording saves preserve written frames for recovery after an interruption.</p></article>
+          <article><h3>Your files stay with you.</h3><p>Recording, editing and GIF encoding happen on your machine. Import images, GIFs or video. Video import uses your system's FFmpeg.</p></article>
+        </div>
+        <a class="text-link" href="https://github.com/tiansongyu/gifromscreen/blob/main/docs/FEATURE_MATRIX.md">Explore feature coverage <span aria-hidden="true">↗</span></a>
+      </div>
+    </section>
+    <section class="install section wrap" id="install" aria-labelledby="install-title">
+      <h2 id="install-title">Your next GIF<br>starts here.</h2>
+      <p>Install the latest stable release for Linux x86_64.</p>
+      <div class="command-box"><pre><code id="install-command">curl --proto '=https' --tlsv1.2 -LsSf https://github.com/tiansongyu/gifromscreen/releases/latest/download/gifromscreen-installer.sh | sh</code></pre><button type="button" id="copy-command" aria-label="Copy installation command">Copy</button></div>
+      <p id="copy-status" class="copy-status" role="status" aria-live="polite"></p>
+      <p class="install-details">No Rust toolchain or administrator access needed. Requires Python 3.8+ and glibc 2.35+. The installer verifies SHA-256 checksums and installs to <code>~/.local</code>.</p>
+      <div class="download-links"><a class="text-link" href="https://github.com/tiansongyu/gifromscreen/releases/latest">Download the portable archive <span aria-hidden="true">↗</span></a><a class="text-link" href="https://github.com/tiansongyu/gifromscreen#run-from-source">Build from source <span aria-hidden="true">↗</span></a></div>
+      <details><summary>Desktop requirements &amp; release notes</summary><p>The current stable package is v0.1.0. A working OpenGL ES or Vulkan driver is required. Wayland recording uses PipeWire and your desktop's xdg-desktop-portal backend; keep recorder controls outside a monitor capture. GIF export does not include audio. Camera and broader desktop, monitor and DPI coverage are still being verified.</p><p>On X11/NVIDIA, if v0.1.0 reports <code>incompatible_surface_backends</code>, launch with <code>WGPU_BACKEND=vulkan gif-from-screen</code>. <a href="https://github.com/tiansongyu/gifromscreen/blob/main/docs/GRAPHICS-BACKEND-STARTUP.md">Startup fix and details</a>.</p><p>Packages are unsigned; checksums detect download corruption. For upgrades, save your projects and use the existing package's uninstaller first. <a href="https://github.com/tiansongyu/gifromscreen/blob/main/docs/PACKAGING.md">Installation and removal</a>.</p></details>
+    </section>
+  </main>
+  <footer class="wrap"><span>GifFromScreen <span class="license">MIT / Apache-2.0</span></span><nav aria-label="Project links"><a href="https://github.com/tiansongyu/gifromscreen#readme">Documentation</a><a href="https://github.com/tiansongyu/gifromscreen/issues">Issues</a><a href="https://github.com/tiansongyu/gifromscreen">GitHub <span aria-hidden="true">↗</span></a></nav></footer>
+  <noscript><p class="wrap">All downloads and documentation work without JavaScript. Enable it to switch previews or copy the installation command.</p></noscript>
+</body>
+</html>

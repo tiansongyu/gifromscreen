@@ -1,29 +1,29 @@
-<p align="center">
-  <img src="packaging/linux/io.github.tiansongyu.gifromscreen.svg" width="88" height="88" alt="GifFromScreen 图标">
-</p>
-
 # GifFromScreen
 
 [![Linux CI](https://github.com/tiansongyu/gifromscreen/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tiansongyu/gifromscreen/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/tiansongyu/gifromscreen)](https://github.com/tiansongyu/gifromscreen/releases/latest)
-[![Rust 1.88+](https://img.shields.io/badge/Rust-1.88%2B-93450a)](Cargo.toml)
-[![MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#参与和许可)
+[![Rust](https://img.shields.io/badge/Rust-1.88%2B-orange?logo=rust)](Cargo.toml)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-在 Linux 上录制一块屏幕，逐帧编辑，再导出 GIF。
+**Your screen. A GIF worth sharing.** A screen recorder and frame editor for Linux, built in Rust. Capture a region, refine every frame and export locally.
 
-使用 Rust 编写，录制、编辑和导出均在本地完成。以 [ScreenToGif](https://github.com/NickeManarin/ScreenToGif) 的工作方式为参考，专注 GIF；这是独立项目，macOS 尚未提供。
+[Website](https://tiansongyu.github.io/gifromscreen/) · [Feature coverage](docs/FEATURE_MATRIX.md) · [Installation](docs/PACKAGING.md) · [Contributing](CONTRIBUTING.md) · [Releases](https://github.com/tiansongyu/gifromscreen/releases)
 
-[English](README.en.md) · [下载](https://github.com/tiansongyu/gifromscreen/releases/latest) · [安装说明](docs/PACKAGING.md) · [已完成与待办](docs/WORK-STATUS.md) · [反馈问题](https://github.com/tiansongyu/gifromscreen/issues)
+[![GifFromScreen — record, pause, move the capture region and open the editor](docs/assets/record-and-retarget.gif)](https://tiansongyu.github.io/gifromscreen/)
 
-## 获取与运行
+Recorded from the real X11 app. The demo shows an earlier interface; see [recording details](docs/assets/README.md).
 
-**[下载 Linux x86_64 正式版](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0/gifromscreen-0.1.0-linux-x86_64.tar.gz)** · [SHA-256 校验文件](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0/gifromscreen-0.1.0-linux-x86_64.tar.gz.sha256) · [版本说明](docs/releases/v0.1.0.md)
+## Install
 
-当前正式版为 **v0.1.0**。无需登录 GitHub 即可下载；这是冻结当前已验收功能的首个正式版本，不代表完整复刻或零缺陷。后续测试构建与正式版分开，见 [CI Artifacts](https://github.com/tiansongyu/gifromscreen/actions/workflows/portable.yml)（需要登录，保留 30 天）。
+Linux x86_64:
 
-**X11 / NVIDIA 启动提示：** v0.1.0 若报 `incompatible_surface_backends: Backends(GL)`，可临时用 `WGPU_BACKEND=vulkan ./bin/gif-from-screen` 启动。`main` 的 0.1.1 修复构建已支持自动选择兼容后端；该修复不在旧的 v0.1.0 下载包中。[修复与验证](docs/GRAPHICS-BACKEND-STARTUP.md)。
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/tiansongyu/gifromscreen/releases/latest/download/gifromscreen-installer.sh | sh
+```
 
-便携包以 **Ubuntu 22.04 / glibc 2.35** 为构建基线，包含桌面程序和命令行工具。下载压缩包与校验文件后，在同一目录运行：
+Launch **GifFromScreen** from your applications menu, or run `gif-from-screen` with `~/.local/bin` on your `PATH`. The installer downloads the latest stable release, verifies its SHA-256 checksum and adds the desktop app and CLI under `~/.local`. Python 3.8+ is required; Rust and administrator access are not. It leaves shell configuration unchanged. For a different installed version, save your projects and run its uninstaller before installing again; [installation and removal](docs/PACKAGING.md#installation-and-removal).
+
+Prefer a portable download? Get the [v0.1.0 archive](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0/gifromscreen-0.1.0-linux-x86_64.tar.gz) and its [SHA-256 file](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0/gifromscreen-0.1.0-linux-x86_64.tar.gz.sha256), then run these commands in the download directory:
 
 ```sh
 sha256sum --check gifromscreen-0.1.0-linux-x86_64.tar.gz.sha256
@@ -33,76 +33,112 @@ sha256sum --check SHA256SUMS
 ./bin/gif-from-screen
 ```
 
-无需安装，也无需管理员权限。可选的 `./install.sh` 会添加用户级桌面入口；[卸载说明](docs/PACKAGING.md#installation-and-removal)列出了对应操作。包尚未签名，校验和用于检查完整性，不是独立身份证明。AppImage 不随本版发布，Flatpak 尚未交付。
+Release packages target **Linux x86_64, Ubuntu 22.04 / glibc 2.35+**, with an X11 or Wayland desktop and a working OpenGL ES or Vulkan driver. Wayland capture needs PipeWire and your desktop's xdg-desktop-portal backend. System `ffmpeg` and `ffprobe` are optional dependencies for video import. Packages are unsigned; checksums detect download corruption. [System libraries](packaging/linux/README.txt).
 
-## 录制 → 编辑 → GIF
+The published stable package is **v0.1.0**; the source workspace is **0.1.2**. Source builds include the [recording-frame drag grip](docs/RECORDER-DRAG-HANDLE.md) and [graphics startup fix](docs/GRAPHICS-BACKEND-STARTUP.md), which are absent from the v0.1.0 archive. [Development artifacts](https://github.com/tiansongyu/gifromscreen/actions/workflows/portable.yml) require GitHub sign-in and expire after 30 days.
 
-![实际 X11 操作：打开录制框、暂停移动选区、继续录制并进入编辑器](docs/assets/record-and-retarget.gif)
+If v0.1.0 fails on X11/NVIDIA with `incompatible_surface_backends: Backends(GL)`, launch it with `WGPU_BACKEND=vulkan ./bin/gif-from-screen` from the portable directory, or `WGPU_BACKEND=vulkan gif-from-screen` after installation.
 
-真实 X11 窗口操作，包含暂停后拖动录制框；演示录自早期版本，正式版的部分文字与布局有所更新。[演示来源与验证](docs/assets/README.md)。
+<a id="从源码运行"></a>
 
-1. **框选并录制。** 打开“屏幕录制”，选择来源和区域。X11 使用独立边框与控制面板；Wayland 先通过系统分享对话框授权，再调整来源内的裁剪区域。开始前可调整尺寸，录制或暂停时可移动固定尺寸区域。
-2. **逐帧整理。** 停止后进入编辑器，删除多余帧、调整播放时间、裁剪画面，或添加文字、箭头和点击提示。编辑支持撤销与重做。
-3. **导出 GIF。** 选择全部或部分帧，设置颜色、循环、透明与抖动后导出；保留 `.gfsproj` 工程，之后仍可继续编辑。
+## Run from source
 
-### 主要功能
-
-- **控制录制：** 倒计时、开始、暂停、继续、停止保存和明确丢弃；连续录制、周期快照、手动快照，以及 X11 桌面交互触发快照。
-- **精确定位：** X11 数字坐标、方向键微调、窗口吸附和拖选窗口；录制位置与控制面板分离。GIF 每帧播放时长可独立于采样间隔设置。
-- **编辑动画：** 帧选择、排序、剪切/复制/粘贴、延时、降帧、去重、往返循环；裁剪、缩放、旋转、翻转，以及淡入淡出和滑动转场。
-- **添加说明：** 字幕、标题帧、水印、形状、自由绘图、边框、阴影和局部动态效果；可编辑的图层、进度、按键、点击与光标标注。
-- **复用素材：** 导入 GIF、PNG/JPEG/BMP/WebP、图片序列和视频；新建空白动画、录制画板，以及摄像头录制入口。
-- **保留工作：** 录制时增量保存工程，异常后可恢复已写入内容；支持另存工程副本、最近项目和自动编辑/导出预设。
-
-本版也包含[多图形画布](docs/VECTOR-SHAPE-CANVAS.md)：三角形、圆角矩形、椭圆、块状箭头，多选、拖动、缩放和旋转。使用已验收的 Vector v1 / 工程 schema 8；未完成的新版渲染集成不包含在正式版内。
-
-`main` 的 0.1.2 维护构建新增[醒目的录制框拖动把手](docs/RECORDER-DRAG-HANDLE.md)，不必再对准细边框；它不在旧 v0.1.0 下载包中。
-
-以[发布工作总结](docs/WORK-STATUS.md)为当前完成状态入口；[功能对照](docs/FEATURE_MATRIX.md)保留 ScreenToGif 目标与差距，[开发记录](docs/DEVELOPMENT-STATUS.md)保留历史证据。
-
-## X11 与 Wayland
-
-| | X11 | Wayland |
-| --- | --- | --- |
-| 选取区域 | 桌面独立边框、坐标微调、窗口拖选与吸附 | 系统 Portal 选择来源，再在预览中裁剪 |
-| 录制中移动 | 移动固定尺寸的桌面区域 | 移动已授权来源内的固定尺寸裁剪 |
-| 控制面板 | 与选区分离，优先放在区域外 | 紧凑控制器；录制显示器时需自行移出选区 |
-| 全局快捷键 | 可选启用，支持自定义并保存 | 通过 GlobalShortcuts Portal，取决于桌面支持与授权 |
-| 输入与光标标注 | 可选采集按键、点击及可编辑光标 | 嵌入/隐藏光标；可使用手工标注 |
-
-快捷键默认关闭；默认组合为 Ctrl+Shift+F7 开框/开始/暂停/继续、Ctrl+Shift+F8 停止、Ctrl+Shift+F9 手动快照。注册失败时仍可用按钮控制。详见[快捷键说明](docs/GLOBAL-SHORTCUTS.md)。
-
-Wayland 不提供通用的全局透明取景框，也不能保证自动排除控制器或强制被遮挡的应用刷新画面。优先选择窗口来源，或确保控制器不在显示器录制区域内。
-
-## 界面语言
-
-默认跟随机器语言，也可在“语言 / Language”中修改并保存，重启后保留。正式版接入 **848 条英文 / 简体中文消息**，覆盖导航、录制、主要编辑、预览、裁剪、导出、效果、图层、水印和文字 / 标题等界面。已迁移的提示随切换更新；部分表单、共享控件和后端诊断尚未完整翻译。
-
-提供 **System + 29 项语言选择**；其中另外 **27 个目标语言尚无译文，会明确回退英语**，仍保存用户选择。可选择不等于已翻译。详见[本地化范围](docs/LOCALIZATION-PLAN.md)。
-
-![真实界面即时切换中英文并自动保存语言选择](docs/assets/language-switch.gif)
-
-## 运行要求与当前边界
-
-- Linux x86_64、X11 或 Wayland 桌面，以及可用的 OpenGL ES / Vulkan 图形驱动。便携包不是静态链接程序，仍需要[系统运行库](packaging/linux/README.txt)。
-- Wayland 屏幕录制需要 PipeWire 和适配桌面的 xdg-desktop-portal 后端，遵循系统分享授权。
-- 视频导入额外需要系统 `ffmpeg` 和 `ffprobe`；普通屏幕录制、图片/GIF 编辑和内置 GIF 导出不需要它们。
-- 目前仅导出 GIF，不录制音频。摄像头入口已实现，但物理设备验收尚未完成。
-- 已有隔离 GNOME/X11 的端到端录制与导出验证；物理 GNOME/KDE、混合 DPI、多显示器、长时间高分辨率录制和部分效果精度仍需继续验收。本项目尚未宣称完整一比一复刻或零缺陷。
-- 窄窗口放大至 150% 时，首页启动卡片可能文字重叠；恢复 100% 或放大窗口可缓解。编辑器已完成单页滚动与关键按钮可见性修复。
-
-按键/点击元数据采集默认关闭。开启后可能记录敏感输入，分享 `.gfsproj` 前请检查工程内容；GIF 不携带工程输入元数据，但已绘制的标注会出现在画面中。
-
-## 从源码运行
-
-需要 Rust 1.88 或更新版本，以及 [CI 列出的 Linux 开发库](.github/workflows/portable.yml)。在仓库根目录运行：
+Install Git, [Rust through rustup](https://rustup.rs/) (1.88 or newer) and native build tools. On Ubuntu 22.04 or newer:
 
 ```sh
-cargo run --locked -p gif-from-screen
-cargo run --locked -p gif-from-screen-cli -- doctor
+sudo apt-get update
+sudo apt-get install --yes build-essential pkg-config clang libclang-dev \
+  libpipewire-0.3-dev libwayland-dev libxkbcommon-dev \
+  libxkbcommon-x11-dev libxcb-shape0-dev libxcb-xfixes0-dev
 ```
 
-开发检查：
+```sh
+git clone https://github.com/tiansongyu/gifromscreen.git
+cd gifromscreen
+cargo run --locked -p gif-from-screen                    # Desktop app
+cargo run --locked -p gif-from-screen-cli -- doctor      # Environment diagnostics
+cargo build --release --locked -p gif-from-screen -p gif-from-screen-cli
+./target/release/gif-from-screen                        # Optimized build
+```
+
+Build dependencies and packaging checks are maintained in the [Linux CI](.github/workflows/ci.yml) and [portable workflow](.github/workflows/portable.yml).
+
+## Use
+
+1. **Record.** Open the screen recorder and choose a source and region. Resize before recording; pause and move the fixed-size region when needed. X11 uses a desktop recording frame. Wayland asks for sharing permission, then lets you crop within the authorized source.
+2. **Edit.** Stop recording to open the editor. Remove unwanted frames, adjust their timing, crop the image or add annotations. Use undo and redo to refine your changes.
+3. **Export.** Choose all or selected frames, set colors, looping, transparency and dithering, then export a GIF. Save the `.gfsproj` project to continue editing later.
+
+### Command line
+
+The portable package includes `bin/gif-from-screen-cli`; the installer also adds it to `~/.local/bin`.
+
+```sh
+gif-from-screen-cli doctor
+gif-from-screen-cli demo demo.gif
+gif-from-screen-cli sources-x11
+gif-from-screen-cli record-x11 capture.gif 3000 10        # Three seconds at 10 FPS
+gif-from-screen-cli export project.gfsproj output.gif
+gif-from-screen-cli export project.gfsproj selected.gif '1,3-5,9-7'
+```
+
+Run `gif-from-screen-cli --help` for command syntax. Export frame expressions are one-based; ranges preserve their written direction. CLI screen recording uses X11.
+
+## Features
+
+| Area | What you can do |
+| --- | --- |
+| Recording | Countdown, pause/resume, stop and save, or explicitly discard; continuous capture, periodic/manual snapshots and X11 interaction-triggered snapshots |
+| Frame editing | Select, reorder, cut/copy/paste, change delays, reduce frames, remove duplicates and create Yoyo loops |
+| Image editing | Crop, resize, rotate, flip and add fade or slide transitions |
+| Annotations | Captions, title frames, watermarks, shapes, freehand drawing, borders, shadows, progress, key/click/cursor annotations and editable layers |
+| Sources | Import GIF, PNG/JPEG/BMP/WebP, image sequences or video; create blank animations, record a drawing board or use the camera entry point |
+| Projects | Incremental recording saves, recovery of persisted frames, Save As, recent projects and reusable edit/export presets |
+
+The [shape canvas](docs/VECTOR-SHAPE-CANVAS.md) supports multiple shapes with selection, move, resize and rotation. Current projects use schema 8 and Vector v1. Detailed capability boundaries are recorded in [feature coverage](docs/FEATURE_MATRIX.md) and the [work summary](docs/WORK-STATUS.md).
+
+## Desktop support
+
+| Capability | X11 | Wayland |
+| --- | --- | --- |
+| Region selection | Desktop frame, numeric positioning, window picking and snapping | System Portal source selection, followed by preview cropping |
+| Movement during capture | Move a fixed-size desktop region | Move a fixed-size crop inside the authorized source |
+| Recorder controls | Separate from the recording region | Keep controls outside monitor captures |
+| Global shortcuts | Optional, configurable bindings | GlobalShortcuts Portal; desktop support and authorization required |
+| Input and cursor annotations | Optional key/button metadata and editable cursors | Embedded or hidden cursor; manual annotations available |
+
+Wayland source sharing, placement and refresh depend on the compositor and portal. A window source is usually easier to keep clear of recording controls. Occluded applications may stop repainting. [Linux status](docs/LINUX-STATUS.md).
+
+## Controls
+
+Global recorder shortcuts are **off by default**. Enable them in the recorder and customize the bindings there. They are active within the recorder scope; source selection and authorization still apply.
+
+| Default shortcut | Action |
+| --- | --- |
+| `Ctrl+Shift+F7` | Prepare the recorder, start when ready, or pause/resume recording |
+| `Ctrl+Shift+F8` | Cancel preparation/countdown, or stop and save |
+| `Ctrl+Shift+F9` | Capture a frame in manual-snapshot mode |
+
+Buttons remain available if shortcut registration fails. [Shortcut behavior and desktop requirements](docs/GLOBAL-SHORTCUTS.md).
+
+## Languages
+
+The app follows the system locale. Choose **Language** to save an override across restarts. English and Simplified Chinese cover the main recording and editing workflows; some forms, shared widgets and diagnostics remain untranslated. The other 27 language choices currently fall back to English. [Localization scope](docs/LOCALIZATION-PLAN.md).
+
+## Known limits
+
+- GIF is the only export format. Audio recording is not supported.
+- Camera recording has an entry point, but physical-device acceptance is pending.
+- Broader GNOME/KDE, physical multi-monitor and mixed-DPI setups, long high-resolution recordings and some effect-fidelity cases need further validation.
+- In v0.1.0, launcher text can overlap in narrow windows at 150% application zoom. Use 100% zoom or widen the window.
+
+Key/click metadata collection is off by default. If enabled, review projects for sensitive input before sharing. Exported GIFs omit project input metadata; visible annotations remain in the images.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidance and [CHANGELOG.md](CHANGELOG.md) for changes. To report a bug, include reproduction steps, the release tag or commit, Linux distribution, X11/Wayland session and monitor setup. Remove personal information from logs and sample projects.
+
+Run the applicable checks before submitting a code change:
 
 ```sh
 cargo fmt --all -- --check
@@ -110,8 +146,8 @@ cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo test --locked --workspace --all-targets --all-features
 ```
 
-## 参与和许可
+Website and installer maintenance are documented in [website/README.md](website/README.md).
 
-欢迎通过 [Issues](https://github.com/tiansongyu/gifromscreen/issues) 提交复现步骤，注明发行版、X11/Wayland、版本和是否涉及多显示器；提交日志或工程前请移除个人信息。见[贡献指南](CONTRIBUTING.md)、[版本记录](CHANGELOG.md)和[设计文档](docs/DESIGN.md)。当前已停止扩大本次发布范围；未完成事项集中保留在[工作总结](docs/WORK-STATUS.md)。
+## License
 
-本项目采用 [MIT](packaging/licenses/LICENSE-MIT) 或 [Apache-2.0](packaging/licenses/LICENSE-APACHE) 许可。它是独立实现，不使用 ScreenToGif 的品牌素材；部分数值算法按 dotnet/WPF 的 MIT 许可移植，第三方来源与许可见 [NOTICE](packaging/licenses/NOTICE.txt)。
+[MIT](packaging/licenses/LICENSE-MIT) or [Apache-2.0](packaging/licenses/LICENSE-APACHE), at your option. Some numerical algorithms are ported from dotnet/WPF under MIT; third-party sources and licenses are listed in [NOTICE](packaging/licenses/NOTICE.txt).
