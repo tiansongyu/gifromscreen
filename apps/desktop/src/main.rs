@@ -7045,6 +7045,7 @@ fn main() -> eframe::Result {
 fn native_options() -> eframe::NativeOptions {
     let mut options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
+        vsync: true,
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_NAME)
             .with_app_id(gif_from_screen_capture_linux::APPLICATION_ID)

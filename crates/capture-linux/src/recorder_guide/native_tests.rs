@@ -232,6 +232,21 @@ impl Fixture {
             .collect()
     }
 
+    fn mapped_strips(&self) -> Vec<Window> {
+        self.strips()
+            .into_iter()
+            .filter(|window| {
+                self.connection
+                    .get_window_attributes(*window)
+                    .unwrap()
+                    .reply()
+                    .unwrap()
+                    .map_state
+                    == MapState::VIEWABLE
+            })
+            .collect()
+    }
+
     fn keeper(&self) -> Window {
         let keepers: Vec<_> = self
             .windows()
@@ -406,7 +421,7 @@ impl Fixture {
     }
 
     fn assert_mapped_argb_strips(&self) -> u32 {
-        let strips = self.strips();
+        let strips = self.mapped_strips();
         assert_eq!(strips.len(), 5);
         let mut thin_strips = 0;
         let mut handles = 0;
@@ -544,11 +559,64 @@ fn request(
         border_width: 4,
         handle_scale: 100,
         handle_avoid: None,
+        resize_handles: false,
     }
 }
 
 fn region() -> PhysicalRect {
     PhysicalRect::new(80, 60, 120, 90).unwrap()
+}
+
+#[test]
+#[ignore = "measures native updates on a private Xvfb; never uses host DISPLAY"]
+fn private_xvfb_position_updates_wake_without_a_frame_poll_timer() {
+    let fixture = Fixture::new();
+    let mut guide = fixture.guide();
+    let (wake, receiver) = mpsc::sync_channel(1);
+    guide.set_repaint_callback(move || {
+        let _ = wake.try_send(());
+    });
+    let mut current = GuideRequest {
+        resize_handles: true,
+        ..request(1, Some(region()), None)
+    };
+    guide.request(current).unwrap();
+    await_ack(&mut guide, 1, true);
+    while receiver.try_recv().is_ok() {}
+    let mut timings = Vec::new();
+    for step in 0..120 {
+        current.generation += 1;
+        current.region = Some(PhysicalRect::new(80 + step % 40, 60 + step % 30, 120, 90).unwrap());
+        let started = Instant::now();
+        guide.request(current).unwrap();
+        loop {
+            let update = guide.poll();
+            assert!(
+                !matches!(update.status, GuideStatus::Failed(_)),
+                "{:?}",
+                update.status
+            );
+            if update
+                .ack
+                .is_some_and(|ack| ack.generation == current.generation)
+            {
+                break;
+            }
+            receiver
+                .recv_timeout(Duration::from_secs(3))
+                .expect("native ACK must wake the UI without timer polling");
+        }
+        timings.push(started.elapsed());
+    }
+    timings.sort_unstable();
+    eprintln!(
+        "120 native guide moves: median {:?}, p95 {:?}; 60 Hz budget {:?}",
+        timings[60],
+        timings[114],
+        Duration::from_secs_f64(1.0 / 60.0)
+    );
+    stop(&mut guide);
+    fixture.assert_cleanup();
 }
 
 fn await_ack(guide: &mut RecorderGuide, generation: u64, visible: bool) -> Vec<GuidePointerEvent> {
@@ -702,7 +770,7 @@ fn private_xvfb_ring_preserves_capture_pixels_shapes_clickthrough_and_owned_clea
     guide.request(request(1, Some(protected), None)).unwrap();
     await_ack(&mut guide, 1, true);
     let windows = fixture.windows();
-    assert_eq!(windows.len(), 6);
+    assert_eq!(windows.len(), 10);
     fixture.keeper();
     let colormap = fixture.assert_mapped_argb_strips();
     assert_eq!(
@@ -972,7 +1040,7 @@ fn private_xvfb_signed_positions_full_root_and_explicit_hide_never_cover_capture
     guide.request(request(1, Some(signed), None)).unwrap();
     await_ack(&mut guide, 1, true);
     let windows = fixture.strips();
-    assert_eq!(windows.len(), 5);
+    assert_eq!(windows.len(), 9);
     assert_shapes_outside(&fixture, &windows, &[signed]);
     assert!(
         fixture.pixels(visible_capture) == baseline,
@@ -1220,5 +1288,111 @@ fn private_xvfb_stopping_an_idle_guide_does_not_ungrab_another_client() {
         .check()
         .unwrap();
     fixture.assert_pointer_free();
+    fixture.assert_cleanup();
+}
+
+#[test]
+#[ignore = "starts a supervised private Xvfb; never uses host DISPLAY"]
+fn private_xvfb_four_resize_handles_route_drags_and_update_without_unmapping() {
+    let fixture = Fixture::new();
+    let mut guide = fixture.guide();
+    let initial = region();
+    let baseline = fixture.pixels(initial);
+    let mut current = GuideRequest {
+        resize_handles: true,
+        ..request(1, Some(initial), None)
+    };
+    guide.request(current).unwrap();
+    await_ack(&mut guide, 1, true);
+    assert_eq!(fixture.mapped_strips().len(), 9);
+    assert_eq!(fixture.pixels(initial), baseline);
+    assert_shapes_outside(&fixture, &fixture.windows(), &[initial]);
+    for ((x, y), edge) in [
+        ((70, 50), GuideEdge::TopLeft),
+        ((210, 50), GuideEdge::TopRight),
+        ((210, 160), GuideEdge::BottomRight),
+        ((70, 160), GuideEdge::BottomLeft),
+    ] {
+        fixture.motion(x, y);
+        fixture.button(1, true);
+        let events = await_event(&mut guide, |event| {
+            matches!(event,
+            GuidePointerEvent::Pressed { edge: actual, .. } if *actual == edge)
+        });
+        let id = pressed_id(&events, current.generation);
+        fixture.motion(x + 4, y + 3);
+        await_event(&mut guide, |event| {
+            matches!(event,
+            GuidePointerEvent::Moved { gesture_id, .. } if *gesture_id == id)
+        });
+        fixture.button(1, false);
+        await_event(&mut guide, |event| {
+            matches!(event,
+            GuidePointerEvent::Released { gesture_id, .. } if *gesture_id == id)
+        });
+        fixture.assert_pointer_free();
+    }
+    // Observe native structure events on these owned windows to catch flicker
+    // regressions: ready-mode movement must not unmap/remap the entire ring.
+    for window in fixture.strips() {
+        fixture
+            .connection
+            .shape_select_input(window, true)
+            .unwrap()
+            .check()
+            .unwrap();
+        fixture
+            .connection
+            .change_window_attributes(
+                window,
+                &x11rb::protocol::xproto::ChangeWindowAttributesAux::new()
+                    .event_mask(EventMask::STRUCTURE_NOTIFY),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+    }
+    fixture.drain_events();
+    fixture.motion(140, 38);
+    fixture.button(1, true);
+    await_event(&mut guide, |event| {
+        matches!(
+            event,
+            GuidePointerEvent::Pressed {
+                edge: GuideEdge::Move,
+                ..
+            }
+        )
+    });
+    let started = Instant::now();
+    for step in 1..=40 {
+        let moved = PhysicalRect::new(80 + step, 60 + step, 120, 90).unwrap();
+        current.generation += 1;
+        current.region = Some(moved);
+        guide.request(current).unwrap();
+        await_ack(&mut guide, current.generation, true);
+        assert_shapes_outside(&fixture, &fixture.windows(), &[moved]);
+    }
+    eprintln!(
+        "40 owned-Xvfb guide updates with acknowledgements and shape checks: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        !fixture
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event, Event::UnmapNotify(_) | Event::ShapeNotify(_)))
+    );
+    fixture.button(1, false);
+    await_event(&mut guide, |event| {
+        matches!(event, GuidePointerEvent::Released { .. })
+    });
+    fixture.assert_pointer_free();
+    current.generation += 1;
+    current.resize_handles = false;
+    guide.request(current).unwrap();
+    await_ack(&mut guide, current.generation, true);
+    assert_eq!(fixture.mapped_strips().len(), 5);
+    stop(&mut guide);
     fixture.assert_cleanup();
 }

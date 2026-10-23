@@ -44,6 +44,8 @@ pub struct GuideRequest {
     pub handle_scale: u16,
     /// Owned controller bounds the handle must avoid; never changes capture pixels.
     pub handle_avoid: Option<PhysicalRect>,
+    /// Show four resize handles only while the recording canvas is editable.
+    pub resize_handles: bool,
 }
 
 impl fmt::Debug for GuideRequest {
@@ -204,6 +206,7 @@ pub struct GuideUpdate {
 }
 
 struct Shared {
+    repaint: Option<Arc<dyn Fn() + Send + Sync>>,
     request: Option<GuideRequest>,
     generation: u64,
     status: GuideStatus,
@@ -218,9 +221,18 @@ struct Shared {
 struct Context {
     shared: Arc<Mutex<Shared>>,
     cancel: Arc<AtomicBool>,
+    #[cfg(all(target_os = "linux", feature = "native-x11"))]
+    wake: Option<Arc<native::WakeSignal>>,
 }
 
 impl Context {
+    fn notify_worker(&self) {
+        #[cfg(all(target_os = "linux", feature = "native-x11"))]
+        if let Some(wake) = &self.wake {
+            wake.notify();
+        }
+    }
+
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Acquire)
     }
@@ -273,6 +285,11 @@ impl Context {
         if !self.cancelled() && shared.generation == ack.generation {
             shared.ack = Some(ack);
             shared.status = GuideStatus::Ready;
+        }
+        let repaint = shared.repaint.clone();
+        drop(shared);
+        if let Some(repaint) = repaint {
+            repaint();
         }
     }
 
@@ -356,6 +373,11 @@ impl Context {
                 shared.active_gesture = None;
             }
         }
+        let repaint = shared.repaint.clone();
+        drop(shared);
+        if let Some(repaint) = repaint {
+            repaint();
+        }
     }
 }
 
@@ -419,10 +441,14 @@ impl RecorderGuide {
         }
         #[cfg(all(target_os = "linux", feature = "native-x11"))]
         {
-            let context = new_context();
+            let mut context = new_context();
+            context.wake = Some(Arc::new(native::WakeSignal::new().map_err(|error| {
+                format!("Could not create recorder guide notification pipe: {error}")
+            })?));
             let worker = Context {
                 shared: Arc::clone(&context.shared),
                 cancel: Arc::clone(&context.cancel),
+                wake: context.wake.clone(),
             };
             let (sender, result) = mpsc::sync_channel(1);
             thread::Builder::new()
@@ -437,6 +463,16 @@ impl RecorderGuide {
                 result: Some(result),
             })
         }
+    }
+
+    /// Wakes the UI when native pointer input or an acknowledgement arrives.
+    /// The callback runs outside the state lock and must return promptly.
+    pub fn set_repaint_callback(&self, callback: impl Fn() + Send + Sync + 'static) {
+        self.context
+            .shared
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .repaint = Some(Arc::new(callback));
     }
 
     /// Coalesces pending updates; an older request may be superseded without an ACK.
@@ -466,6 +502,8 @@ impl RecorderGuide {
             generation: request.generation,
         };
         shared.request = Some(request);
+        drop(shared);
+        self.context.notify_worker();
         Ok(())
     }
 
@@ -473,6 +511,7 @@ impl RecorderGuide {
     /// Native pointer ungrab is asynchronous and bounded; later presses get new ids.
     pub fn cancel_gesture(&self) {
         self.context.cancel_gesture();
+        self.context.notify_worker();
     }
 
     /// Immediately suppresses input. Native destruction finishes asynchronously.
@@ -492,6 +531,8 @@ impl RecorderGuide {
         if self.result.is_some() {
             shared.status = GuideStatus::Stopping;
         }
+        drop(shared);
+        self.context.notify_worker();
     }
 
     /// True until poll observes the worker's completed cleanup.
@@ -556,6 +597,7 @@ impl Drop for RecorderGuide {
 fn new_context() -> Context {
     Context {
         shared: Arc::new(Mutex::new(Shared {
+            repaint: None,
             request: None,
             generation: 0,
             status: GuideStatus::Starting,
@@ -567,5 +609,7 @@ fn new_context() -> Context {
             cancel_epoch: 0,
         })),
         cancel: Arc::new(AtomicBool::new(false)),
+        #[cfg(all(target_os = "linux", feature = "native-x11"))]
+        wake: None,
     }
 }

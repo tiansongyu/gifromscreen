@@ -13,6 +13,7 @@ import os
 from pathlib import Path, PurePosixPath
 import platform
 import re
+import runpy
 import shlex
 import shutil
 import subprocess
@@ -101,17 +102,81 @@ def extract_checked(archive, destination, root_name):
     return bundle
 
 
+def installed_version(prefix):
+    receipt = prefix / "lib/gifromscreen/BUILD-INFO.json"
+    if not receipt.exists():
+        return None
+    if receipt.is_symlink() or receipt.stat().st_size > 1024 * 1024:
+        raise ValueError("invalid installed build receipt: " + str(receipt))
+    version = json.loads(receipt.read_text(encoding="utf-8")).get("package_version")
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise ValueError("cannot identify the installed version; keep the existing installation")
+    return version
+
+
+def install_bundle(bundle, prefix):
+    manifest = prefix / "lib/gifromscreen/install-manifest.json"
+    if not manifest.exists():
+        subprocess.run([sys.executable, str(bundle / "installer.py"), "install", "--prefix", str(prefix)], check=True)
+        return
+    # Use the newly verified package's ownership checks; never run arbitrary
+    # code from an existing installation to remove files.
+    package = runpy.run_path(str(bundle / "installer.py"))
+    previous = package["load_manifest"](prefix)
+    package["check_installed"](prefix, previous)
+    planned = package["installation_files"](bundle, prefix)
+    if package["manifest_records"](planned) == previous:
+        print("The identical package is already installed; no files changed.")
+        return
+    for name in planned:
+        if name not in previous and os.path.lexists(prefix / name):
+            raise ValueError("refusing to overwrite an existing file: " + str(prefix / name))
+    backup = Path(tempfile.mkdtemp(prefix="gifromscreen-upgrade-backup-"))
+    try:
+        for name in previous:
+            path = PurePosixPath(name)
+            if path.parts[:2] == ("lib", "gifromscreen"):
+                relative = Path(*path.parts[2:])
+                target = backup / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(prefix / name, target)
+        package["verify_bundle"](backup)
+    except Exception:
+        shutil.rmtree(backup)
+        raise
+    try:
+        package["uninstall"](prefix)
+        try:
+            package["install"](bundle, prefix)
+        except Exception:
+            package["install"](backup, prefix)
+            raise
+    except Exception as error:
+        # Retain a verified copy if either replacement or rollback fails.
+        raise OSError("upgrade failed; previous package retained at " + str(backup) + ": " + str(error)) from error
+    shutil.rmtree(backup)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Install an official GifFromScreen Linux release.")
     parser.add_argument("--version", help="release version; defaults to the latest stable release")
+    parser.add_argument("--allow-downgrade", action="store_true", help="explicitly allow replacing a newer installed version")
     parser.add_argument("--prefix", default=os.environ.get("GIFROMSCREEN_PREFIX", str(Path.home() / ".local")),
                         help="absolute installation prefix (default: ~/.local)")
     args = parser.parse_args()
     check_platform()
-    prefix = Path(args.prefix).expanduser()
-    if not prefix.is_absolute():
+    prefix = Path(os.path.abspath(Path(args.prefix).expanduser()))
+    if not Path(args.prefix).expanduser().is_absolute():
         raise ValueError("--prefix must be an absolute path")
+    if prefix in (Path("/"), Path.home()) or any(ord(char) < 32 for char in str(prefix)):
+        raise ValueError("choose a dedicated installation prefix")
     tag = release_version(args.version)
+    current = installed_version(prefix)
+    target_numbers = tuple(map(int, tag[1:].split("-", 1)[0].split(".")))
+    if current and tuple(map(int, current.split("."))) > target_numbers and not args.allow_downgrade:
+        print("Installed GifFromScreen " + current + " is newer than release " + tag + ". Keeping the installed version.")
+        print("No files changed. Use --allow-downgrade only if you intend to install the older release.")
+        return
     root_name = "gifromscreen-" + tag[1:] + "-linux-x86_64"
     filename = root_name + ".tar.gz"
     print("Downloading GifFromScreen " + tag + " for Linux x86_64...", flush=True)
@@ -125,7 +190,7 @@ def main():
         verify_checksum(archive, checksum)
         print("SHA-256 verified. Installing to " + str(prefix), flush=True)
         bundle = extract_checked(archive, work / "unpacked", root_name)
-        subprocess.run([sys.executable, str(bundle / "installer.py"), "install", "--prefix", str(prefix)], check=True)
+        install_bundle(bundle, prefix)
     print("\nInstalled GifFromScreen " + tag + ". Launch it from your applications menu or run:")
     print("  " + shlex.quote(str(prefix / "bin/gif-from-screen")))
     if str(prefix / "bin") not in os.environ.get("PATH", "").split(os.pathsep):

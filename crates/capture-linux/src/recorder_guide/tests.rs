@@ -9,6 +9,7 @@ fn request(generation: u64) -> GuideRequest {
         border_width: 4,
         handle_scale: 100,
         handle_avoid: None,
+        resize_handles: false,
     }
 }
 
@@ -21,6 +22,34 @@ fn service() -> (RecorderGuide, mpsc::SyncSender<Result<(), String>>) {
         },
         send,
     )
+}
+
+#[test]
+fn native_input_and_ack_wake_ui_after_releasing_the_state_lock() {
+    use std::sync::atomic::AtomicUsize;
+    let (guide, _send) = service();
+    let shared = Arc::clone(&guide.context.shared);
+    let count = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&count);
+    guide.set_repaint_callback(move || {
+        assert!(
+            shared.try_lock().is_ok(),
+            "repaint callbacks must not hold the guide lock"
+        );
+        observed.fetch_add(1, Ordering::SeqCst);
+    });
+    guide.request(request(1)).unwrap();
+    guide.context.acknowledge(GuideAck {
+        generation: 1,
+        visible: true,
+    });
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    let id = guide.context.begin_gesture(1, 0).unwrap().unwrap();
+    guide.context.event(GuidePointerEvent::Moved {
+        gesture_id: id,
+        position: PhysicalPosition { x: 100, y: 100 },
+    });
+    assert_eq!(count.load(Ordering::SeqCst), 2);
 }
 
 #[test]
@@ -386,4 +415,55 @@ fn a_new_guide_never_reuses_an_old_recording_gesture_identity() {
         .event(GuidePointerEvent::Cancelled { gesture_id: old_id });
     assert!(new.poll().events.is_empty());
     assert!(new.context.active_gesture(new_id));
+}
+
+#[test]
+fn resize_targets_stay_outside_capture_at_all_scales_and_edges() {
+    let root = PhysicalSize::new(800, 600).unwrap();
+    for scale in [100, 150, 200, 400] {
+        let mut request = request(1);
+        request.region = Some(PhysicalRect::new(200, 200, 320, 240).unwrap());
+        request.resize_handles = true;
+        request.handle_scale = scale;
+        let handles = geometry::resize_handles(request, root);
+        assert!(handles.iter().all(Option::is_some));
+        for handle in handles.into_iter().flatten() {
+            assert!(geometry::intersection(handle.rect, request.region.unwrap()).is_none());
+            assert_eq!(
+                handle.rect.size().width(),
+                (20 * u32::from(scale)).div_ceil(100)
+            );
+        }
+        request.region = Some(PhysicalRect::new(0, 0, 320, 240).unwrap());
+        assert_eq!(
+            geometry::resize_handles(request, root)
+                .iter()
+                .flatten()
+                .count(),
+            1
+        );
+        request.protected_region = Some(PhysicalRect::new(0, 0, 800, 600).unwrap());
+        assert!(
+            geometry::resize_handles(request, root)
+                .iter()
+                .all(Option::is_none)
+        );
+        request.protected_region = None;
+        request.handle_avoid = Some(PhysicalRect::new(0, 0, 800, 600).unwrap());
+        assert_eq!(
+            geometry::resize_handles(request, root)
+                .iter()
+                .flatten()
+                .count(),
+            1,
+            "ready-only corners stay reachable over a fallback controller"
+        );
+        request.handle_avoid = None;
+        request.resize_handles = false;
+        assert!(
+            geometry::resize_handles(request, root)
+                .iter()
+                .all(Option::is_none)
+        );
+    }
 }

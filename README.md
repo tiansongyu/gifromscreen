@@ -21,21 +21,21 @@ Linux x86_64:
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/tiansongyu/gifromscreen/releases/latest/download/gifromscreen-installer.sh | sh
 ```
 
-Launch **GifFromScreen** from your applications menu, or run `gif-from-screen` with `~/.local/bin` on your `PATH`. The installer downloads the latest stable release, verifies its SHA-256 checksum and adds the desktop app and CLI under `~/.local`. Python 3.8+ is required; Rust and administrator access are not. It leaves shell configuration unchanged. For a different installed version, save your projects and run its uninstaller before installing again; [installation and removal](docs/PACKAGING.md#installation-and-removal).
+Launch **GifFromScreen** from your applications menu, or run `gif-from-screen` with `~/.local/bin` on your `PATH`. The installer downloads the latest stable release, verifies its SHA-256 checksum and adds the desktop app and CLI under `~/.local`. Python 3.8+ is required; Rust and administrator access are not. It leaves shell configuration unchanged. Upgrades verify the existing installation and preserve a rollback copy before replacing application files; modified files are left untouched. Newer local versions are kept unless `--allow-downgrade` is explicitly supplied; [installation and removal](docs/PACKAGING.md#installation-and-removal).
 
-Prefer a portable download? Get the [v0.1.0 archive](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0/gifromscreen-0.1.0-linux-x86_64.tar.gz) and its [SHA-256 file](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0/gifromscreen-0.1.0-linux-x86_64.tar.gz.sha256), then run these commands in the download directory:
+Prefer a portable download? Get the [v0.1.3 archive](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.3/gifromscreen-0.1.3-linux-x86_64.tar.gz) and its [SHA-256 file](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.3/gifromscreen-0.1.3-linux-x86_64.tar.gz.sha256), then run these commands in the download directory:
 
 ```sh
-sha256sum --check gifromscreen-0.1.0-linux-x86_64.tar.gz.sha256
-tar -xzf gifromscreen-0.1.0-linux-x86_64.tar.gz
-cd gifromscreen-0.1.0-linux-x86_64
+sha256sum --check gifromscreen-0.1.3-linux-x86_64.tar.gz.sha256
+tar -xzf gifromscreen-0.1.3-linux-x86_64.tar.gz
+cd gifromscreen-0.1.3-linux-x86_64
 sha256sum --check SHA256SUMS
 ./bin/gif-from-screen
 ```
 
 Release packages target **Linux x86_64, Ubuntu 22.04 / glibc 2.35+**, with an X11 or Wayland desktop and a working OpenGL ES or Vulkan driver. Wayland capture needs PipeWire and your desktop's xdg-desktop-portal backend. System `ffmpeg` and `ffprobe` are optional dependencies for video import. Packages are unsigned; checksums detect download corruption. [System libraries](packaging/linux/README.txt).
 
-The published stable package is **v0.1.0**; the source workspace is **0.1.2**. Source builds include the [recording-frame drag grip](docs/RECORDER-DRAG-HANDLE.md) and [graphics startup fix](docs/GRAPHICS-BACKEND-STARTUP.md), which are absent from the v0.1.0 archive. [Development artifacts](https://github.com/tiansongyu/gifromscreen/actions/workflows/portable.yml) require GitHub sign-in and expire after 30 days.
+The stable package and source workspace are **0.1.3**. This release includes event-driven X11 guide updates, VSync-paced dragging, reusable border windows and automatic installer upgrades. See the [release notes](docs/releases/v0.1.3.md) and [drag scheduling details](docs/RECORDER-DRAG-CADENCE.md). [Development artifacts](https://github.com/tiansongyu/gifromscreen/actions/workflows/portable.yml) require GitHub sign-in and expire after 30 days.
 
 If v0.1.0 fails on X11/NVIDIA with `incompatible_surface_backends: Backends(GL)`, launch it with `WGPU_BACKEND=vulkan ./bin/gif-from-screen` from the portable directory, or `WGPU_BACKEND=vulkan gif-from-screen` after installation.
 

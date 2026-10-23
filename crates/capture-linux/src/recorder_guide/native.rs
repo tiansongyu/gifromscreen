@@ -1,5 +1,3 @@
-use std::{thread, time::Duration};
-
 use gif_from_screen_capture::{PhysicalPosition, PhysicalRect, PhysicalSize};
 use x11rb::{
     connection::Connection,
@@ -27,9 +25,13 @@ mod argb;
 mod controller;
 mod gesture;
 mod handle;
+mod translation;
+mod wakeup;
+pub(super) use wakeup::WakeSignal;
 
 const HANDLE_INDEX: usize = 4;
-const WINDOW_COUNT: usize = 5;
+const CORNER_INDEX: usize = 5;
+const WINDOW_COUNT: usize = 9;
 
 pub(super) fn run(
     display: Option<&str>,
@@ -95,6 +97,8 @@ pub(super) fn run(
         handle_rect: None,
         handle_gc: None,
         handle_cursor: None,
+        corner_rects: [None; 4],
+        corner_cursors: [None; 4],
         event_floor: 0,
         gesture: None,
         cancel_epoch: 0,
@@ -104,6 +108,9 @@ pub(super) fn run(
     if interactive {
         // A missing cursor font must not prevent recording; the large grip remains.
         let _ = owned.create_handle_cursor();
+        for (index, glyph) in [134, 136, 14, 12].into_iter().enumerate() {
+            owned.corner_cursors[index] = owned.create_cursor(glyph).ok();
+        }
     }
     for _ in 0..if interactive {
         WINDOW_COUNT
@@ -136,6 +143,8 @@ struct Windows<'a, 'c> {
     handle_rect: Option<PhysicalRect>,
     handle_gc: Option<Gcontext>,
     handle_cursor: Option<Cursor>,
+    corner_rects: [Option<PhysicalRect>; 4],
+    corner_cursors: [Option<Cursor>; 4],
     event_floor: u64,
     gesture: Option<gesture::Gesture>,
     cancel_epoch: u64,
@@ -149,6 +158,9 @@ impl Windows<'_, '_> {
         mut observer: Option<controller::ControllerObserver>,
     ) -> Result<(), String> {
         while !context.cancelled() {
+            if let Some(wake) = &context.wake {
+                wake.drain();
+            }
             self.service_gesture(context)?;
             if let Some(request) = context.request() {
                 self.connection.stream().begin_operation();
@@ -159,11 +171,21 @@ impl Windows<'_, '_> {
                     visible,
                 });
             }
-            self.events(context)?;
             if let Some(observer) = &mut observer {
                 observer.update(self.connection, self.root, context)?;
             }
-            thread::sleep(Duration::from_millis(10));
+            // Drain events after replies/observations too: x11rb may already
+            // have buffered pointer events while waiting for those replies.
+            if self.events(context)? {
+                continue;
+            }
+            self.connection.flush().map_err(native_error)?;
+            if let Some(wake) = &context.wake {
+                self.connection
+                    .stream()
+                    .wait_for_input(&wake.reader)
+                    .map_err(native_error)?;
+            }
         }
         Ok(())
     }
@@ -181,7 +203,8 @@ impl Windows<'_, '_> {
 
     fn create(&mut self, visual: argb::ArgbVisual) -> Result<(), String> {
         let id = self.connection.generate_id().map_err(native_error)?;
-        let is_handle = self.ids.len() == HANDLE_INDEX;
+        let index = self.ids.len();
+        let is_handle = index >= HANDLE_INDEX;
         let mut attributes = CreateWindowAux::new()
             .override_redirect(1)
             .background_pixel(visual.pixel)
@@ -199,7 +222,14 @@ impl Windows<'_, '_> {
                         EventMask::NO_EVENT
                     },
             );
-        if is_handle && let Some(cursor) = self.handle_cursor {
+        let cursor = if index >= CORNER_INDEX {
+            self.corner_cursors[index - CORNER_INDEX]
+        } else if is_handle {
+            self.handle_cursor
+        } else {
+            None
+        };
+        if let Some(cursor) = cursor {
             attributes = attributes.cursor(cursor);
         }
         self.connection
@@ -227,15 +257,27 @@ impl Windows<'_, '_> {
 
     fn apply(&mut self, request: GuideRequest, context: &Context) -> Result<bool, String> {
         self.check_root()?;
-        for id in &self.ids {
-            self.connection
-                .unmap_window(*id)
-                .map_err(native_error)?
-                .check()
-                .map_err(native_error)?;
+        if self.interactive && self.translate(request)? {
+            return Ok(true);
+        }
+        let keep_mapped = request.resize_handles
+            && request.protected_region.is_none()
+            && self
+                .current
+                .is_some_and(|old| old.resize_handles && old.protected_region.is_none());
+        let previously_visible = self.visible;
+        if !keep_mapped {
+            for id in &self.ids {
+                self.connection
+                    .unmap_window(*id)
+                    .map_err(native_error)?
+                    .check()
+                    .map_err(native_error)?;
+            }
         }
         self.visible = [false; WINDOW_COUNT];
         self.handle_rect = None;
+        self.corner_rects = [None; 4];
         let region = request
             .region
             .filter(|region| !geometry::covers_root(*region, self.root_size));
@@ -270,6 +312,7 @@ impl Windows<'_, '_> {
             } else if let Some(id) = self.ids.get(HANDLE_INDEX) {
                 self.shapes(*id, None, None)?;
             }
+            self.configure_corners(request)?;
         } else {
             for id in &self.ids {
                 self.shapes(*id, None, None)?;
@@ -280,13 +323,21 @@ impl Windows<'_, '_> {
         }
         for (index, id) in self.ids.iter().enumerate() {
             if self.visible[index] {
+                if !keep_mapped || !previously_visible[index] {
+                    self.connection
+                        .map_window(*id)
+                        .map_err(native_error)?
+                        .check()
+                        .map_err(native_error)?;
+                }
                 self.connection
-                    .map_window(*id)
+                    .configure_window(*id, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))
                     .map_err(native_error)?
                     .check()
                     .map_err(native_error)?;
+            } else if keep_mapped && previously_visible[index] {
                 self.connection
-                    .configure_window(*id, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))
+                    .unmap_window(*id)
                     .map_err(native_error)?
                     .check()
                     .map_err(native_error)?;
@@ -298,6 +349,26 @@ impl Windows<'_, '_> {
         self.check_root()?;
         self.current = Some(request);
         Ok(self.visible.iter().any(|visible| *visible))
+    }
+
+    fn configure_corners(&mut self, request: GuideRequest) -> Result<(), String> {
+        if self.interactive {
+            for (corner, handle) in geometry::resize_handles(request, self.root_size)
+                .into_iter()
+                .enumerate()
+            {
+                let index = CORNER_INDEX + corner;
+                if let Some(handle) = handle {
+                    self.configure(index, handle, Some(handle.rect), None)?;
+                    self.corner_rects[corner] = Some(handle.rect);
+                    self.visible[index] = true;
+                    self.paint_corner(corner)?;
+                } else {
+                    self.shapes(self.ids[index], None, None)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn configure(
@@ -393,7 +464,7 @@ impl Windows<'_, '_> {
         check_root_dimensions(root.width, root.height, self.root_size)
     }
 
-    fn events(&mut self, context: &Context) -> Result<(), String> {
+    fn events(&mut self, context: &Context) -> Result<bool, String> {
         for _ in 0..128 {
             if context.cancelled() {
                 break;
@@ -403,11 +474,27 @@ impl Windows<'_, '_> {
                 .poll_for_event_with_sequence()
                 .map_err(native_error)?
             else {
-                break;
+                return Ok(false);
             };
             // The sequence floor filters stale POINTER coordinates only. Never
             // discard a root/lifetime failure that happened during an update.
             match &event {
+                Event::Expose(event)
+                    if event.count == 0
+                        && self
+                            .ids
+                            .iter()
+                            .skip(CORNER_INDEX)
+                            .any(|id| *id == event.window) =>
+                {
+                    if let Some(index) = self.ids.iter().position(|id| *id == event.window)
+                        && self.visible[index]
+                    {
+                        self.connection.stream().begin_operation();
+                        self.paint_corner(index - CORNER_INDEX)?;
+                        self.connection.stream().registration_complete();
+                    }
+                }
                 Event::Expose(event)
                     if self.ids.get(HANDLE_INDEX) == Some(&event.window)
                         && event.count == 0
@@ -439,7 +526,7 @@ impl Windows<'_, '_> {
                 self.pointer_event(&event, sequence, context)?;
             }
         }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -454,6 +541,9 @@ impl Drop for Windows<'_, '_> {
         }
         if let Some(cursor) = self.handle_cursor {
             let _ = self.connection.free_cursor(cursor);
+        }
+        for cursor in self.corner_cursors.iter().flatten() {
+            let _ = self.connection.free_cursor(*cursor);
         }
         for id in &self.ids {
             let _ = self.connection.destroy_window(*id);
@@ -502,6 +592,14 @@ fn local(rect: PhysicalRect, strip: PhysicalRect) -> Result<Rectangle, String> {
 }
 
 fn hit_edge(index: usize, point: PhysicalPosition, region: PhysicalRect) -> GuideEdge {
+    if index >= CORNER_INDEX {
+        return [
+            GuideEdge::TopLeft,
+            GuideEdge::TopRight,
+            GuideEdge::BottomRight,
+            GuideEdge::BottomLeft,
+        ][index - CORNER_INDEX];
+    }
     if index == HANDLE_INDEX {
         return GuideEdge::Move;
     }

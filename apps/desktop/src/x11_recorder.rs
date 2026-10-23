@@ -1,7 +1,9 @@
 //! Physical X11 selection and a separate native border/control window.
 
+mod desktop_space;
 #[cfg(test)]
 mod tests;
+use desktop_space::{desktop_capture_source, monitor_workareas, prefer_region_monitor};
 
 use std::time::{Duration, Instant};
 
@@ -109,6 +111,7 @@ impl RecorderOverlay {
 
     pub(super) fn ready(&self) -> bool {
         self.initialized
+            && self.gesture.is_none()
             && !self.snap.is_pending()
             && !self.snap.is_closing()
             && (self.guide.is_none() || self.controller_geometry.is_some())
@@ -161,7 +164,7 @@ impl RecorderOverlay {
             })
     }
 
-    fn update_guide(&mut self, protected_region: Option<PhysicalRect>) {
+    fn update_guide(&mut self, protected_region: Option<PhysicalRect>, stage: RecorderStage) {
         if self.failure.is_some() {
             return;
         }
@@ -173,11 +176,13 @@ impl RecorderOverlay {
         let protected_region = protected_region.filter(|protected| Some(*protected) != region);
         let handle_avoid = self.controller_geometry.map(|geometry| geometry.outer);
         let handle_scale = drag_handle_scale(self.last_scale);
+        let resize_handles = stage.allows_resizing() && !self.geometry.size_is_frozen();
         if self.request.is_some_and(|request| {
             request.region == region
                 && request.protected_region == protected_region
                 && request.handle_avoid == handle_avoid
                 && request.handle_scale == handle_scale
+                && request.resize_handles == resize_handles
         }) {
             return;
         }
@@ -195,6 +200,7 @@ impl RecorderOverlay {
             border_width: 4,
             handle_scale,
             handle_avoid,
+            resize_handles,
         };
         self.acknowledged = None;
         self.settle = None;
@@ -205,6 +211,15 @@ impl RecorderOverlay {
             return;
         }
         self.request = Some(request);
+    }
+
+    fn update_capture_guide(&mut self, job: Option<&RecordingJob>, stage: RecorderStage) {
+        let protected = job.and_then(|job| {
+            job.retarget
+                .as_ref()
+                .and_then(|retarget| global_region(self.geometry.source(), retarget.plan.applied()))
+        });
+        self.update_guide(protected, stage);
     }
 
     fn poll_guide(&mut self, stage: RecorderStage) {
@@ -285,6 +300,19 @@ impl RecorderOverlay {
     }
 
     fn place(&mut self, context: &egui::Context, native: NativeWindow, now: Instant) {
+        // Moving an egui toplevel on every pointer sample makes the WM/compositor
+        // part of the drag loop. Keep controls stationary until release; capture
+        // remains paused if a moving selection approaches the controls.
+        if self.gesture.is_some()
+            && self.last_scale.to_bits() == native.pixels_per_point.to_bits()
+            && matches!(
+                self.window_state,
+                WindowState::Ready { .. } | WindowState::Hidden
+            )
+        {
+            return;
+        }
+        prefer_region_monitor(&mut self.workareas, self.geometry.region());
         let scale = native.pixels_per_point;
         let area = self
             .workareas
@@ -535,20 +563,10 @@ impl GifFromScreenApp {
             height,
         )
         .map_err(|error| error.to_string())?;
-        let geometry = RecorderGeometry::new(source, region)?;
-        let mut workareas = self
-            .sources
-            .iter()
-            .filter(|source| source.kind() == gif_from_screen_capture::CaptureSourceKind::Monitor)
-            .filter_map(gif_from_screen_capture::CaptureSource::geometry)
-            .take(32)
-            .collect::<Vec<_>>();
-        if workareas.is_empty() {
-            workareas.push(source);
-        }
-        if let Some(index) = workareas.iter().position(|area| *area == source) {
-            workareas.swap(0, index);
-        }
+        let capture_index = desktop_capture_source(&self.sources, self.selected_source);
+        let capture_bounds = self.sources[capture_index].geometry().unwrap_or(source);
+        let geometry = RecorderGeometry::new(capture_bounds, region)?;
+        let workareas = monitor_workareas(&self.sources, source);
         let guide = if context.embed_viewports() {
             None
         } else {
@@ -560,19 +578,27 @@ impl GifFromScreenApp {
             )?)
         };
         let mut overlay = RecorderOverlay::new(geometry, workareas, guide, scale);
+        if let Some(guide) = &overlay.guide {
+            let context = context.clone();
+            guide.set_repaint_callback(move || context.request_repaint());
+        }
         if self.sources[self.selected_source].kind()
             == gif_from_screen_capture::CaptureSourceKind::Monitor
         {
             overlay.snap.set_candidates(&self.sources);
         }
+        // Use one root source for the complete recording, including retargets.
+        // Changing only drag bounds would still fail in the capture backend.
+        self.selected_source = capture_index;
+        apply_overlay_region(
+            &mut self.settings,
+            RecorderStage::Ready,
+            geometry.source_local_region()?,
+        );
         self.recorder_overlay = Some(overlay);
         self.main_window_snapshot = Some(snapshot);
         self.pending_recorder_start = None;
-        self.notice = Some(Notice::localized(
-            localizer,
-            Message::RecorderBorderDragHint,
-            &[],
-        ));
+        self.notice = None;
         context.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
         context.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
             egui::WindowLevel::AlwaysOnTop,
@@ -625,11 +651,7 @@ impl GifFromScreenApp {
         let may_place = prepare_change(&mut overlay, self.job.as_mut(), native, now);
         if may_place {
             overlay.place(context, native, now);
-            overlay.update_guide(self.job.as_ref().and_then(|job| {
-                job.retarget.as_ref().and_then(|retarget| {
-                    global_region(overlay.geometry.source(), retarget.plan.applied())
-                })
-            }));
+            overlay.update_capture_guide(self.job.as_ref(), stage);
         }
         let hidden = matches!(overlay.window_state, WindowState::Hidden);
         let wants_resume = overlay.change.as_ref().is_some_and(|change| {
@@ -702,7 +724,7 @@ impl GifFromScreenApp {
         if !self.handle_geometry_action(context, action) {
             self.handle_recorder_overlay_action(context, action);
         }
-        context.request_repaint_after(Duration::from_millis(16));
+        request_recorder_repaint(context, self.recorder_overlay.as_ref());
     }
 
     fn start_prepared_x11(&mut self, context: &egui::Context) {
@@ -807,7 +829,14 @@ impl GifFromScreenApp {
         } else {
             ""
         };
-        let current_notice = self.recorder_notice_text(stage, localizer);
+        let current_notice = self.recorder_notice_text(stage, localizer).filter(|_| {
+            !self.notice.as_ref().is_some_and(|notice| {
+                matches!(
+                    notice.message_id(),
+                    Some(Message::RecorderStarted | Message::RecorderBorderDragHint)
+                )
+            })
+        });
         let message = current_notice
             .as_deref()
             .filter(|message| *message != notice)
@@ -866,6 +895,15 @@ fn must_hide_for_capture(
                     .is_none_or(|applied| outer.is_none_or(|outer| !outside(outer, applied)))
             })
     })
+}
+
+fn request_recorder_repaint(context: &egui::Context, overlay: Option<&RecorderOverlay>) {
+    if overlay.is_some_and(|overlay| overlay.gesture.is_some()) {
+        // Follow display cadence while dragging; avoid a timer after each frame.
+        context.request_repaint();
+    } else {
+        context.request_repaint_after(Duration::from_millis(8));
+    }
 }
 
 fn global_region(source: PhysicalRect, local: PhysicalRect) -> Option<PhysicalRect> {
@@ -928,13 +966,18 @@ fn prepare_change(
     let Some(change) = &mut overlay.change else {
         return true;
     };
+    let (pending, acknowledged) = job.controller.pause_status();
+    // A healthy paused capture may wait for the user to release the grip.
+    // Keep the timeout for missing pause acknowledgements and post-release work.
+    if overlay.gesture.is_some() && pending == 0 && acknowledged == Some(true) {
+        change.started = now;
+    }
     if now.saturating_duration_since(change.started) >= CHANGE_TIMEOUT && !overlay.recovering {
         overlay.failure = Some(
             "The recording position update timed out; stopping and saving the project.".into(),
         );
         return false;
     }
-    let (pending, acknowledged) = job.controller.pause_status();
     if pending != 0 {
         return false;
     }
@@ -954,6 +997,9 @@ fn finish_change(
     hidden: bool,
     notice: &mut Option<Notice>,
 ) {
+    if overlay.gesture.is_some() {
+        return;
+    }
     let Some(job) = job else {
         return;
     };
@@ -1000,7 +1046,7 @@ fn finish_change(
     }
     // Retire the old extra exclusion inside the paused transaction, not on the
     // first resumed sample. The final guide generation must also be acknowledged.
-    overlay.update_guide(None);
+    overlay.update_guide(None, RecorderStage::Paused);
     if !overlay.guide_ready() {
         return;
     }

@@ -29,7 +29,10 @@ pub(super) fn validate(request: GuideRequest) -> Result<(), String> {
             })
             .ok_or_else(invalid)?;
         let (handle_width, handle_height) = handle_size(request.handle_scale);
-        if pixels + u64::from(handle_width) * u64::from(handle_height) > 2 * 1024 * 1024 {
+        let corner = u64::from(corner_size(request.handle_scale));
+        if pixels + u64::from(handle_width) * u64::from(handle_height) + 4 * corner * corner
+            > 2 * 1024 * 1024
+        {
             return Err("Recorder guide border backing exceeds its bounded pixel budget.".into());
         }
     }
@@ -41,6 +44,57 @@ fn handle_size(scale: u16) -> (u32, u32) {
         (144 * u32::from(scale)).div_ceil(100),
         (36 * u32::from(scale)).div_ceil(100),
     )
+}
+
+fn corner_size(scale: u16) -> u32 {
+    (20 * u32::from(scale)).div_ceil(100)
+}
+
+/// Clockwise from top-left. Keep the full hit target outside capture pixels;
+/// clip at the root edge and omit corners with no safe visible space.
+/// Ready-only corners remain reachable even if the controller cannot fit outside
+/// a centered selection. Unlike the move grip, they cannot switch to another edge.
+#[cfg(any(all(target_os = "linux", feature = "native-x11"), test))]
+pub(super) fn resize_handles(request: GuideRequest, root_size: PhysicalSize) -> [Option<Strip>; 4] {
+    let mut handles = [None; 4];
+    let Some(region) = request.region.filter(|_| request.resize_handles) else {
+        return handles;
+    };
+    let root = PhysicalRect::new(0, 0, root_size.width(), root_size.height())
+        .expect("validated root size");
+    let size = corner_size(request.handle_scale);
+    let left = i64::from(region.origin().x);
+    let top = i64::from(region.origin().y);
+    let right = left + i64::from(region.size().width());
+    let bottom = top + i64::from(region.size().height());
+    for (index, (x, y)) in [
+        (left - i64::from(size), top - i64::from(size)),
+        (right, top - i64::from(size)),
+        (right, bottom),
+        (left - i64::from(size), bottom),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (Ok(x), Ok(y)) = (i32::try_from(x), i32::try_from(y)) else {
+            continue;
+        };
+        let Ok(rect) = PhysicalRect::new(x, y, size, size) else {
+            continue;
+        };
+        let Some(rect) = intersection(rect, root) else {
+            continue;
+        };
+        if i16::try_from(rect.origin().x).is_ok()
+            && i16::try_from(rect.origin().y).is_ok()
+            && request
+                .protected_region
+                .is_none_or(|old| intersection(rect, old).is_none())
+        {
+            handles[index] = Some(Strip { rect });
+        }
+    }
+    handles
 }
 
 /// Prefer the top center, then other edges/anchors without entering capture or

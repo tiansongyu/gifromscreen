@@ -55,10 +55,10 @@ fn handle_scale_and_owned_controller_bounds_invalidate_the_guide_request() {
     assert_eq!(drag_handle_scale(8.0), 400);
     assert_eq!(drag_handle_scale(f32::NAN), 100);
     let mut overlay = overlay(region(), false);
-    overlay.update_guide(None);
+    overlay.update_guide(None, RecorderStage::Ready);
     let first = overlay.request.unwrap();
     overlay.last_scale = 2.0;
-    overlay.update_guide(None);
+    overlay.update_guide(None, RecorderStage::Ready);
     let scaled = overlay.request.unwrap();
     assert_eq!(scaled.generation, first.generation + 1);
     assert_eq!(scaled.handle_scale, 200);
@@ -68,10 +68,10 @@ fn handle_scale_and_owned_controller_bounds_invalidate_the_guide_request() {
         outer: controller,
         viewable: true,
     });
-    overlay.update_guide(None);
+    overlay.update_guide(None, RecorderStage::Ready);
     assert_eq!(overlay.request.unwrap().handle_avoid, Some(controller));
     assert_eq!(overlay.request.unwrap().generation, scaled.generation + 1);
-    overlay.update_guide(None);
+    overlay.update_guide(None, RecorderStage::Ready);
     assert_eq!(overlay.request.unwrap().generation, scaled.generation + 1);
 }
 fn source() -> PhysicalRect {
@@ -106,7 +106,7 @@ fn overlay(region: PhysicalRect, hidden: bool) -> RecorderOverlay {
             workarea_index: 0,
         }
     };
-    overlay.update_guide(None);
+    overlay.update_guide(None, RecorderStage::Ready);
     acknowledge(&mut overlay);
     overlay
 }
@@ -156,17 +156,17 @@ fn commands(output: &egui::FullOutput) -> &[egui::ViewportCommand] {
 fn equal_protection_normalizes_without_new_generation_or_ack_loss() {
     let mut overlay = overlay(region(), false);
     let before = overlay.request.unwrap();
-    overlay.update_guide(Some(region()));
+    overlay.update_guide(Some(region()), RecorderStage::Ready);
     assert_eq!(overlay.request, Some(before));
     assert!(overlay.ready());
     let extra = PhysicalRect::new(80, 100, 100, 80).unwrap();
-    overlay.update_guide(Some(extra));
+    overlay.update_guide(Some(extra), RecorderStage::Ready);
     assert_eq!(overlay.request.unwrap().generation, before.generation + 1);
     assert_eq!(overlay.acknowledged, None);
     acknowledge(&mut overlay);
-    overlay.update_guide(Some(extra));
+    overlay.update_guide(Some(extra), RecorderStage::Ready);
     assert!(overlay.ready());
-    overlay.update_guide(Some(region()));
+    overlay.update_guide(Some(region()), RecorderStage::Ready);
     assert_eq!(overlay.request.unwrap().protected_region, None);
     assert_eq!(overlay.request.unwrap().generation, before.generation + 2);
     assert!(!overlay.ready());
@@ -250,7 +250,7 @@ fn guide_change_discards_old_settle_and_stale_ack_cannot_ready_new_geometry() {
     });
     let old_generation = overlay.request.unwrap().generation;
     overlay.geometry.move_by(10, 0);
-    overlay.update_guide(None);
+    overlay.update_guide(None, RecorderStage::Ready);
     overlay.acknowledged = Some(old_generation);
     assert!(
         !frame(&context, Some(false), |context| overlay.settled(
@@ -310,6 +310,38 @@ fn pending_start_cancel_and_failed_settle_restore_interactive_ready_geometry() {
 }
 
 #[test]
+fn dragging_holds_controller_position_and_blocks_start_until_release() {
+    let context = egui::Context::default();
+    let mut overlay = overlay(region(), false);
+    let now = Instant::now();
+    for _ in 0..3 {
+        frame(&context, Some(false), |context| {
+            overlay.place(context, native(), now);
+        });
+    }
+    assert!(overlay.ready());
+    overlay.gesture = Some(Gesture {
+        id: 1,
+        start: region().origin(),
+        initial: overlay.geometry,
+        edge: GuideEdge::Move,
+    });
+    overlay
+        .geometry
+        .move_to(PhysicalPosition { x: 700, y: 500 });
+    let (output, ()) = frame(&context, Some(false), |context| {
+        overlay.place(context, native(), now);
+    });
+    assert!(commands(&output).is_empty());
+    assert!(!overlay.ready());
+    overlay.gesture = None;
+    let (output, ()) = frame(&context, Some(false), |context| {
+        overlay.place(context, native(), now);
+    });
+    assert!(!commands(&output).is_empty());
+}
+
+#[test]
 fn native_start_validation_failure_keeps_ready_selection_resizable() {
     let context = egui::Context::default();
     let mut app = GifFromScreenApp::default();
@@ -326,6 +358,8 @@ fn native_start_validation_failure_keeps_ready_selection_resizable() {
     }
     assert!(overlay.ready());
     overlay.pending_live_start = Some(now);
+    overlay.update_guide(None, RecorderStage::Countdown(0));
+    acknowledge(&mut overlay);
     overlay.settle = Some(Settling {
         region: region(),
         frame: 0,
@@ -555,7 +589,7 @@ fn final_extra_exclusion_cleanup_ack_is_required_before_real_workflow_resume() {
     assert!(!prepare_change(&mut overlay, Some(&mut job), native(), now));
     until(|| job.controller.pause_status() == (0, Some(true)));
     assert!(prepare_change(&mut overlay, Some(&mut job), native(), now));
-    overlay.update_guide(Some(old));
+    overlay.update_guide(Some(old), RecorderStage::Ready);
     acknowledge(&mut overlay);
     let extra_generation = overlay.request.unwrap().generation;
     let mut notice = None;
@@ -624,7 +658,7 @@ fn final_extra_exclusion_cleanup_ack_is_required_before_real_workflow_resume() {
     assert!(overlay.change.is_none());
     assert_eq!(worker.stats.lock().unwrap().resumes, 1);
     let final_generation = overlay.request.unwrap().generation;
-    overlay.update_guide(Some(moved_region));
+    overlay.update_guide(Some(moved_region), RecorderStage::Ready);
     assert_eq!(
         overlay.request.unwrap().generation,
         final_generation,
@@ -674,6 +708,34 @@ fn explicit_pause_intent_survives_default_resume_sampling_after_pending_controls
             .unwrap()
             .resume_intent()
     );
+}
+
+#[test]
+fn acknowledged_pause_can_wait_for_a_held_grip_without_timing_out() {
+    let (mut job, _worker) = Worker::start(region());
+    let mut overlay = overlay(region(), false);
+    overlay.gesture = Some(Gesture {
+        id: 1,
+        start: region().origin(),
+        initial: overlay.geometry,
+        edge: GuideEdge::Move,
+    });
+    overlay.geometry.move_by(10, 0);
+    let now = Instant::now();
+    begin_change(&mut overlay, &job, now);
+    assert!(!prepare_change(&mut overlay, Some(&mut job), native(), now));
+    until(|| job.controller.pause_status() == (0, Some(true)));
+    let held = now + CHANGE_TIMEOUT * 2;
+    assert!(prepare_change(&mut overlay, Some(&mut job), native(), held));
+    assert!(!overlay.failed());
+    overlay.gesture = None;
+    assert!(!prepare_change(
+        &mut overlay,
+        Some(&mut job),
+        native(),
+        held + CHANGE_TIMEOUT
+    ));
+    assert!(overlay.failed(), "post-release stalls must still time out");
 }
 
 #[test]
@@ -843,4 +905,52 @@ fn recovered_full_root_resume_button_accepts_intent_without_premature_native_res
         (0, Some(true))
     );
     assert_eq!(worker.stats.lock().unwrap().resumes, 0);
+}
+
+#[test]
+fn corner_handles_follow_ready_state_and_frozen_canvas() {
+    let mut overlay = overlay(region(), false);
+    overlay.update_guide(None, RecorderStage::Ready);
+    assert!(overlay.request.unwrap().resize_handles);
+    for stage in [
+        RecorderStage::Countdown(2),
+        RecorderStage::Recording,
+        RecorderStage::Paused,
+        RecorderStage::Finalizing,
+    ] {
+        overlay.update_guide(None, stage);
+        assert!(!overlay.request.unwrap().resize_handles);
+    }
+    overlay.update_guide(None, RecorderStage::Ready);
+    assert!(overlay.request.unwrap().resize_handles);
+    overlay.geometry.freeze_size();
+    overlay.update_guide(None, RecorderStage::Ready);
+    assert!(!overlay.request.unwrap().resize_handles);
+}
+
+#[test]
+fn all_four_corners_resize_with_the_opposite_corner_anchored() {
+    let initial = RecorderGeometry::new(source(), region()).unwrap();
+    for (edge, dx, dy, expected) in [
+        (GuideEdge::TopLeft, -20, -10, (80, 90, 120, 90)),
+        (GuideEdge::TopRight, 20, -10, (100, 90, 120, 90)),
+        (GuideEdge::BottomRight, 20, 10, (100, 100, 120, 90)),
+        (GuideEdge::BottomLeft, -20, 10, (80, 100, 120, 90)),
+    ] {
+        let gesture = Gesture {
+            id: 1,
+            start: PhysicalPosition { x: 0, y: 0 },
+            initial,
+            edge,
+        };
+        let actual = gesture_geometry(
+            &gesture,
+            PhysicalPosition { x: dx, y: dy },
+            RecorderStage::Ready,
+        );
+        assert_eq!(
+            actual.region(),
+            PhysicalRect::new(expected.0, expected.1, expected.2, expected.3).unwrap()
+        );
+    }
 }

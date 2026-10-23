@@ -11,6 +11,8 @@ import tarfile
 import tempfile
 import types
 import unittest
+import runpy
+import shutil
 from unittest.mock import patch
 
 SCRIPT = Path(__file__).with_name("gifromscreen-installer.sh")
@@ -46,6 +48,89 @@ class ReleaseInstallerTests(unittest.TestCase):
                     archive.addfile(member, io.BytesIO(data))
                     continue
                 archive.addfile(member)
+
+    def make_bundle(self, version):
+        bundle = self.root / ("bundle-" + version)
+        bundle.mkdir()
+        packaging = SCRIPT.parent.parent / "packaging/linux"
+        names = ["installer.py", "install.sh", "uninstall.sh"]
+        for name in names:
+            shutil.copy2(packaging / name, bundle / name)
+        app_id = "io.github.tiansongyu.gifromscreen"
+        files = {
+            "bin/gif-from-screen": "#!/bin/sh\nexit 0\n",
+            "bin/gif-from-screen-cli": "#!/bin/sh\nexit 0\n",
+            "share/applications/" + app_id + ".desktop": "[Desktop Entry]\nExec=gif-from-screen\nIcon=" + app_id + "\n",
+            "share/icons/hicolor/scalable/apps/" + app_id + ".svg": "<svg/>\n",
+            "BUILD-INFO.json": json.dumps({"package_version": version}),
+        }
+        for name, content in files.items():
+            path = bundle / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        checksums = []
+        for path in sorted(bundle.rglob("*")):
+            if path.is_file():
+                checksums.append(hashlib.sha256(path.read_bytes()).hexdigest() + "  " + path.relative_to(bundle).as_posix())
+        (bundle / "SHA256SUMS").write_text("\n".join(checksums) + "\n")
+        return bundle
+
+    def test_newer_installed_version_is_kept_without_downloading(self):
+        prefix = self.root / "prefix"
+        receipt = prefix / "lib/gifromscreen/BUILD-INFO.json"
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text(json.dumps({"package_version": "0.1.2"}))
+        with patch.object(installer, "check_platform"), patch.object(installer, "download") as download, \
+                patch.object(installer, "release_version", return_value="v0.1.0"), \
+                patch.object(installer.sys, "argv", ["installer", "--prefix", str(prefix)]):
+            installer.main()
+        download.assert_not_called()
+        self.assertEqual(installer.installed_version(prefix), "0.1.2")
+
+    def test_upgrade_preserves_projects_and_replaces_only_verified_owned_files(self):
+        old = self.make_bundle("0.1.0")
+        new = self.make_bundle("0.1.3")
+        prefix = self.root / "user prefix"
+        runpy.run_path(str(old / "installer.py"))["install"](old, prefix)
+        project = prefix / "lib/gifromscreen/personal.gfsproj"
+        project.write_text("keep this project")
+        installer.install_bundle(new, prefix)
+        self.assertEqual(installer.installed_version(prefix), "0.1.3")
+        self.assertEqual(project.read_text(), "keep this project")
+        installer.install_bundle(new, prefix)
+
+    def test_upgrade_rejects_modified_owned_files_without_removal(self):
+        old = self.make_bundle("0.1.0")
+        new = self.make_bundle("0.1.3")
+        prefix = self.root / "prefix"
+        runpy.run_path(str(old / "installer.py"))["install"](old, prefix)
+        binary = prefix / "lib/gifromscreen/bin/gif-from-screen"
+        binary.write_text("modified binary")
+        with self.assertRaisesRegex(ValueError, "changed"):
+            installer.install_bundle(new, prefix)
+        self.assertEqual(installer.installed_version(prefix), "0.1.0")
+        self.assertEqual(binary.read_text(), "modified binary")
+
+    def test_failed_upgrade_restores_previous_verified_package(self):
+        old = self.make_bundle("0.1.0")
+        new = self.make_bundle("0.1.3")
+        prefix = self.root / "prefix"
+        package = runpy.run_path(str(new / "installer.py"))
+        package["install"](old, prefix)
+        original_install = package["install"]
+        def fail_new(bundle, destination):
+            if bundle == new:
+                raise OSError("injected installation failure")
+            original_install(bundle, destination)
+        package["install"] = fail_new
+        backup = self.root / "backup"
+        backup.mkdir()
+        with patch.object(installer.runpy, "run_path", return_value=package), \
+                patch.object(installer.tempfile, "mkdtemp", return_value=str(backup)), \
+                self.assertRaisesRegex(OSError, "upgrade failed"):
+            installer.install_bundle(new, prefix)
+        self.assertEqual(installer.installed_version(prefix), "0.1.0")
+        self.assertTrue((prefix / "bin/gif-from-screen").exists())
 
     def test_shell_help_does_not_download_or_install(self):
         result = subprocess.run(["sh", str(SCRIPT), "--help"], text=True, capture_output=True)
@@ -131,4 +216,4 @@ class ReleaseInstallerTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(buffer=True)

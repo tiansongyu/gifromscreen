@@ -6,6 +6,11 @@ use super::*;
 
 impl Windows<'_, '_> {
     pub(super) fn create_handle_cursor(&mut self) -> Result<(), String> {
+        self.handle_cursor = Some(self.create_cursor(52)?);
+        Ok(())
+    }
+
+    pub(super) fn create_cursor(&self, glyph: u16) -> Result<Cursor, String> {
         let font = self.connection.generate_id().map_err(native_error)?;
         self.connection
             .open_font(font, b"cursor")
@@ -13,15 +18,15 @@ impl Windows<'_, '_> {
             .check()
             .map_err(native_error)?;
         let cursor = self.connection.generate_id().map_err(native_error)?;
-        // X11 cursorfont.h: XC_fleur (52), followed by its mask glyph (53).
+        // X11 cursorfont.h: each source glyph is followed by its mask.
         let result = self
             .connection
             .create_glyph_cursor(
                 cursor,
                 font,
                 font,
-                52,
-                53,
+                glyph,
+                glyph + 1,
                 0,
                 0,
                 0,
@@ -33,7 +38,43 @@ impl Windows<'_, '_> {
             .and_then(|cookie| cookie.check().map_err(native_error));
         let _ = self.connection.close_font(font);
         result?;
-        self.handle_cursor = Some(cursor);
+        Ok(cursor)
+    }
+
+    pub(super) fn paint_corner(&self, corner: usize) -> Result<(), String> {
+        let Some(rect) = self.corner_rects[corner] else {
+            return Ok(());
+        };
+        let window = self.ids[CORNER_INDEX + corner];
+        let gc = self
+            .handle_gc
+            .ok_or("Recorder handle drawing context is unavailable.")?;
+        self.connection
+            .clear_area(false, window, 0, 0, 0, 0)
+            .map_err(native_error)?
+            .check()
+            .map_err(native_error)?;
+        let width = u16::try_from(rect.size().width()).map_err(native_error)?;
+        let height = u16::try_from(rect.size().height()).map_err(native_error)?;
+        let inset = (width.min(height) / 4).max(1);
+        if width > 2 * inset && height > 2 * inset {
+            // An inset square remains legible at every scale and makes the
+            // orange target distinct from the thin border and move grip.
+            self.connection
+                .poly_rectangle(
+                    window,
+                    gc,
+                    &[Rectangle {
+                        x: i16::try_from(inset).map_err(native_error)?,
+                        y: i16::try_from(inset).map_err(native_error)?,
+                        width: width - 2 * inset - 1,
+                        height: height - 2 * inset - 1,
+                    }],
+                )
+                .map_err(native_error)?
+                .check()
+                .map_err(native_error)?;
+        }
         Ok(())
     }
 

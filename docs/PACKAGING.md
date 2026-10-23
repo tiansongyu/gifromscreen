@@ -2,13 +2,32 @@
 
 The supported package is a native **x86_64 Linux tar.gz**, built on Ubuntu 22.04 with Rust 1.88.0 and the checked-in `Cargo.lock`. It contains the desktop application and CLI. It is not a static binary: system graphics, PipeWire, Wayland/X11, and portal libraries remain system dependencies. FFmpeg and ffprobe are optional system dependencies for video import and are **not bundled**.
 
+## One-command installation and upgrades
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/tiansongyu/gifromscreen/releases/latest/download/gifromscreen-installer.sh | sh
+```
+
+The standalone installer requires Python 3.8+, Linux x86_64 and glibc 2.35+.
+It defaults to `~/.local`, verifies archive checksums and rejects unsafe archive
+entries. A different prefix or pinned release can be selected with
+`sh -s -- --prefix /absolute/path --version v0.1.3` after the pipe.
+
+Existing managed files are verified before an upgrade. The previous package is
+copied and verified before its application files are removed; an installation
+failure attempts to restore it and retains a recovery copy. Modified managed
+files and foreign destination files are never overwritten. Projects and
+preferences are preserved. A newer installed version is kept unless
+`--allow-downgrade` is explicitly supplied. The extracted package's own
+`./install.sh` retains its explicit uninstall-first behavior described below.
+
 ## Download and run
 
-Download the [v0.1.0 Linux tarball](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0/gifromscreen-0.1.0-linux-x86_64.tar.gz)
-and its [SHA-256 file](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.0/gifromscreen-0.1.0-linux-x86_64.tar.gz.sha256).
-This is the first non-prerelease release, with a frozen feature scope. It remains
+Download the [v0.1.3 Linux tarball](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.3/gifromscreen-0.1.3-linux-x86_64.tar.gz)
+and its [SHA-256 file](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.3/gifromscreen-0.1.3-linux-x86_64.tar.gz.sha256).
+This maintenance release includes the recorder and installer fixes. It remains
 unsigned and does not claim full upstream parity or complete hardware coverage.
-See the [release notes](releases/v0.1.0.md) and [completed/deferred summary](WORK-STATUS.md).
+See the [release notes](releases/v0.1.3.md) and [completed/deferred summary](WORK-STATUS.md).
 
 The `Linux portable package` GitHub Actions workflow also uploads a tarball and
 its `.sha256` file for successful main-branch builds. These newer CI artifacts
@@ -17,9 +36,9 @@ create Releases or tags. After downloading both Release files (or extracting a
 CI artifact ZIP), run:
 
 ```sh
-sha256sum --check gifromscreen-0.1.0-linux-x86_64.tar.gz.sha256
-tar -xzf gifromscreen-0.1.0-linux-x86_64.tar.gz
-cd gifromscreen-0.1.0-linux-x86_64
+sha256sum --check gifromscreen-0.1.3-linux-x86_64.tar.gz.sha256
+tar -xzf gifromscreen-0.1.3-linux-x86_64.tar.gz
+cd gifromscreen-0.1.3-linux-x86_64
 sha256sum --check SHA256SUMS
 ./bin/gif-from-screen
 ./bin/gif-from-screen-cli --help

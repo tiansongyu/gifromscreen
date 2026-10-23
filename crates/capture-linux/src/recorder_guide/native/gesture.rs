@@ -153,7 +153,9 @@ impl Windows<'_, '_> {
         };
         let started = Instant::now();
         self.connection.stream().begin_operation();
-        let cursor = if index == HANDLE_INDEX {
+        let cursor = if index >= CORNER_INDEX {
+            self.corner_cursors[index - CORNER_INDEX].unwrap_or(x11rb::NONE)
+        } else if index == HANDLE_INDEX {
             self.handle_cursor.unwrap_or(x11rb::NONE)
         } else {
             x11rb::NONE

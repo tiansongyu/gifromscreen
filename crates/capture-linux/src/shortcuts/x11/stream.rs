@@ -38,6 +38,19 @@ pub(crate) struct BoundedStream<'a> {
     cleanup: AtomicBool,
 }
 impl BoundedStream<'_> {
+    /// Wait for native input or a caller-owned command notification, not a frame timer.
+    pub(crate) fn wait_for_input(&self, wake: &UnixStream) -> io::Result<()> {
+        self.check()?;
+        let mut fds = [
+            PollFd::new(&self.inner, PollFlags::IN),
+            PollFd::new(wake, PollFlags::IN),
+        ];
+        match poll(&mut fds, Some(&POLL_TIME)) {
+            Ok(_) | Err(rustix::io::Errno::INTR) => self.check(),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub(crate) fn registration_complete(&self) {
         *self.deadline.lock().unwrap_or_else(PoisonError::into_inner) = None;
     }

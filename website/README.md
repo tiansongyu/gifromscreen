@@ -26,8 +26,9 @@ Animation starts only after an explicit Play action and stops when hidden.
 The installation command downloads `scripts/gifromscreen-installer.sh` from the
 latest stable Release. The installer needs Python 3.8+, Linux x86_64 and glibc
 2.35+. It verifies the release archive, rejects unsafe archive entries, then
-runs the package's existing per-user installer. Existing different versions
-must be uninstalled first; it does not silently replace them.
+runs the package's existing per-user installer. Upgrades verify all managed files and retain a rollback copy; modified files
+are not removed. Newer installed versions are kept unless `--allow-downgrade`
+is explicitly supplied.
 
 Run `python3 scripts/test_release_installer.py` and
 `shellcheck scripts/gifromscreen-installer.sh` before publishing changes.
