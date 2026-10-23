@@ -34,6 +34,7 @@ mod image_effect_ui;
 mod import_gif_job;
 mod import_static_image_job;
 mod import_static_sequence_job;
+mod landing_ui;
 mod motion_tools;
 mod open_project_job;
 mod path_picker;
@@ -42,6 +43,7 @@ mod project_insert_ui;
 mod project_library_ui;
 mod recorder_geometry;
 mod recorder_shortcuts;
+mod recording_output;
 mod retarget;
 mod shortcut_ui;
 mod static_sequence_ui;
@@ -181,8 +183,6 @@ mod recorder_localization_tests;
 const MAX_RECORDING_DURATION_MS: u64 = 3_600_000;
 const EDITOR_HISTORY_LIMIT: usize = 100;
 const EDITOR_PREVIEW_MAX_SIZE: [u32; 2] = [960, 540];
-const LANDING_COLUMN_COUNT: usize = 2;
-const LANDING_CARD_MIN_WIDTH: f32 = 280.0;
 const MAX_STATIC_SEQUENCE_FRAMES: usize = 10_000;
 const MAX_STATIC_SEQUENCE_EDGE: u16 = 16_384;
 const MAX_STATIC_SEQUENCE_RGBA_BYTES: u64 = 512 * 1024 * 1024;
@@ -809,6 +809,13 @@ struct RecorderOverlayFrame {
     region: Option<PhysicalRect>,
 }
 
+#[derive(Default)]
+enum RegionPlacement {
+    #[default]
+    CenterOnSource,
+    Positioned,
+}
+
 struct GifFromScreenApp {
     language_settings: preferences::LanguageSettings,
     ui_language: &'static str,
@@ -820,6 +827,7 @@ struct GifFromScreenApp {
     settings: RecordingSettings,
     sources: Vec<CaptureSource>,
     selected_source: usize,
+    region_placement: RegionPlacement,
     display_server: Option<LinuxDisplayServer>,
     source_catalog_attempted: bool,
     source_catalog_job: CaptureSourceJob,
@@ -854,6 +862,9 @@ struct GifFromScreenApp {
     remembered_project: Option<(ProjectId, PathBuf)>,
     open_picker: PathPicker,
     gif_picker: PathPicker,
+    output_picker: recording_output::OutputUi,
+    pending_launcher_action: Option<AppView>,
+    initial_window_fit: landing_ui::InitialWindowFit,
     image_picker: PathPicker,
     shutdown: ShutdownState,
     blank_project_ui: BlankProjectUiState,
@@ -868,6 +879,7 @@ struct GifFromScreenApp {
     vector_shapes: vector_shapes::VectorShapes,
     editor_preview_cache: EditorPreviewCache,
     editor_export_settings: EditorExportSettings,
+    export_scroll_target: Option<egui::Align>,
     export_job: ExportJob,
 }
 
@@ -884,6 +896,7 @@ impl Default for GifFromScreenApp {
             settings: RecordingSettings::default(),
             sources: Vec::new(),
             selected_source: 0,
+            region_placement: RegionPlacement::CenterOnSource,
             display_server: None,
             source_catalog_attempted: false,
             source_catalog_job: CaptureSourceJob::default(),
@@ -918,6 +931,9 @@ impl Default for GifFromScreenApp {
             remembered_project: None,
             open_picker: PathPicker::default(),
             gif_picker: PathPicker::default(),
+            output_picker: recording_output::OutputUi::default(),
+            pending_launcher_action: None,
+            initial_window_fit: landing_ui::InitialWindowFit::Pending,
             image_picker: PathPicker::default(),
             shutdown: ShutdownState::default(),
             blank_project_ui: BlankProjectUiState::default(),
@@ -932,6 +948,7 @@ impl Default for GifFromScreenApp {
             vector_shapes: vector_shapes::VectorShapes::default(),
             editor_preview_cache: EditorPreviewCache::new(),
             editor_export_settings: EditorExportSettings::default(),
+            export_scroll_target: None,
             export_job: ExportJob::default(),
         }
     }
@@ -962,6 +979,12 @@ impl eframe::App for GifFromScreenApp {
     }
 
     fn update(&mut self, context: &egui::Context, frame: &mut eframe::Frame) {
+        if self.view != AppView::Landing
+            && self.initial_window_fit == landing_ui::InitialWindowFit::Pending
+        {
+            landing_ui::expand_for_work(context);
+            self.initial_window_fit = landing_ui::InitialWindowFit::Done;
+        }
         // Do not accept a last UI edit after this frame's close gate has already
         // decided to exit. Also cover the final frame of a deferred shutdown.
         let allow_preference_changes = self.shutdown == ShutdownState::Active
@@ -1066,7 +1089,9 @@ impl GifFromScreenApp {
             AppView::ScreenRecorder => {
                 egui::ScrollArea::vertical()
                     .id_salt("screen-recorder-page")
-                    .show(ui, |ui| self.show_screen_recorder(ui));
+                    .show(ui, |ui| {
+                        landing_ui::content(ui, |ui| self.show_screen_recorder(ui));
+                    });
             }
             AppView::CameraRecorder => self.camera_recorder.show(ui),
             AppView::BoardRecorder => self.board_recorder.show(ui),
@@ -1207,7 +1232,7 @@ impl GifFromScreenApp {
             context.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(false));
             let scale = context.pixels_per_point();
             context.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(
-                egui::vec2(680.0, 440.0).min(snapshot.size) / scale,
+                egui::vec2(600.0, 260.0).min(snapshot.size) / scale,
             ));
             context.send_viewport_cmd(egui::ViewportCommand::InnerSize(snapshot.size / scale));
             if let Some(maximized) = snapshot.maximized {
@@ -1222,35 +1247,119 @@ impl GifFromScreenApp {
         self.restore_main_window = false;
     }
 
-    fn show_app_header(&mut self, context: &egui::Context) {
+    fn show_launcher_header(&mut self, context: &egui::Context) {
         let localizer = self.language_settings.localizer();
-        egui::TopBottomPanel::top("app_header").show(context, |ui| {
-            let back_enabled = self.watermark_job.state() != WatermarkDecodeJobState::Running
-                && !self.source_workers_active()
-                && can_navigate_back(
-                    self.view,
-                    self.open_project_job.state(),
-                    self.import_gif_job.state(),
-                    self.import_image_job.state(),
-                    self.import_sequence_job.state(),
-                    self.blank_project_job.state(),
-                );
-            if editor_shell_layout::header(
-                ui,
-                (self.view != AppView::Landing).then_some(back_enabled),
-                localizer,
-                |ui| self.language_settings.show_button(ui),
-            ) {
-                if self.view == AppView::Editor {
-                    self.editor_ui_state.pause_preview();
+        let mut selected = None;
+        let mut project = None;
+        egui::TopBottomPanel::top("launcher_header")
+            .frame(
+                egui::Frame::new()
+                    .fill(
+                        appearance::Palette::for_theme(context.style().visuals.dark_mode)
+                            .background,
+                    )
+                    .inner_margin(egui::Margin::symmetric(10, 5)),
+            )
+            .show(context, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(APP_NAME).size(18.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.menu_button(localizer.text(Message::HomeOptions), |ui| {
+                            self.language_settings.show_button(ui);
+                            egui::widgets::global_theme_preference_buttons(ui);
+                            ui.separator();
+                            for (view, label) in [
+                                (AppView::OpenProject, Message::HomeOpenProject),
+                                (AppView::ImportGif, Message::HomeImportGif),
+                                (AppView::ImportImage, Message::HomeImportImage),
+                                (AppView::ImportVideo, Message::HomeImportVideo),
+                                (AppView::ImportImageSequence, Message::HomeImportSequence),
+                                (AppView::NewBlankAnimation, Message::HomeNewAnimation),
+                                (AppView::Automation, Message::HomeAutomaticTasks),
+                            ] {
+                                if ui.button(localizer.text(label)).clicked() {
+                                    selected = Some(view);
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
+                            self.show_resume_editor(ui);
+                            if self.project_library.history_ready() {
+                                project = self.project_library.show_recent(ui, localizer);
+                            }
+                        });
+                    });
+                });
+            });
+        if let Some(view) = selected {
+            self.open_landing_view(view);
+        }
+        if let Some(path) = project {
+            self.open_library_project(&path);
+        }
+    }
+
+    fn show_app_header(&mut self, context: &egui::Context) {
+        if self.view == AppView::Landing {
+            self.show_launcher_header(context);
+            return;
+        }
+        let localizer = self.language_settings.localizer();
+        let colors = appearance::Palette::for_theme(context.style().visuals.dark_mode);
+        let editor_visible = self.view == AppView::Editor;
+        let mut reveal_export = false;
+        egui::TopBottomPanel::top("app_header")
+            .frame(
+                egui::Frame::new()
+                    .fill(colors.surface)
+                    .inner_margin(egui::Margin::symmetric(18, 10))
+                    .stroke(egui::Stroke::new(1.0_f32, colors.border)),
+            )
+            .show(context, |ui| {
+                let back_enabled = self.watermark_job.state() != WatermarkDecodeJobState::Running
+                    && !self.source_workers_active()
+                    && can_navigate_back(
+                        self.view,
+                        self.open_project_job.state(),
+                        self.import_gif_job.state(),
+                        self.import_image_job.state(),
+                        self.import_sequence_job.state(),
+                        self.blank_project_job.state(),
+                    );
+                if editor_shell_layout::header(
+                    ui,
+                    (self.view != AppView::Landing).then_some(back_enabled),
+                    localizer,
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            if editor_visible {
+                                reveal_export = ui
+                                    .add(appearance::primary_button(
+                                        ui,
+                                        localizer.text(Message::ExportTitle),
+                                    ))
+                                    .clicked();
+                            }
+                            self.language_settings.show_button(ui);
+                        });
+                    },
+                ) {
+                    if self.view == AppView::Editor {
+                        self.editor_ui_state.pause_preview();
+                    }
+                    if self.view == AppView::ScreenRecorder && self.wayland_prepare_job.is_active()
+                    {
+                        let _ = self.wayland_prepare_job.cancel();
+                        self.wayland_frozen_preview = None;
+                    }
+                    self.view = AppView::Landing;
                 }
-                if self.view == AppView::ScreenRecorder && self.wayland_prepare_job.is_active() {
-                    let _ = self.wayland_prepare_job.cancel();
-                    self.wayland_frozen_preview = None;
-                }
-                self.view = AppView::Landing;
-            }
-        });
+            });
+        if reveal_export {
+            self.editor_ui_state.open_project_tools();
+            self.editor_ui_state.pause_preview();
+            self.export_scroll_target = Some(egui::Align::Min);
+        }
     }
 
     fn receive_background_messages(&mut self, context: &egui::Context) {
@@ -1517,137 +1626,56 @@ impl GifFromScreenApp {
     fn show_landing(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical()
             .id_salt("landing-page")
+            .auto_shrink([false, false])
             .show(ui, |ui| self.show_landing_contents(ui));
     }
 
     fn show_landing_contents(&mut self, ui: &mut egui::Ui) {
         let localizer = self.language_settings.localizer();
-        ui.vertical_centered(|ui| {
-            ui.add_space(48.0);
-            ui.heading(localizer.text(Message::HomeTitle));
-            ui.label(localizer.text(Message::HomeDescription));
-            self.show_resume_editor(ui);
-            if let Some(path) = self.project_library.show_recent(ui, localizer) { self.open_library_project(&path); }
-            ui.add_space(28.0);
-
-            ui.columns(LANDING_COLUMN_COUNT, |columns| {
-                if landing_action(
-                    &mut columns[0],
-                    localizer.text(Message::HomeScreenRecorder),
-                    localizer.text(Message::HomeScreenDescription),
-                    true,
-                ) {
-                    self.view = AppView::ScreenRecorder;
-                }
-                if landing_action(
-                    &mut columns[1],
-                    localizer.text(Message::HomeOpenProject),
-                    localizer.text(Message::HomeOpenDescription),
-                    true,
-                ) {
-                    self.view = AppView::OpenProject;
-                    self.open_project_take_over_lock = false;
-                    self.notice = None;
-                }
-            });
-
-            ui.add_space(12.0);
-            ui.columns(LANDING_COLUMN_COUNT, |columns| {
-                if landing_action(
-                    &mut columns[0],
-                    localizer.text(Message::HomeImportGif),
-                    localizer.text(Message::HomeGifDescription),
-                    true,
-                ) {
-                    self.view = AppView::ImportGif;
-                    self.notice = Some(
-                        "GIF import uses strict 10,000-frame, 16K-canvas, and 512 MiB limits. Import cannot currently be cancelled once started."
-                            .to_owned().into(),
-                    );
-                }
-                if landing_action(
-                    &mut columns[1],
-                    localizer.text(Message::HomeImportImage),
-                    localizer.text(Message::HomeImageDescription),
-                    true,
-                ) {
-                    self.view = AppView::ImportImage;
-                    self.notice = Some(
-                        "Static image import uses strict 16K and 512 MiB limits with a 100 ms frame. Import cannot currently be cancelled once started."
-                            .to_owned().into(),
-                    );
-                }
-            });
-
-            ui.add_space(12.0);
-            ui.columns(LANDING_COLUMN_COUNT, |columns| {
-                if landing_action(
-                    &mut columns[0],
-                    localizer.text(Message::HomeNewAnimation),
-                    localizer.text(Message::HomeNewDescription),
-                    true,
-                ) {
-                    self.blank_project_ui = BlankProjectUiState::default();
-                    self.view = AppView::NewBlankAnimation;
-                    self.notice = Some(
-                        "Choose the canvas, background, first-frame duration, and a new project path."
-                            .to_owned().into(),
-                    );
-                }
-                if landing_action(
-                    &mut columns[1],
-                    localizer.text(Message::HomeImportSequence),
-                    localizer.text(Message::HomeSequenceDescription),
-                    true,
-                ) {
-                    self.view = AppView::ImportImageSequence;
-                    self.notice = Some(
-                        "Add at least two same-sized images or drop them together. Their order can be adjusted before import."
-                            .to_owned().into(),
-                    );
-                }
-            });
-
-            self.show_additional_sources(ui);
+        landing_ui::content(ui, |ui| {
+            if let Some(view) = landing_ui::actions(ui, localizer) {
+                self.open_landing_view(view);
+            }
             if let Some(notice) = &self.notice {
-                ui.add_space(24.0);
-                ui.label(notice);
+                ui.add_space(4.0);
+                ui.label(notice.render(localizer));
             }
         });
+        if self.view == AppView::Landing {
+            self.initial_window_fit = landing_ui::InitialWindowFit::Done;
+        } else {
+            landing_ui::expand_for_work(ui.ctx());
+        }
     }
 
-    fn show_additional_sources(&mut self, ui: &mut egui::Ui) {
-        let localizer = self.language_settings.localizer();
-        ui.add_space(12.0);
-        ui.columns(LANDING_COLUMN_COUNT, |columns| {
-            if landing_action(
-                &mut columns[0],
-                localizer.text(Message::HomeCameraRecorder),
-                localizer.text(Message::HomeCameraDescription),
-                true,
-            ) {
-                self.view = AppView::CameraRecorder;
-                self.notice = None;
+    fn open_landing_view(&mut self, view: AppView) {
+        self.view = view;
+        self.pending_launcher_action = (view == AppView::ScreenRecorder).then_some(view);
+        self.notice = None;
+        match view {
+            AppView::OpenProject => self.open_project_take_over_lock = false,
+            AppView::NewBlankAnimation => {
+                self.blank_project_ui = BlankProjectUiState::default();
             }
-            if landing_action(
-                &mut columns[1],
-                localizer.text(Message::HomeBoardRecorder),
-                localizer.text(Message::HomeBoardDescription),
-                true,
-            ) {
-                self.view = AppView::BoardRecorder;
-                self.notice = None;
+            AppView::ImportGif => {
+                self.notice = Some(
+                    "GIF import uses strict 10,000-frame, 16K-canvas, and 512 MiB limits. Import cannot currently be cancelled once started."
+                        .to_owned().into(),
+                );
             }
-        });
-        ui.add_space(12.0);
-        if landing_action(
-            ui,
-            localizer.text(Message::HomeImportVideo),
-            localizer.text(Message::HomeVideoDescription),
-            true,
-        ) {
-            self.view = AppView::ImportVideo;
-            self.notice = None;
+            AppView::ImportImage => {
+                self.notice = Some(
+                    "Static image import uses strict 16K and 512 MiB limits with a 100 ms frame. Import cannot currently be cancelled once started."
+                        .to_owned().into(),
+                );
+            }
+            AppView::ImportImageSequence => {
+                self.notice = Some(
+                    "Add at least two same-sized images or drop them together. Their order can be adjusted before import."
+                        .to_owned().into(),
+                );
+            }
+            _ => {}
         }
     }
 
@@ -1673,12 +1701,6 @@ impl GifFromScreenApp {
 
     fn show_resume_editor(&mut self, ui: &mut egui::Ui) {
         let localizer = self.language_settings.localizer();
-        if ui
-            .button(localizer.text(Message::HomeAutomaticTasks))
-            .clicked()
-        {
-            self.view = AppView::Automation;
-        }
         let Some(workspace) = &self.editor_workspace else {
             return;
         };
@@ -1690,7 +1712,7 @@ impl GifFromScreenApp {
         let label = localizer
             .format(Message::HomeContinueEditing, &[("name", &name)])
             .unwrap_or_else(|error| error.to_string());
-        if ui.button(label).clicked() {
+        if ui.add(appearance::primary_button(ui, &label)).clicked() {
             self.resume_editor();
         }
     }
@@ -2033,21 +2055,41 @@ impl GifFromScreenApp {
             self.show_region_picker(ui);
             return;
         }
-        ui.heading(match self.display_server {
-            Some(LinuxDisplayServer::Wayland) => localizer.text(Message::RecorderWaylandTitle),
-            Some(LinuxDisplayServer::X11) => localizer.text(Message::RecorderX11Title),
-            Some(_) | None => localizer.text(Message::RecorderLinuxTitle),
-        });
-        ui.label(localizer.text(Message::RecorderBackgroundWork));
+        ui.heading(localizer.text(Message::HomeScreenRecorder));
         ui.add_space(8.0);
+        if let Some(notice) = &self.notice
+            && notice.message_id() != Some(Message::RecorderSourcesFound)
+        {
+            egui::ScrollArea::vertical()
+                .id_salt("screen-recorder-status")
+                .max_height(96.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| ui.label(notice));
+        }
+        self.show_screen_recorder_options(ui);
+        if self.pending_launcher_action == Some(AppView::ScreenRecorder)
+            && self.source_catalog_job.state() != CaptureSourceJobState::Loading
+            && !self.sources.is_empty()
+        {
+            self.pending_launcher_action = None;
+            if self.output_picker.is_valid() {
+                if let Err(error) = self.open_recorder_overlay(ui.ctx()) {
+                    self.notice = Some(error.into());
+                }
+                return;
+            }
+        }
+        ui.add_space(12.0);
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
                     self.job.is_none()
                         && self.recorder_overlay.is_none()
+                        && !self.output_picker.is_running()
+                        && self.output_picker.is_valid()
                         && !self.sources.is_empty()
                         && self.source_catalog_job.state() != CaptureSourceJobState::Loading,
-                    egui::Button::new(localizer.text(Message::RecorderOpenFrame)),
+                    appearance::primary_button(ui, localizer.text(Message::RecorderOpenFrame)),
                 )
                 .clicked()
                 && let Err(error) = self.open_recorder_overlay(ui.ctx())
@@ -2059,29 +2101,11 @@ impl GifFromScreenApp {
             ui.add(egui::Label::new(&summary).truncate())
                 .on_hover_text(summary);
         }
-        if let Some(notice) = &self.notice {
-            egui::ScrollArea::vertical()
-                .id_salt("screen-recorder-status")
-                .max_height(96.0)
-                .auto_shrink([false, true])
-                .show(ui, |ui| ui.label(notice));
-        }
-        ui.separator();
-        egui::ScrollArea::vertical()
-            .id_salt("screen-recorder-settings")
-            .auto_shrink([false, false])
-            .show(ui, |ui| self.show_screen_recorder_options(ui));
     }
 
     fn show_screen_recorder_options(&mut self, ui: &mut egui::Ui) {
         let localizer = self.language_settings.localizer();
         self.show_recording_settings(ui);
-        ui.separator();
-        egui::CollapsingHeader::new(localizer.text(Message::RecorderGlobalShortcuts))
-            .id_salt("global-recorder-shortcuts")
-            .show(ui, |ui| {
-                self.shortcut_tool.show(ui, self.display_server, localizer);
-            });
         if let Some(progress) = self.progress {
             ui.add_space(12.0);
             ui.label(format_message(
@@ -2104,6 +2128,27 @@ impl GifFromScreenApp {
     }
 
     fn show_editor(&mut self, ui: &mut egui::Ui) {
+        if self.editor_workspace.is_none() {
+            let localizer = self.language_settings.localizer();
+            ui.add_space(28.0);
+            ui.heading(localizer.text(Message::EditorEmptyTitle));
+            ui.add_space(12.0);
+            for (view, label) in [
+                (AppView::OpenProject, Message::HomeOpenProject),
+                (AppView::ImportGif, Message::HomeImportGif),
+                (AppView::ImportImage, Message::HomeImportImage),
+                (AppView::NewBlankAnimation, Message::HomeNewAnimation),
+            ] {
+                if ui.button(localizer.text(label)).clicked() {
+                    self.open_landing_view(view);
+                }
+            }
+            ui.separator();
+            if let Some(path) = self.project_library.show_recent(ui, localizer) {
+                self.open_library_project(&path);
+            }
+            return;
+        }
         if self.auto_tasks.is_running() {
             drawing_preview::invalidate(ui.ctx(), &mut self.editor_ui_state.drawing_overlay);
             self.vector_shapes.invalidate(ui.ctx());
@@ -2134,6 +2179,9 @@ impl GifFromScreenApp {
             }
             return;
         }
+        if !self.editor_ui_state.project_tools_selected() {
+            return;
+        }
         let motion_enabled = !self.source_workers_active()
             && !self.text_overlay.is_running()
             && self.watermark_job.state() == WatermarkDecodeJobState::Idle
@@ -2162,8 +2210,9 @@ impl GifFromScreenApp {
         );
         let open_copy = self.project_library.show_save_as(ui, workspace);
         ui.separator();
-        let export_action = egui::CollapsingHeader::new(localizer.text(Message::ExportTitle))
+        let export_panel = egui::CollapsingHeader::new(localizer.text(Message::ExportTitle))
             .id_salt("editor-export-options")
+            .open(self.export_scroll_target.map(|_| true))
             .show(ui, |ui| {
                 show_export_panel(
                     ui,
@@ -2176,7 +2225,11 @@ impl GifFromScreenApp {
                         || self.annotation_tools.is_running(),
                     localizer,
                 )
-            })
+            });
+        if let Some(align) = self.export_scroll_target.take() {
+            export_panel.header_response.scroll_to_me(Some(align));
+        }
+        let export_action = export_panel
             .body_returned
             .unwrap_or(EditorExportAction::None);
         match export_action {
@@ -2213,6 +2266,10 @@ impl GifFromScreenApp {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one editor paint transaction collects tool, preview and timeline actions before dispatch"
+    )]
     fn show_editor_work_area(&mut self, ui: &mut egui::Ui) {
         let localizer = self.language_settings.localizer();
         let cine_input_enabled = !self.source_workers_active()
@@ -2270,7 +2327,7 @@ impl GifFromScreenApp {
             }
             watermark_action = action;
         };
-        ui.columns(layout.columns(), |columns| {
+        editor_shell_layout::work_area(ui, layout, |columns| {
             if layout == editor_shell_layout::InspectorLayout::SideBySide {
                 inspector(
                     &mut columns[0],
@@ -2307,6 +2364,12 @@ impl GifFromScreenApp {
                 );
             }
         });
+        results.extend(editor_ui::show_editor_timeline(
+            ui,
+            workspace,
+            &mut self.editor_ui_state,
+            localizer,
+        ));
         self.handle_vector_intent(vector_intent, cine_input_enabled, localizer);
         self.handle_editor_actions(results, watermark_action, cine_input_enabled, localizer);
     }
@@ -2428,9 +2491,10 @@ impl GifFromScreenApp {
 
     fn show_recording_settings(&mut self, ui: &mut egui::Ui) {
         let localizer = self.language_settings.localizer();
+        let previous_source = self.selected_source;
         egui::Grid::new("recording_settings")
             .num_columns(2)
-            .spacing([16.0, 8.0])
+            .spacing([12.0, 6.0])
             .show(ui, |ui| {
                 ui.label(localizer.text(Message::RecorderCaptureSource));
                 ui.horizontal(|ui| {
@@ -2469,45 +2533,80 @@ impl GifFromScreenApp {
                 });
                 ui.end_row();
 
-                ui.label(localizer.text(Message::RecorderOutputGif));
-                ui.text_edit_singleline(&mut self.settings.output);
-                ui.end_row();
-                ui.label(localizer.text(Message::RecorderMaximumDurationManualStopMs));
-                ui.add(
-                    egui::DragValue::new(&mut self.settings.duration_ms)
-                        .range(0..=MAX_RECORDING_DURATION_MS),
-                );
-                ui.end_row();
+                self.show_recording_output(ui, localizer);
                 show_recording_cadence_settings(
                     ui,
                     &mut self.settings,
                     self.display_server == Some(LinuxDisplayServer::X11),
                     localizer,
                 );
-                show_frame_retention_setting(ui, &mut self.settings, localizer);
-                show_recording_annotations_setting(
-                    ui,
-                    &mut self.settings,
-                    self.display_server == Some(LinuxDisplayServer::X11),
-                    localizer,
-                );
-                ui.label(localizer.text(Message::RecorderCountdownSeconds));
-                ui.add(
-                    egui::DragValue::new(&mut self.settings.countdown_seconds)
-                        .range(0..=MAX_COUNTDOWN_SECONDS),
-                );
-                ui.end_row();
-                ui.label(localizer.text(Message::RecorderCaptureRegion));
-                ui.checkbox(
-                    &mut self.settings.region_enabled,
-                    localizer.text(Message::RecorderPhysicalRectangle),
-                );
-                ui.end_row();
             });
 
+        if self.selected_source != previous_source {
+            self.center_selected_recording_region();
+        }
+        egui::CollapsingHeader::new(localizer.text(Message::UiAdvancedSettings))
+            .id_salt("recording-advanced")
+            .show(ui, |ui| {
+                egui::Grid::new("recording-advanced-fields")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label(localizer.text(Message::RecorderCountdownSeconds));
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.countdown_seconds)
+                                .range(0..=MAX_COUNTDOWN_SECONDS),
+                        );
+                        ui.end_row();
+                        ui.label(localizer.text(Message::RecorderMaximumDurationManualStopMs));
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.duration_ms)
+                                .range(0..=MAX_RECORDING_DURATION_MS),
+                        );
+                        ui.end_row();
+                        show_recording_playback_settings(ui, &mut self.settings, localizer);
+                        show_frame_retention_setting(ui, &mut self.settings, localizer);
+                        show_recording_annotations_setting(
+                            ui,
+                            &mut self.settings,
+                            self.display_server == Some(LinuxDisplayServer::X11),
+                            localizer,
+                        );
+                        ui.label(localizer.text(Message::RecorderCaptureRegion));
+                        ui.checkbox(
+                            &mut self.settings.region_enabled,
+                            localizer.text(Message::RecorderPhysicalRectangle),
+                        );
+                        ui.end_row();
+                    });
+                self.show_recording_region_settings(ui, localizer);
+                self.show_recording_source_description(ui, localizer);
+                ui.separator();
+                egui::CollapsingHeader::new(localizer.text(Message::RecorderGlobalShortcuts))
+                    .id_salt("global-recorder-shortcuts")
+                    .show(ui, |ui| {
+                        self.shortcut_tool.show(ui, self.display_server, localizer);
+                    });
+            });
+    }
+
+    fn show_recording_output(&mut self, ui: &mut egui::Ui, localizer: Localizer) {
+        ui.label(localizer.text(Message::RecorderOutputGif));
+        self.output_picker
+            .show(ui, &mut self.settings.output, localizer);
+        ui.end_row();
+    }
+
+    fn show_recording_region_settings(&mut self, ui: &mut egui::Ui, localizer: Localizer) {
         if self.settings.region_enabled {
+            let before = (
+                self.settings.region_x,
+                self.settings.region_y,
+                self.settings.region_width,
+                self.settings.region_height,
+            );
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("X");
                 ui.add(egui::DragValue::new(&mut self.settings.region_x));
                 ui.label("Y");
@@ -2517,6 +2616,16 @@ impl GifFromScreenApp {
                 ui.label(localizer.text(Message::RecorderHeight));
                 ui.add(egui::DragValue::new(&mut self.settings.region_height).range(1..=65_535));
             });
+            if before
+                != (
+                    self.settings.region_x,
+                    self.settings.region_y,
+                    self.settings.region_width,
+                    self.settings.region_height,
+                )
+            {
+                self.region_placement = RegionPlacement::Positioned;
+            }
             if ui
                 .button(localizer.text(Message::RecorderSelectRegion))
                 .clicked()
@@ -2525,7 +2634,6 @@ impl GifFromScreenApp {
                 self.notice = Some(error.into());
             }
         }
-        self.show_recording_source_description(ui, localizer);
     }
 
     fn show_recording_source_description(&self, ui: &mut egui::Ui, localizer: Localizer) {
@@ -3070,13 +3178,29 @@ impl GifFromScreenApp {
             Ok(catalog) => {
                 let display_server = catalog.display_server();
                 let sources = catalog.into_sources();
+                let previous = self.sources.get(self.selected_source);
                 let selected_source = sources
                     .iter()
-                    .position(|source| !source.name().contains("(root)"))
+                    .position(|source| previous.is_some_and(|old| old.id() == source.id()))
+                    .or_else(|| {
+                        sources
+                            .iter()
+                            .position(|source| !source.name().contains("(root)"))
+                    })
                     .unwrap_or(0);
+                if previous.is_some_and(|old| {
+                    sources
+                        .get(selected_source)
+                        .is_none_or(|new| old.id() != new.id() || old.geometry() != new.geometry())
+                }) {
+                    self.region_placement = RegionPlacement::CenterOnSource;
+                }
                 self.display_server = Some(display_server);
                 self.sources = sources;
                 self.selected_source = selected_source;
+                if matches!(self.region_placement, RegionPlacement::CenterOnSource) {
+                    self.center_selected_recording_region();
+                }
                 let display_name = match display_server {
                     LinuxDisplayServer::X11 => "X11",
                     LinuxDisplayServer::Wayland => "Wayland",
@@ -3101,6 +3225,16 @@ impl GifFromScreenApp {
                     &[("error", &error.to_string())],
                 ));
             }
+        }
+    }
+
+    fn center_selected_recording_region(&mut self) {
+        if self.display_server == Some(LinuxDisplayServer::X11)
+            && let Some(source) = self.sources.get(self.selected_source)
+            && let Some(rect) = source.geometry()
+        {
+            center_recording_region(&mut self.settings, rect.size());
+            self.region_placement = RegionPlacement::Positioned;
         }
     }
 
@@ -4194,15 +4328,17 @@ fn show_editor_preview_panel(
     if transition.is_some() || state.playback.is_some() {
         state.canvas.crop.cancel();
     }
-    ui.heading(if vector_reference.is_some() {
-        localizer.text(Message::VectorShapesTitle)
+    if let Some(title) = if vector_reference.is_some() {
+        Some(Message::VectorShapesTitle)
     } else if cine_reference.is_some() {
-        localizer.text(Message::PreviewCinemagraphReference)
+        Some(Message::PreviewCinemagraphReference)
     } else if transition.is_some() {
-        localizer.text(Message::PreviewTransitionTitle)
+        Some(Message::PreviewTransitionTitle)
     } else {
-        localizer.text(Message::PreviewCurrentFrameTitle)
-    });
+        None
+    } {
+        ui.strong(localizer.text(title));
+    }
     state.canvas.show_zoom(ui, localizer);
     if show_preview_asset_issues(ui, workspace, localizer) {
         drawing_preview::invalidate(ui.ctx(), &mut state.drawing_overlay);
@@ -4374,16 +4510,6 @@ fn draw_editor_preview(
             &[("step", &step.step.to_string())],
         ));
     }
-    ui.weak(format_message(
-        localizer,
-        Message::PreviewRenderedSizes,
-        &[
-            ("rendered_width", &preview.rendered_size[0].to_string()),
-            ("rendered_height", &preview.rendered_size[1].to_string()),
-            ("preview_width", &preview.preview_size[0].to_string()),
-            ("preview_height", &preview.preview_size[1].to_string()),
-        ],
-    ));
 }
 
 fn show_preview_asset_issues(
@@ -4518,7 +4644,11 @@ fn show_export_panel(
     let asset_issue_count = workspace.asset_issues().len();
     let active = export_job_is_active(job.state());
     ui.add_enabled_ui(!active && !editor_mutation_active, |ui| {
-        editor_export_presets::show_export_presets(ui, settings, workspace, localizer);
+        egui::CollapsingHeader::new(localizer.text(Message::ExportProjectPreset))
+            .id_salt("export-preset-management")
+            .show(ui, |ui| {
+                editor_export_presets::show_export_presets(ui, settings, workspace, localizer);
+            });
         show_export_configuration(ui, output, settings, selected_count, localizer);
     });
     if editor_mutation_active {
@@ -4540,7 +4670,7 @@ fn show_export_panel(
             if ui
                 .add_enabled(
                     asset_issue_count == 0 && !editor_mutation_active,
-                    egui::Button::new(localizer.text(Message::ExportTitle)),
+                    appearance::primary_button(ui, localizer.text(Message::ExportTitle)),
                 )
                 .clicked()
             {
@@ -5142,6 +5272,18 @@ fn draw_wayland_region_selector(
         &mut preview.drag_initial_region,
         allow_resize,
     )
+}
+
+fn center_recording_region(
+    settings: &mut RecordingSettings,
+    source_size: gif_from_screen_capture::PhysicalSize,
+) {
+    settings.region_width = settings.region_width.clamp(1, source_size.width());
+    settings.region_height = settings.region_height.clamp(1, source_size.height());
+    settings.region_x =
+        i32::try_from((source_size.width() - settings.region_width) / 2).unwrap_or(i32::MAX);
+    settings.region_y =
+        i32::try_from((source_size.height() - settings.region_height) / 2).unwrap_or(i32::MAX);
 }
 
 fn initial_wayland_region(
@@ -6212,35 +6354,40 @@ fn show_recording_cadence_settings(
     localizer: Localizer,
 ) {
     ui.label(localizer.text(Message::RecorderCaptureFrequency));
-    egui::ComboBox::from_id_salt("recording_cadence")
-        .selected_text(recording_cadence_label(settings.cadence, localizer))
-        .show_ui(ui, |ui| {
-            for choice in [
-                RecordingCadenceChoice::FixedFps,
-                RecordingCadenceChoice::Periodic,
-                RecordingCadenceChoice::Manual,
-            ] {
-                ui.selectable_value(
-                    &mut settings.cadence,
-                    choice,
-                    recording_cadence_label(choice, localizer),
-                );
-            }
-            ui.add_enabled_ui(x11, |ui| {
-                ui.selectable_value(
-                    &mut settings.cadence,
-                    RecordingCadenceChoice::Interaction,
-                    recording_cadence_label(RecordingCadenceChoice::Interaction, localizer),
-                );
+    ui.horizontal_wrapped(|ui| {
+        egui::ComboBox::from_id_salt("recording_cadence")
+            .selected_text(recording_cadence_label(settings.cadence, localizer))
+            .show_ui(ui, |ui| {
+                for choice in [
+                    RecordingCadenceChoice::FixedFps,
+                    RecordingCadenceChoice::Periodic,
+                    RecordingCadenceChoice::Manual,
+                ] {
+                    ui.selectable_value(
+                        &mut settings.cadence,
+                        choice,
+                        recording_cadence_label(choice, localizer),
+                    );
+                }
+                ui.add_enabled_ui(x11, |ui| {
+                    ui.selectable_value(
+                        &mut settings.cadence,
+                        RecordingCadenceChoice::Interaction,
+                        recording_cadence_label(RecordingCadenceChoice::Interaction, localizer),
+                    );
+                });
             });
-        });
+        if settings.cadence == RecordingCadenceChoice::FixedFps {
+            ui.add(
+                egui::DragValue::new(&mut settings.fps)
+                    .range(1..=60)
+                    .suffix(" FPS"),
+            )
+            .on_hover_text(localizer.text(Message::RecorderFramesPerSecond));
+        }
+    });
     ui.end_row();
     match settings.cadence {
-        RecordingCadenceChoice::FixedFps => {
-            ui.label(localizer.text(Message::RecorderFramesPerSecond));
-            ui.add(egui::DragValue::new(&mut settings.fps).range(1..=60));
-            ui.end_row();
-        }
         RecordingCadenceChoice::Periodic => {
             ui.label(localizer.text(Message::RecorderPeriodicInterval));
             ui.horizontal(|ui| {
@@ -6266,7 +6413,7 @@ fn show_recording_cadence_settings(
             });
             ui.end_row();
         }
-        RecordingCadenceChoice::Manual => {}
+        RecordingCadenceChoice::FixedFps | RecordingCadenceChoice::Manual => {}
         RecordingCadenceChoice::Interaction => {
             ui.label(localizer.text(Message::RecorderInteractionScope));
             ui.vertical(|ui| {
@@ -6276,7 +6423,6 @@ fn show_recording_cadence_settings(
             ui.end_row();
         }
     }
-    show_recording_playback_settings(ui, settings, localizer);
 }
 
 fn show_recording_playback_settings(
@@ -6773,25 +6919,6 @@ const fn frame_retention(changes_only: bool) -> FrameRetention {
     }
 }
 
-fn landing_action(ui: &mut egui::Ui, title: &str, description: &str, enabled: bool) -> bool {
-    let mut clicked = false;
-    ui.group(|ui| {
-        ui.set_min_height(112.0);
-        ui.set_min_width(LANDING_CARD_MIN_WIDTH);
-        clicked = ui.add_enabled(enabled, egui::Button::new(title)).clicked();
-        ui.label(description);
-        if !enabled {
-            ui.weak("Planned");
-        }
-    });
-    clicked
-}
-
-#[cfg(test)]
-fn landing_cards_fit(available_width: f32, column_spacing: f32) -> bool {
-    available_width >= LANDING_CARD_MIN_WIDTH * 2.0 + column_spacing
-}
-
 const fn file_drop_block_reason(activity: FileDropActivity) -> Option<&'static str> {
     match activity {
         FileDropActivity::Idle => None,
@@ -7052,8 +7179,8 @@ fn native_options() -> eframe::NativeOptions {
             // eframe creates one shared painter; child transparency alone is
             // insufficient to enable alpha-capable Wgpu swapchains.
             .with_transparent(true)
-            .with_inner_size([1040.0, 760.0])
-            .with_min_inner_size([680.0, 440.0]),
+            .with_inner_size([520.0, 190.0])
+            .with_min_inner_size([440.0, 180.0]),
         ..Default::default()
     };
     let display = gif_from_screen_capture_linux::LinuxEnvironment::from_process()
@@ -7111,7 +7238,7 @@ mod tests {
         create_incremental_recording_project, default_gif_path_for_project,
         default_sequence_project_path, edited_gif_path_for_import, editor_result_notice,
         export_job_is_active, export_result_notice, file_drop_block_reason, fit_dimensions,
-        frame_retention, has_static_image_extension, initial_wayland_region, landing_cards_fit,
+        frame_retention, has_static_image_extension, initial_wayland_region,
         map_drawing_preview_point, map_preview_selection, open_project_controls_enabled,
         open_project_lock_policy, parse_startup_intent, prepare_file_drop_route,
         project_path_for_output, recording_cadence, recording_project_canvas,
@@ -8497,15 +8624,13 @@ mod tests {
     }
 
     #[test]
-    fn imported_gif_derives_non_overwriting_output_and_landing_cards_fit_default_width() {
+    fn imported_gif_derives_non_overwriting_output() {
         let source = Path::new("/tmp/animation.gif");
         assert_eq!(
             edited_gif_path_for_import(source).unwrap(),
             PathBuf::from("/tmp/animation-edited.gif")
         );
         assert_ne!(edited_gif_path_for_import(source).unwrap(), source);
-        assert!(landing_cards_fit(820.0 - 32.0, 8.0));
-        assert!(!landing_cards_fit(550.0, 8.0));
     }
 
     #[test]
@@ -9482,6 +9607,30 @@ mod tests {
             map_drawing_preview_point(preview, egui::pos2(f32::NAN, 0.0), [1_000, 500]).is_none()
         );
         assert!(map_drawing_preview_point(preview, preview.center(), [0, 500]).is_none());
+    }
+
+    #[test]
+    fn default_recording_region_is_centered_and_fits_small_sources() {
+        for (width, height, expected) in [
+            (1920, 1080, (640, 300, 640, 480)),
+            (1921, 1081, (640, 300, 640, 480)),
+            (320, 200, (0, 0, 320, 200)),
+        ] {
+            let mut settings = RecordingSettings::default();
+            crate::center_recording_region(
+                &mut settings,
+                gif_from_screen_capture::PhysicalSize::new(width, height).unwrap(),
+            );
+            assert_eq!(
+                (
+                    settings.region_x,
+                    settings.region_y,
+                    settings.region_width,
+                    settings.region_height
+                ),
+                expected
+            );
+        }
     }
 
     #[test]

@@ -81,7 +81,7 @@ fn region() -> PhysicalRect {
     PhysicalRect::new(100, 100, 100, 80).unwrap()
 }
 fn native() -> NativeWindow {
-    let rect = PhysicalRect::new(400, 400, 420, 300).unwrap();
+    let rect = PhysicalRect::new(400, 400, 480, 40).unwrap();
     NativeWindow {
         outer: Some(rect),
         client: Some(rect),
@@ -129,7 +129,7 @@ fn frame_events<R>(
     events: Vec<egui::Event>,
     mut draw: impl FnMut(&egui::Context) -> R,
 ) -> (egui::FullOutput, R) {
-    let size = egui::vec2(420.0, 300.0);
+    let size = egui::vec2(480.0, 40.0);
     let mut input = egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
         events,
@@ -658,7 +658,7 @@ fn final_extra_exclusion_cleanup_ack_is_required_before_real_workflow_resume() {
     assert!(overlay.change.is_none());
     assert_eq!(worker.stats.lock().unwrap().resumes, 1);
     let final_generation = overlay.request.unwrap().generation;
-    overlay.update_guide(Some(moved_region), RecorderStage::Ready);
+    overlay.update_guide(Some(moved_region), RecorderStage::Recording);
     assert_eq!(
         overlay.request.unwrap().generation,
         final_generation,
@@ -953,4 +953,32 @@ fn all_four_corners_resize_with_the_opposite_corner_anchored() {
             PhysicalRect::new(expected.0, expected.1, expected.2, expected.3).unwrap()
         );
     }
+}
+
+#[test]
+fn native_motion_permission_is_revoked_before_a_held_capture_pause_ends() {
+    let (mut job, _worker) = Worker::start(region());
+    let mut overlay = overlay(region(), false);
+    overlay.update_capture_guide(Some(&job), RecorderStage::Recording);
+    assert!(overlay.request.unwrap().preview_bounds.is_none());
+    overlay.gesture = Some(Gesture {
+        id: 1,
+        start: region().origin(),
+        initial: overlay.geometry,
+        edge: GuideEdge::Move,
+    });
+    // A pointer hold alone does not authorize moving over live capture.
+    overlay.update_capture_guide(Some(&job), RecorderStage::Recording);
+    assert!(overlay.request.unwrap().preview_bounds.is_none());
+    let now = Instant::now();
+    begin_change(&mut overlay, &job, now);
+    assert!(!prepare_change(&mut overlay, Some(&mut job), native(), now));
+    until(|| job.controller.pause_status() == (0, Some(true)));
+    overlay.update_capture_guide(Some(&job), RecorderStage::Paused);
+    assert_eq!(overlay.request.unwrap().preview_bounds, Some(source()));
+    overlay.gesture = None;
+    overlay.update_capture_guide(Some(&job), RecorderStage::Paused);
+    assert!(overlay.request.unwrap().preview_bounds.is_none());
+    assert_eq!(job.controller.pause_status(), (0, Some(true)));
+    assert!(overlay.change.is_some());
 }

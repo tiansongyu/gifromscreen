@@ -68,6 +68,10 @@ impl Default for ProjectLibraryTool {
 }
 
 impl ProjectLibraryTool {
+    pub(crate) fn history_ready(&self) -> bool {
+        self.loaded
+    }
+
     fn empty() -> Self {
         Self {
             store: None,
@@ -193,12 +197,20 @@ impl ProjectLibraryTool {
     ) -> Option<PathBuf> {
         let mut open = None;
         let mut remove = None;
+        if self.recent.is_empty() && self.notice.is_none() && !self.is_active() {
+            ui.weak(localizer.text(Message::RecentEmpty));
+            return None;
+        }
         ui.horizontal(|ui| {
-            ui.heading(localizer.text(Message::HomeRecentProjects));
+            ui.label(
+                egui::RichText::new(localizer.text(Message::HomeRecentProjects))
+                    .size(16.0)
+                    .strong(),
+            );
             if ui
                 .add_enabled(
                     !self.history_task.is_running(),
-                    egui::Button::new(localizer.text(Message::RecentRefresh)),
+                    egui::Button::new(localizer.text(Message::RecentRefresh)).frame(false),
                 )
                 .clicked()
             {
@@ -225,7 +237,11 @@ impl ProjectLibraryTool {
                     {
                         open = Some(entry.path.clone());
                     }
-                    ui.weak(entry.path.display().to_string());
+
+                    if let Some(parent) = entry.path.parent().and_then(Path::file_name) {
+                        ui.weak(parent.to_string_lossy())
+                            .on_hover_text(entry.path.display().to_string());
+                    }
                     if !entry.available {
                         ui.colored_label(
                             ui.visuals().warn_fg_color,
@@ -522,31 +538,17 @@ mod tests {
     }
 
     #[test]
-    fn recent_empty_state_switches_language_and_refresh_stays_an_explicit_action() {
+    fn empty_recent_list_is_a_single_translated_hint_without_actions() {
         let context = egui::Context::default();
         let mut library = ProjectLibraryTool::empty();
         library.loaded = true;
         for tag in ["en", "zh", "en"] {
             let localizer = localizer(tag);
             let frame = recent_frame(&context, &mut library, localizer, Vec::new());
-            for key in [
-                Message::HomeRecentProjects,
-                Message::RecentRefresh,
-                Message::RecentEmpty,
-            ] {
-                assert!(frame.contains(localizer.text(key)));
-            }
+            assert!(frame.contains(localizer.text(Message::RecentEmpty)));
+            assert!(!frame.contains(localizer.text(Message::RecentRefresh)));
             assert!(frame.open.is_none());
             assert!(library.loaded && library.pending.is_empty());
-            let position = frame.position(localizer.text(Message::RecentRefresh), 0);
-            assert!(
-                click_recent(&context, &mut library, localizer, position)
-                    .open
-                    .is_none()
-            );
-            assert!(!library.loaded);
-            assert!(library.pending.is_empty());
-            library.loaded = true;
         }
     }
 
@@ -569,8 +571,8 @@ mod tests {
         let chinese = localizer("zh");
         let frame = recent_frame(&context, &mut library, chinese, Vec::new());
         assert!(frame.contains(raw));
-        assert!(frame.contains(first.to_str().unwrap()));
-        assert!(frame.contains(second.to_str().unwrap()));
+        assert!(frame.contains("first"));
+        assert!(frame.contains("second"));
         let position = frame.position("movie{subtitle}.gfsproj", 1);
         assert_eq!(
             click_recent(&context, &mut library, chinese, position).open,

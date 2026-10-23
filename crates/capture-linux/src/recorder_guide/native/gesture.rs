@@ -9,9 +9,10 @@ use super::*;
 const GESTURE_LIFETIME: Duration = Duration::from_secs(30);
 
 pub(super) struct Gesture {
-    id: u64,
+    pub(super) id: u64,
     started: Instant,
     event_floor: u64,
+    pub(super) direct: Option<super::direct_drag::DirectDrag>,
 }
 
 impl Windows<'_, '_> {
@@ -93,8 +94,15 @@ impl Windows<'_, '_> {
                     return Ok(());
                 }
                 if event.root == self.root {
+                    if let Some(drag) = self
+                        .gesture
+                        .as_mut()
+                        .and_then(|gesture| gesture.direct.as_mut())
+                    {
+                        drag.position = position(event.root_x, event.root_y);
+                    }
                     context.event(GuidePointerEvent::Moved {
-                        gesture_id: gesture.id,
+                        gesture_id: self.gesture.as_ref().unwrap().id,
                         position: position(event.root_x, event.root_y),
                     });
                 } else {
@@ -116,6 +124,16 @@ impl Windows<'_, '_> {
                     return Ok(());
                 }
                 self.connection.stream().begin_operation();
+                if let Some(drag) = self
+                    .gesture
+                    .as_mut()
+                    .and_then(|gesture| gesture.direct.as_mut())
+                {
+                    drag.position = position(event.root_x, event.root_y);
+                }
+                if event.root == self.root {
+                    self.present_direct_drag(context)?;
+                }
                 let gesture = self.gesture.take().ok_or("Recorder gesture disappeared.")?;
                 self.ungrab()?;
                 context.event(if event.root == self.root {
@@ -164,11 +182,21 @@ impl Windows<'_, '_> {
         self.connection.stream().registration_complete();
         if result {
             let position = position(event.root_x, event.root_y);
+            let edge = hit_edge(index, position, region);
+            if let Some(gesture) = &mut self.gesture {
+                gesture.direct = Some(super::direct_drag::DirectDrag {
+                    initial: request,
+                    start: position,
+                    position,
+                    edge,
+                });
+            }
+            self.present_direct_drag(context)?;
             context.event(GuidePointerEvent::Pressed {
                 generation: request.generation,
                 gesture_id: id,
                 position,
-                edge: hit_edge(index, position, region),
+                edge,
                 modifiers: u16::from(event.state) & 0xff,
             });
         }
@@ -219,6 +247,7 @@ impl Windows<'_, '_> {
             id,
             started,
             event_floor,
+            direct: None,
         });
         let pointer = self
             .connection

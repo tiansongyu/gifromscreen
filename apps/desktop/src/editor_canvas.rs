@@ -85,7 +85,13 @@ impl EditorCanvasState {
                     (PreviewZoom::Native, Message::PreviewZoomNative),
                     (PreviewZoom::Double, Message::PreviewZoomDouble),
                 ] {
-                    ui.selectable_value(&mut self.zoom, zoom, localizer.text(message));
+                    ui.selectable_value(&mut self.zoom, zoom, localizer.text(message))
+                        .on_hover_text(localizer.text(match zoom {
+                            PreviewZoom::Fit => Message::PreviewFitHint,
+                            PreviewZoom::Native | PreviewZoom::Double => {
+                                Message::PreviewExactPixelHint
+                            }
+                        }));
                 }
             });
         });
@@ -94,10 +100,6 @@ impl EditorCanvasState {
             self.panning = false;
             self.crop.cancel_gesture();
         }
-        ui.small(localizer.text(match self.zoom {
-            PreviewZoom::Fit => Message::PreviewFitHint,
-            PreviewZoom::Native | PreviewZoom::Double => Message::PreviewExactPixelHint,
-        }));
     }
 
     /// Calls every overlay painter within the same clipped scrolling viewport.
@@ -110,16 +112,24 @@ impl EditorCanvasState {
         editable: bool,
         overlay: impl FnOnce(&mut egui::Ui, &egui::Response),
     ) -> Result<egui::Response, Notice> {
-        let available = egui::vec2(ui.available_width().max(1.0), CANVAS_HEIGHT);
+        // Leave room for the filmstrip and playback controls below the canvas.
+        let height = (ui.ctx().screen_rect().bottom() - ui.cursor().top() - 150.0)
+            .clamp(100.0, CANVAS_HEIGHT);
+        let available = egui::vec2(ui.available_width().max(1.0), height);
         let size = self.zoom.extent(
             preview.rendered_size,
             available,
             ui.ctx().pixels_per_point(),
         )?;
         self.update_pan(ui);
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(ui.cursor().min, available),
+            0,
+            crate::appearance::Palette::of(ui).surface,
+        );
         let output = egui::ScrollArea::both()
             .id_salt("editor-image-viewport")
-            .max_height(CANVAS_HEIGHT)
+            .max_height(height)
             .auto_shrink([false, true])
             .scroll_source(egui::scroll_area::ScrollSource {
                 drag: false,
@@ -127,16 +137,27 @@ impl EditorCanvasState {
             })
             .scroll_offset(self.scroll_offset)
             .show(ui, |ui| {
-                let response = crate::show_editor_preview_image(ui, &preview.texture, size, sense);
-                let crop_input = editable
-                    && !self.panning
-                    && !ui.input(|input| input.pointer.button_down(egui::PointerButton::Middle));
-                self.crop
-                    .interact(ui, &response, preview.rendered_size, crop_input);
-                self.crop
-                    .paint(ui.painter(), response.rect, preview.rendered_size);
-                overlay(ui, &response);
-                response
+                ui.allocate_ui_with_layout(
+                    egui::vec2(available.x.max(size.x), available.y.max(size.y)),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        ui.add_space(((available.y - size.y) * 0.5).max(0.0));
+                        let response =
+                            crate::show_editor_preview_image(ui, &preview.texture, size, sense);
+                        let crop_input = editable
+                            && !self.panning
+                            && !ui.input(|input| {
+                                input.pointer.button_down(egui::PointerButton::Middle)
+                            });
+                        self.crop
+                            .interact(ui, &response, preview.rendered_size, crop_input);
+                        self.crop
+                            .paint(ui.painter(), response.rect, preview.rendered_size);
+                        overlay(ui, &response);
+                        response
+                    },
+                )
+                .inner
             });
         self.scroll_offset = output.state.offset;
         self.viewport = Some(output.inner_rect);

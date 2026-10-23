@@ -30,46 +30,165 @@ pub(crate) fn draw(
     snap: &mut crate::window_snap::WindowSnapUi,
     localizer: Localizer,
 ) -> RecorderOverlayAction {
-    move_from_keyboard(context, geometry, stage);
     let mut action = RecorderOverlayAction::None;
-    egui::TopBottomPanel::bottom("x11_controller_actions")
-        .resizable(false)
+    let settings_id = egui::Id::new("recorder-options-expanded");
+    let mut expanded = context
+        .data(|data| data.get_temp::<bool>(settings_id))
+        .unwrap_or(false);
+    let panel = egui::CentralPanel::default()
+        .frame(
+            egui::Frame::new()
+                .fill(
+                    crate::appearance::Palette::for_theme(context.style().visuals.dark_mode)
+                        .surface,
+                )
+                .inner_margin(6)
+                .stroke(egui::Stroke::new(
+                    1.0_f32,
+                    crate::appearance::Palette::for_theme(context.style().visuals.dark_mode).border,
+                )),
+        )
         .show(context, |ui| {
-            action = primary_controls(
-                ui,
-                stage,
-                settings.cadence == RecordingCadenceChoice::Manual,
-                input_ready,
-                localizer,
-            );
-        });
-    egui::CentralPanel::default().show(context, |ui| {
-        egui::ScrollArea::vertical()
-            .id_salt("x11_controller_settings")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                show_status(ui, stage, progress, localizer);
-                if let Some(notice) = notice {
-                    ui.add(egui::Label::new(notice).wrap());
+            ui.vertical(|ui| {
+                let separate_actions = ui.available_width() < 480.0
+                    || ui.text_style_height(&egui::TextStyle::Body) > 20.0;
+                if separate_actions {
+                    ui.horizontal_wrapped(|ui| {
+                        action = primary_controls(
+                            ui,
+                            stage,
+                            settings.cadence == RecordingCadenceChoice::Manual,
+                            input_ready,
+                            localizer,
+                        );
+                    });
                 }
-                // A native button claim disables Start before the root grab.
-                // Reserve exactly the same wrapped status area in both states:
-                // inserting it only when busy would move the claimed hit target.
-                ui.add_visible(
-                    !input_ready,
-                    egui::Label::new(localizer.text(Message::RecorderWaitGeometry)).wrap(),
-                );
-                ui.separator();
-                snap.show(ui, geometry, stage, localizer);
-                show_geometry(ui, geometry, stage, localizer);
-                ui.separator();
-                show_timing(ui, settings, stage, localizer);
-            });
+                ui.horizontal_wrapped(|ui| {
+                    show_metrics(
+                        ui,
+                        geometry,
+                        stage,
+                        settings,
+                        &mut expanded,
+                        separate_actions,
+                        localizer,
+                    );
+                    if !separate_actions {
+                        action = primary_controls(
+                            ui,
+                            stage,
+                            settings.cadence == RecordingCadenceChoice::Manual,
+                            input_ready,
+                            localizer,
+                        );
+                    }
+                });
+                if stage != RecorderStage::Ready && !(expanded && separate_actions) {
+                    ui.horizontal_wrapped(|ui| show_status(ui, stage, progress, localizer));
+                }
+                if let Some(notice) = notice.filter(|text| !text.trim().is_empty()) {
+                    egui::ScrollArea::vertical()
+                        .id_salt("recorder-notice")
+                        .max_height(32.0)
+                        .show(ui, |ui| {
+                            ui.add(egui::Label::new(notice).truncate())
+                                .on_hover_text(notice)
+                        });
+                }
+                if expanded {
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .max_height(ui.available_height().clamp(40.0, 280.0))
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            snap.show(ui, geometry, stage, localizer);
+                            show_geometry(ui, geometry, stage, localizer);
+                            ui.separator();
+                            show_timing(ui, settings, stage, localizer);
+                        });
+                }
+            })
+            .response
+            .rect
+            .height()
+                + 12.0
+        });
+    context.data_mut(|data| {
+        data.insert_temp(settings_id, expanded);
+        data.insert_temp(
+            egui::Id::new("recorder-panel-height"),
+            panel.inner.max(40.0),
+        );
     });
     if context.input(|input| input.viewport().close_requested()) {
         action = RecorderOverlayAction::Close;
     }
     action
+}
+
+fn show_metrics(
+    ui: &mut egui::Ui,
+    geometry: &mut RecorderGeometry,
+    stage: RecorderStage,
+    settings: &mut RecordingSettings,
+    expanded: &mut bool,
+    separate_actions: bool,
+    localizer: Localizer,
+) {
+    if ui
+        .selectable_label(*expanded, localizer.text(Message::HomeOptions))
+        .clicked()
+    {
+        *expanded = !*expanded;
+    }
+    if *expanded && separate_actions {
+        return;
+    }
+    ui.separator();
+    ui.add_enabled(
+        stage == RecorderStage::Ready,
+        egui::DragValue::new(&mut settings.fps)
+            .range(1..=240)
+            .speed(1.0),
+    );
+    ui.label("fps");
+    ui.separator();
+    let size = geometry.region().size();
+    let (mut width, mut height) = (size.width(), size.height());
+    let bounds = geometry.source().size();
+    let mut changed = false;
+    ui.add_enabled_ui(
+        stage.allows_resizing() && !geometry.size_is_frozen(),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut width)
+                        .range(1..=bounds.width())
+                        .speed(1.0),
+                )
+                .changed();
+            ui.label("×");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut height)
+                        .range(1..=bounds.height())
+                        .speed(1.0),
+                )
+                .changed();
+            ui.label("px");
+        },
+    );
+    if changed && let Ok(size) = PhysicalSize::new(width, height) {
+        let _ = geometry.resize(size);
+    }
+    ui.separator();
+}
+
+pub(crate) fn panel_height(context: &egui::Context) -> f32 {
+    context
+        .data(|data| data.get_temp::<f32>(egui::Id::new("recorder-panel-height")))
+        .unwrap_or(40.0)
 }
 
 fn primary_controls(
@@ -80,75 +199,91 @@ fn primary_controls(
     localizer: Localizer,
 ) -> RecorderOverlayAction {
     let mut action = RecorderOverlayAction::None;
-    ui.horizontal_wrapped(|ui| {
-        let mut button = |message, enabled, requested| {
-            // Buttons use sequential auto IDs, not their translated captions.
-            // Keep them direct children so horizontal wrapping sees each button.
-            if ui
-                .add_enabled(enabled, egui::Button::new(localizer.text(message)).wrap())
-                .clicked()
-            {
-                action = requested;
-            }
-        };
-        match stage {
-            RecorderStage::Ready => {
-                button(
-                    Message::RecorderStart,
-                    input_ready,
-                    RecorderOverlayAction::Start,
-                );
-                button(Message::CancelButton, true, RecorderOverlayAction::Close);
-            }
-            RecorderStage::Countdown(_) => {
-                button(
-                    Message::CancelButton,
-                    true,
-                    RecorderOverlayAction::CancelCountdown,
-                );
-            }
-            RecorderStage::Recording => {
-                if manual {
-                    button(
-                        Message::RecorderTakeSnapshot,
-                        input_ready,
-                        RecorderOverlayAction::Snapshot,
-                    );
-                }
-                button(Message::RecorderPause, true, RecorderOverlayAction::Pause);
-                button(
-                    Message::RecorderStopShort,
-                    true,
-                    RecorderOverlayAction::Stop,
-                );
-                button(
-                    Message::RecorderDiscardShort,
-                    true,
-                    RecorderOverlayAction::Discard,
-                );
-            }
-            RecorderStage::Paused => {
-                button(
-                    Message::RecorderResume,
-                    input_ready,
-                    RecorderOverlayAction::Resume,
-                );
-                button(
-                    Message::RecorderStopShort,
-                    true,
-                    RecorderOverlayAction::Stop,
-                );
-                button(
-                    Message::RecorderDiscardShort,
-                    true,
-                    RecorderOverlayAction::Discard,
-                );
-            }
-            RecorderStage::Finalizing => {
-                button(Message::CancelButton, true, RecorderOverlayAction::Discard);
-            }
+    let mut button = |message, enabled, requested| {
+        // Buttons use sequential auto IDs, not their translated captions.
+        // Keep them direct children so horizontal wrapping sees each button.
+        if requested == RecorderOverlayAction::Discard && stage != RecorderStage::Finalizing {
+            ui.add_space(16.0);
+            ui.separator();
         }
-    });
+        if ui
+            .add_enabled(
+                enabled,
+                if requested == RecorderOverlayAction::Start
+                    || requested == RecorderOverlayAction::Resume
+                    || (requested == RecorderOverlayAction::Stop && stage != RecorderStage::Paused)
+                {
+                    egui::Button::new(
+                        egui::RichText::new(localizer.text(message))
+                            .color(egui::Color32::from_rgb(171, 40, 40)),
+                    )
+                    .wrap()
+                } else {
+                    egui::Button::new(localizer.text(message)).wrap()
+                },
+            )
+            .clicked()
+        {
+            action = requested;
+        }
+    };
+    match stage {
+        RecorderStage::Ready => {
+            button(
+                Message::RecorderStart,
+                input_ready,
+                RecorderOverlayAction::Start,
+            );
+            button(Message::CancelButton, true, RecorderOverlayAction::Close);
+        }
+        RecorderStage::Countdown(_) => {
+            button(
+                Message::CancelButton,
+                true,
+                RecorderOverlayAction::CancelCountdown,
+            );
+        }
+        RecorderStage::Recording => {
+            if manual {
+                button(
+                    Message::RecorderTakeSnapshot,
+                    input_ready,
+                    RecorderOverlayAction::Snapshot,
+                );
+            }
+            button(Message::RecorderPause, true, RecorderOverlayAction::Pause);
+            button(
+                Message::RecorderStopShort,
+                true,
+                RecorderOverlayAction::Stop,
+            );
+            button(
+                Message::RecorderDiscardShort,
+                true,
+                RecorderOverlayAction::Discard,
+            );
+        }
+        RecorderStage::Paused => {
+            button(
+                Message::RecorderResume,
+                input_ready,
+                RecorderOverlayAction::Resume,
+            );
+            button(
+                Message::RecorderStopShort,
+                true,
+                RecorderOverlayAction::Stop,
+            );
+            button(
+                Message::RecorderDiscardShort,
+                true,
+                RecorderOverlayAction::Discard,
+            );
+        }
+        RecorderStage::Finalizing => {
+            button(Message::CancelButton, true, RecorderOverlayAction::Discard);
+        }
+    }
     action
 }
 
@@ -210,8 +345,6 @@ fn show_geometry(
     localizer: Localizer,
 ) {
     ui.strong(localizer.text(Message::RecorderPhysicalRegion));
-    ui.label(localizer.text(Message::RecorderGlobalCoordinates));
-    show_position_buttons(ui, geometry, stage, localizer);
 
     let before = geometry.region();
     let mut position = before.origin();
@@ -221,34 +354,35 @@ fn show_geometry(
     let resizing = stage.allows_resizing() && !geometry.size_is_frozen();
     let mut changed = false;
     ui.add_enabled_ui(moving, |ui| {
-        changed |= ui
-            .add(egui::DragValue::new(&mut position.x).speed(1).prefix("X: "))
-            .changed();
-        changed |= ui
-            .add(egui::DragValue::new(&mut position.y).speed(1).prefix("Y: "))
-            .changed();
+        ui.horizontal_wrapped(|ui| {
+            changed |= ui
+                .add(egui::DragValue::new(&mut position.x).speed(1).prefix("X: "))
+                .changed();
+            changed |= ui
+                .add(egui::DragValue::new(&mut position.y).speed(1).prefix("Y: "))
+                .changed();
+        });
     });
     ui.add_enabled_ui(resizing, |ui| {
-        changed |= ui
-            .add(
-                egui::DragValue::new(&mut width)
-                    .speed(1)
-                    .range(1..=geometry.source().size().width())
-                    .prefix(localizer.text(Message::RecorderWidthPrefix)),
-            )
-            .changed();
-        changed |= ui
-            .add(
-                egui::DragValue::new(&mut height)
-                    .speed(1)
-                    .range(1..=geometry.source().size().height())
-                    .prefix(localizer.text(Message::RecorderHeightPrefix)),
-            )
-            .changed();
+        ui.horizontal_wrapped(|ui| {
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut width)
+                        .speed(1)
+                        .range(1..=geometry.source().size().width())
+                        .prefix(localizer.text(Message::RecorderWidthPrefix)),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut height)
+                        .speed(1)
+                        .range(1..=geometry.source().size().height())
+                        .prefix(localizer.text(Message::RecorderHeightPrefix)),
+                )
+                .changed();
+        });
     });
-    if !resizing {
-        ui.label(localizer.text(Message::RecorderCanvasPositionOnly));
-    }
     if changed {
         let result = PhysicalSize::new(width, height)
             .map_err(|_| Message::RecorderInvalidDimensions)
@@ -256,134 +390,6 @@ fn show_geometry(
         if let Err(error) = result {
             ui.colored_label(ui.visuals().error_fg_color, localizer.text(error));
         }
-    }
-}
-
-fn show_position_buttons(
-    ui: &mut egui::Ui,
-    geometry: &mut RecorderGeometry,
-    stage: RecorderStage,
-    localizer: Localizer,
-) {
-    let step = if ui.input(|input| input.modifiers.shift) {
-        10
-    } else {
-        1
-    };
-    ui.add_enabled_ui(stage.allows_moving(), |ui| {
-        let painted = ui.add(
-            egui::Button::new(localizer.text(Message::RecorderKeyboardMove))
-                .sense(egui::Sense::hover()),
-        );
-        let target = ui.interact(painted.rect, keyboard_move_id(), egui::Sense::click());
-        target.widget_info(|| {
-            egui::WidgetInfo::labeled(
-                egui::WidgetType::Button,
-                ui.is_enabled(),
-                localizer.text(Message::RecorderKeyboardMove),
-            )
-        });
-        if target.clicked() {
-            target.request_focus();
-        }
-        if target.has_focus() {
-            ui.memory_mut(|memory| {
-                memory.set_focus_lock_filter(
-                    keyboard_move_id(),
-                    egui::EventFilter {
-                        horizontal_arrows: true,
-                        vertical_arrows: true,
-                        ..Default::default()
-                    },
-                );
-            });
-            ui.painter().rect_stroke(
-                target.rect,
-                3.0,
-                ui.visuals().selection.stroke,
-                egui::StrokeKind::Inside,
-            );
-        }
-        target.on_hover_text(localizer.text(Message::RecorderKeyboardMoveHint));
-        ui.horizontal_wrapped(|ui| {
-            for (label, dx, dy) in [
-                ("X−", -step, 0),
-                ("X+", step, 0),
-                ("Y−", 0, -step),
-                ("Y+", 0, step),
-            ] {
-                if ui.button(label).clicked() {
-                    geometry.move_by(dx, dy);
-                }
-            }
-        });
-    });
-    ui.small(localizer.text(Message::RecorderMoveStepHint));
-}
-
-fn keyboard_move_id() -> egui::Id {
-    egui::Id::new("x11-recorder-keyboard-move")
-}
-
-fn move_from_keyboard(
-    context: &egui::Context,
-    geometry: &mut RecorderGeometry,
-    stage: RecorderStage,
-) {
-    if !stage.allows_moving() || !context.memory(|memory| memory.has_focus(keyboard_move_id())) {
-        return;
-    }
-    // A click can transfer focus later in this input batch. Do not consume a
-    // field's editing keys before it has had a chance to take that focus.
-    if !context.input(|input| input.focused)
-        || context.input(|input| {
-            input
-                .events
-                .iter()
-                .any(|event| matches!(event, egui::Event::PointerButton { pressed: true, .. }))
-        })
-    {
-        return;
-    }
-    if context.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-        context.memory_mut(|memory| memory.surrender_focus(keyboard_move_id()));
-        return;
-    }
-    let (mut dx, mut dy, mut count) = (0_i64, 0_i64, 0_usize);
-    context.input_mut(|input| {
-        input.events.retain(|event| {
-            let egui::Event::Key {
-                key,
-                pressed: true,
-                modifiers,
-                ..
-            } = event
-            else {
-                return true;
-            };
-            if modifiers.ctrl || modifiers.alt || modifiers.command || modifiers.mac_cmd {
-                return true;
-            }
-            let step = if modifiers.shift { 10 } else { 1 };
-            let delta = match key {
-                egui::Key::ArrowLeft => (-step, 0),
-                egui::Key::ArrowRight => (step, 0),
-                egui::Key::ArrowUp => (0, -step),
-                egui::Key::ArrowDown => (0, step),
-                _ => return true,
-            };
-            // Native key repeat is supported, with a bounded amount of work per UI
-            // update even if an input producer floods the event queue.
-            if count < 64 {
-                dx += delta.0;
-                dy += delta.1;
-                count += 1;
-            }
-            false
-        });
-    });
-    if count > 0 {
-        geometry.move_by(dx, dy);
     }
 }
 
@@ -572,9 +578,33 @@ mod tests {
                 if let Some(rect) = visible_text(&output, self.viewport, label) {
                     return rect;
                 }
+                let output = self.warm();
+                if visible_text(&output, self.viewport, label).is_none() {
+                    // Existing reachability tests exercise the settings after an explicit click.
+                    if let Some(rect) = visible_text(
+                        &output,
+                        self.viewport,
+                        self.localizer.text(Message::HomeOptions),
+                    ) {
+                        let id = self
+                            .context
+                            .memory(|memory| {
+                                memory
+                                    .data
+                                    .get_temp::<bool>(egui::Id::new("test-details-open"))
+                            })
+                            .unwrap_or(false);
+                        if !id {
+                            self.click(rect.center(), false);
+                            self.context.data_mut(|data| {
+                                data.insert_temp(egui::Id::new("test-details-open"), true);
+                            });
+                        }
+                    }
+                }
                 self.frame(
                     vec![
-                        egui::Event::PointerMoved(egui::pos2(20.0, 30.0)),
+                        egui::Event::PointerMoved(egui::pos2(20.0, self.viewport.bottom() - 20.0)),
                         egui::Event::MouseWheel {
                             unit: egui::MouseWheelUnit::Point,
                             delta: egui::vec2(0.0, -25.0),
@@ -790,27 +820,13 @@ mod tests {
     }
 
     #[test]
-    fn switching_language_preserves_movement_focus_and_numeric_edit_semantics() {
+    fn switching_language_preserves_numeric_edit_semantics() {
         let mut view = View::new(420.0, 320.0, 1.0, RecorderStage::Ready);
         crate::preferences::fonts::install(&view.context);
-        let target = view
-            .seek(view.localizer.text(Message::RecorderKeyboardMove))
-            .center();
-        view.click(target, false);
         view.warm();
         let before = view.geometry.region();
         view.localizer = chinese();
         view.warm();
-        assert!(
-            view.context
-                .memory(|memory| memory.has_focus(keyboard_move_id()))
-        );
-        view.frame(
-            vec![arrow(egui::Key::ArrowRight, true, false)],
-            egui::Modifiers::SHIFT,
-        );
-        assert_eq!(view.geometry.region().origin().x, before.origin().x + 10);
-        assert_eq!(view.geometry.region().size(), before.size());
         view.edit_number("3", "6");
         view.edit_number("0", "1500");
         assert_eq!(view.settings.countdown_seconds, 6);
@@ -840,39 +856,34 @@ mod tests {
     }
 
     #[test]
-    fn moving_uses_physical_pixels_and_shift_ten_without_changing_settings_coordinates() {
-        let mut view = View::new(320.0, 240.0, 1.0, RecorderStage::Paused);
-        view.geometry.freeze_size();
-        let settings_region = (
-            view.settings.region_x,
-            view.settings.region_y,
-            view.settings.region_width,
-            view.settings.region_height,
-        );
-        let button = view.seek("X+");
-        assert_eq!(
-            view.click(button.center(), false),
-            RecorderOverlayAction::None
-        );
-        assert_eq!(view.geometry.region().origin().x, -99);
-        assert_eq!(
-            view.click(button.center(), true),
-            RecorderOverlayAction::None
-        );
-        assert_eq!(view.geometry.region().origin().x, -89);
-        assert_eq!(
-            view.geometry.region().size(),
-            PhysicalSize::new(640, 420).unwrap()
-        );
-        assert_eq!(
-            (
-                view.settings.region_x,
-                view.settings.region_y,
-                view.settings.region_width,
-                view.settings.region_height
-            ),
-            settings_region
-        );
+    fn controller_requested_height_grows_and_shrinks_with_settings() {
+        let mut view = View::new(360.0, 600.0, 1.0, RecorderStage::Ready);
+        view.notice.clear();
+        let output = view.warm();
+        let compact = panel_height(&view.context);
+        assert!(compact <= 180.0);
+        let header = visible_text(&output, view.viewport, "Options").unwrap();
+        view.click(header.center(), false);
+        view.warm();
+        let expanded = panel_height(&view.context);
+        assert!(expanded > compact + 100.0);
+        let output = view.warm();
+        let header = visible_text(&output, view.viewport, "Options").unwrap();
+        view.click(header.center(), false);
+        view.warm();
+        assert!((panel_height(&view.context) - compact).abs() < 0.01);
+    }
+
+    #[test]
+    fn default_panel_hides_precision_controls_and_removes_step_buttons() {
+        let mut view = View::new(360.0, 180.0, 1.0, RecorderStage::Ready);
+        view.notice.clear();
+        let output = view.warm();
+        assert!(visible_text(&output, view.viewport, "Options").is_some());
+        assert!(visible_text(&output, view.viewport, "X+").is_none());
+        assert!(visible_text(&output, view.viewport, "Timing").is_none());
+        assert!(visible_text(&output, view.viewport, "Start").is_some());
+        view.seek("Timing");
     }
 
     #[test]
@@ -975,7 +986,7 @@ mod tests {
     fn finalizing_disables_physical_movement_and_sends_no_viewport_geometry_commands() {
         let mut view = View::new(320.0, 240.0, 1.0, RecorderStage::Finalizing);
         let before = view.geometry;
-        let position = view.seek("X+").center();
+        let position = view.seek("X: -100").center();
         assert_eq!(view.click(position, true), RecorderOverlayAction::None);
         assert_eq!(view.geometry, before);
         let output = view.warm();
@@ -1001,7 +1012,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_movement_keys_use_physical_pixels_and_preserve_canvas_across_zoom() {
+    fn arrow_keys_no_longer_move_the_recording_region() {
         for stage in [
             RecorderStage::Ready,
             RecorderStage::Countdown(2),
@@ -1009,99 +1020,25 @@ mod tests {
             RecorderStage::Paused,
         ] {
             let mut view = View::new(420.0, 300.0, 1.0, stage);
-            let target = view.seek("Move with arrow keys").center();
-            view.click(target, false);
-            view.warm();
-            assert!(
-                view.context
-                    .memory(|memory| memory.has_focus(keyboard_move_id()))
-            );
-            let before = view.geometry.region();
-            view.frame(
-                vec![arrow(egui::Key::ArrowRight, false, false)],
-                egui::Modifiers::NONE,
-            );
-            view.context.set_zoom_factor(2.0);
-            view.warm();
-            view.frame(
-                vec![arrow(egui::Key::ArrowDown, true, true)],
-                egui::Modifiers::SHIFT,
-            );
-            assert_eq!(view.geometry.region().origin().x, before.origin().x + 1);
-            assert_eq!(view.geometry.region().origin().y, before.origin().y + 10);
-            assert_eq!(view.geometry.region().size(), before.size());
-            assert!(
-                view.context
-                    .memory(|memory| memory.has_focus(keyboard_move_id()))
-            );
+            let output = view.warm();
+            assert!(visible_text(&output, view.viewport, "Move with arrow keys").is_none());
+            let before = view.geometry;
+            // Even stale focus from the old control cannot enable movement.
+            view.context.memory_mut(|memory| {
+                memory.request_focus(egui::Id::new("x11-recorder-keyboard-move"));
+            });
+            for key in [
+                egui::Key::ArrowLeft,
+                egui::Key::ArrowRight,
+                egui::Key::ArrowUp,
+                egui::Key::ArrowDown,
+            ] {
+                view.frame(
+                    vec![arrow(key, false, false), arrow(key, true, true)],
+                    egui::Modifiers::SHIFT,
+                );
+                assert_eq!(view.geometry, before);
+            }
         }
-    }
-
-    #[test]
-    fn movement_keys_do_not_steal_unfocused_text_modified_or_click_batch_input() {
-        let mut view = View::new(420.0, 300.0, 1.0, RecorderStage::Ready);
-        view.warm();
-        let before = view.geometry;
-        view.frame(
-            vec![arrow(egui::Key::ArrowLeft, false, false)],
-            egui::Modifiers::NONE,
-        );
-        assert_eq!(view.geometry, before);
-        let target = view.seek("Move with arrow keys").center();
-        view.click(target, false);
-        view.warm();
-        let modified = egui::Event::Key {
-            key: egui::Key::ArrowLeft,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::CTRL,
-        };
-        view.frame(vec![modified], egui::Modifiers::CTRL);
-        assert_eq!(view.geometry, before);
-        view.frame(
-            vec![
-                egui::Event::PointerButton {
-                    pos: egui::pos2(410.0, 20.0),
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::NONE,
-                },
-                arrow(egui::Key::ArrowDown, false, false),
-            ],
-            egui::Modifiers::NONE,
-        );
-        assert_eq!(view.geometry, before);
-    }
-
-    #[test]
-    fn escape_releases_movement_and_a_key_flood_is_bounded() {
-        let mut view = View::new(420.0, 300.0, 1.0, RecorderStage::Ready);
-        let target = view.seek("Move with arrow keys").center();
-        view.click(target, false);
-        view.warm();
-        let before = view.geometry.region();
-        view.frame(
-            (0..1000)
-                .map(|_| arrow(egui::Key::ArrowRight, false, true))
-                .collect(),
-            egui::Modifiers::NONE,
-        );
-        assert_eq!(view.geometry.region().origin().x, before.origin().x + 64);
-        view.frame(
-            vec![arrow(egui::Key::Escape, false, false)],
-            egui::Modifiers::NONE,
-        );
-        assert!(
-            !view
-                .context
-                .memory(|memory| memory.has_focus(keyboard_move_id()))
-        );
-        let after = view.geometry;
-        view.frame(
-            vec![arrow(egui::Key::ArrowRight, false, false)],
-            egui::Modifiers::NONE,
-        );
-        assert_eq!(view.geometry, after);
     }
 }

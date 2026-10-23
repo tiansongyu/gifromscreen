@@ -1756,6 +1756,45 @@ mod tests {
         assert_eq!(geometry, before);
     }
 
+    fn open_controller_settings(
+        context: &egui::Context,
+        snap: &mut WindowSnapUi,
+        geometry: &mut RecorderGeometry,
+        settings: &mut crate::RecordingSettings,
+        first: &egui::FullOutput,
+    ) {
+        let settings_header = first
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape
+                    && text.galley.text() == "Options"
+                {
+                    Some(text.pos + text.galley.size() * 0.5)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        for pressed in [true, false] {
+            controller_frame(
+                context,
+                snap,
+                geometry,
+                settings,
+                vec![
+                    egui::Event::PointerMoved(settings_header),
+                    egui::Event::PointerButton {
+                        pos: settings_header,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+    }
+
     #[test]
     fn actual_controller_busy_warning_never_moves_the_claimed_native_button() {
         let (mut snap, shared) = fake_drag();
@@ -1763,6 +1802,14 @@ mod tests {
         context.style_mut(|style| style.animation_time = 0.0);
         let mut geometry = geometry();
         let mut settings = crate::RecordingSettings::default();
+        let first = controller_frame(
+            &context,
+            &mut snap,
+            &mut geometry,
+            &mut settings,
+            Vec::new(),
+        );
+        open_controller_settings(&context, &mut snap, &mut geometry, &mut settings, &first);
         let first = controller_frame(
             &context,
             &mut snap,

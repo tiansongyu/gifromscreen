@@ -46,6 +46,10 @@ pub struct GuideRequest {
     pub handle_avoid: Option<PhysicalRect>,
     /// Show four resize handles only while the recording canvas is editable.
     pub resize_handles: bool,
+    /// Authorizes native pointer-driven preview inside these source bounds.
+    /// Set only before capture, or while a retarget transaction holds capture
+    /// paused. Revoke and acknowledge final geometry before capture resumes.
+    pub preview_bounds: Option<PhysicalRect>,
 }
 
 impl fmt::Debug for GuideRequest {
@@ -195,6 +199,8 @@ pub struct GuideUpdate {
     pub status: GuideStatus,
     /// Retained latest acknowledgement, cleared by a newer request.
     pub ack: Option<GuideAck>,
+    /// Native preview retained through release until final geometry is acknowledged.
+    pub preview: Option<GuidePreview>,
     /// Latest optional read-only controller observation; not an atomic server
     /// snapshot or presentation ACK. Normal window motion can race the reads.
     /// Cleared on stop/failure, and always None for `RecorderGuide::start`.
@@ -205,7 +211,23 @@ pub struct GuideUpdate {
     pub dropped_events: u64,
 }
 
+/// Pointer-driven presentation; this is not permission to start/resume capture.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct GuidePreview {
+    /// Presentation generation on which this explicit gesture began.
+    pub generation: u64,
+    /// Identity of the owned pointer gesture.
+    pub gesture_id: u64,
+    /// Most recently presented native region.
+    pub region: PhysicalRect,
+    /// Latest physical pointer position used for the preview.
+    pub position: PhysicalPosition,
+    /// False after release/cancellation, until a final request is acknowledged.
+    pub active: bool,
+}
+
 struct Shared {
+    preview: Option<GuidePreview>,
     repaint: Option<Arc<dyn Fn() + Send + Sync>>,
     request: Option<GuideRequest>,
     generation: u64,
@@ -240,6 +262,9 @@ impl Context {
     fn cancel_gesture(&self) {
         let mut shared = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
         shared.cancel_epoch = shared.cancel_epoch.wrapping_add(1);
+        if let Some(preview) = &mut shared.preview {
+            preview.active = false;
+        }
         if let Some(gesture_id) = shared.active_gesture.take() {
             shared
                 .events
@@ -285,6 +310,9 @@ impl Context {
         if !self.cancelled() && shared.generation == ack.generation {
             shared.ack = Some(ack);
             shared.status = GuideStatus::Ready;
+            if shared.preview.is_some_and(|preview| !preview.active) {
+                shared.preview = None;
+            }
         }
         let repaint = shared.repaint.clone();
         drop(shared);
@@ -346,6 +374,13 @@ impl Context {
         if shared.active_gesture != Some(event.gesture_id()) {
             return;
         }
+        if matches!(
+            event,
+            GuidePointerEvent::Released { .. } | GuidePointerEvent::Cancelled { .. }
+        ) && let Some(preview) = &mut shared.preview
+        {
+            preview.active = false;
+        }
         if matches!(event, GuidePointerEvent::Moved { .. })
             && shared.events.back().is_some_and(|previous| {
                 matches!(previous, GuidePointerEvent::Moved { .. })
@@ -360,6 +395,9 @@ impl Context {
                 .saturating_add(shared.events.len() as u64 + 1);
             shared.events.clear();
             shared.active_gesture = None;
+            if let Some(preview) = &mut shared.preview {
+                preview.active = false;
+            }
             shared.cancel_epoch = shared.cancel_epoch.wrapping_add(1);
             shared.events.push_back(GuidePointerEvent::Cancelled {
                 gesture_id: event.gesture_id(),
@@ -374,6 +412,24 @@ impl Context {
             }
         }
         let repaint = shared.repaint.clone();
+        drop(shared);
+        if let Some(repaint) = repaint {
+            repaint();
+        }
+    }
+
+    #[cfg(feature = "native-x11")]
+    fn preview(&self, preview: GuidePreview) {
+        let mut shared = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.cancelled() || shared.active_gesture != Some(preview.gesture_id) {
+            return;
+        }
+        let changed = shared.preview != Some(preview) || shared.ack.is_some();
+        shared.preview = Some(preview);
+        // A previous request was acknowledged before the pointer moved it.
+        // A fresh final request must verify the resulting native geometry.
+        shared.ack = None;
+        let repaint = changed.then(|| shared.repaint.clone()).flatten();
         drop(shared);
         if let Some(repaint) = repaint {
             repaint();
@@ -523,6 +579,7 @@ impl RecorderGuide {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         shared.request = None;
+        shared.preview = None;
         shared.events.clear();
         shared.ack = None;
         shared.controller = None;
@@ -566,6 +623,7 @@ impl RecorderGuide {
                     }
                 };
                 shared.ack = None;
+                shared.preview = None;
                 shared.controller = None;
                 shared.events.clear();
                 shared.request = None;
@@ -580,6 +638,7 @@ impl RecorderGuide {
         GuideUpdate {
             status: shared.status.clone(),
             ack: shared.ack,
+            preview: shared.preview,
             controller: shared.controller,
             events: shared.events.drain(..).collect(),
             dropped_events: std::mem::take(&mut shared.dropped),
@@ -597,6 +656,7 @@ impl Drop for RecorderGuide {
 fn new_context() -> Context {
     Context {
         shared: Arc::new(Mutex::new(Shared {
+            preview: None,
             repaint: None,
             request: None,
             generation: 0,

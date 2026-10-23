@@ -43,6 +43,7 @@ pub(super) struct RecorderOverlay {
     was_minimized: bool,
     last_scale: f32,
     gesture: Option<Gesture>,
+    native_preview: Option<gif_from_screen_capture_linux::GuidePreview>,
     snap: crate::window_snap::WindowSnapUi,
 }
 
@@ -105,6 +106,7 @@ impl RecorderOverlay {
             was_minimized: false,
             last_scale: scale,
             gesture: None,
+            native_preview: None,
             snap: crate::window_snap::WindowSnapUi::default(),
         }
     }
@@ -165,6 +167,15 @@ impl RecorderOverlay {
     }
 
     fn update_guide(&mut self, protected_region: Option<PhysicalRect>, stage: RecorderStage) {
+        self.update_guide_with_preview(protected_region, stage, None);
+    }
+
+    fn update_guide_with_preview(
+        &mut self,
+        protected_region: Option<PhysicalRect>,
+        stage: RecorderStage,
+        suspended_bounds: Option<PhysicalRect>,
+    ) {
         if self.failure.is_some() {
             return;
         }
@@ -177,13 +188,24 @@ impl RecorderOverlay {
         let handle_avoid = self.controller_geometry.map(|geometry| geometry.outer);
         let handle_scale = drag_handle_scale(self.last_scale);
         let resize_handles = stage.allows_resizing() && !self.geometry.size_is_frozen();
+        let preview_bounds = region.and_then(|_| {
+            if stage == RecorderStage::Ready {
+                Some(self.geometry.source())
+            } else {
+                suspended_bounds
+            }
+        });
+        let native_owns_motion =
+            self.native_preview.is_some_and(|preview| preview.active) && self.gesture.is_some();
         if self.request.is_some_and(|request| {
-            request.region == region
+            (request.region == region || native_owns_motion)
                 && request.protected_region == protected_region
                 && request.handle_avoid == handle_avoid
                 && request.handle_scale == handle_scale
                 && request.resize_handles == resize_handles
-        }) {
+                && request.preview_bounds == preview_bounds
+        }) && self.native_preview.is_none_or(|preview| preview.active)
+        {
             return;
         }
         let Some(generation) = self
@@ -197,10 +219,11 @@ impl RecorderOverlay {
             generation,
             region,
             protected_region,
-            border_width: 4,
+            border_width: 2,
             handle_scale,
             handle_avoid,
             resize_handles,
+            preview_bounds,
         };
         self.acknowledged = None;
         self.settle = None;
@@ -219,7 +242,14 @@ impl RecorderOverlay {
                 .as_ref()
                 .and_then(|retarget| global_region(self.geometry.source(), retarget.plan.applied()))
         });
-        self.update_guide(protected, stage);
+        let suspended_bounds = job
+            .filter(|job| {
+                self.change.is_some()
+                    && self.gesture.is_some()
+                    && job.controller.pause_status() == (0, Some(true))
+            })
+            .map(|_| self.geometry.source());
+        self.update_guide_with_preview(protected, stage, suspended_bounds);
     }
 
     fn poll_guide(&mut self, stage: RecorderStage) {
@@ -227,6 +257,13 @@ impl RecorderOverlay {
             return;
         };
         let update = guide.poll();
+        self.native_preview = update.preview;
+        let mut preview_geometry = self.gesture.as_ref().and_then(|gesture| {
+            update
+                .preview
+                .filter(|preview| preview.gesture_id == gesture.id)
+                .map(|preview| gesture_geometry(gesture, preview.position, stage))
+        });
         self.controller_geometry = update.controller;
         match update.status {
             GuideStatus::Failed(error) => self.failure = Some(error.into()),
@@ -251,10 +288,14 @@ impl RecorderOverlay {
                     edge,
                     ..
                 } => {
-                    if self
-                        .request
-                        .is_some_and(|request| request.generation == generation)
-                        && self.acknowledged == Some(generation)
+                    let native_proof = update.preview.is_some_and(|preview| {
+                        preview.gesture_id == gesture_id && preview.generation == generation
+                    });
+                    if native_proof
+                        || (self
+                            .request
+                            .is_some_and(|request| request.generation == generation)
+                            && self.acknowledged == Some(generation))
                     {
                         self.gesture = Some(Gesture {
                             id: gesture_id,
@@ -262,6 +303,16 @@ impl RecorderOverlay {
                             initial: self.geometry,
                             edge,
                         });
+                        preview_geometry = update
+                            .preview
+                            .filter(|preview| preview.gesture_id == gesture_id)
+                            .map(|preview| {
+                                gesture_geometry(
+                                    self.gesture.as_ref().unwrap(),
+                                    preview.position,
+                                    stage,
+                                )
+                            });
                     }
                 }
                 GuidePointerEvent::Moved {
@@ -297,6 +348,9 @@ impl RecorderOverlay {
                 }
             }
         }
+        if let Some(geometry) = preview_geometry {
+            self.geometry = geometry;
+        }
     }
 
     fn place(&mut self, context: &egui::Context, native: NativeWindow, now: Instant) {
@@ -319,14 +373,19 @@ impl RecorderOverlay {
             .first()
             .copied()
             .unwrap_or(self.geometry.source());
-        let size = panel_size(area.size(), scale);
+        let size = panel_size(
+            area.size(),
+            scale,
+            crate::x11_controller_ui::panel_height(context),
+            self.geometry.region().size().width(),
+        );
         let update = self.window.advance(
             native,
             WindowRequest {
                 region: self.geometry.region(),
                 workareas: &self.workareas,
                 panel_size: size,
-                gap: 8,
+                gap: 3,
             },
             now,
         );
@@ -403,15 +462,18 @@ impl RecorderOverlay {
     clippy::cast_precision_loss,
     reason = "finite physical panel budgets are clamped to nonempty u32 source dimensions"
 )]
-fn panel_size(area: PhysicalSize, scale: f32) -> PhysicalSize {
+fn panel_size(area: PhysicalSize, scale: f32, height: f32, region_width: u32) -> PhysicalSize {
     let scale = if scale.is_finite() && scale > 0.0 {
         scale
     } else {
         1.0
     };
     PhysicalSize::new(
-        (420.0 * scale).round().clamp(1.0, area.width() as f32) as u32,
-        (300.0 * scale).round().clamp(1.0, area.height() as f32) as u32,
+        (region_width as f32)
+            .max(480.0 * scale)
+            .round()
+            .clamp(1.0, area.width() as f32) as u32,
+        (height * scale).round().clamp(1.0, area.height() as f32) as u32,
     )
     .unwrap()
 }
@@ -515,6 +577,8 @@ fn finish_snap_frame(
 impl GifFromScreenApp {
     pub(super) fn open_recorder_overlay(&mut self, context: &egui::Context) -> Result<(), String> {
         let localizer = self.language_settings.localizer();
+        crate::recording_output::validate(&self.settings.output)
+            .map_err(|message| localizer.text(message).to_owned())?;
         crate::validate_settings(&self.settings)?;
         if self.display_server == Some(gif_from_screen_capture_linux::LinuxDisplayServer::Wayland) {
             return self.begin_wayland_preparation();

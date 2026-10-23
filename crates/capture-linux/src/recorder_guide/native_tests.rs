@@ -388,9 +388,9 @@ impl Fixture {
             u32::from_be_bytes(bytes)
         };
         for (shift, mask, expected) in [
-            (format.direct.red_shift, format.direct.red_mask, 242_u32),
-            (format.direct.green_shift, format.direct.green_mask, 153),
-            (format.direct.blue_shift, format.direct.blue_mask, 74),
+            (format.direct.red_shift, format.direct.red_mask, 96_u32),
+            (format.direct.green_shift, format.direct.green_mask, 112),
+            (format.direct.blue_shift, format.direct.blue_mask, 128),
             (format.direct.alpha_shift, format.direct.alpha_mask, 255),
         ] {
             assert_eq!(
@@ -560,6 +560,7 @@ fn request(
         handle_scale: 100,
         handle_avoid: None,
         resize_handles: false,
+        preview_bounds: None,
     }
 }
 
@@ -615,6 +616,134 @@ fn private_xvfb_position_updates_wake_without_a_frame_poll_timer() {
         timings[114],
         Duration::from_secs_f64(1.0 / 60.0)
     );
+    stop(&mut guide);
+    fixture.assert_cleanup();
+}
+
+#[test]
+#[ignore = "pointer-to-window checks on an owned Xvfb; never uses host DISPLAY"]
+fn private_xvfb_direct_drag_tracks_pointer_without_ui_polling_and_requires_final_ack() {
+    let fixture = Fixture::new();
+    let mut guide = fixture.guide();
+    let mut current = GuideRequest {
+        resize_handles: true,
+        preview_bounds: Some(PhysicalRect::new(0, 0, 400, 300).unwrap()),
+        ..request(1, Some(region()), None)
+    };
+    guide.request(current).unwrap();
+    await_ack(&mut guide, 1, true);
+    let top = fixture.mapped_strips()[0];
+    let gesture = begin_drag(&fixture, &mut guide, 1);
+    let mut timings = Vec::new();
+    // No Guide.poll(), UI frame, or new geometry request during these moves.
+    for step in 1..=60_i16 {
+        let started = Instant::now();
+        fixture.motion(140 + step, 58 + step);
+        loop {
+            let actual = fixture
+                .connection
+                .get_geometry(top)
+                .unwrap()
+                .reply()
+                .unwrap();
+            if actual.x == 76 + step && actual.y == 56 + step {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "native movement waited for UI"
+            );
+            thread::sleep(Duration::from_micros(100));
+        }
+        timings.push(started.elapsed());
+        thread::sleep(Duration::from_millis(16));
+    }
+    fixture.button(1, false);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let update = guide.poll();
+        assert!(!matches!(update.status, GuideStatus::Failed(_)));
+        if let Some(preview) = update.preview.filter(|preview| !preview.active) {
+            assert_eq!(preview.gesture_id, gesture);
+            assert_eq!(
+                preview.region,
+                PhysicalRect::new(140, 120, 120, 90).unwrap()
+            );
+            assert!(
+                update.ack.is_none(),
+                "old ACK cannot authorize moved geometry"
+            );
+            current.region = Some(preview.region);
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(1));
+    }
+    current.generation += 1;
+    current.preview_bounds = None;
+    guide.request(current).unwrap();
+    await_ack(&mut guide, 2, true);
+    assert!(guide.poll().preview.is_none());
+    assert_eq!(fixture.try_pointer(), GrabStatus::SUCCESS);
+    timings.sort_unstable();
+    eprintln!(
+        "Direct pointer-to-window, UI unpolled: median {:?}, p95 {:?}",
+        timings[30], timings[57]
+    );
+    stop(&mut guide);
+    fixture.assert_cleanup();
+}
+
+#[test]
+#[ignore = "native permission checks on an owned Xvfb; never uses host DISPLAY"]
+fn private_xvfb_direct_drag_cannot_move_without_permission_or_after_revocation() {
+    let fixture = Fixture::new();
+    let mut guide = fixture.guide();
+    let mut current = request(1, Some(region()), None);
+    guide.request(current).unwrap();
+    await_ack(&mut guide, 1, true);
+    let top = fixture.mapped_strips()[0];
+    begin_drag(&fixture, &mut guide, 1);
+    fixture.motion(170, 88);
+    await_event(&mut guide, |event| {
+        matches!(event, GuidePointerEvent::Moved { .. })
+    });
+    let actual = fixture
+        .connection
+        .get_geometry(top)
+        .unwrap()
+        .reply()
+        .unwrap();
+    assert_eq!((actual.x, actual.y), (76, 56));
+    assert!(guide.poll().preview.is_none());
+    fixture.button(1, false);
+    await_event(&mut guide, |event| {
+        matches!(event, GuidePointerEvent::Released { .. })
+    });
+    current.generation = 2;
+    current.preview_bounds = Some(PhysicalRect::new(0, 0, 400, 300).unwrap());
+    guide.request(current).unwrap();
+    await_ack(&mut guide, 2, true);
+    begin_drag(&fixture, &mut guide, 2);
+    current.generation = 3;
+    current.preview_bounds = None;
+    guide.request(current).unwrap();
+    await_ack(&mut guide, 3, true);
+    fixture.motion(180, 98);
+    await_event(&mut guide, |event| {
+        matches!(event, GuidePointerEvent::Moved { .. })
+    });
+    let actual = fixture
+        .connection
+        .get_geometry(top)
+        .unwrap()
+        .reply()
+        .unwrap();
+    assert_eq!((actual.x, actual.y), (76, 56));
+    fixture.button(1, false);
+    await_event(&mut guide, |event| {
+        matches!(event, GuidePointerEvent::Released { .. })
+    });
     stop(&mut guide);
     fixture.assert_cleanup();
 }
@@ -775,7 +904,7 @@ fn private_xvfb_ring_preserves_capture_pixels_shapes_clickthrough_and_owned_clea
     let colormap = fixture.assert_mapped_argb_strips();
     assert_eq!(
         fixture.pixel_rgb(140, 58),
-        0x00f2_994a,
+        0x0060_7080,
         "the accepted guide must paint the requested orange border on Xvfb"
     );
     assert_shapes_outside(&fixture, &windows, &[protected]);
@@ -948,7 +1077,7 @@ fn private_xvfb_large_grip_moves_from_its_corner_and_protects_both_capture_regio
         0,
         "the large grip has a visible dark move glyph"
     );
-    assert_eq!(fixture.pixel_rgb(72, 24), 0x00f2_994a);
+    assert_eq!(fixture.pixel_rgb(72, 24), 0x0060_7080);
     fixture.motion(72, 24);
     fixture.button(1, true);
     let pressed = await_event(&mut guide, |event| {
@@ -1024,7 +1153,7 @@ fn private_xvfb_grip_avoids_controller_and_passive_highlights_have_no_grip() {
     passive.request(request(1, Some(region()), None)).unwrap();
     await_ack(&mut passive, 1, true);
     assert_eq!(fixture.pixel_rgb(140, 38), 0x0012_3456);
-    assert_eq!(fixture.pixel_rgb(140, 58), 0x00f2_994a);
+    assert_eq!(fixture.pixel_rgb(140, 58), 0x0060_7080);
     stop(&mut passive);
     fixture.assert_cleanup();
 }

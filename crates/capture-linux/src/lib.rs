@@ -21,8 +21,8 @@ mod recorder_guide;
 pub use drag_picker::{DragPickerButton, DragPickerRequest, DragPickerSelection, DragPickerUpdate};
 mod recorder_input;
 pub use recorder_guide::{
-    ControllerGeometry, GuideAck, GuideEdge, GuidePointerEvent, GuideRequest, GuideStatus,
-    GuideUpdate, RecorderGuide,
+    ControllerGeometry, GuideAck, GuideEdge, GuidePointerEvent, GuidePreview, GuideRequest,
+    GuideStatus, GuideUpdate, RecorderGuide,
 };
 pub use recorder_input::set_recorder_input_shape;
 

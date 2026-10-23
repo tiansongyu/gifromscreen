@@ -51,7 +51,7 @@ function selectView(tab, moveFocus = false) {
   document.getElementById("view-description").textContent = views[currentView].description;
   note.textContent = currentView === "export"
     ? "Sample content generated with gif-from-screen-cli demo. Playback starts when you press Play."
-    : "Actual X11 app footage from an earlier interface. The current source interface has changed.";
+    : "Version 0.1.4 screenshots. Play shows an earlier X11 recording.";
   stopDemo();
   if (moveFocus) tab.focus();
 }

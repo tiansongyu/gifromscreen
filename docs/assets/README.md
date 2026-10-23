@@ -38,3 +38,15 @@ Both labs were explicitly stopped, leaving recordings for inspection.
 
 See [preview package acceptance](../LINUX-PREVIEW-1-QA.md) for actual capture
 origin, timing, project and GIF checks beyond the demonstration video.
+
+## Version 0.1.4 desktop interface
+
+`ui-v014-launcher.png`, `ui-v014-recorder.png` and `ui-v014-editor.png` are native
+source-build screenshots from an owned 1024 × 768 Xvfb server on 2026-10-23.
+They show the 520 × 190 launcher, transparent 640 × 480 capture area with its
+bottom bar, and a 960 × 680 editor with the CLI-generated 36-frame demo.
+The recorder's gray area is the plain test desktop visible through the frame.
+Screenshots are cropped to the app/frame without adding UI elements. No upstream
+ScreenToGif image is included. Website WebP stills use these current screenshots;
+the earlier animated recordings above retain their original provenance.
+[Current interface and verification](../DESKTOP-INTERFACE.md).

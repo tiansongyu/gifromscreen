@@ -59,7 +59,7 @@ fn selection_uses_render_alpha_not_root_visual_or_a_guessed_high_byte() {
     let (mut screen, mut formats) = fixture();
     let selected = select(&screen, 0, &formats).unwrap();
     assert_eq!(selected.visual, 42);
-    assert_eq!(selected.pixel, 0xfff2_994a);
+    assert_eq!(selected.pixel, 0xff60_7080);
     let direct = &mut formats.formats[0].direct;
     direct.red_shift = 0;
     direct.green_shift = 24;
@@ -69,7 +69,7 @@ fn selection_uses_render_alpha_not_root_visual_or_a_guessed_high_byte() {
     visual.red_mask = 0x0000_00ff;
     visual.green_mask = 0xff00_0000;
     visual.blue_mask = 0x0000_ff00;
-    assert_eq!(select(&screen, 0, &formats).unwrap().pixel, 0x99ff_4af2);
+    assert_eq!(select(&screen, 0, &formats).unwrap().pixel, 0x70ff_8060);
 }
 
 #[test]
@@ -114,7 +114,7 @@ fn malformed_masks_cannot_alias_alpha_and_color_or_overflow_the_pixel() {
     }
     let mut valid = formats;
     valid.formats.insert(0, Pictforminfo::default());
-    assert_eq!(select(&screen, 0, &valid).unwrap().pixel, 0xfff2_994a);
+    assert_eq!(select(&screen, 0, &valid).unwrap().pixel, 0xff60_7080);
 }
 
 #[test]
@@ -136,7 +136,7 @@ fn unequal_channel_widths_are_scaled_and_the_entire_alpha_field_is_set() {
     visual.blue_mask = 1023;
     let pixel = select(&screen, 0, &formats).unwrap().pixel;
     assert_eq!(pixel >> 30, 3);
-    assert_eq!((pixel >> 20) & 1023, (242 * 1023 + 127) / 255);
-    assert_eq!((pixel >> 10) & 1023, (153 * 1023 + 127) / 255);
-    assert_eq!(pixel & 1023, (74 * 1023 + 127) / 255);
+    assert_eq!((pixel >> 20) & 1023, (96 * 1023 + 127) / 255);
+    assert_eq!((pixel >> 10) & 1023, (112 * 1023 + 127) / 255);
+    assert_eq!(pixel & 1023, (128 * 1023 + 127) / 255);
 }

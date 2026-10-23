@@ -178,7 +178,12 @@ fn real_editor_preserves_wide_columns_and_font_focus_across_stacked_resize_and_l
     let output = app_frame(&context, &mut app, wide, vec![]);
     let image = preview_rect(&output);
     assert!(
-        text_rect(&output, language("en").text(Message::EditorExpression)).right() < image.left()
+        text_rect(
+            &output,
+            language("en").text(Message::EditorAdvancedSelection)
+        )
+        .left()
+            > image.right()
     );
     let tab = text_rect(&output, language("en").text(Message::EditorOverlaysTab));
     click_app(&context, &mut app, wide, tab.center());
@@ -449,6 +454,105 @@ fn header_keeps_brand_back_and_language_visible_and_clickable_at_narrow_zoom() {
             );
         }
     }
+}
+
+#[test]
+fn redesigned_home_actions_fit_narrow_zoom_and_full_cards_dispatch_the_correct_route() {
+    for (width, height, zoom) in [
+        (1280.0, 900.0, 1.0),
+        (680.0, 900.0, 1.5),
+        (480.0, 900.0, 1.5),
+        (680.0, 440.0, 1.5),
+        (600.0, 360.0, 1.0),
+        (600.0, 360.0, 1.5),
+        (600.0, 260.0, 1.0),
+        (600.0, 260.0, 1.5),
+    ] {
+        for tag in ["en", "zh"] {
+            let context = context(zoom);
+            crate::appearance::configure(&context);
+            context
+                .style_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+            let mut app = crate::GifFromScreenApp::default();
+            app.language_settings = crate::preferences::LanguageSettings::with_language(
+                gif_from_screen_localization::LanguagePreference::explicit(tag).unwrap(),
+            );
+            let size = egui::vec2(width, height);
+            for (message, route) in [
+                (Message::HomeRecorderTile, crate::AppView::ScreenRecorder),
+                (Message::HomeCameraTile, crate::AppView::CameraRecorder),
+                (Message::HomeBoardTile, crate::AppView::BoardRecorder),
+                (Message::HomeEditorTile, crate::AppView::Editor),
+            ] {
+                app.view = crate::AppView::Landing;
+                for _ in 0..3 {
+                    app_frame(&context, &mut app, size, vec![]);
+                }
+                scroll_to_text(&context, &mut app, size, language(tag).text(message));
+                // Wheel input is smoothed separately from scroll-to animations.
+                // Let that motion finish before choosing a physical click point.
+                for _ in 0..30 {
+                    app_frame(&context, &mut app, size, vec![]);
+                }
+                let output = app_frame(&context, &mut app, size, vec![]);
+                let title = visible_text(&output, language(tag).text(message)).unwrap();
+                assert!(
+                    title.left() >= 0.0 && title.right() <= width / zoom,
+                    "{width}/{zoom}/{tag}: {message:?} {title:?}"
+                );
+                // Click the empty corner of a large action card, beyond its title.
+                let card = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| {
+                        if let egui::Shape::Rect(rect) = &shape.shape {
+                            (rect.rect.height() >= 60.0
+                                && rect.rect.height() < 300.0
+                                && rect.rect.contains_rect(title)
+                                && rect.rect.width() < width / zoom * 0.4
+                                && shape.clip_rect.contains_rect(rect.rect))
+                            .then_some(rect.rect)
+                        } else {
+                            None
+                        }
+                    })
+                    .min_by(|a, b| a.area().total_cmp(&b.area()));
+                let point = card.map_or(title.center(), |rect| {
+                    rect.right_bottom() - egui::vec2(9.0, 9.0)
+                });
+                let clicked = click_app(&context, &mut app, size, point);
+                assert_eq!(
+                    app.view,
+                    route,
+                    "{width}/{zoom}/{tag}: {message:?}, title={title:?}, card={card:?}, point={point:?}, after={:?}",
+                    visible_text(&clicked, language(tag).text(message))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn header_export_reveals_configuration_without_exporting_or_mutating_the_project() {
+    let (_directory, mut app) = app_fixture();
+    let context = context(1.5);
+    crate::appearance::configure(&context);
+    let size = egui::vec2(680.0, 900.0);
+    let before = app.editor_workspace.as_ref().unwrap().manifest().clone();
+    for _ in 0..3 {
+        app_frame(&context, &mut app, size, vec![]);
+    }
+    let output = app_frame(&context, &mut app, size, vec![]);
+    let export = text_rect(&output, language("en").text(Message::ExportTitle));
+    click_app(&context, &mut app, size, export.center());
+    for _ in 0..12 {
+        app_frame(&context, &mut app, size, vec![]);
+    }
+    let output = app_frame(&context, &mut app, size, vec![]);
+    assert!(visible_text(&output, language("en").text(Message::ExportOutputLabel)).is_some());
+    assert_eq!(app.export_job.state(), crate::ExportJobState::Idle);
+    assert_eq!(app.editor_workspace.as_ref().unwrap().manifest(), &before);
+    assert!(app.export_scroll_target.is_none());
 }
 
 #[test]

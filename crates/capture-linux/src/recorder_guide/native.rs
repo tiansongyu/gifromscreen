@@ -16,13 +16,14 @@ use x11rb::{
 };
 
 use super::{
-    Context, GuideAck, GuideEdge, GuidePointerEvent, GuideRequest,
+    Context, GuideAck, GuideEdge, GuidePointerEvent, GuidePreview, GuideRequest,
     geometry::{self, Strip},
 };
 use crate::shortcuts::x11::{Client, stream};
 
 mod argb;
 mod controller;
+mod direct_drag;
 mod gesture;
 mod handle;
 mod translation;
@@ -177,8 +178,10 @@ impl Windows<'_, '_> {
             // Drain events after replies/observations too: x11rb may already
             // have buffered pointer events while waiting for those replies.
             if self.events(context)? {
+                self.present_direct_drag(context)?;
                 continue;
             }
+            self.present_direct_drag(context)?;
             self.connection.flush().map_err(native_error)?;
             if let Some(wake) = &context.wake {
                 self.connection
@@ -260,11 +263,13 @@ impl Windows<'_, '_> {
         if self.interactive && self.translate(request)? {
             return Ok(true);
         }
-        let keep_mapped = request.resize_handles
-            && request.protected_region.is_none()
-            && self
-                .current
-                .is_some_and(|old| old.resize_handles && old.protected_region.is_none());
+        let keep_mapped = (request.preview_bounds.is_some()
+            && self.current.is_some_and(|old| old.preview_bounds.is_some()))
+            || request.resize_handles
+                && request.protected_region.is_none()
+                && self
+                    .current
+                    .is_some_and(|old| old.resize_handles && old.protected_region.is_none());
         let previously_visible = self.visible;
         if !keep_mapped {
             for id in &self.ids {

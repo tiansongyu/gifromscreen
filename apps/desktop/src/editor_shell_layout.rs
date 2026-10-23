@@ -17,13 +17,75 @@ impl InspectorLayout {
             Self::Stacked
         }
     }
+}
 
-    pub(crate) const fn columns(self) -> usize {
-        match self {
-            Self::SideBySide => 2,
-            Self::Stacked => 1,
-        }
+/// Unequal columns retain the same child-ID order as egui's columns, including
+/// the stacked layout, so changing width does not transfer keyboard focus.
+pub(crate) fn work_area<R>(
+    ui: &mut egui::Ui,
+    layout: InspectorLayout,
+    contents: impl FnOnce(&mut [egui::Ui]) -> R,
+) -> R {
+    if layout == InspectorLayout::Stacked {
+        return ui.columns(1, contents);
     }
+    let id = ui.id().with("inspector-width");
+    let available = ui.available_width();
+    let mut width = ui
+        .ctx()
+        .data_mut(|data| data.get_persisted::<f32>(id))
+        .unwrap_or(300.0);
+    width = width.clamp(240.0, (available * 0.45).max(240.0));
+    let gap = 12.0;
+    let origin = ui.cursor().min;
+    let mut columns: Vec<_> = [
+        (origin.x + available - width, width),
+        (origin.x, available - width - gap),
+    ]
+    .into_iter()
+    .map(|(x, width)| {
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(x, origin.y),
+            egui::pos2(x + width, ui.max_rect().bottom()),
+        );
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::top_down_justified(egui::Align::LEFT)),
+        );
+        child.set_width(width);
+        child
+    })
+    .collect();
+    let result = contents(&mut columns);
+    let height = columns
+        .iter()
+        .map(|column| column.min_size().y)
+        .fold(0.0_f32, f32::max);
+    let divider = egui::Rect::from_min_size(
+        egui::pos2(origin.x + available - width - gap, origin.y),
+        egui::vec2(gap, height),
+    );
+    let response = ui
+        .interact(divider, id, egui::Sense::drag())
+        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+    if response.dragged()
+        && let Some(pointer) = response.interact_pointer_pos()
+    {
+        width = (origin.x + available - pointer.x - gap * 0.5).clamp(240.0, available * 0.45);
+        ui.ctx().data_mut(|data| data.insert_persisted(id, width));
+        ui.ctx().request_repaint();
+    }
+    ui.painter().vline(
+        divider.center().x,
+        divider.y_range(),
+        ui.visuals().widgets.noninteractive.bg_stroke,
+    );
+    ui.advance_cursor_after_rect(egui::Rect::from_min_size(
+        origin,
+        egui::vec2(available, height),
+    ));
+    result
 }
 
 pub(crate) fn inspector<R>(
@@ -60,7 +122,7 @@ pub(crate) fn header(
         egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
         egui::Layout::right_to_left(egui::Align::Center),
         |ui| {
-            // Allocate the action first, before the optional subtitle. The left
+            // Allocate the actions first, before the brand. The left
             // section can wrap within the actual remaining width without hiding it.
             ui.push_id("app-header-language", language);
             ui.with_layout(
@@ -76,18 +138,18 @@ pub(crate) fn header(
                         .inner
                         .clicked()
                     });
-                    ui.heading(crate::APP_NAME);
-                    let subtitle = localizer.text(Message::HeaderPreview);
-                    let font = egui::TextStyle::Body.resolve(ui.style());
-                    let width = ui
-                        .painter()
-                        .layout_no_wrap(subtitle.to_owned(), font, ui.visuals().text_color())
-                        .size()
-                        .x;
-                    if width + ui.spacing().item_spacing.x * 2.0 + 8.0 <= ui.available_width() {
-                        ui.separator();
-                        ui.label(subtitle);
+                    if ui.available_width() >= 600.0 {
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+                        crate::landing_ui::draw_icon(
+                            ui.painter(),
+                            rect.center(),
+                            20.0,
+                            crate::landing_ui::Icon::Screen,
+                            crate::appearance::Palette::of(ui).accent,
+                        );
                     }
+                    ui.label(egui::RichText::new(crate::APP_NAME).size(18.0).strong());
                     back
                 },
             )
@@ -95,4 +157,60 @@ pub(crate) fn header(
         },
     )
     .inner
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splitter_tracks_pointer_without_accumulating_repaint_delta() {
+        let context = egui::Context::default();
+        let mut width = 0.0;
+        let mut frame = |events| {
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 720.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        work_area(ui, InspectorLayout::SideBySide, |columns| {
+                            width = columns[0].available_width();
+                            columns[0].allocate_space(egui::vec2(width, 400.0));
+                            assert!(columns[1].available_width() > width);
+                        });
+                    });
+                },
+            );
+            width
+        };
+        frame(vec![]);
+        let start = egui::pos2(966.0, 100.0);
+        frame(vec![
+            egui::Event::PointerMoved(start),
+            egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let end = egui::pos2(876.0, 100.0);
+        frame(vec![egui::Event::PointerMoved(end)]);
+        for _ in 0..4 {
+            assert!((frame(vec![]) - 390.0).abs() < 0.01);
+        }
+        frame(vec![egui::Event::PointerButton {
+            pos: end,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!((frame(vec![]) - 390.0).abs() < 0.01);
+    }
 }

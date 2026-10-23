@@ -11,7 +11,7 @@
 
 [![GifFromScreen — record, pause, move the capture region and open the editor](docs/assets/record-and-retarget.gif)](https://tiansongyu.github.io/gifromscreen/)
 
-Recorded from the real X11 app. The demo shows an earlier interface; see [recording details](docs/assets/README.md).
+Recorded from the real X11 app. The animation shows an earlier interface. See the current [launcher, recorder and editor](docs/DESKTOP-INTERFACE.md).
 
 ## Install
 
@@ -23,19 +23,19 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/tiansongyu/gifromscreen
 
 Launch **GifFromScreen** from your applications menu, or run `gif-from-screen` with `~/.local/bin` on your `PATH`. The installer downloads the latest stable release, verifies its SHA-256 checksum and adds the desktop app and CLI under `~/.local`. Python 3.8+ is required; Rust and administrator access are not. It leaves shell configuration unchanged. Upgrades verify the existing installation and preserve a rollback copy before replacing application files; modified files are left untouched. Newer local versions are kept unless `--allow-downgrade` is explicitly supplied; [installation and removal](docs/PACKAGING.md#installation-and-removal).
 
-Prefer a portable download? Get the [v0.1.3 archive](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.3/gifromscreen-0.1.3-linux-x86_64.tar.gz) and its [SHA-256 file](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.3/gifromscreen-0.1.3-linux-x86_64.tar.gz.sha256), then run these commands in the download directory:
+Prefer a portable download? Get the [v0.1.4 archive](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.4/gifromscreen-0.1.4-linux-x86_64.tar.gz) and its [SHA-256 file](https://github.com/tiansongyu/gifromscreen/releases/download/v0.1.4/gifromscreen-0.1.4-linux-x86_64.tar.gz.sha256), then run these commands in the download directory:
 
 ```sh
-sha256sum --check gifromscreen-0.1.3-linux-x86_64.tar.gz.sha256
-tar -xzf gifromscreen-0.1.3-linux-x86_64.tar.gz
-cd gifromscreen-0.1.3-linux-x86_64
+sha256sum --check gifromscreen-0.1.4-linux-x86_64.tar.gz.sha256
+tar -xzf gifromscreen-0.1.4-linux-x86_64.tar.gz
+cd gifromscreen-0.1.4-linux-x86_64
 sha256sum --check SHA256SUMS
 ./bin/gif-from-screen
 ```
 
 Release packages target **Linux x86_64, Ubuntu 22.04 / glibc 2.35+**, with an X11 or Wayland desktop and a working OpenGL ES or Vulkan driver. Wayland capture needs PipeWire and your desktop's xdg-desktop-portal backend. System `ffmpeg` and `ffprobe` are optional dependencies for video import. Packages are unsigned; checksums detect download corruption. [System libraries](packaging/linux/README.txt).
 
-The stable package and source workspace are **0.1.3**. This release includes event-driven X11 guide updates, VSync-paced dragging, reusable border windows and automatic installer upgrades. See the [release notes](docs/releases/v0.1.3.md) and [drag scheduling details](docs/RECORDER-DRAG-CADENCE.md). [Development artifacts](https://github.com/tiansongyu/gifromscreen/actions/workflows/portable.yml) require GitHub sign-in and expire after 30 days.
+The stable package and source workspace are **0.1.4**. This release adds a four-tile launcher, compact recording controls, an editor with a bottom filmstrip, and X11 frame movement driven directly by native pointer events. See the [release notes](docs/releases/v0.1.4.md) and [drag scheduling details](docs/RECORDER-DRAG-CADENCE.md). [Development artifacts](https://github.com/tiansongyu/gifromscreen/actions/workflows/portable.yml) require GitHub sign-in and expire after 30 days.
 
 If v0.1.0 fails on X11/NVIDIA with `incompatible_surface_backends: Backends(GL)`, launch it with `WGPU_BACKEND=vulkan ./bin/gif-from-screen` from the portable directory, or `WGPU_BACKEND=vulkan gif-from-screen` after installation.
 
@@ -65,8 +65,8 @@ Build dependencies and packaging checks are maintained in the [Linux CI](.github
 
 ## Use
 
-1. **Record.** Open the screen recorder and choose a source and region. Resize before recording; pause and move the fixed-size region when needed. X11 uses a desktop recording frame. Wayland asks for sharing permission, then lets you crop within the authorized source.
-2. **Edit.** Stop recording to open the editor. Remove unwanted frames, adjust their timing, crop the image or add annotations. Use undo and redo to refine your changes.
+1. **Record.** Choose **Recorder** on the launcher to open the recording frame with valid defaults. Open its options for precise positioning and timing; cancel back to recording setup to change the source or save location. Resize before recording; pause and move the fixed-size region when needed. X11 uses a desktop recording frame. Wayland asks for sharing permission, then lets you crop within the authorized source.
+2. **Edit.** Stop recording to open the editor. Tools run across the top, the preview sits in the center and frames appear along the bottom. Remove unwanted frames, adjust their timing, crop the image or add annotations. Use undo and redo to refine your changes.
 3. **Export.** Choose all or selected frames, set colors, looping, transparency and dithering, then export a GIF. Save the `.gfsproj` project to continue editing later.
 
 ### Command line

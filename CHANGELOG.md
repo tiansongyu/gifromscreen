@@ -4,6 +4,18 @@ Release notes describe shipped behavior. Plans, experimental APIs and unfinished
 branches are not completed features. [中文工作总结](docs/WORK-STATUS.md) ·
 [All releases](https://github.com/tiansongyu/gifromscreen/releases)
 
+## 0.1.4 — 2026-10-23
+
+- Replace the launcher with four tiles and an Options menu, and open the recorder
+  directly when the source and output defaults are valid.
+- Add a thin recording border and compact bottom controls, a top editor ribbon,
+  right-side inspector and bottom filmstrip/playback bar with adaptive preview.
+- Move X11 border presentation onto the native pointer-event worker, independent
+  of UI/GPU frame timing. Retain acknowledged pause and final geometry checks.
+- Include localized save-path validation and the native save-location picker.
+- [Interface and screenshots](docs/DESKTOP-INTERFACE.md) ·
+  [Release notes](docs/releases/v0.1.4.md).
+
 ## 0.1.3 — 2026-10-23
 
 - Wake X11 guides directly for native input, position updates and cancellation;

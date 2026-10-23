@@ -70,7 +70,7 @@ fn color(visual: &Visualtype, format: &Pictforminfo) -> Option<u32> {
     // Fully opaque colored strip pixels, with channel positions established by
     // XRender, not guessed from the root visual or assumed to be 0xAARRGGBB.
     let mut pixel = alpha;
-    for (value, mask) in [(242_u32, red), (153, green), (74, blue)] {
+    for (value, mask) in [(96_u32, red), (112, green), (128, blue)] {
         let shift = mask.trailing_zeros();
         let range = mask >> shift;
         let channel = (u64::from(value) * u64::from(range) + 127) / 255;

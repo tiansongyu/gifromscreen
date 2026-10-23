@@ -31,9 +31,9 @@ use crate::editor_workspace::{EditorWorkspace, EditorWorkspaceError, OverlaySele
 use crate::thumbnail_cache::ThumbnailCache;
 use crate::ui_notice::Notice;
 
-const FILMSTRIP_ITEM_WIDTH: f64 = 112.0;
+const FILMSTRIP_ITEM_WIDTH: f64 = 88.0;
 const FILMSTRIP_ITEM_GAP: f64 = 8.0;
-const FILMSTRIP_ITEM_HEIGHT: f32 = 78.0;
+const FILMSTRIP_ITEM_HEIGHT: f32 = 60.0;
 const FILMSTRIP_OVERSCAN: usize = 3;
 const OVERLAY_TRACK_PAGE_SIZE: usize = 64;
 pub(crate) const MAX_DRAWING_DRAFT_POINTS: usize = 4_096;
@@ -697,10 +697,11 @@ pub(crate) fn show_editor_ui(
 ) -> Vec<EditorUiResult> {
     let mut results = show_editor_chrome(ui, workspace, state, localizer);
     results.extend(show_editor_tool_panel(ui, workspace, state, localizer));
+    results.extend(show_editor_timeline(ui, workspace, state, localizer));
     results
 }
 
-/// Draws persistent navigation, the virtual filmstrip, tool tabs and history.
+/// Draws ribbon tabs, history and common frame actions.
 /// The shell can place the preview next to the selected tool panel below this chrome.
 pub(crate) fn show_editor_chrome(
     ui: &mut egui::Ui,
@@ -712,10 +713,6 @@ pub(crate) fn show_editor_chrome(
     let mut results = Vec::new();
     advance_playback(ui.ctx(), workspace, state, now, &mut results);
 
-    show_editor_summary(ui, workspace, localizer);
-    show_navigation_toolbar(ui, workspace, state, now, &mut results, localizer);
-    show_virtual_filmstrip(ui, workspace, state, now, &mut results, localizer);
-    ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
         for tool in EditorToolTab::ALL {
             ui.selectable_value(&mut state.active_tool, tool, tool.label(localizer));
@@ -724,8 +721,42 @@ pub(crate) fn show_editor_chrome(
         show_history_buttons(ui, workspace, state, now, &mut results, localizer);
     });
     ui.separator();
+    if state.active_tool == EditorToolTab::Frames {
+        show_edit_toolbar(ui, workspace, state, now, &mut results, localizer);
+        ui.separator();
+    }
     schedule_playback_repaint(ui.ctx(), state, now);
     results
+}
+
+pub(crate) fn show_editor_timeline(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    localizer: Localizer,
+) -> Vec<EditorUiResult> {
+    let now = Instant::now();
+    let mut results = Vec::new();
+    ui.separator();
+    let colors = crate::appearance::Palette::of(ui);
+    egui::Frame::new()
+        .fill(colors.surface)
+        .stroke(egui::Stroke::new(1.0_f32, colors.border))
+        .inner_margin(4)
+        .show(ui, |ui| {
+            show_virtual_filmstrip(ui, workspace, state, now, &mut results, localizer);
+        });
+    show_navigation_toolbar(ui, workspace, state, now, &mut results, localizer);
+    results
+}
+
+impl EditorUiState {
+    pub(crate) fn open_project_tools(&mut self) {
+        self.active_tool = EditorToolTab::Project;
+    }
+    pub(crate) fn project_tools_selected(&self) -> bool {
+        self.active_tool == EditorToolTab::Project
+    }
 }
 
 /// Draws only the selected editing tools; the host owns sizing and scrolling.
@@ -753,7 +784,6 @@ fn show_active_tool(
     match state.active_tool {
         EditorToolTab::Frames => {
             show_selection_toolbar(ui, workspace, state, now, results, localizer);
-            show_edit_toolbar(ui, workspace, state, now, results, localizer);
             show_clipboard_history(ui, workspace, results, localizer);
         }
         EditorToolTab::Timing => {
@@ -801,43 +831,32 @@ fn show_active_tool(
 }
 
 fn show_editor_summary(ui: &mut egui::Ui, workspace: &EditorWorkspace, localizer: Localizer) {
-    ui.horizontal_wrapped(|ui| {
-        ui.heading(localizer.text(Message::EditorTitle));
-        ui.label(crate::format_message(
-            localizer,
-            Message::EditorFrameCount,
-            &[(
-                "count",
-                &workspace.manifest().timeline.frames.len().to_string(),
-            )],
-        ));
-        ui.label(crate::format_message(
-            localizer,
-            Message::EditorSelectedCount,
-            &[("count", &workspace.selection().len().to_string())],
-        ));
-        ui.label(crate::format_message(
-            localizer,
-            Message::EditorClipboardSummary,
-            &[
-                ("frames", &workspace.clipboard_len().to_string()),
-                ("snapshots", &workspace.clipboard_history_len().to_string()),
-            ],
-        ));
-        if workspace.is_dirty() {
-            ui.strong(localizer.text(Message::EditorCheckpointPending));
-        }
-        if !workspace.asset_issues().is_empty() {
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
-                crate::format_message(
-                    localizer,
-                    Message::EditorAssetIssues,
-                    &[("count", &workspace.asset_issues().len().to_string())],
-                ),
-            );
-        }
-    });
+    ui.label(crate::format_message(
+        localizer,
+        Message::EditorFrameCount,
+        &[(
+            "count",
+            &workspace.manifest().timeline.frames.len().to_string(),
+        )],
+    ));
+    ui.label(crate::format_message(
+        localizer,
+        Message::EditorSelectedCount,
+        &[("count", &workspace.selection().len().to_string())],
+    ));
+    if workspace.is_dirty() {
+        ui.strong(localizer.text(Message::EditorCheckpointPending));
+    }
+    if !workspace.asset_issues().is_empty() {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            crate::format_message(
+                localizer,
+                Message::EditorAssetIssues,
+                &[("count", &workspace.asset_issues().len().to_string())],
+            ),
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1136,24 +1155,6 @@ fn show_navigation_toolbar(
 ) {
     let has_frames = !workspace.manifest().timeline.frames.is_empty();
     ui.horizontal_wrapped(|ui| {
-        ui.label(localizer.text(Message::EditorNavigate));
-        if ui
-            .add_enabled(
-                has_frames,
-                egui::Button::new(localizer.text(Message::EditorFirst)),
-            )
-            .clicked()
-        {
-            let result = workspace.select_first();
-            record_selection_result(
-                workspace,
-                state,
-                now,
-                results,
-                EditorUiOperation::SelectFirst,
-                result,
-            );
-        }
         if ui
             .add_enabled(
                 has_frames,
@@ -1199,66 +1200,86 @@ fn show_navigation_toolbar(
                 result,
             );
         }
-        if ui
-            .add_enabled(
-                has_frames,
-                egui::Button::new(localizer.text(Message::EditorLast)),
-            )
-            .clicked()
-        {
-            let result = workspace.select_last();
-            record_selection_result(
-                workspace,
-                state,
-                now,
-                results,
-                EditorUiOperation::SelectLast,
-                result,
-            );
-        }
         ui.checkbox(
             &mut state.loop_preview,
             localizer.text(Message::EditorLoopPreview),
         )
         .on_hover_text(localizer.text(Message::EditorLoopPreviewHint));
 
-        ui.separator();
-        ui.label(localizer.text(Message::EditorFrame));
-        ui.add(egui::TextEdit::singleline(&mut state.frame_number_input).desired_width(54.0));
-        if ui.button(localizer.text(Message::EditorGo)).clicked() {
-            match parse_input::<usize>(&state.frame_number_input, "frame number") {
-                Ok(frame_number) => {
-                    let result = workspace.select_frame_number(frame_number);
-                    record_selection_result(
-                        workspace,
-                        state,
-                        now,
-                        results,
-                        EditorUiOperation::JumpToFrame,
-                        result,
-                    );
-                }
-                Err(message) => push_failure(results, EditorUiOperation::JumpToFrame, message),
+        ui.menu_button(localizer.text(Message::EditorJump), |ui| {
+            if ui
+                .add_enabled(
+                    has_frames,
+                    egui::Button::new(localizer.text(Message::EditorFirst)),
+                )
+                .clicked()
+            {
+                let result = workspace.select_first();
+                record_selection_result(
+                    workspace,
+                    state,
+                    now,
+                    results,
+                    EditorUiOperation::SelectFirst,
+                    result,
+                );
             }
-        }
-        ui.label(localizer.text(Message::EditorTimeMs));
-        ui.add(egui::TextEdit::singleline(&mut state.time_ms_input).desired_width(72.0));
-        if ui.button(localizer.text(Message::EditorGoToTime)).clicked() {
-            match parse_time_ms(&state.time_ms_input) {
-                Ok(time) => {
-                    let result = workspace.select_time(time);
-                    record_selection_result(
-                        workspace,
-                        state,
-                        now,
-                        results,
-                        EditorUiOperation::JumpToTime,
-                        result,
-                    );
-                }
-                Err(message) => push_failure(results, EditorUiOperation::JumpToTime, message),
+            if ui
+                .add_enabled(
+                    has_frames,
+                    egui::Button::new(localizer.text(Message::EditorLast)),
+                )
+                .clicked()
+            {
+                let result = workspace.select_last();
+                record_selection_result(
+                    workspace,
+                    state,
+                    now,
+                    results,
+                    EditorUiOperation::SelectLast,
+                    result,
+                );
             }
-        }
+            ui.separator();
+            ui.label(localizer.text(Message::EditorFrame));
+            ui.add(egui::TextEdit::singleline(&mut state.frame_number_input).desired_width(54.0));
+            if ui.button(localizer.text(Message::EditorGo)).clicked() {
+                match parse_input::<usize>(&state.frame_number_input, "frame number") {
+                    Ok(frame_number) => {
+                        let result = workspace.select_frame_number(frame_number);
+                        record_selection_result(
+                            workspace,
+                            state,
+                            now,
+                            results,
+                            EditorUiOperation::JumpToFrame,
+                            result,
+                        );
+                    }
+                    Err(message) => push_failure(results, EditorUiOperation::JumpToFrame, message),
+                }
+            }
+            ui.label(localizer.text(Message::EditorTimeMs));
+            ui.add(egui::TextEdit::singleline(&mut state.time_ms_input).desired_width(72.0));
+            if ui.button(localizer.text(Message::EditorGoToTime)).clicked() {
+                match parse_time_ms(&state.time_ms_input) {
+                    Ok(time) => {
+                        let result = workspace.select_time(time);
+                        record_selection_result(
+                            workspace,
+                            state,
+                            now,
+                            results,
+                            EditorUiOperation::JumpToTime,
+                            result,
+                        );
+                    }
+                    Err(message) => push_failure(results, EditorUiOperation::JumpToTime, message),
+                }
+            }
+        });
+        show_editor_summary(ui, workspace, localizer);
     });
 }
 
@@ -1305,16 +1326,23 @@ fn show_selection_toolbar(
                 EditorUiOperation::ClearSelection,
             );
         }
-        ui.separator();
-        ui.label(localizer.text(Message::EditorExpression));
-        ui.add(egui::TextEdit::singleline(&mut state.frame_expression).desired_width(180.0));
-        if ui
-            .button(localizer.text(Message::EditorApplySelection))
-            .clicked()
-        {
-            apply_frame_expression(workspace, state, now, results);
-        }
     });
+    egui::CollapsingHeader::new(localizer.text(Message::EditorAdvancedSelection))
+        .id_salt("advanced-frame-selection")
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(localizer.text(Message::EditorExpression));
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.frame_expression).desired_width(180.0),
+                );
+                if ui
+                    .button(localizer.text(Message::EditorApplySelection))
+                    .clicked()
+                {
+                    apply_frame_expression(workspace, state, now, results);
+                }
+            });
+        });
 }
 
 fn show_time_range_toolbar(
@@ -1467,71 +1495,89 @@ fn show_edit_toolbar(
                 result,
             );
         }
-        if ui
-            .button(localizer.text(Message::EditorDeleteBefore))
-            .clicked()
-        {
-            let result = workspace.delete_before_selection();
-            record_project_result(
-                workspace,
-                state,
-                now,
-                results,
-                EditorUiOperation::DeleteBeforeSelection,
-                result,
-            );
-        }
-        if ui
-            .button(localizer.text(Message::EditorDeleteAfter))
-            .clicked()
-        {
-            let result = workspace.delete_after_selection();
-            record_project_result(
-                workspace,
-                state,
-                now,
-                results,
-                EditorUiOperation::DeleteAfterSelection,
-                result,
-            );
-        }
-        if ui.button(localizer.text(Message::EditorMoveLeft)).clicked() {
-            let result = workspace.move_selection_left();
-            record_project_result(
-                workspace,
-                state,
-                now,
-                results,
-                EditorUiOperation::MoveSelectionLeft,
-                result,
-            );
-        }
-        if ui
-            .button(localizer.text(Message::EditorMoveRight))
-            .clicked()
-        {
-            let result = workspace.move_selection_right();
-            record_project_result(
-                workspace,
-                state,
-                now,
-                results,
-                EditorUiOperation::MoveSelectionRight,
-                result,
-            );
-        }
-        if ui.button(localizer.text(Message::EditorReverse)).clicked() {
-            let result = workspace.reverse_selection();
-            record_project_result(
-                workspace,
-                state,
-                now,
-                results,
-                EditorUiOperation::ReverseSelection,
-                result,
-            );
-        }
+        ui.menu_button(localizer.text(Message::EditorMoreOperations), |ui| {
+            show_more_edit_buttons(ui, workspace, state, now, results, localizer);
+        });
     });
+}
+
+fn show_more_edit_buttons(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    state: &mut EditorUiState,
+    now: Instant,
+    results: &mut Vec<EditorUiResult>,
+    localizer: Localizer,
+) {
+    if ui
+        .button(localizer.text(Message::EditorDeleteBefore))
+        .clicked()
+    {
+        ui.close();
+        let result = workspace.delete_before_selection();
+        record_project_result(
+            workspace,
+            state,
+            now,
+            results,
+            EditorUiOperation::DeleteBeforeSelection,
+            result,
+        );
+    }
+    if ui
+        .button(localizer.text(Message::EditorDeleteAfter))
+        .clicked()
+    {
+        ui.close();
+        let result = workspace.delete_after_selection();
+        record_project_result(
+            workspace,
+            state,
+            now,
+            results,
+            EditorUiOperation::DeleteAfterSelection,
+            result,
+        );
+    }
+    if ui.button(localizer.text(Message::EditorMoveLeft)).clicked() {
+        ui.close();
+        let result = workspace.move_selection_left();
+        record_project_result(
+            workspace,
+            state,
+            now,
+            results,
+            EditorUiOperation::MoveSelectionLeft,
+            result,
+        );
+    }
+    if ui
+        .button(localizer.text(Message::EditorMoveRight))
+        .clicked()
+    {
+        ui.close();
+        let result = workspace.move_selection_right();
+        record_project_result(
+            workspace,
+            state,
+            now,
+            results,
+            EditorUiOperation::MoveSelectionRight,
+            result,
+        );
+    }
+    if ui.button(localizer.text(Message::EditorReverse)).clicked() {
+        ui.close();
+        let result = workspace.reverse_selection();
+        record_project_result(
+            workspace,
+            state,
+            now,
+            results,
+            EditorUiOperation::ReverseSelection,
+            result,
+        );
+    }
 }
 
 fn show_clipboard_edit_buttons(
@@ -3342,7 +3388,7 @@ fn show_virtual_filmstrip(
                 workspace.active_project(),
                 visible.clone(),
                 ui.ctx(),
-                [100, 48],
+                [76, 36],
             );
             let content_origin = ui.min_rect().min;
             for index in visible {
@@ -3404,7 +3450,7 @@ fn show_virtual_filmstrip(
                 });
                 let image_bounds = egui::Rect::from_min_max(
                     rect.min + egui::vec2(6.0, 4.0),
-                    egui::pos2(rect.right() - 6.0, rect.top() + 47.0),
+                    egui::pos2(rect.right() - 6.0, rect.top() + 40.0),
                 );
                 match state.thumbnail_cache.get(frame_id) {
                     Some(Ok(preview)) => {
@@ -3436,7 +3482,7 @@ fn show_virtual_filmstrip(
                     ),
                 }
                 ui.painter().text(
-                    egui::pos2(rect.center().x, rect.top() + 53.0),
+                    egui::pos2(rect.center().x, rect.top() + 50.0),
                     egui::Align2::CENTER_CENTER,
                     crate::format_message(
                         localizer,
@@ -3446,13 +3492,7 @@ fn show_virtual_filmstrip(
                     egui::FontId::proportional(11.0),
                     ui.visuals().text_color(),
                 );
-                ui.painter().text(
-                    egui::pos2(rect.center().x, rect.top() + 68.0),
-                    egui::Align2::CENTER_CENTER,
-                    format!("{}.{:03} ms", duration_us / 1_000, duration_us % 1_000),
-                    egui::FontId::proportional(10.0),
-                    ui.visuals().weak_text_color(),
-                );
+                response = response.on_hover_text(&label);
                 if response.clicked() {
                     let modifiers = ui.input(|input| input.modifiers);
                     let operation = frame_click_operation(modifiers.ctrl, modifiers.shift);

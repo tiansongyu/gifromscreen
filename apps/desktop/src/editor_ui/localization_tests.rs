@@ -97,11 +97,34 @@ impl Harness {
             egui::CentralPanel::default().show(context, |ui| {
                 results = match surface {
                     Surface::Chrome => {
-                        show_editor_chrome(ui, &mut self.workspace, &mut self.state, localizer)
+                        let mut results =
+                            show_editor_chrome(ui, &mut self.workspace, &mut self.state, localizer);
+                        results.extend(super::show_editor_timeline(
+                            ui,
+                            &mut self.workspace,
+                            &mut self.state,
+                            localizer,
+                        ));
+                        results
                     }
                     Surface::Tool(tool) => {
                         self.state.active_tool = tool;
-                        show_editor_tool_panel(ui, &mut self.workspace, &mut self.state, localizer)
+                        let mut results = Vec::new();
+                        if tool == EditorToolTab::Frames {
+                            results.extend(show_editor_chrome(
+                                ui,
+                                &mut self.workspace,
+                                &mut self.state,
+                                localizer,
+                            ));
+                        }
+                        results.extend(show_editor_tool_panel(
+                            ui,
+                            &mut self.workspace,
+                            &mut self.state,
+                            localizer,
+                        ));
+                        results
                     }
                 };
             });
@@ -274,6 +297,7 @@ fn chinese_navigation_and_filmstrip_keep_frame_identity_and_half_open_times() {
         Some(FrameId::from_u128(2))
     );
     harness.state.frame_number_input = "3".to_owned();
+    harness.click(Surface::Chrome, chinese, Message::EditorJump);
     harness.click(Surface::Chrome, chinese, Message::EditorGo);
     assert_eq!(
         harness.workspace.selection().current(),
@@ -281,6 +305,7 @@ fn chinese_navigation_and_filmstrip_keep_frame_identity_and_half_open_times() {
     );
     for (time, expected) in [("99", 1), ("100", 2), ("300", 3)] {
         harness.state.time_ms_input = time.to_owned();
+        harness.click(Surface::Chrome, chinese, Message::EditorJump);
         harness.click(Surface::Chrome, chinese, Message::EditorGoToTime);
         assert_eq!(
             harness.workspace.selection().current(),
@@ -413,9 +438,9 @@ fn chinese_primary_controls_wrap_in_narrow_panels_with_larger_fonts() {
             (
                 Surface::Chrome,
                 vec![
-                    Message::EditorFirst,
+                    Message::EditorPrevious,
                     Message::EditorNext,
-                    Message::EditorGoToTime,
+                    Message::EditorJump,
                     Message::EditorFramesTab,
                     Message::EditorTransformTab,
                 ],
@@ -423,7 +448,7 @@ fn chinese_primary_controls_wrap_in_narrow_panels_with_larger_fonts() {
             (
                 Surface::Tool(EditorToolTab::Frames),
                 vec![
-                    Message::EditorApplySelection,
+                    Message::EditorAdvancedSelection,
                     Message::EditorCopy,
                     Message::EditorPaste,
                     Message::EditorDelete,
@@ -533,4 +558,24 @@ fn clipboard_clear_success_keeps_message_identity_for_later_language_switches() 
     );
     assert_eq!(harness.workspace.clipboard_len(), 0);
     assert_eq!(harness.workspace.manifest(), &original);
+}
+
+#[test]
+fn folded_frame_controls_apply_selection_and_reverse_with_undo() {
+    for tag in ["en", "zh"] {
+        let mut harness = Harness::new();
+        let localizer = language(tag);
+        let frames = Surface::Tool(EditorToolTab::Frames);
+        let original = harness.workspace.manifest().timeline.frames.clone();
+        harness.state.frame_expression = "1-3".to_owned();
+        harness.click(frames, localizer, Message::EditorAdvancedSelection);
+        harness.click(frames, localizer, Message::EditorApplySelection);
+        harness.click(frames, localizer, Message::EditorMoreOperations);
+        harness.click(frames, localizer, Message::EditorReverse);
+        let mut reversed = original.clone();
+        reversed.reverse();
+        assert_eq!(harness.workspace.manifest().timeline.frames, reversed);
+        harness.click(Surface::Chrome, localizer, Message::EditorUndo);
+        assert_eq!(harness.workspace.manifest().timeline.frames, original);
+    }
 }
