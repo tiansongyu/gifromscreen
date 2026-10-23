@@ -35,6 +35,8 @@ mod import_gif_job;
 mod import_static_image_job;
 mod import_static_sequence_job;
 mod landing_ui;
+#[cfg(test)]
+mod main_window_size_tests;
 mod motion_tools;
 mod open_project_job;
 mod path_picker;
@@ -864,7 +866,7 @@ struct GifFromScreenApp {
     gif_picker: PathPicker,
     output_picker: recording_output::OutputUi,
     pending_launcher_action: Option<AppView>,
-    initial_window_fit: landing_ui::InitialWindowFit,
+    window_sizing: landing_ui::WindowSizing,
     image_picker: PathPicker,
     shutdown: ShutdownState,
     blank_project_ui: BlankProjectUiState,
@@ -933,7 +935,7 @@ impl Default for GifFromScreenApp {
             gif_picker: PathPicker::default(),
             output_picker: recording_output::OutputUi::default(),
             pending_launcher_action: None,
-            initial_window_fit: landing_ui::InitialWindowFit::Pending,
+            window_sizing: landing_ui::WindowSizing::default(),
             image_picker: PathPicker::default(),
             shutdown: ShutdownState::default(),
             blank_project_ui: BlankProjectUiState::default(),
@@ -979,12 +981,6 @@ impl eframe::App for GifFromScreenApp {
     }
 
     fn update(&mut self, context: &egui::Context, frame: &mut eframe::Frame) {
-        if self.view != AppView::Landing
-            && self.initial_window_fit == landing_ui::InitialWindowFit::Pending
-        {
-            landing_ui::expand_for_work(context);
-            self.initial_window_fit = landing_ui::InitialWindowFit::Done;
-        }
         // Do not accept a last UI edit after this frame's close gate has already
         // decided to exit. Also cover the final frame of a deferred shutdown.
         let allow_preference_changes = self.shutdown == ShutdownState::Active
@@ -1067,7 +1063,21 @@ impl eframe::App for GifFromScreenApp {
 }
 
 impl GifFromScreenApp {
+    fn sync_main_window_size(&mut self, context: &egui::Context) {
+        // Native recording restoration owns geometry until its acknowledgement.
+        // In particular, a delayed restore must not overwrite the home size.
+        if self.recorder_overlay.is_none()
+            && self.wayland_crop_controller.is_none()
+            && self.main_window_snapshot.is_none()
+            && !self.restore_main_window
+        {
+            self.window_sizing
+                .update(context, self.view == AppView::Landing);
+        }
+    }
+
     fn show_main_view(&mut self, context: &egui::Context) {
+        self.sync_main_window_size(context);
         self.show_app_header(context);
         // Route changes made by a page take effect next frame. Track what was
         // actually drawn so a hidden editor cannot retain an old pointer hold.
@@ -1131,6 +1141,7 @@ impl GifFromScreenApp {
             }
             AppView::Editor => self.show_editor(ui),
         });
+        self.sync_main_window_size(context);
         if !editor_visible {
             drawing_preview::invalidate(context, &mut self.editor_ui_state.drawing_overlay);
             self.vector_shapes.invalidate(context);
@@ -1660,11 +1671,6 @@ impl GifFromScreenApp {
                 ui.label(notice.render(localizer));
             }
         });
-        if self.view == AppView::Landing {
-            self.initial_window_fit = landing_ui::InitialWindowFit::Done;
-        } else {
-            landing_ui::expand_for_work(ui.ctx());
-        }
     }
 
     fn open_landing_view(&mut self, view: AppView) {
@@ -7168,8 +7174,8 @@ fn native_options() -> eframe::NativeOptions {
             // eframe creates one shared painter; child transparency alone is
             // insufficient to enable alpha-capable Wgpu swapchains.
             .with_transparent(true)
-            .with_inner_size([520.0, 190.0])
-            .with_min_inner_size([440.0, 180.0]),
+            .with_inner_size(landing_ui::INITIAL_WINDOW_SIZE)
+            .with_min_inner_size(landing_ui::MINIMUM_WINDOW_SIZE),
         ..Default::default()
     };
     let display = gif_from_screen_capture_linux::LinuxEnvironment::from_process()

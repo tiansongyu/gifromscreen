@@ -198,6 +198,71 @@ pub(crate) fn draw_icon(
     }
 }
 
+pub(crate) const INITIAL_WINDOW_SIZE: egui::Vec2 = egui::vec2(520.0, 190.0);
+pub(crate) const MINIMUM_WINDOW_SIZE: egui::Vec2 = egui::vec2(440.0, 180.0);
+
+/// The launcher owns its size independently of the editor and recorder. Store
+/// native logical units so changing UI zoom cannot accumulate size inflation.
+pub(crate) struct WindowSizing {
+    home_size: egui::Vec2,
+    home_maximized: Option<bool>,
+    on_home: bool,
+    restore: Option<crate::wayland_controller_layout::GeometryTransition>,
+}
+
+impl Default for WindowSizing {
+    fn default() -> Self {
+        Self {
+            home_size: INITIAL_WINDOW_SIZE,
+            home_maximized: Some(false),
+            on_home: true,
+            restore: None,
+        }
+    }
+}
+
+impl WindowSizing {
+    pub(crate) fn update(&mut self, context: &egui::Context, on_home: bool) {
+        let zoom = context.zoom_factor();
+        let (size, maximized) =
+            context.input(|input| (input.screen_rect.size() * zoom, input.viewport().maximized));
+        if on_home != self.on_home {
+            self.on_home = on_home;
+            self.restore = None;
+            if on_home {
+                self.restore = Some(crate::wayland_controller_layout::GeometryTransition::new(
+                    self.home_size,
+                    MINIMUM_WINDOW_SIZE.min(self.home_size),
+                    self.home_maximized,
+                    std::time::Instant::now(),
+                ));
+            } else if maximized != Some(true) && size.y < 360.0 {
+                context.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                    size.max(egui::vec2(960.0, 680.0)) / zoom,
+                ));
+            }
+        }
+        if let Some(restore) = &mut self.restore {
+            let update = restore.advance(size, maximized, zoom, std::time::Instant::now());
+            for command in update.commands {
+                context.send_viewport_cmd(command);
+            }
+            if update.finished {
+                self.restore = None;
+            } else {
+                context.request_repaint_after(std::time::Duration::from_millis(16));
+            }
+        } else if on_home {
+            // Do not save an editor/recorder size while a native resize is still
+            // pending. Normal manual resizing on the home page remains allowed.
+            if maximized != Some(true) {
+                self.home_size = size;
+            }
+            self.home_maximized = maximized;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,25 +316,5 @@ mod tests {
                 (true, true)
             );
         }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InitialWindowFit {
-    Pending,
-    Done,
-}
-
-/// Grow only when leaving the compact launcher; retain larger/manual sizes.
-pub(crate) fn expand_for_work(context: &egui::Context) {
-    let viewport = context.input(|input| input.viewport().clone());
-    if viewport.maximized != Some(true)
-        && let Some(rect) = viewport.inner_rect
-        && rect.height() < 360.0
-    {
-        context.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-            rect.width().max(960.0),
-            680.0,
-        )));
     }
 }

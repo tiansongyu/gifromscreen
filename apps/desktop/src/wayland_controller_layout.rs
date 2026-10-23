@@ -1,4 +1,4 @@
-//! Local-only Wayland window sizing with bounded compositor acknowledgement.
+//! Local window sizing with bounded window-system acknowledgement.
 //! Targets use native logical pixels, independent of application UI zoom.
 
 use std::time::{Duration, Instant};
@@ -51,7 +51,12 @@ impl GeometryTransition {
         Self::new(size, size.min(vec2(680.0, 440.0)), maximized, now)
     }
 
-    fn new(target: Vec2, minimum: Vec2, final_maximized: Option<bool>, now: Instant) -> Self {
+    pub(super) fn new(
+        target: Vec2,
+        minimum: Vec2,
+        final_maximized: Option<bool>,
+        now: Instant,
+    ) -> Self {
         Self {
             target,
             minimum,

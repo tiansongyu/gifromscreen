@@ -1,6 +1,6 @@
 # Desktop interface
 
-Version 0.1.5 uses a compact desktop-tool layout. The startup and recorder
+Version 0.1.6 uses a compact desktop-tool layout. The startup and recorder
 screens follow the arrangement requested from ScreenToGif's public interface;
 all controls and vector icons are implemented in this project's egui code.
 
@@ -10,6 +10,11 @@ The initial window is 520 × 190 logical points, with four equal entry tiles:
 **Recorder**, **Webcam**, **Board**, and **Editor**. Options contains language,
 theme, import/create actions and recent projects. Cards accept full-area clicks,
 Tab focus, Enter and Space. The default theme is light; dark mode is available.
+
+Returning home restores its size from before opening a work page (520 × 190 by
+default). Manual home resizing is retained separately from editor and recorder
+geometry. Restoration resets the work-window minimum and waits for native
+recording restoration to finish; UI zoom does not multiply the saved size.
 
 ![Launcher](assets/ui-v014-launcher.png)
 
@@ -74,7 +79,7 @@ scrolling and partial rows at vertical scroll boundaries are excluded.
 
 ## Verification and scope
 
-- 855 desktop tests pass, including the new layout audit and existing input,
+- 859 desktop tests pass, including the new layout audit and existing input,
   focus, capture-state and editing regressions.
 - All 18 explicitly isolated native recorder-guide tests pass, including movement
   with the UI unpolled, permission revocation, capture exclusions, grab cleanup
