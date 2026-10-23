@@ -274,7 +274,11 @@ fn primary_controls(
             );
         }
         RecorderStage::Finalizing => {
-            button(Message::CancelButton, true, RecorderOverlayAction::Discard);
+            button(
+                Message::RecorderDiscardShort,
+                true,
+                RecorderOverlayAction::Discard,
+            );
         }
     }
     action
@@ -688,7 +692,7 @@ mod tests {
             ),
             (
                 RecorderStage::Finalizing,
-                "Cancel",
+                "Discard",
                 RecorderOverlayAction::Discard,
             ),
         ]
@@ -756,19 +760,17 @@ mod tests {
         Localizer::new(gif_from_screen_localization::find_language("zh").unwrap())
     }
 
-    fn action_message(stage: RecorderStage, action: RecorderOverlayAction) -> Message {
+    fn action_message(_stage: RecorderStage, action: RecorderOverlayAction) -> Message {
         match action {
             RecorderOverlayAction::Start => Message::RecorderStart,
             RecorderOverlayAction::Pause => Message::RecorderPause,
             RecorderOverlayAction::Resume => Message::RecorderResume,
             RecorderOverlayAction::Stop => Message::RecorderStopShort,
             RecorderOverlayAction::Snapshot => Message::RecorderTakeSnapshot,
-            RecorderOverlayAction::Discard if stage != RecorderStage::Finalizing => {
-                Message::RecorderDiscardShort
+            RecorderOverlayAction::Discard => Message::RecorderDiscardShort,
+            RecorderOverlayAction::CancelCountdown | RecorderOverlayAction::Close => {
+                Message::CancelButton
             }
-            RecorderOverlayAction::Discard
-            | RecorderOverlayAction::CancelCountdown
-            | RecorderOverlayAction::Close => Message::CancelButton,
             RecorderOverlayAction::None => panic!("not a primary controller action"),
         }
     }

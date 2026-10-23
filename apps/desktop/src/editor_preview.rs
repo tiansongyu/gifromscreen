@@ -24,6 +24,9 @@ const DEFAULT_CACHE_ENTRIES: usize = 16;
 const DEFAULT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RENDER_SURFACE_BYTES: usize = 512 * 1024 * 1024;
 
+#[path = "editor_preview_async.rs"]
+mod asynchronous;
+
 #[cfg(test)]
 #[path = "editor_preview_pm_tests.rs"]
 mod pm_tests;
@@ -39,6 +42,8 @@ pub(crate) struct EditorPreview {
 /// Typed failures while loading, rendering, resizing, or uploading a preview.
 #[derive(Debug, Error)]
 pub(crate) enum EditorPreviewError {
+    #[error("preview rendering was cancelled")]
+    Cancelled,
     #[error("premultiplied snapshot descriptor {asset_id} is invalid: {reason}")]
     InvalidPremultipliedDescriptor { asset_id: AssetId, reason: String },
     #[error("premultiplied snapshot {asset_id} is invalid: {source}")]
@@ -267,6 +272,8 @@ impl<K: Eq, V> BoundedLru<K, V> {
 pub(crate) struct EditorPreviewCache {
     cache: BoundedLru<PreviewCacheKey, EditorPreview>,
     render_surface_limit_bytes: usize,
+    asynchronous: asynchronous::AsyncPreviewRenderer,
+    #[cfg(test)]
     transition_endpoints: Option<CachedTransitionEndpoints>,
 }
 
@@ -295,6 +302,8 @@ impl EditorPreviewCache {
         Self {
             cache: BoundedLru::new(max_entries, max_cached_bytes),
             render_surface_limit_bytes,
+            asynchronous: asynchronous::AsyncPreviewRenderer::default(),
+            #[cfg(test)]
             transition_endpoints: None,
         }
     }
@@ -313,6 +322,7 @@ impl EditorPreviewCache {
 
     /// Renders only the requested original or generated intermediate. Generated
     /// textures share the same bounded LRU as ordinary editing previews.
+    #[cfg(test)]
     pub(crate) fn presentation_preview(
         &mut self,
         project: &ActiveProject,
@@ -327,6 +337,7 @@ impl EditorPreviewCache {
     /// 100% and 200% share one original-resolution texture. Reject excessive
     /// resources before reading pixels rather than silently downsampling an
     /// allegedly exact-pixel view. Fit remains available for those images.
+    #[cfg(test)]
     pub(crate) fn native_presentation_preview(
         &mut self,
         project: &ActiveProject,
@@ -377,6 +388,7 @@ impl EditorPreviewCache {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     fn load_presentation_preview(
         &mut self,
         project: &ActiveProject,
@@ -461,6 +473,7 @@ impl EditorPreviewCache {
     }
 }
 
+#[cfg(test)]
 struct CachedTransitionEndpoints {
     project_id: ProjectId,
     revision: ProjectRevision,
@@ -469,6 +482,7 @@ struct CachedTransitionEndpoints {
     to: RgbaSurface,
 }
 
+#[cfg(test)]
 impl CachedTransitionEndpoints {
     fn matches(&self, project: &ActiveProject, step: PresentationTransitionStep) -> bool {
         self.project_id == project.manifest().project_id
@@ -582,6 +596,7 @@ fn invalidate_stale_project_revisions<V>(
     cache.retain(|key| key.project_id != project_id || key.revision == revision);
 }
 
+#[cfg(test)]
 fn prepare_preview(
     project: &ActiveProject,
     frame_id: FrameId,
@@ -594,11 +609,29 @@ fn prepare_preview(
     downsample_preview(rendered_surface, max_size, preview_limit_bytes)
 }
 
+#[cfg(test)]
 fn downsample_preview(
     rendered_surface: RgbaSurface,
     max_size: [u32; 2],
     preview_limit_bytes: usize,
 ) -> Result<PreparedPreview, EditorPreviewError> {
+    downsample_preview_cancellable(
+        rendered_surface,
+        max_size,
+        preview_limit_bytes,
+        &NeverCancel,
+    )
+}
+
+fn downsample_preview_cancellable(
+    rendered_surface: RgbaSurface,
+    max_size: [u32; 2],
+    preview_limit_bytes: usize,
+    cancellation: &dyn CancellationToken,
+) -> Result<PreparedPreview, EditorPreviewError> {
+    if cancellation.is_cancelled() {
+        return Err(EditorPreviewError::Cancelled);
+    }
     let rendered_size = [rendered_surface.width(), rendered_surface.height()];
     let preview_size = fit_preview_dimensions(rendered_size, max_size)?;
     let preview_bytes = checked_rgba_byte_len(preview_size)?;
@@ -611,7 +644,12 @@ fn downsample_preview(
     let rgba = if preview_size == rendered_size {
         rendered_surface.into_pixels()
     } else {
-        resize_nearest_rgba(rendered_surface.pixels(), rendered_size, preview_size)?
+        resize_nearest_rgba_cancellable(
+            rendered_surface.pixels(),
+            rendered_size,
+            preview_size,
+            cancellation,
+        )?
     };
     Ok(PreparedPreview {
         rendered_size,
@@ -719,7 +757,7 @@ impl PreviewRenderPlan {
     ) -> Result<PreparedPreview, EditorPreviewError> {
         validate_preview_bounds(max_size)?;
         let surface = self.render(render_surface_limit_bytes, cancellation)?;
-        downsample_preview(surface, max_size, preview_limit_bytes)
+        downsample_preview_cancellable(surface, max_size, preview_limit_bytes, cancellation)
     }
 
     pub(crate) fn render(
@@ -1146,10 +1184,20 @@ fn checked_rgba_byte_len(size: [u32; 2]) -> Result<usize, EditorPreviewError> {
     })
 }
 
+#[cfg(test)]
 fn resize_nearest_rgba(
     source: &[u8],
     source_size: [u32; 2],
     target_size: [u32; 2],
+) -> Result<Vec<u8>, EditorPreviewError> {
+    resize_nearest_rgba_cancellable(source, source_size, target_size, &NeverCancel)
+}
+
+fn resize_nearest_rgba_cancellable(
+    source: &[u8],
+    source_size: [u32; 2],
+    target_size: [u32; 2],
+    cancellation: &dyn CancellationToken,
 ) -> Result<Vec<u8>, EditorPreviewError> {
     validate_preview_bounds(target_size)?;
     if source_size[0] == 0 || source_size[1] == 0 {
@@ -1171,6 +1219,9 @@ fn resize_nearest_rgba(
         .try_reserve_exact(requested)
         .map_err(|_| EditorPreviewError::PreviewAllocationFailed { requested })?;
     for target_y in 0..target_size[1] {
+        if cancellation.is_cancelled() {
+            return Err(EditorPreviewError::Cancelled);
+        }
         let source_y = u64::from(target_y) * u64::from(source_size[1]) / u64::from(target_size[1]);
         for target_x in 0..target_size[0] {
             let source_x =

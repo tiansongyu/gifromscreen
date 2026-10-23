@@ -754,7 +754,7 @@ mod tests {
             .push(egui::ViewportEvent::Close);
         let mut app = GifFromScreenApp::default();
         let (controller, _control) = RecordingController::channel();
-        let (_sender, receiver) = std::sync::mpsc::channel();
+        let (_sender, receiver) = crate::recording_messages::channel();
         let cancellation = gif_from_screen_gif::CancellationFlag::default();
         app.job = Some(crate::RecordingJob {
             shortcut_state: LiveShortcutState::default(),

@@ -1,10 +1,13 @@
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use gif_from_screen_capture::{
     CaptureBackend, CaptureError, CaptureErrorKind, CaptureRequest, CaptureSession,
     CaptureSessionState, CapturedFrame, FramePoll, PhysicalSize, PixelFormat, RecoveryHint,
 };
-use gif_from_screen_gif::{CancellationToken, RgbaFrame};
+use gif_from_screen_gif::{CancellationToken, FrameError, RgbaFrame};
 
 use crate::{
     RecordingControl, RecordingFrameSink, RecordingFrameSinkOperation, WorkflowError,
@@ -145,8 +148,58 @@ struct NormalizedCapture {
     timestamp_us: u64,
     width: u16,
     height: u16,
-    pixels: Vec<u8>,
+    pixels: NormalizedPixels,
     metadata: crate::RecordingMetadata,
+}
+
+#[derive(Debug)]
+enum NormalizedPixels {
+    /// Native capture is already tightly packed RGBA: retain its immutable allocation.
+    Shared(Arc<[u8]>),
+    /// Normalization changed layout/channels: preserve ownership of the conversion buffer.
+    Converted(Vec<u8>),
+}
+
+impl NormalizedPixels {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Shared(pixels) => pixels,
+            Self::Converted(pixels) => pixels,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    fn frame(&self, width: u16, height: u16, duration_us: u64) -> Result<RgbaFrame, FrameError> {
+        match self {
+            Self::Shared(pixels) => {
+                RgbaFrame::from_shared_pixels(width, height, Arc::clone(pixels), duration_us)
+            }
+            Self::Converted(pixels) => RgbaFrame::new(width, height, pixels.clone(), duration_us),
+        }
+    }
+
+    fn into_frame(
+        self,
+        width: u16,
+        height: u16,
+        duration_us: u64,
+    ) -> Result<RgbaFrame, FrameError> {
+        match self {
+            Self::Shared(pixels) => {
+                RgbaFrame::from_shared_pixels(width, height, pixels, duration_us)
+            }
+            Self::Converted(pixels) => RgbaFrame::new(width, height, pixels, duration_us),
+        }
+    }
+}
+
+impl PartialEq for NormalizedPixels {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
 }
 
 struct CollectionFinishState {
@@ -277,9 +330,11 @@ pub fn collect_controlled(
 ///
 /// Each retained frame is sent to `sink` immediately with its configured fixed
 /// delay or measured tail-duration provisional value. Only measured durations
-/// need correction at the next retained sample or stop boundary. Sink calls
-/// run synchronously on the capture worker so a
-/// successful return means the corresponding journal operation completed.
+/// need correction at the next retained sample or stop boundary. Synchronous
+/// sinks persist each operation immediately; bounded write-behind sinks may
+/// accept it for later persistence. Successful collection and manual snapshot
+/// acknowledgements wait for [`RecordingFrameSink::flush_pending`], including
+/// any deferred persistence failure. Capture progress counts accepted frames.
 ///
 /// # Errors
 ///
@@ -649,6 +704,9 @@ fn collect_session(
                     )?;
                 }
                 if controlled_manual && let Some(control) = control.as_deref_mut() {
+                    if let Some(sink) = sink.as_deref_mut() {
+                        flush_sink(sink, captures.len().saturating_sub(1))?;
+                    }
                     control.complete_snapshot(&frame, retain);
                 }
                 stream_index = next_stream_index;
@@ -752,6 +810,7 @@ fn collect_session_to_sink(
                 let (outcome, retained) =
                     state.observe_frame(&frame, &mut options, sink, controlled_manual)?;
                 if controlled_manual && let Some(retained) = retained {
+                    flush_sink(sink, state.retained_frames.saturating_sub(1))?;
                     control.complete_snapshot(&frame, retained);
                 }
                 if outcome == SinkFrameOutcome::DurationReached {
@@ -923,6 +982,7 @@ impl SinkOnlyCollectionState {
             WorkflowPhase::StoppingCapture,
             summary,
         ));
+        flush_sink(sink, self.retained_frames.saturating_sub(1))?;
         Ok(summary)
     }
 }
@@ -987,7 +1047,7 @@ fn finish_session_collection(
     state: CollectionFinishState,
     stop_reason: StopReason,
     options: ValidatedOptions,
-    sink: Option<&mut dyn RecordingFrameSink>,
+    mut sink: Option<&mut dyn RecordingFrameSink>,
     progress: &mut dyn WorkflowProgressSink,
 ) -> Result<CollectedRecording, WorkflowError> {
     let CollectionFinishState {
@@ -998,12 +1058,12 @@ fn finish_session_collection(
     } = state;
     let last_duration_us =
         calculate_last_duration(&captures, last_observed_timestamp, stop_reason, options)?;
-    if let Some(sink) = sink
+    if let Some(sink) = sink.as_deref_mut()
         && !captures.is_empty()
         && options.fixed_duration_us.is_none()
     {
         let frame_index = u64::try_from(captures.len() - 1).unwrap_or(u64::MAX);
-        sink.update_frame_duration(frame_index, last_duration_us)
+        sink.enqueue_frame_duration(frame_index, last_duration_us)
             .map_err(|source| WorkflowError::FrameSink {
                 operation: RecordingFrameSinkOperation::UpdateFrameDuration,
                 frame_index,
@@ -1027,7 +1087,19 @@ fn finish_session_collection(
         WorkflowPhase::StoppingCapture,
         recording.summary(),
     ));
+    if let Some(sink) = sink {
+        flush_sink(sink, recording.frames().len().saturating_sub(1))?;
+    }
     Ok(recording)
+}
+
+fn flush_sink(sink: &mut dyn RecordingFrameSink, frame_index: usize) -> Result<(), WorkflowError> {
+    sink.flush_pending()
+        .map_err(|source| WorkflowError::FrameSink {
+            operation: RecordingFrameSinkOperation::FlushPending,
+            frame_index: u64::try_from(frame_index).unwrap_or(u64::MAX),
+            source,
+        })
 }
 
 fn report_collection_progress(
@@ -1074,13 +1146,10 @@ fn append_sink_frame(
     capture: &NormalizedCapture,
     provisional_duration_us: u64,
 ) -> Result<(), WorkflowError> {
-    let frame = RgbaFrame::new(
-        capture.width,
-        capture.height,
-        capture.pixels.clone(),
-        provisional_duration_us,
-    )?;
-    sink.append_provisional_frame_with_metadata(frame_index, &frame, &capture.metadata)
+    let frame = capture
+        .pixels
+        .frame(capture.width, capture.height, provisional_duration_us)?;
+    sink.enqueue_provisional_frame_with_metadata(frame_index, &frame, &capture.metadata)
         .map_err(|source| WorkflowError::FrameSink {
             operation: RecordingFrameSinkOperation::AppendProvisionalFrame,
             frame_index,
@@ -1093,7 +1162,7 @@ fn update_sink_duration(
     frame_index: u64,
     duration_us: u64,
 ) -> Result<(), WorkflowError> {
-    sink.update_frame_duration(frame_index, duration_us)
+    sink.enqueue_frame_duration(frame_index, duration_us)
         .map_err(|source| WorkflowError::FrameSink {
             operation: RecordingFrameSinkOperation::UpdateFrameDuration,
             frame_index,
@@ -1318,23 +1387,40 @@ fn normalize_frame(
                 width: size.width(),
                 height: size.height(),
             })?;
+    let pixels = if frame.format() == PixelFormat::Rgba8
+        && frame.stride() == row_bytes
+        && frame.pixels().len() == output_len
+    {
+        NormalizedPixels::Shared(frame.shared_pixels())
+    } else {
+        normalize_pixels(frame, frame_index, row_bytes, height_usize, output_len)?
+    };
+    debug_assert_eq!(pixels.len(), output_len);
+    Ok(NormalizedCapture {
+        timestamp_us: frame.captured_at().as_micros(),
+        width,
+        height,
+        pixels,
+        metadata: crate::RecordingMetadata::from_frame(frame),
+    })
+}
+
+fn normalize_pixels(
+    frame: &CapturedFrame,
+    frame_index: u64,
+    row_bytes: usize,
+    height: usize,
+    output_len: usize,
+) -> Result<NormalizedPixels, WorkflowError> {
     let mut pixels = Vec::with_capacity(output_len);
     match frame.format() {
         PixelFormat::Rgba8 => {
-            for row in frame
-                .pixels()
-                .chunks_exact(frame.stride())
-                .take(height_usize)
-            {
+            for row in frame.pixels().chunks_exact(frame.stride()).take(height) {
                 pixels.extend_from_slice(&row[..row_bytes]);
             }
         }
         PixelFormat::Bgra8 => {
-            for row in frame
-                .pixels()
-                .chunks_exact(frame.stride())
-                .take(height_usize)
-            {
+            for row in frame.pixels().chunks_exact(frame.stride()).take(height) {
                 for pixel in row[..row_bytes].as_chunks::<4>().0 {
                     pixels.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
                 }
@@ -1347,14 +1433,7 @@ fn normalize_frame(
             });
         }
     }
-    debug_assert_eq!(pixels.len(), output_len);
-    Ok(NormalizedCapture {
-        timestamp_us: frame.captured_at().as_micros(),
-        width,
-        height,
-        pixels,
-        metadata: crate::RecordingMetadata::from_frame(frame),
-    })
+    Ok(NormalizedPixels::Converted(pixels))
 }
 
 fn validate_dimensions(
@@ -1412,12 +1491,11 @@ fn finish_collection(
                 "collected presentation duration overflowed u64 microseconds".to_owned(),
             )
         })?;
-        frames.push(RgbaFrame::new(
-            capture.width,
-            capture.height,
-            capture.pixels,
-            frame_duration,
-        )?);
+        frames.push(
+            capture
+                .pixels
+                .into_frame(capture.width, capture.height, frame_duration)?,
+        );
         metadata.push(capture.metadata);
     }
     let summary = CollectionSummary {
@@ -1535,5 +1613,102 @@ fn ensure_not_cancelled(cancellation: &dyn CancellationToken) -> Result<(), Work
         Err(WorkflowError::Cancelled)
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pixel_storage_tests {
+    use gif_from_screen_capture::CaptureTimestamp;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct RetainingSink(Option<RgbaFrame>);
+
+    impl RecordingFrameSink for RetainingSink {
+        fn append_provisional_frame(
+            &mut self,
+            _: u64,
+            frame: &RgbaFrame,
+        ) -> Result<(), crate::RecordingFrameSinkError> {
+            self.0 = Some(frame.clone());
+            Ok(())
+        }
+
+        fn update_frame_duration(
+            &mut self,
+            _: u64,
+            _: u64,
+        ) -> Result<(), crate::RecordingFrameSinkError> {
+            Ok(())
+        }
+    }
+
+    fn native_frame(format: PixelFormat, stride: usize, pixels: Vec<u8>) -> CapturedFrame {
+        CapturedFrame::new(
+            0,
+            CaptureTimestamp::default(),
+            PhysicalSize::new(1, 2).unwrap(),
+            stride,
+            format,
+            pixels,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn tightly_packed_rgba_is_shared_through_normalization_and_sink() {
+        let native = native_frame(PixelFormat::Rgba8, 4, vec![1, 2, 3, 255, 4, 5, 6, 255]);
+        let address = native.pixels().as_ptr();
+        let capture = normalize_frame(&native, 0, None).unwrap();
+        assert_eq!(capture.pixels.as_slice().as_ptr(), address);
+
+        let mut sink = RetainingSink::default();
+        append_sink_frame(&mut sink, 0, &capture, 20_000).unwrap();
+        let stored = sink.0.unwrap();
+        assert_eq!(stored.pixels().as_ptr(), address);
+        assert_eq!(stored.duration_us(), 20_000);
+        let recording = finish_collection(vec![capture], 8, 20_000, None, 0).unwrap();
+        assert_eq!(recording.frames()[0].pixels().as_ptr(), address);
+        drop(native);
+        drop(recording);
+        assert_eq!(stored.pixels(), &[1, 2, 3, 255, 4, 5, 6, 255]);
+    }
+
+    #[test]
+    fn padded_or_oversized_rgba_excludes_native_padding() {
+        for (stride, pixels) in [
+            (8, vec![1, 2, 3, 255, 9, 9, 9, 9, 4, 5, 6, 255, 8, 8, 8, 8]),
+            (4, vec![1, 2, 3, 255, 4, 5, 6, 255, 9, 9, 9, 9]),
+        ] {
+            let native = native_frame(PixelFormat::Rgba8, stride, pixels);
+            let capture = normalize_frame(&native, 0, None).unwrap();
+            assert_eq!(capture.pixels.as_slice(), &[1, 2, 3, 255, 4, 5, 6, 255]);
+            assert_ne!(capture.pixels.as_slice().as_ptr(), native.pixels().as_ptr());
+        }
+    }
+
+    #[test]
+    fn converted_pixels_move_into_finished_collection_without_an_extra_copy() {
+        let native = native_frame(PixelFormat::Bgra8, 4, vec![3, 2, 1, 255, 6, 5, 4, 255]);
+        let capture = normalize_frame(&native, 0, None).unwrap();
+        let address = capture.pixels.as_slice().as_ptr();
+        let recording = finish_collection(vec![capture], 8, 20_000, None, 0).unwrap();
+
+        assert_eq!(recording.frames()[0].pixels().as_ptr(), address);
+        assert_eq!(
+            recording.frames()[0].pixels(),
+            &[1, 2, 3, 255, 4, 5, 6, 255]
+        );
+    }
+
+    #[test]
+    fn retention_compares_content_across_shared_and_converted_layouts() {
+        let rgba = native_frame(PixelFormat::Rgba8, 4, vec![1, 2, 3, 255, 4, 5, 6, 255]);
+        let bgra = native_frame(PixelFormat::Bgra8, 4, vec![3, 2, 1, 255, 6, 5, 4, 255]);
+        let shared = normalize_frame(&rgba, 0, None).unwrap();
+        let converted = normalize_frame(&bgra, 1, Some(&shared)).unwrap();
+
+        assert_eq!(shared.pixels, converted.pixels);
     }
 }

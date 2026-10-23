@@ -3,7 +3,7 @@
 
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Mutex},
     thread,
 };
 
@@ -498,7 +498,7 @@ struct Worker {
     cancel: CancellationFlag,
     join: Option<thread::JoinHandle<()>>,
     stats: Arc<Mutex<NativeStats>>,
-    _messages: mpsc::Sender<crate::JobMessage>,
+    _messages: crate::recording_messages::RecordingMessageSender,
 }
 impl Worker {
     fn start(initial: PhysicalRect) -> (RecordingJob, Self) {
@@ -532,7 +532,7 @@ impl Worker {
                 &mut gif_from_screen_workflow::NoopWorkflowProgress,
             );
         });
-        let (messages, receiver) = mpsc::channel();
+        let (messages, receiver) = crate::recording_messages::channel();
         let job = RecordingJob {
             shortcut_state: LiveShortcutState::default(),
             receiver,

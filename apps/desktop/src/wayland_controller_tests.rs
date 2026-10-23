@@ -416,7 +416,7 @@ fn compact_controller_buttons_remain_visible_and_clickable_with_wrapped_large_fo
                 ),
                 (
                     RecorderStage::Finalizing,
-                    "Cancel",
+                    "Discard",
                     RecorderOverlayAction::Discard,
                 ),
             ] {
@@ -863,9 +863,9 @@ fn wayland_handoff_accepts_local_extent_when_desktop_window_positions_are_privat
 fn recording_job() -> (
     RecordingJob,
     RecordingControl,
-    std::sync::mpsc::Sender<JobMessage>,
+    crate::recording_messages::RecordingMessageSender,
 ) {
-    let (sender, receiver) = std::sync::mpsc::channel();
+    let (sender, receiver) = crate::recording_messages::channel();
     let (controller, control) = RecordingController::channel();
     (
         RecordingJob {
@@ -917,6 +917,36 @@ fn failed_or_discarded_recording_clears_live_progress_and_ignores_late_messages(
         assert!(notice.contains("Recoverable autosave retained") || notice.contains("discarded"));
         assert!(!notice.contains("Finalizing"));
     }
+}
+
+#[test]
+fn coalesced_recording_progress_retains_pause_ack_when_latest_phase_is_stopping() {
+    let mut app = GifFromScreenApp::default();
+    let (mut job, _control, sender) = recording_job();
+    assert!(job.request_pause(true));
+    app.job = Some(job);
+    for phase in [
+        WorkflowPhase::Capturing,
+        WorkflowPhase::Paused,
+        WorkflowPhase::StoppingCapture,
+    ] {
+        sender
+            .send(JobMessage::Progress(WorkflowProgress {
+                phase,
+                frames_captured: 5,
+                capture_duration: Duration::from_millis(500),
+                playback_duration: Duration::from_millis(500),
+                encode: None,
+            }))
+            .unwrap();
+    }
+    app.receive_job_messages();
+    let job = app.job.as_ref().unwrap();
+    assert!(job.paused, "coalescing must retain the native pause ACK");
+    assert_eq!(job.pause_requested, None);
+    assert_eq!(app.progress.unwrap().phase, WorkflowPhase::StoppingCapture);
+    assert!(app.job.as_ref().unwrap().terminal_requested);
+    assert_eq!(app.recorder_stage(), crate::RecorderStage::Finalizing);
 }
 
 #[test]

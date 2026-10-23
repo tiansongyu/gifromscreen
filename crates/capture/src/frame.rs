@@ -428,6 +428,13 @@ impl CapturedFrame {
         &self.pixels
     }
 
+    /// Shares the immutable pixel allocation without copying its contents.
+    ///
+    /// The buffer retains the same native row padding as [`Self::pixels`].
+    pub fn shared_pixels(&self) -> Arc<[u8]> {
+        Arc::clone(&self.pixels)
+    }
+
     /// Native damage rectangles, or an empty slice when unavailable.
     pub fn damage(&self) -> &[PhysicalRect] {
         &self.damage
@@ -447,6 +454,23 @@ impl CapturedFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sharing_pixels_preserves_the_allocation_and_lifetime() {
+        let frame = CapturedFrame::new(
+            0,
+            CaptureTimestamp::default(),
+            PhysicalSize::new(1, 1).unwrap(),
+            4,
+            PixelFormat::Rgba8,
+            vec![1, 2, 3, 255],
+        )
+        .unwrap();
+        let pixels = frame.shared_pixels();
+        assert_eq!(pixels.as_ptr(), frame.pixels().as_ptr());
+        drop(frame);
+        assert_eq!(&*pixels, &[1, 2, 3, 255]);
+    }
 
     #[test]
     fn rejects_short_stride_and_buffer() {

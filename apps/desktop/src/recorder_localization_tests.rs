@@ -537,7 +537,7 @@ fn chinese_compact_wayland_primary_actions_are_visible_and_clickable() {
             ),
             (
                 RecorderStage::Finalizing,
-                Message::CancelButton,
+                Message::RecorderDiscardShort,
                 RecorderOverlayAction::Discard,
             ),
         ] {

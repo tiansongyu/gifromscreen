@@ -112,53 +112,29 @@ impl EditorCanvasState {
         editable: bool,
         overlay: impl FnOnce(&mut egui::Ui, &egui::Response),
     ) -> Result<egui::Response, Notice> {
-        // Leave room for the filmstrip and playback controls below the canvas.
-        let height = (ui.ctx().screen_rect().bottom() - ui.cursor().top() - 150.0)
-            .clamp(100.0, CANVAS_HEIGHT);
-        let available = egui::vec2(ui.available_width().max(1.0), height);
-        let size = self.zoom.extent(
-            preview.rendered_size,
-            available,
-            ui.ctx().pixels_per_point(),
-        )?;
         self.update_pan(ui);
-        ui.painter().rect_filled(
-            egui::Rect::from_min_size(ui.cursor().min, available),
-            0,
-            crate::appearance::Palette::of(ui).surface,
-        );
-        let output = egui::ScrollArea::both()
-            .id_salt("editor-image-viewport")
-            .max_height(height)
-            .auto_shrink([false, true])
-            .scroll_source(egui::scroll_area::ScrollSource {
+        let output = preview_viewport(
+            ui,
+            preview.rendered_size,
+            self.zoom,
+            self.scroll_offset,
+            egui::scroll_area::ScrollSource {
                 drag: false,
                 ..egui::scroll_area::ScrollSource::ALL
-            })
-            .scroll_offset(self.scroll_offset)
-            .show(ui, |ui| {
-                ui.allocate_ui_with_layout(
-                    egui::vec2(available.x.max(size.x), available.y.max(size.y)),
-                    egui::Layout::top_down(egui::Align::Center),
-                    |ui| {
-                        ui.add_space(((available.y - size.y) * 0.5).max(0.0));
-                        let response =
-                            crate::show_editor_preview_image(ui, &preview.texture, size, sense);
-                        let crop_input = editable
-                            && !self.panning
-                            && !ui.input(|input| {
-                                input.pointer.button_down(egui::PointerButton::Middle)
-                            });
-                        self.crop
-                            .interact(ui, &response, preview.rendered_size, crop_input);
-                        self.crop
-                            .paint(ui.painter(), response.rect, preview.rendered_size);
-                        overlay(ui, &response);
-                        response
-                    },
-                )
-                .inner
-            });
+            },
+            |ui, size| {
+                let response = crate::show_editor_preview_image(ui, &preview.texture, size, sense);
+                let crop_input = editable
+                    && !self.panning
+                    && !ui.input(|input| input.pointer.button_down(egui::PointerButton::Middle));
+                self.crop
+                    .interact(ui, &response, preview.rendered_size, crop_input);
+                self.crop
+                    .paint(ui.painter(), response.rect, preview.rendered_size);
+                overlay(ui, &response);
+                response
+            },
+        )?;
         self.scroll_offset = output.state.offset;
         self.viewport = Some(output.inner_rect);
         let (focused, pressed, position) = ui.input(|input| {
@@ -182,6 +158,43 @@ impl EditorCanvasState {
         Ok(output.inner)
     }
 
+    /// Keep downstream controls in place while no current pixels are ready.
+    /// The child is clipped and scrollable so long errors cannot grow the page.
+    pub(crate) fn show_placeholder<R>(
+        &mut self,
+        ui: &mut egui::Ui,
+        rendered_size: [u32; 2],
+        contents: impl FnOnce(&mut egui::Ui, egui::Rect) -> R,
+    ) -> Result<R, Notice> {
+        self.cancel_layout_gestures();
+        self.viewport = None;
+        // Allocate exactly the same natural scroll content as the real image,
+        // including centering and scrollbar geometry. The maximum viewport
+        // height alone differs for short landscape frames.
+        let output = preview_viewport(
+            ui,
+            rendered_size,
+            self.zoom,
+            self.scroll_offset,
+            egui::scroll_area::ScrollSource::NONE,
+            |ui, size| ui.allocate_exact_size(size, egui::Sense::hover()).0,
+        )?;
+        let rect = output.inner_rect;
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("editor-preview-placeholder")
+                .max_rect(rect)
+                .layout(egui::Layout::top_down(egui::Align::LEFT)),
+        );
+        child.set_clip_rect(rect.intersect(ui.clip_rect()));
+        Ok(egui::ScrollArea::vertical()
+            .id_salt("editor-preview-placeholder-scroll")
+            .max_height(rect.height())
+            .auto_shrink([false, false])
+            .show(&mut child, |ui| contents(ui, rect))
+            .inner)
+    }
+
     fn update_pan(&mut self, ui: &egui::Ui) {
         let (focused, down, delta) = ui.input(|input| {
             (
@@ -198,6 +211,47 @@ impl EditorCanvasState {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
         }
     }
+}
+
+fn preview_viewport<R>(
+    ui: &mut egui::Ui,
+    rendered_size: [u32; 2],
+    zoom: PreviewZoom,
+    scroll_offset: egui::Vec2,
+    scroll_source: egui::scroll_area::ScrollSource,
+    contents: impl FnOnce(&mut egui::Ui, egui::Vec2) -> R,
+) -> Result<egui::scroll_area::ScrollAreaOutput<R>, Notice> {
+    let available = preview_viewport_size(ui);
+    let size = zoom.extent(rendered_size, available, ui.ctx().pixels_per_point())?;
+    ui.painter().rect_filled(
+        egui::Rect::from_min_size(ui.cursor().min, available),
+        0,
+        crate::appearance::Palette::of(ui).surface,
+    );
+    Ok(egui::ScrollArea::both()
+        .id_salt("editor-image-viewport")
+        .max_height(available.y)
+        .auto_shrink([false, true])
+        .scroll_source(scroll_source)
+        .scroll_offset(scroll_offset)
+        .show(ui, |ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(available.x.max(size.x), available.y.max(size.y)),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    ui.add_space(((available.y - size.y) * 0.5).max(0.0));
+                    contents(ui, size)
+                },
+            )
+            .inner
+        }))
+}
+
+fn preview_viewport_size(ui: &egui::Ui) -> egui::Vec2 {
+    // Leave room for the filmstrip and playback controls below every state.
+    let height =
+        (ui.ctx().screen_rect().bottom() - ui.cursor().top() - 150.0).clamp(100.0, CANVAS_HEIGHT);
+    egui::vec2(ui.available_width().max(1.0), height)
 }
 
 #[cfg(test)]

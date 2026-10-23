@@ -45,7 +45,11 @@ mod project_insert_ui;
 mod project_library_ui;
 mod recorder_geometry;
 mod recorder_shortcuts;
+mod recording_messages;
 mod recording_output;
+#[cfg(all(test, target_os = "linux"))]
+mod recording_perf_tests;
+mod recording_writer;
 mod retarget;
 mod shortcut_ui;
 mod static_sequence_ui;
@@ -78,7 +82,6 @@ use std::{
     fs, io,
     num::NonZeroU64,
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -412,10 +415,6 @@ impl IncrementalProjectFrameSink {
         }
     }
 
-    fn root(&self) -> &Path {
-        self.project.root()
-    }
-
     fn finish(
         self,
     ) -> Result<ActiveProject, gif_from_screen_application::IncrementalRecordingProjectError> {
@@ -543,7 +542,7 @@ impl Default for EditorExportSettings {
 
 struct RecordingJob {
     shortcut_state: recorder_shortcuts::LiveShortcutState,
-    receiver: Receiver<JobMessage>,
+    receiver: recording_messages::RecordingMessageReceiver,
     cancellation: CancellationFlag,
     controller: RecordingController,
     paused: bool,
@@ -633,6 +632,16 @@ impl RecordingJob {
     }
 
     fn acknowledge_phase(&mut self, phase: WorkflowPhase) {
+        if matches!(
+            phase,
+            WorkflowPhase::StoppingCapture
+                | WorkflowPhase::Encoding
+                | WorkflowPhase::Committing
+                | WorkflowPhase::Complete
+        ) {
+            self.stop_retargeting();
+            return;
+        }
         let paused = match phase {
             WorkflowPhase::Paused => true,
             WorkflowPhase::Capturing => false,
@@ -2819,7 +2828,8 @@ impl GifFromScreenApp {
         }
         match self.progress.map(|progress| progress.phase) {
             Some(
-                gif_from_screen_workflow::WorkflowPhase::Encoding
+                gif_from_screen_workflow::WorkflowPhase::StoppingCapture
+                | gif_from_screen_workflow::WorkflowPhase::Encoding
                 | gif_from_screen_workflow::WorkflowPhase::Committing,
             ) => RecorderStage::Finalizing,
             _ => RecorderStage::Recording,
@@ -3043,7 +3053,7 @@ impl GifFromScreenApp {
         let cancellation = CancellationFlag::default();
         let worker_cancellation = cancellation.clone();
         let (controller, mut control) = RecordingController::channel();
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = recording_messages::channel();
         let worker_request = RecordingWorkerRequest {
             settings,
             source_id,
@@ -3737,14 +3747,25 @@ impl GifFromScreenApp {
 
     fn receive_job_messages(&mut self) {
         let localizer = self.language_settings.localizer();
-        let Some(job) = &self.job else {
+        let Some(job) = &mut self.job else {
             return;
         };
-        let messages: Vec<_> = job.receiver.try_iter().collect();
-        for message in messages {
-            if self.job.is_none() {
+        for phase in job
+            .receiver
+            .take_phase_acknowledgements()
+            .into_iter()
+            .flatten()
+        {
+            job.acknowledge_phase(phase);
+        }
+        for _ in 0..recording_messages::MAX_MESSAGES_PER_FRAME {
+            let Some(message) = self
+                .job
+                .as_ref()
+                .and_then(|job| job.receiver.try_recv().ok())
+            else {
                 break;
-            }
+            };
             match message {
                 JobMessage::Progress(progress) => {
                     if let Some(job) = &mut self.job {
@@ -4354,53 +4375,156 @@ fn show_editor_preview_panel(
         vector.invalidate(ui.ctx());
         return;
     };
-    let preview = if state.canvas.zoom == editor_canvas::PreviewZoom::Fit {
-        cache.presentation_preview(
-            workspace.active_project(),
-            frame_id,
-            transition,
-            ui.ctx(),
-            EDITOR_PREVIEW_MAX_SIZE,
-        )
-    } else {
-        cache.native_presentation_preview(
-            workspace.active_project(),
-            frame_id,
-            transition,
-            ui.ctx(),
-        )
+    let preview = cache.request_presentation_preview(
+        workspace.active_project(),
+        frame_id,
+        transition,
+        ui.ctx(),
+        EDITOR_PREVIEW_MAX_SIZE,
+        state.canvas.zoom != editor_canvas::PreviewZoom::Fit,
+        state.playback.is_some(),
+    );
+    show_editor_preview_status(ui, matches!(&preview, Ok(None)), localizer);
+    let target = EditorPreviewTarget {
+        frame_id,
+        transition,
+        cinemagraph: cine_reference.is_some(),
+        input_enabled: cine_input_enabled,
     };
     match preview {
-        Ok(preview) => draw_editor_preview(
+        Ok(Some(preview)) => draw_editor_preview(
             ui,
             workspace,
             state,
             (motion, vector),
             &preview,
-            EditorPreviewTarget {
-                frame_id,
-                transition,
-                cinemagraph: cine_reference.is_some(),
-                input_enabled: cine_input_enabled,
-            },
+            target,
             localizer,
         ),
-        Err(error) => {
-            drawing_preview::invalidate(ui.ctx(), &mut state.drawing_overlay);
-            vector.invalidate(ui.ctx());
+        Ok(None) => show_unavailable_editor_preview(
+            ui,
+            workspace,
+            cache,
+            state,
+            (motion, vector),
+            (target, None),
+            localizer,
+        ),
+        Err(error) => show_unavailable_editor_preview(
+            ui,
+            workspace,
+            cache,
+            state,
+            (motion, vector),
+            (target, Some(&error)),
+            localizer,
+        ),
+    }
+}
+
+fn show_editor_preview_status(ui: &mut egui::Ui, pending: bool, localizer: Localizer) {
+    // Keep a stable status-line height when an async cache miss becomes ready.
+    // Long localized labels truncate here instead of shifting the image.
+    ui.horizontal(|ui| {
+        ui.set_min_height(ui.spacing().interact_size.y);
+        if pending {
+            ui.spinner();
+        }
+        ui.add(
+            egui::Label::new(localizer.text(if pending {
+                Message::EditorThumbnailLoading
+            } else {
+                Message::PreviewCurrentFrameTitle
+            }))
+            .truncate(),
+        );
+    });
+}
+
+fn show_unavailable_editor_preview(
+    ui: &mut egui::Ui,
+    workspace: &mut EditorWorkspace,
+    cache: &mut EditorPreviewCache,
+    state: &mut EditorUiState,
+    (_motion, vector): (&mut MotionTools, &mut vector_shapes::VectorShapes),
+    (target, error): (EditorPreviewTarget, Option<&str>),
+    localizer: Localizer,
+) {
+    drawing_preview::invalidate(ui.ctx(), &mut state.drawing_overlay);
+    vector.invalidate(ui.ctx());
+    let fallback = error
+        .is_none()
+        .then(|| cache.latest_ready_presentation())
+        .flatten()
+        .map(|(_, _, preview)| preview);
+    let rendered_size = editor_preview_target_size(workspace, target.frame_id);
+    state.canvas.cancel_layout_gestures();
+    state.canvas.crop.show_controls(
+        ui,
+        workspace,
+        target.frame_id,
+        rendered_size,
+        false,
+        localizer,
+    );
+    let zoom = state.canvas.zoom;
+    let exact_pixels = zoom != editor_canvas::PreviewZoom::Fit;
+    let retry = state
+        .canvas
+        .show_placeholder(ui, rendered_size, |ui, rect| {
+            if let Some(preview) = fallback {
+                if let Ok(size) = zoom.extent(
+                    preview.rendered_size,
+                    rect.size(),
+                    ui.ctx().pixels_per_point(),
+                ) {
+                    egui::Image::new(&preview.texture)
+                        .paint_at(ui, egui::Rect::from_center_size(rect.center(), size));
+                }
+                return false;
+            }
+            let Some(error) = error else {
+                return false;
+            };
             ui.colored_label(
                 ui.visuals().error_fg_color,
-                format_message(
-                    localizer,
-                    Message::PreviewRenderFailed,
-                    &[("error", &error.to_string())],
-                ),
+                format_message(localizer, Message::PreviewRenderFailed, &[("error", error)]),
             );
-            if state.canvas.zoom != editor_canvas::PreviewZoom::Fit {
+            if exact_pixels {
                 ui.label(localizer.text(Message::PreviewExactLimitHint));
             }
-        }
+            ui.button(localizer.text(Message::SettingsRetry)).clicked()
+        })
+        .unwrap_or_else(|error| {
+            ui.colored_label(ui.visuals().error_fg_color, error.render(localizer));
+            false
+        });
+    if retry {
+        cache.retry_presentation_preview();
+        ui.ctx().request_repaint();
     }
+    if let Some(step) = target.transition {
+        ui.weak(format_message(
+            localizer,
+            Message::PreviewTransitionStep,
+            &[("step", &step.step.to_string())],
+        ));
+    }
+}
+
+fn editor_preview_target_size(workspace: &EditorWorkspace, frame_id: FrameId) -> [u32; 2] {
+    let manifest = workspace.manifest();
+    let size = manifest
+        .timeline
+        .frames
+        .iter()
+        .find(|frame| frame.id == frame_id)
+        .and_then(|frame| {
+            let source = manifest.assets.get(&frame.asset_id)?.kind.raster_size()?;
+            gif_from_screen_domain::FrameGeometryPlan::new(frame, source).ok()
+        })
+        .map_or(manifest.canvas.size, |plan| plan.output_size());
+    [size.width.get(), size.height.get()]
 }
 
 #[derive(Clone, Copy)]
@@ -5185,7 +5309,10 @@ fn draw_wayland_toolbar_contents(
             }
         }
         RecorderStage::Finalizing => {
-            if ui.button(localizer.text(Message::CancelButton)).clicked() {
+            if ui
+                .button(localizer.text(Message::RecorderDiscardShort))
+                .clicked()
+            {
                 action = RecorderOverlayAction::Discard;
             }
             ui.spinner();
@@ -6661,7 +6788,15 @@ fn run_incremental_x11_recording(
             };
         }
     };
-    let mut sink = IncrementalProjectFrameSink::new(project);
+    let mut sink = match recording_writer::BufferedRecordingSink::new(project) {
+        Ok(sink) => sink,
+        Err(error) => {
+            return RecordingCompletion::Failed {
+                error,
+                recovery_path: Some(worker.project_path.clone()),
+            };
+        }
+    };
     match collect_x11_recording(worker, control, &mut sink, cancellation, progress) {
         Ok(()) => {
             on_finalizing();
@@ -6676,16 +6811,20 @@ fn run_incremental_x11_recording(
         }
         Err(WorkflowError::Discarded | WorkflowError::Cancelled) => {
             let project_path = sink.root().to_path_buf();
-            drop(sink);
+            let _ = sink.discard();
             RecordingCompletion::Discarded {
                 cleanup_error: remove_recording_project_path(&project_path).err(),
             }
         }
         Err(error) => {
             let recovery_path = sink.root().to_path_buf();
-            drop(sink);
+            on_finalizing();
+            let error = match sink.preserve() {
+                Ok(()) => error.to_string(),
+                Err(save_error) => format!("{error}; saving accepted frames failed: {save_error}"),
+            };
             RecordingCompletion::Failed {
-                error: error.to_string(),
+                error,
                 recovery_path: Some(recovery_path),
             }
         }
@@ -6718,7 +6857,16 @@ fn run_incremental_prestarted_recording(
             };
         }
     };
-    let mut sink = IncrementalProjectFrameSink::new(project);
+    let mut sink = match recording_writer::BufferedRecordingSink::new(project) {
+        Ok(sink) => sink,
+        Err(error) => {
+            let _ = session.discard();
+            return RecordingCompletion::Failed {
+                error,
+                recovery_path: Some(worker.project_path.clone()),
+            };
+        }
+    };
     let options = match collection_options(&worker.settings) {
         Ok(options) => options,
         Err(error) => {
@@ -6756,16 +6904,20 @@ fn run_incremental_prestarted_recording(
         }
         Err(WorkflowError::Discarded | WorkflowError::Cancelled) => {
             let project_path = sink.root().to_path_buf();
-            drop(sink);
+            let _ = sink.discard();
             RecordingCompletion::Discarded {
                 cleanup_error: remove_recording_project_path(&project_path).err(),
             }
         }
         Err(error) => {
             let recovery_path = sink.root().to_path_buf();
-            drop(sink);
+            on_finalizing();
+            let error = match sink.preserve() {
+                Ok(()) => error.to_string(),
+                Err(save_error) => format!("{error}; saving accepted frames failed: {save_error}"),
+            };
             RecordingCompletion::Failed {
-                error: error.to_string(),
+                error,
                 recovery_path: Some(recovery_path),
             }
         }
@@ -8442,7 +8594,7 @@ mod tests {
 
     #[test]
     fn paused_indicator_waits_for_capture_acknowledgement_and_rejects_stale_messages() {
-        let (_sender, receiver) = std::sync::mpsc::channel();
+        let (_sender, receiver) = crate::recording_messages::channel();
         let (controller, _control) = gif_from_screen_workflow::RecordingController::channel();
         let mut job = super::RecordingJob {
             shortcut_state: super::recorder_shortcuts::LiveShortcutState::default(),

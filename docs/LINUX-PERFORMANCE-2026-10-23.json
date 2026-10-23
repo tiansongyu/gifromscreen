@@ -1,0 +1,220 @@
+{
+  "date": "2026-10-23",
+  "tested_worktree_base": "e48ccd0b928fecd04fa77341da88f829026e47f0",
+  "scope": "Linux X11 application capture/writer cadence and recovery; physical display FPS not measured",
+  "runs": [
+    {
+      "schema": 1,
+      "scope": "desktop incremental capture/writer worker on owned Xvfb; excludes GUI rendering",
+      "profile": "release",
+      "environment": {
+        "os": "Linux-6.8.0-106-generic-x86_64-with-glibc2.35",
+        "kernel": "6.8.0-106-generic",
+        "architecture": "x86_64",
+        "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+        "ram_bytes": 64961724416,
+        "renderer_scope": "owned Xvfb software X server; application GUI renderer is not started",
+        "gpu_driver": "not exercised by this capture/writer benchmark",
+        "physical_display_refresh_hz": null,
+        "refresh_scope": "source callback scheduling only; physical display refresh/presentation unknown"
+      },
+      "binary_sha256": "38eb6926226841f39fd35473e30146b287122258b5831a6d7e144be19d05f342",
+      "dirty_diff_sha256": "aa0d404be5b8a72b2a0c504c3e9351f1e8f8206344e7321faa8f813d587c30f5",
+      "test_exit": 0,
+      "configuration": {
+        "width": 1920,
+        "height": 1080,
+        "fps": 60,
+        "duration_ms": 5000
+      },
+      "recording": {
+        "capture_fps_from_pts": 59.99941405254504,
+        "capture_interval_us": {
+          "max": 18837,
+          "p50": 16667,
+          "p95": 16672,
+          "p99": 16685
+        },
+        "capture_pts_span_us": 4983382,
+        "capture_stopped_wall_seconds": 5.020774991,
+        "collection_and_barrier_wall_seconds": 5.02284423,
+        "error": null,
+        "final_checkpoint_seconds": 0.005036967,
+        "frames": 300,
+        "height": 1080,
+        "playback_duration_us": 5000000,
+        "progress_frames": 300,
+        "project_bytes": 2488739950,
+        "recording_and_flush_wall_seconds": 5.027881197,
+        "recovery": {
+          "full_digest": true,
+          "monotonic_pts": true,
+          "reopen": true,
+          "verification_seconds": 0.32918275
+        },
+        "requested_duration_ms": 5000,
+        "requested_fps": 60,
+        "schema": 1,
+        "scope": "desktop incremental X11 capture and project writer; no GUI/physical-display FPS claim",
+        "status": "completed",
+        "stopping_and_pending_writer_drain_seconds": 0.002069239,
+        "unique_pixel_assets": 300,
+        "width": 1920
+      },
+      "source": {
+        "scope": "Tk submitted updates on owned Xvfb, not physical presentation",
+        "source_updates": 339,
+        "active_updates": 302,
+        "active_fps": 59.9968120125861,
+        "interval_ms": {
+          "p50": 16.404114,
+          "p95": 17.424922,
+          "p99": 17.555549
+        },
+        "skipped_schedule_slots": 0
+      }
+    },
+    {
+      "schema": 1,
+      "scope": "desktop incremental capture/writer worker on owned Xvfb; excludes GUI rendering",
+      "profile": "release",
+      "environment": {
+        "os": "Linux-6.8.0-106-generic-x86_64-with-glibc2.35",
+        "kernel": "6.8.0-106-generic",
+        "architecture": "x86_64",
+        "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+        "ram_bytes": 64961724416,
+        "renderer_scope": "owned Xvfb software X server; application GUI renderer is not started",
+        "gpu_driver": "not exercised by this capture/writer benchmark",
+        "physical_display_refresh_hz": null,
+        "refresh_scope": "source callback scheduling only; physical display refresh/presentation unknown"
+      },
+      "binary_sha256": "38eb6926226841f39fd35473e30146b287122258b5831a6d7e144be19d05f342",
+      "dirty_diff_sha256": "aa0d404be5b8a72b2a0c504c3e9351f1e8f8206344e7321faa8f813d587c30f5",
+      "test_exit": 0,
+      "configuration": {
+        "width": 1920,
+        "height": 1080,
+        "fps": 60,
+        "duration_ms": 30000
+      },
+      "recording": {
+        "capture_fps_from_pts": 59.99989660940551,
+        "capture_interval_us": {
+          "max": 16739,
+          "p50": 16667,
+          "p95": 16679,
+          "p99": 16692
+        },
+        "capture_pts_span_us": 29983385,
+        "capture_stopped_wall_seconds": 30.016324278,
+        "collection_and_barrier_wall_seconds": 30.018459373,
+        "error": null,
+        "final_checkpoint_seconds": 0.008179334,
+        "frames": 1800,
+        "height": 1080,
+        "playback_duration_us": 30000000,
+        "progress_frames": 1800,
+        "project_bytes": 11009025439,
+        "recording_and_flush_wall_seconds": 30.026638707,
+        "recovery": {
+          "full_digest": true,
+          "monotonic_pts": true,
+          "reopen": true,
+          "verification_seconds": 1.640126511
+        },
+        "requested_duration_ms": 30000,
+        "requested_fps": 60,
+        "schema": 1,
+        "scope": "desktop incremental X11 capture and project writer; no GUI/physical-display FPS claim",
+        "status": "completed",
+        "stopping_and_pending_writer_drain_seconds": 0.002135095,
+        "unique_pixel_assets": 1327,
+        "width": 1920
+      },
+      "source": {
+        "scope": "Tk submitted updates on owned Xvfb, not physical presentation",
+        "source_updates": 1920,
+        "active_updates": 1802,
+        "active_fps": 60.00249932298432,
+        "interval_ms": {
+          "p50": 16.371092,
+          "p95": 18.875854,
+          "p99": 19.208824
+        },
+        "skipped_schedule_slots": 0
+      }
+    },
+    {
+      "schema": 1,
+      "scope": "desktop incremental capture/writer worker on owned Xvfb; excludes GUI rendering",
+      "profile": "debug",
+      "environment": {
+        "os": "Linux-6.8.0-106-generic-x86_64-with-glibc2.35",
+        "kernel": "6.8.0-106-generic",
+        "architecture": "x86_64",
+        "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+        "ram_bytes": 64961724416,
+        "renderer_scope": "owned Xvfb software X server; application GUI renderer is not started",
+        "gpu_driver": "not exercised by this capture/writer benchmark",
+        "physical_display_refresh_hz": null,
+        "refresh_scope": "source callback scheduling only; physical display refresh/presentation unknown"
+      },
+      "binary_sha256": "aa235bc37bc8219bcf67ec55b9fb5486149bf3ab131bb3eb9e0d7eb472d435e8",
+      "dirty_diff_sha256": "aa0d404be5b8a72b2a0c504c3e9351f1e8f8206344e7321faa8f813d587c30f5",
+      "test_exit": 0,
+      "configuration": {
+        "width": 320,
+        "height": 240,
+        "fps": 10,
+        "duration_ms": 2000
+      },
+      "recording": {
+        "capture_fps_from_pts": 9.99969474616038,
+        "capture_interval_us": {
+          "max": 100054,
+          "p50": 100001,
+          "p95": 100054,
+          "p99": 100054
+        },
+        "capture_pts_span_us": 1900058,
+        "capture_stopped_wall_seconds": 2.011226221,
+        "collection_and_barrier_wall_seconds": 2.012524284,
+        "error": null,
+        "final_checkpoint_seconds": 0.004814096,
+        "frames": 20,
+        "height": 240,
+        "playback_duration_us": 2000000,
+        "progress_frames": 20,
+        "project_bytes": 6172568,
+        "recording_and_flush_wall_seconds": 2.01733838,
+        "recovery": {
+          "full_digest": true,
+          "monotonic_pts": true,
+          "reopen": true,
+          "verification_seconds": 0.003790602
+        },
+        "requested_duration_ms": 2000,
+        "requested_fps": 10,
+        "schema": 1,
+        "scope": "desktop incremental X11 capture and project writer; no GUI/physical-display FPS claim",
+        "status": "completed",
+        "stopping_and_pending_writer_drain_seconds": 0.001298063,
+        "unique_pixel_assets": 20,
+        "width": 320
+      },
+      "source": {
+        "scope": "Tk submitted updates on owned Xvfb, not physical presentation",
+        "source_updates": 25,
+        "active_updates": 20,
+        "active_fps": 9.99819183226934,
+        "interval_ms": {
+          "p50": 100.23518,
+          "p95": 100.513987,
+          "p99": 100.513987
+        },
+        "skipped_schedule_slots": 0
+      }
+    }
+  ]
+}

@@ -53,12 +53,56 @@ pub type RecordingFrameSinkError = Box<dyn Error + Send + Sync + 'static>;
 
 /// Durable observer for frames retained by the capture workflow.
 ///
-/// A newly retained frame is appended immediately with its fixed playback
+/// A newly retained frame is accepted immediately with its fixed playback
 /// duration or a safe measured-playback provisional tail. Only measured timing
 /// is corrected when a later sample or final stop boundary is known. Fixed
 /// playback never requires a duration update. Calls are strictly ordered and
 /// never overlap; native metadata always keeps its original capture clock.
+/// Write-behind implementations defer durability until [`Self::flush_pending`];
+/// the original append/update methods remain synchronous durability operations.
 pub trait RecordingFrameSink {
+    /// Accepts pixels and metadata in timeline order. The default persists
+    /// synchronously; a bounded write-behind sink may enqueue instead.
+    /// Collection calls [`Self::flush_pending`] before successful completion or
+    /// acknowledging a manual snapshot. Progress counts accepted captures,
+    /// not durable saves. Callers abandoning collection must drain/preserve or
+    /// explicitly discard any accepted work before deleting project storage.
+    ///
+    /// # Errors
+    /// Returns admission/overload or persistence errors. A sink must never
+    /// silently drop accepted recording frames when its queue fills.
+    fn enqueue_provisional_frame_with_metadata(
+        &mut self,
+        frame_index: u64,
+        frame: &RgbaFrame,
+        metadata: &RecordingMetadata,
+    ) -> Result<(), RecordingFrameSinkError> {
+        self.append_provisional_frame_with_metadata(frame_index, frame, metadata)
+    }
+
+    /// Accepts an ordered duration correction, with the same admission and
+    /// flush contract as [`Self::enqueue_provisional_frame_with_metadata`].
+    ///
+    /// # Errors
+    /// Returns admission/overload or persistence errors.
+    fn enqueue_frame_duration(
+        &mut self,
+        frame_index: u64,
+        duration_us: u64,
+    ) -> Result<(), RecordingFrameSinkError> {
+        self.update_frame_duration(frame_index, duration_us)
+    }
+
+    /// Waits until all accepted frames and duration corrections are durable.
+    /// Synchronous sinks need no additional barrier. Never call from the UI.
+    ///
+    /// # Errors
+    /// Returns any deferred persistence failure; success must not be reported
+    /// until both pixel assets and their ordered journal commits are durable.
+    fn flush_pending(&mut self) -> Result<(), RecordingFrameSinkError> {
+        Ok(())
+    }
+
     /// Durably appends one newly retained frame in zero-based timeline order.
     ///
     /// # Errors
@@ -105,4 +149,6 @@ pub enum RecordingFrameSinkOperation {
     AppendProvisionalFrame,
     /// Replace a previous provisional duration with its known duration.
     UpdateFrameDuration,
+    /// Make all previously accepted frames and metadata durable.
+    FlushPending,
 }

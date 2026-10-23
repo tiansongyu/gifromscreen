@@ -200,7 +200,7 @@ enum WorkerCommand {
         worker: Box<RecordingWorkerRequest>,
         control: RecordingControl,
         cancellation: CancellationFlag,
-        messages: Sender<JobMessage>,
+        messages: crate::recording_messages::RecordingMessageSender,
     },
 }
 
@@ -352,7 +352,7 @@ impl WaylandPrepareJob {
         let cancellation = CancellationFlag::default();
         let worker_cancellation = cancellation.clone();
         let (controller, control) = RecordingController::channel();
-        let (messages, receiver) = mpsc::channel();
+        let (messages, receiver) = crate::recording_messages::channel();
         self.commands
             .as_ref()
             .ok_or(WaylandCommitError::WorkerExited)?
@@ -656,7 +656,7 @@ fn run_committed_recording(
     worker: &RecordingWorkerRequest,
     mut control: RecordingControl,
     cancellation: &CancellationFlag,
-    messages: &Sender<JobMessage>,
+    messages: &crate::recording_messages::RecordingMessageSender,
 ) {
     let source_id = worker.source_id.clone();
     let mut session = match FixedCropSession::new(session, source_id, source_size, crop) {

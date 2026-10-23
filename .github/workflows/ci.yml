@@ -30,6 +30,7 @@ jobs:
             libxkbcommon-x11-dev \
             libxcb-shape0-dev \
             libxcb-xfixes0-dev \
+            python3-tk \
             xvfb \
             xauth
 
@@ -50,6 +51,26 @@ jobs:
 
       - name: Test
         run: cargo test --locked --workspace --all-targets --all-features
+
+      - name: Test recording benchmark harness isolation
+        run: python3 scripts/qa/test_recording_perf.py
+
+      - name: Check desktop recording and recovery on an owned X11 server
+        run: >-
+          python3 scripts/qa/recording_perf.py --profile debug
+          --width 320 --height 240 --fps 10 --seconds 2
+          --output-dir "${{ runner.temp }}/gfs-recording-smoke"
+
+      - name: Upload recording smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recording-smoke-diagnostics
+          path: |
+            ${{ runner.temp }}/gfs-recording-smoke/*.json
+            ${{ runner.temp }}/gfs-recording-smoke/*.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   native-capture-ubuntu-22:
     runs-on: ubuntu-22.04

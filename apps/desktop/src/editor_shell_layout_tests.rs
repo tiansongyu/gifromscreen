@@ -80,6 +80,125 @@ fn app_fixture() -> (tempfile::TempDir, crate::GifFromScreenApp) {
     (directory, app)
 }
 
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one real-layout matrix compares ready, first-load, fallback and long-error geometry"
+)]
+fn pending_and_failed_previews_keep_the_stacked_inspector_in_place() {
+    for (width, font_scale, tag, zoom) in [
+        (320.0, 1.0, "en", crate::editor_canvas::PreviewZoom::Fit),
+        (440.0, 1.5, "zh", crate::editor_canvas::PreviewZoom::Fit),
+        (320.0, 1.0, "en", crate::editor_canvas::PreviewZoom::Double),
+    ] {
+        let (_directory, mut app) = app_fixture();
+        let workspace = app.editor_workspace.as_mut().unwrap();
+        let frame_id = workspace.selection().current().unwrap();
+        let mut positions = Vec::new();
+        for phase in ["ready", "first-load", "cached-pending", "error"] {
+            let context = context(1.0);
+            context.style_mut(|style| {
+                for font in style.text_styles.values_mut() {
+                    font.size *= font_scale;
+                }
+            });
+            let mut cache = crate::EditorPreviewCache::new();
+            let mut state = crate::EditorUiState::default();
+            state.canvas.zoom = zoom;
+            let mut motion = crate::MotionTools::default();
+            let mut vector = crate::vector_shapes::VectorShapes::default();
+            let preview = if zoom == crate::editor_canvas::PreviewZoom::Fit {
+                cache.preview(
+                    workspace.active_project(),
+                    frame_id,
+                    &context,
+                    crate::EDITOR_PREVIEW_MAX_SIZE,
+                )
+            } else {
+                cache.native_presentation_preview(
+                    workspace.active_project(),
+                    frame_id,
+                    None,
+                    &context,
+                )
+            }
+            .unwrap();
+            // Bind the cache to the exact production request without starting
+            // a worker, so this layout regression is deterministic.
+            cache
+                .request_presentation_preview(
+                    workspace.active_project(),
+                    frame_id,
+                    None,
+                    &context,
+                    crate::EDITOR_PREVIEW_MAX_SIZE,
+                    zoom != crate::editor_canvas::PreviewZoom::Fit,
+                    false,
+                )
+                .unwrap();
+            if phase == "first-load" {
+                cache = crate::EditorPreviewCache::new();
+            }
+            let target = crate::EditorPreviewTarget {
+                frame_id,
+                transition: None,
+                cinemagraph: false,
+                input_enabled: true,
+            };
+            let long_error = "A deliberately long asset path and read failure. ".repeat(80);
+            let mut inspector_y = 0.0;
+            let _ = context.run(
+                input(&context, egui::vec2(width, 640.0), Vec::new()),
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        editor_shell_layout::work_area(ui, InspectorLayout::Stacked, |columns| {
+                            let ui = &mut columns[0];
+                            state.canvas.show_zoom(ui, language(tag));
+                            crate::show_editor_preview_status(
+                                ui,
+                                phase != "ready" && phase != "error",
+                                language(tag),
+                            );
+                            if phase == "ready" {
+                                crate::draw_editor_preview(
+                                    ui,
+                                    workspace,
+                                    &mut state,
+                                    (&mut motion, &mut vector),
+                                    &preview,
+                                    target,
+                                    language(tag),
+                                );
+                            } else {
+                                crate::show_unavailable_editor_preview(
+                                    ui,
+                                    workspace,
+                                    &mut cache,
+                                    &mut state,
+                                    (&mut motion, &mut vector),
+                                    (target, (phase == "error").then_some(long_error.as_str())),
+                                    language(tag),
+                                );
+                            }
+                            ui.separator();
+                            inspector_y = ui.cursor().top();
+                            ui.label("Inspector sentinel");
+                        });
+                    });
+                },
+            );
+            positions.push((phase, inspector_y));
+        }
+        let ready = positions[0].1;
+        for (phase, y) in positions {
+            assert!(
+                (y - ready).abs() <= 1.0,
+                "{tag} {width}px {zoom:?} {phase}: inspector moved from {ready} to {y}"
+            );
+        }
+    }
+}
+
 fn app_frame(
     context: &egui::Context,
     app: &mut crate::GifFromScreenApp,
