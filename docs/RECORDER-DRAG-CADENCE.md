@@ -9,6 +9,8 @@ For a 60 Hz desktop the presentation budget is approximately 16.7 ms.
 - An owned pointer gesture updates the border and handles directly on the X11
   worker. Native updates continue while the app is not polling the guide.
   Pending motion is coalesced to the latest pointer position before presenting.
+  After geometry replies, the worker drains events buffered by x11rb before
+  waiting for socket readiness, avoiding a housekeeping-timeout delay.
 - Native preview permission is explicit: ready mode, or an acknowledged capture
   pause held by a retarget transaction. Live capture never receives that permission.
 - Moving preview geometry invalidates the previous capture ACK. Release retains

@@ -181,7 +181,11 @@ impl Windows<'_, '_> {
                 self.present_direct_drag(context)?;
                 continue;
             }
-            self.present_direct_drag(context)?;
+            // Geometry replies can read later motion into x11rb's event queue.
+            // Drain that queue before sleeping on the socket's readiness again.
+            if self.present_direct_drag(context)? {
+                continue;
+            }
             self.connection.flush().map_err(native_error)?;
             if let Some(wake) = &context.wake {
                 self.connection

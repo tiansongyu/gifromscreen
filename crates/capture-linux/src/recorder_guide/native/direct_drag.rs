@@ -13,25 +13,25 @@ pub(super) struct DirectDrag {
 }
 
 impl Windows<'_, '_> {
-    pub(super) fn present_direct_drag(&mut self, context: &Context) -> Result<(), String> {
+    pub(super) fn present_direct_drag(&mut self, context: &Context) -> Result<bool, String> {
         let Some((id, drag)) = self
             .gesture
             .as_ref()
             .and_then(|gesture| gesture.direct.map(|drag| (gesture.id, drag)))
         else {
-            return Ok(());
+            return Ok(false);
         };
         if !context.active_gesture(id) {
-            return Ok(());
+            return Ok(false);
         }
         let Some(mut request) = self.current else {
-            return Ok(());
+            return Ok(false);
         };
         let Some(bounds) = request.preview_bounds else {
-            return Ok(());
+            return Ok(false);
         };
         let Some(initial) = drag.initial.region else {
-            return Ok(());
+            return Ok(false);
         };
         let Some(region) = dragged_region(
             initial,
@@ -41,9 +41,10 @@ impl Windows<'_, '_> {
             bounds,
             request.resize_handles,
         ) else {
-            return Ok(());
+            return Ok(false);
         };
-        if request.region != Some(region) {
+        let moved = request.region != Some(region);
+        if moved {
             request.region = Some(region);
             self.connection.stream().begin_operation();
             self.apply(request, context)?;
@@ -56,7 +57,7 @@ impl Windows<'_, '_> {
             position: drag.position,
             active: true,
         });
-        Ok(())
+        Ok(moved)
     }
 }
 
