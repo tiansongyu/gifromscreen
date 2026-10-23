@@ -601,3 +601,237 @@ fn original_nested_scroll_reproduces_64_point_collapse_and_inline_shell_expands(
         "inline visible={visible}, body_height={body_height}"
     );
 }
+
+/// Inspect actual glyph rows, not widget rectangles (which include whitespace).
+pub(crate) fn text_layout_issues(output: &egui::FullOutput) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut issues = Vec::new();
+    for (index, shape) in output.shapes.iter().enumerate() {
+        if let egui::Shape::Text(text) = &shape.shape {
+            for row in &text.galley.rows {
+                let rect = row
+                    .visuals
+                    .mesh_bounds
+                    .translate(text.pos.to_vec2() + row.pos.to_vec2());
+                let visible = rect.intersect(shape.clip_rect);
+                if !visible.is_positive() {
+                    continue;
+                }
+                if rect.left() < shape.clip_rect.left() - 1.0
+                    || rect.right() > shape.clip_rect.right() + 1.0
+                {
+                    // Single-line text fields and timeline cells intentionally scroll/clip.
+                    if text.galley.job.wrap.max_width.is_finite() {
+                        issues.push(format!(
+                            "clipped {:?} at {rect:?} by {:?}",
+                            text.galley.text(),
+                            shape.clip_rect
+                        ));
+                    }
+                }
+                rows.push((index, text.galley.text(), visible));
+            }
+        }
+    }
+    for (i, (id, text, rect)) in rows.iter().enumerate() {
+        for (other_id, other, other_rect) in &rows[i + 1..] {
+            let overlap = rect.intersect(*other_rect);
+            if id != other_id && overlap.width() > 1.0 && overlap.height() > 1.0 {
+                issues.push(format!(
+                    "overlap {text:?} {rect:?} with {other:?} {other_rect:?}"
+                ));
+            }
+        }
+    }
+    issues
+}
+
+fn audit_scroll(
+    ctx: &egui::Context,
+    app: &mut crate::GifFromScreenApp,
+    size: egui::Vec2,
+    position: egui::Pos2,
+) -> Vec<String> {
+    let mut issues = Vec::new();
+    for delta in std::iter::repeat_n(-250.0, 10).chain([100_000.0]) {
+        app_frame(
+            ctx,
+            app,
+            size,
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, delta),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        // Let scroll smoothing finish before judging geometry.
+        for _ in 0..12 {
+            app_frame(ctx, app, size, vec![]);
+        }
+        issues.extend(text_layout_issues(&app_frame(ctx, app, size, vec![])));
+    }
+    issues.sort();
+    issues.dedup();
+    issues
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one matrix exercises the actual page routes and editor tabs with identical rendering checks"
+)]
+fn page_text_layout_audit() {
+    let mut issues = Vec::new();
+    for (width, font_scale, tag) in [
+        (960.0, 1.0, "en"),
+        (960.0, 1.0, "zh"),
+        (440.0, 1.0, "en"),
+        (440.0, 1.5, "zh"),
+        (960.0, 1.5, "en"),
+        (320.0, 2.0, "zh"),
+    ] {
+        for view in [
+            crate::AppView::OpenProject,
+            crate::AppView::ImportGif,
+            crate::AppView::ImportImage,
+            crate::AppView::ImportImageSequence,
+            crate::AppView::ImportVideo,
+            crate::AppView::NewBlankAnimation,
+            crate::AppView::CameraRecorder,
+            crate::AppView::BoardRecorder,
+            crate::AppView::Automation,
+            crate::AppView::ScreenRecorder,
+            crate::AppView::Editor,
+        ] {
+            let (_dir, mut app) = app_fixture();
+            let ctx = context(1.0);
+            crate::appearance::configure(&ctx);
+            ctx.style_mut(|style| {
+                for font in style.text_styles.values_mut() {
+                    font.size *= font_scale;
+                }
+            });
+            app.view = view;
+            app.language_settings = crate::preferences::LanguageSettings::with_language(
+                gif_from_screen_localization::LanguagePreference::explicit(tag).unwrap(),
+            );
+            let size = egui::vec2(width, 1000.0);
+            for _ in 0..4 {
+                app_frame(&ctx, &mut app, size, vec![]);
+            }
+            if view == crate::AppView::ScreenRecorder {
+                let output = app_frame(&ctx, &mut app, size, vec![]);
+                let pos = visible_text(&output, language(tag).text(Message::UiAdvancedSettings))
+                    .unwrap()
+                    .center();
+                click_app(&ctx, &mut app, size, pos);
+                for _ in 0..4 {
+                    app_frame(&ctx, &mut app, size, vec![]);
+                }
+            }
+            let output = app_frame(&ctx, &mut app, size, vec![]);
+            for issue in text_layout_issues(&output) {
+                issues.push(format!("{view:?}/{width}/{font_scale}/{tag}: {issue}"));
+            }
+            for issue in audit_scroll(&ctx, &mut app, size, egui::pos2(width - 30.0, 970.0)) {
+                issues.push(format!("{view:?}/{width}/{font_scale}/{tag}: {issue}"));
+            }
+            if view == crate::AppView::Editor {
+                for tab in [
+                    Message::EditorTimingTab,
+                    Message::EditorTransformTab,
+                    Message::EditorEffectsTab,
+                    Message::EditorOverlaysTab,
+                    Message::EditorProjectTab,
+                ] {
+                    let output = app_frame(&ctx, &mut app, size, vec![]);
+                    let pos = visible_text(&output, language(tag).text(tab))
+                        .unwrap()
+                        .center();
+                    click_app(&ctx, &mut app, size, pos);
+                    for _ in 0..3 {
+                        app_frame(&ctx, &mut app, size, vec![]);
+                    }
+                    let output = app_frame(&ctx, &mut app, size, vec![]);
+                    for issue in text_layout_issues(&output) {
+                        issues.push(format!("{tab:?}/{width}/{font_scale}/{tag}: {issue}"));
+                    }
+                    let point = if width >= 900.0 {
+                        egui::pos2(width - 60.0, 300.0)
+                    } else {
+                        egui::pos2(width - 30.0, 970.0)
+                    };
+                    for issue in audit_scroll(&ctx, &mut app, size, point) {
+                        issues.push(format!("{tab:?}/{width}/{font_scale}/{tag}: {issue}"));
+                    }
+                    if tab == Message::EditorOverlaysTab {
+                        for tool in [
+                            crate::editor_ui::OverlayTool::Image,
+                            crate::editor_ui::OverlayTool::Shape,
+                            crate::editor_ui::OverlayTool::Drawing,
+                        ] {
+                            app.editor_ui_state.overlay_tool = tool;
+                            for _ in 0..4 {
+                                app_frame(&ctx, &mut app, size, vec![]);
+                            }
+                            let output = app_frame(&ctx, &mut app, size, vec![]);
+                            for issue in text_layout_issues(&output) {
+                                issues
+                                    .push(format!("{tool:?}/{width}/{font_scale}/{tag}: {issue}"));
+                            }
+                            for issue in audit_scroll(&ctx, &mut app, size, point) {
+                                issues
+                                    .push(format!("{tool:?}/{width}/{font_scale}/{tag}: {issue}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(issues.is_empty(), "{}", issues.join("\n"));
+}
+
+#[test]
+fn export_form_text_layout_audit() {
+    for (width, scale, tag) in [(960.0, 1.0, "en"), (440.0, 1.5, "en"), (320.0, 2.0, "zh")] {
+        let ctx = context(1.0);
+        crate::appearance::configure(&ctx);
+        ctx.style_mut(|style| {
+            for font in style.text_styles.values_mut() {
+                font.size *= scale;
+            }
+        });
+        let mut settings = crate::EditorExportSettings {
+            quantizer: crate::ExportQuantizerChoice::Custom,
+            loop_choice: crate::ExportLoopChoice::Finite,
+            ..Default::default()
+        };
+        let mut path = "/tmp/long-export-path-with-中文-animation.gif".to_owned();
+        let mut output = None;
+        for _ in 0..4 {
+            output = Some(
+                ctx.run(input(&ctx, egui::vec2(width, 4000.0), vec![]), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        crate::show_export_configuration(
+                            ui,
+                            &mut path,
+                            &mut settings,
+                            100,
+                            language(tag),
+                        );
+                    });
+                }),
+            );
+        }
+        let issues = text_layout_issues(&output.unwrap());
+        assert!(
+            issues.is_empty(),
+            "{width}/{scale}/{tag}: {}",
+            issues.join("\n")
+        );
+    }
+}

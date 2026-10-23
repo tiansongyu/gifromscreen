@@ -276,7 +276,7 @@ impl ProjectLibraryTool {
         workspace: &EditorWorkspace,
     ) -> Option<PathBuf> {
         let mut open = None;
-        egui::CollapsingHeader::new("Save project copy…").id_salt("save-project-copy").show(ui, |ui| {
+        crate::appearance::section(ui, "Save project copy…").id_salt("save-project-copy").show(ui, |ui| {
             ui.label("Save this revision to a new .gfsproj. The current project stays open and editable.");
             ui.add_enabled_ui(!self.copy_task.is_running(), |ui| {
                 ui.horizontal_wrapped(|ui| {

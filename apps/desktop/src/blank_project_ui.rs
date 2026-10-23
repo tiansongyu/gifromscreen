@@ -72,7 +72,7 @@ pub(crate) fn show_blank_project_ui(
     ui.add_enabled_ui(!running, |ui| {
         show_canvas_controls(ui, state);
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Initial frame duration");
             ui.add(
                 egui::DragValue::new(&mut state.frame_duration_ms)
@@ -80,7 +80,7 @@ pub(crate) fn show_blank_project_ui(
                     .suffix(" ms"),
             );
         });
-        ui.horizontal(|ui| {
+        ui.vertical(|ui| {
             ui.label("Project directory");
             ui.add(
                 egui::TextEdit::singleline(&mut state.target)
@@ -92,7 +92,7 @@ pub(crate) fn show_blank_project_ui(
 
     ui.add_space(12.0);
     let mut action = BlankProjectUiAction::None;
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui
             .add_enabled(!running, egui::Button::new("Create project"))
             .clicked()
@@ -114,46 +114,43 @@ pub(crate) fn show_blank_project_ui(
 }
 
 fn show_canvas_controls(ui: &mut egui::Ui, state: &mut BlankProjectUiState) {
-    egui::Grid::new("blank-project-canvas")
-        .num_columns(2)
-        .spacing([12.0, 6.0])
-        .show(ui, |ui| {
-            ui.label("Canvas width");
-            ui.add(egui::DragValue::new(&mut state.width).range(1..=MAX_GIF_EDGE));
-            ui.end_row();
-            ui.label("Canvas height");
-            ui.add(egui::DragValue::new(&mut state.height).range(1..=MAX_GIF_EDGE));
-            ui.end_row();
-            ui.label("Background");
-            ui.horizontal(|ui| {
-                ui.radio_value(
-                    &mut state.background_choice,
-                    BlankBackgroundChoice::Transparent,
-                    "Transparent",
-                );
-                ui.radio_value(
-                    &mut state.background_choice,
-                    BlankBackgroundChoice::Solid,
-                    "Solid RGBA",
-                );
-            });
-            ui.end_row();
-            ui.label("Solid color");
-            ui.add_enabled_ui(
-                state.background_choice == BlankBackgroundChoice::Solid,
-                |ui| {
-                    ui.label("R");
-                    ui.add(egui::DragValue::new(&mut state.red));
-                    ui.label("G");
-                    ui.add(egui::DragValue::new(&mut state.green));
-                    ui.label("B");
-                    ui.add(egui::DragValue::new(&mut state.blue));
-                    ui.label("A");
-                    ui.add(egui::DragValue::new(&mut state.alpha).range(1..=u8::MAX));
-                },
+    crate::appearance::form(ui, "blank-project-canvas", |ui| {
+        ui.label("Canvas width");
+        ui.add(egui::DragValue::new(&mut state.width).range(1..=MAX_GIF_EDGE));
+        ui.end_row();
+        ui.label("Canvas height");
+        ui.add(egui::DragValue::new(&mut state.height).range(1..=MAX_GIF_EDGE));
+        ui.end_row();
+        ui.label("Background");
+        ui.horizontal_wrapped(|ui| {
+            ui.radio_value(
+                &mut state.background_choice,
+                BlankBackgroundChoice::Transparent,
+                "Transparent",
             );
-            ui.end_row();
+            ui.radio_value(
+                &mut state.background_choice,
+                BlankBackgroundChoice::Solid,
+                "Solid RGBA",
+            );
         });
+        ui.end_row();
+        ui.label("Solid color");
+        ui.add_enabled_ui(
+            state.background_choice == BlankBackgroundChoice::Solid,
+            |ui| {
+                ui.label("R");
+                ui.add(egui::DragValue::new(&mut state.red));
+                ui.label("G");
+                ui.add(egui::DragValue::new(&mut state.green));
+                ui.label("B");
+                ui.add(egui::DragValue::new(&mut state.blue));
+                ui.label("A");
+                ui.add(egui::DragValue::new(&mut state.alpha).range(1..=u8::MAX));
+            },
+        );
+        ui.end_row();
+    });
 }
 
 fn available_blank_target(directory: &std::path::Path) -> PathBuf {

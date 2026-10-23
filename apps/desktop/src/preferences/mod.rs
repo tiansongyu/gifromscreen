@@ -78,12 +78,17 @@ impl LanguageSettings {
 
     pub(crate) fn show(&mut self, context: &egui::Context) {
         let mut open = self.open;
+        let width = (context.screen_rect().width() - 48.0).clamp(160.0, 430.0);
         egui::Window::new(self.localizer().text(Message::LanguageSettingsTitle))
             .id(egui::Id::new("application-language-settings"))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(430.0)
+            .min_width(160.0)
+            .default_width(width)
+            .max_width(width)
+            .default_height(240.0)
+            .vscroll(true)
             .show(context, |ui| self.show_contents(ui));
         self.open = open;
     }
@@ -99,8 +104,8 @@ impl LanguageSettings {
         let localizer = self.localizer();
         let mut choice = self.preferences.language.clone();
         ui.label(localizer.text(Message::LanguageChoice));
-        egui::ComboBox::from_id_salt("application-language-choice")
-            .width(340.0)
+        crate::appearance::combo(ui, "application-language-choice")
+            .width(340.0_f32.min(ui.available_width()))
             .height(300.0)
             .selected_text(choice_label(&choice, localizer))
             .show_ui(ui, |ui| {

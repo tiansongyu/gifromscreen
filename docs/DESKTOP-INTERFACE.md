@@ -1,6 +1,6 @@
 # Desktop interface
 
-Version 0.1.4 uses a compact desktop-tool layout. The startup and recorder
+Version 0.1.5 uses a compact desktop-tool layout. The startup and recorder
 screens follow the arrangement requested from ScreenToGif's public interface;
 all controls and vector icons are implemented in this project's egui code.
 
@@ -54,9 +54,28 @@ into view. It pauses preview and does not start an export. Import, Save As,
 annotations and additional project operations remain available in the Project
 category. Undo/redo and existing edit commands retain their project semantics.
 
+## Text reflow in 0.1.5
+
+Long section titles wrap within their page. Dropdowns reserve a usable line
+before painting, path pickers reserve space for Browse, and forms stack labels
+above values when two columns no longer fit. Import, camera, board and creation
+pages scroll vertically. The recorder setup action stays above its settings;
+its coordinate labels stay with their fields. The language window fits the
+available width and scrolls when necessary.
+
+The layout regression suite inspects rendered glyph rows for intersections and
+horizontal clipping. It covers 11 page routes, all six editor categories,
+text/image/shape/drawing overlays, custom GIF export and the language window.
+The matrix includes English and Chinese, widths from 320 to 960 logical points,
+and font scaling up to 2×, with wheel input through long pages and inspectors.
+The recorder bar is checked separately from 240 to 640 points, in ready,
+recording and paused states, with Options open and closed. Intentional text-field
+scrolling and partial rows at vertical scroll boundaries are excluded.
+
 ## Verification and scope
 
-- 851 desktop tests, 155 capture tests and 43 localization tests pass.
+- 855 desktop tests pass, including the new layout audit and existing input,
+  focus, capture-state and editing regressions.
 - All 18 explicitly isolated native recorder-guide tests pass, including movement
   with the UI unpolled, permission revocation, capture exclusions, grab cleanup
   and the 30-second gesture watchdog.

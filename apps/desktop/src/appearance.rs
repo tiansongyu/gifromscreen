@@ -115,6 +115,58 @@ pub(crate) fn primary_button(ui: &egui::Ui, label: &str) -> egui::Button<'static
         .min_size(egui::vec2(0.0, ui.spacing().interact_size.y))
 }
 
+/// egui's stock collapsing header forces `Extend`, even with a wrapping style.
+/// Lay out its title first so long translations cannot widen the whole page.
+pub(crate) fn section(ui: &egui::Ui, title: impl Into<egui::WidgetText>) -> egui::CollapsingHeader {
+    let width =
+        (ui.available_width() - ui.spacing().indent - ui.spacing().button_padding.x).max(1.0);
+    let title = title.into().into_galley(
+        ui,
+        Some(egui::TextWrapMode::Wrap),
+        width,
+        egui::TextStyle::Button,
+    );
+    egui::CollapsingHeader::new(title)
+}
+
+/// A combo is a child UI: reserve a usable line before it is painted, since
+/// wrapping its outer response afterwards cannot move the already drawn text.
+pub(crate) fn combo(ui: &mut egui::Ui, id: impl std::hash::Hash) -> egui::ComboBox {
+    let preferred = ui
+        .spacing()
+        .combo_width
+        .max(ui.text_style_height(&TextStyle::Body) * 8.0);
+    if ui.layout().is_horizontal()
+        && ui.layout().main_wrap()
+        && ui.available_size_before_wrap().x < preferred
+    {
+        ui.end_row();
+    }
+    egui::ComboBox::from_id_salt(id)
+        .width(preferred.min(ui.available_width()).max(1.0))
+        .wrap()
+}
+
+/// Full forms use labels above values when two readable columns no longer fit.
+pub(crate) fn form<R>(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
+    contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let width = ui.available_width();
+    if width < ui.text_style_height(&TextStyle::Body) * 30.0 {
+        ui.push_id(id, |ui| ui.vertical(contents).inner).inner
+    } else {
+        egui::Grid::new(id)
+            .num_columns(2)
+            .min_col_width(0.0)
+            .max_col_width((width - 12.0) * 0.5)
+            .spacing([12.0, 6.0])
+            .show(ui, contents)
+            .inner
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

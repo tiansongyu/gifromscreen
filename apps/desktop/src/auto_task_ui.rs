@@ -15,14 +15,14 @@ impl AutoTasks {
         workspace: Option<&EditorWorkspace>,
         localizer: Localizer,
     ) {
-        egui::CollapsingHeader::new("Automatic tasks & editing presets").id_salt("automatic-editing-tasks").default_open(true).show(ui, |ui| {
+        crate::appearance::section(ui, "Automatic tasks & editing presets").id_salt("automatic-editing-tasks").default_open(true).show(ui, |ui| {
             ui.label("Apply a saved, ordered editing chain after recording or import. Reuse it manually with one undo for the whole chain.");
-            if self.is_loading() { ui.horizontal(|ui| { ui.spinner(); ui.label("Loading or saving editing presets…"); }); }
+            if self.is_loading() { ui.horizontal_wrapped(|ui| { ui.spinner(); ui.label("Loading or saving editing presets…"); }); }
             if let Some(error) = &self.settings_error { ui.colored_label(ui.visuals().error_fg_color, error); }
             let editable = !self.is_loading() && !self.is_running() && self.snapshot.is_some();
             ui.add_enabled_ui(editable, |ui| {
                 ui.add_enabled_ui(self.draft.active_preset.is_some(), |ui| { ui.checkbox(&mut self.draft.enabled, "Apply automatically to new recordings and imports"); });
-                egui::ComboBox::from_id_salt("active-editing-preset").selected_text(self.draft.active_preset.as_deref().unwrap_or("No active preset")).show_ui(ui, |ui| {
+                crate::appearance::combo(ui, "active-editing-preset").selected_text(self.draft.active_preset.as_deref().unwrap_or("No active preset")).show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.draft.active_preset, None, "No active preset");
                     for preset in &self.draft.presets { ui.selectable_value(&mut self.draft.active_preset, Some(preset.name.clone()), &preset.name); }
                 });
@@ -38,10 +38,10 @@ impl AutoTasks {
                 });
                 self.selected = self.selected.min(self.draft.presets.len().saturating_sub(1));
                 if !self.draft.presets.is_empty() {
-                    egui::ComboBox::from_id_salt("edit-editing-preset").selected_text(&self.draft.presets[self.selected].name).show_ui(ui, |ui| { for (index, preset) in self.draft.presets.iter().enumerate() { ui.selectable_value(&mut self.selected, index, &preset.name); } });
+                    crate::appearance::combo(ui, "edit-editing-preset").selected_text(&self.draft.presets[self.selected].name).show_ui(ui, |ui| { for (index, preset) in self.draft.presets.iter().enumerate() { ui.selectable_value(&mut self.selected, index, &preset.name); } });
                     let preset = &mut self.draft.presets[self.selected];
                     let previous_name = preset.name.clone();
-                    ui.horizontal(|ui| { ui.label("Name"); ui.text_edit_singleline(&mut preset.name); });
+                    ui.horizontal_wrapped(|ui| { ui.label("Name"); ui.text_edit_singleline(&mut preset.name); });
                     if self.draft.active_preset.as_deref() == Some(previous_name.as_str()) { self.draft.active_preset = Some(preset.name.clone()); }
                     ui.horizontal_wrapped(|ui| {
                         ui.label("After"); ui.checkbox(&mut preset.sources.screen, "Screen recording"); ui.checkbox(&mut preset.sources.camera, "Camera"); ui.checkbox(&mut preset.sources.board, "Board"); ui.checkbox(&mut preset.sources.import, "Import");
@@ -64,7 +64,7 @@ impl AutoTasks {
                     }
                     if let Some((index, direction)) = operation { match direction { -1 if index > 0 => preset.tasks.swap(index, index - 1), 1 if index + 1 < preset.tasks.len() => preset.tasks.swap(index, index + 1), 0 => { preset.tasks.remove(index); }, _ => {} } }
                     ui.horizontal_wrapped(|ui| {
-                        egui::ComboBox::from_id_salt("new-editing-task-type").selected_text(task_label(self.new_kind)).show_ui(ui, |ui| { for kind in 0..7 { ui.selectable_value(&mut self.new_kind, kind, task_label(kind)); } });
+                        crate::appearance::combo(ui, "new-editing-task-type").selected_text(task_label(self.new_kind)).show_ui(ui, |ui| { for kind in 0..7 { ui.selectable_value(&mut self.new_kind, kind, task_label(kind)); } });
                         if ui.add_enabled(preset.tasks.len() < MAX_EDIT_TASKS, egui::Button::new("Add task")).clicked() { preset.tasks.push(new_task(self.new_kind, workspace.map(|workspace| workspace.manifest().canvas.size))); }
                     });
                     if ui.button("Delete this preset").clicked() {
@@ -89,7 +89,7 @@ impl AutoTasks {
     }
 
     pub(crate) fn show_running(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.spinner();
             ui.label("Preparing automatic editing tasks…");
         });
@@ -122,7 +122,7 @@ fn show_task(ui: &mut egui::Ui, action: &mut EditingTaskAction, localizer: Local
                 TaskDelay::Scale { .. } => 2,
             };
             let previous = selected;
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut selected, 0, "Set delay");
                 ui.selectable_value(&mut selected, 1, "Add / subtract");
                 ui.selectable_value(&mut selected, 2, "Scale");
@@ -211,7 +211,7 @@ fn show_task(ui: &mut egui::Ui, action: &mut EditingTaskAction, localizer: Local
 }
 
 fn color_input(ui: &mut egui::Ui, label: &str, color: &mut Rgba) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(label);
         let mut bytes = [color.red, color.green, color.blue, color.alpha];
         if ui

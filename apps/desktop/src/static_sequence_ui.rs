@@ -122,7 +122,7 @@ pub(crate) fn show_static_sequence_ui(
 
     let mut action = StaticSequenceUiAction::None;
     ui.add_enabled_ui(!running, |ui| {
-        ui.horizontal(|ui| {
+        ui.vertical(|ui| {
             ui.label("Image path");
             let response = ui.add(
                 egui::TextEdit::singleline(&mut state.pending_path)
@@ -148,7 +148,7 @@ pub(crate) fn show_static_sequence_ui(
     show_sequence_settings(ui, state, running);
 
     ui.add_space(8.0);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui
             .add_enabled(!running, egui::Button::new("Import sequence"))
             .clicked()
@@ -174,7 +174,7 @@ pub(crate) fn show_static_sequence_ui(
 
 fn show_sequence_settings(ui: &mut egui::Ui, state: &mut StaticSequenceUiState, running: bool) {
     ui.add_enabled_ui(!running, |ui| {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Frame timing");
             ui.radio_value(
                 &mut state.timing,
@@ -196,7 +196,7 @@ fn show_sequence_settings(ui: &mut egui::Ui, state: &mut StaticSequenceUiState, 
                 ),
             );
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Loop");
             ui.radio_value(
                 &mut state.loop_choice,
@@ -220,7 +220,7 @@ fn show_sequence_settings(ui: &mut egui::Ui, state: &mut StaticSequenceUiState, 
                 "Infinite",
             );
         });
-        ui.horizontal(|ui| {
+        ui.vertical(|ui| {
             ui.label("Project directory");
             ui.add(
                 egui::TextEdit::singleline(&mut state.target)
@@ -247,7 +247,7 @@ fn show_ordered_input_list(
                 return;
             }
             for (index, path) in state.inputs.iter().enumerate() {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(format!("{}.", index + 1));
                     if ui
                         .add_enabled(!running && index > 0, egui::Button::new("↑"))

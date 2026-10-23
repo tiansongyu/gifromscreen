@@ -252,12 +252,12 @@ impl BoardRecorderTool {
                 ui.add_enabled(self.cadence == BoardCadence::Fps, egui::DragValue::new(&mut self.fps).range(1..=60).suffix(" fps"));
                 ui.selectable_value(&mut self.cadence, BoardCadence::Stroke, "Each completed stroke");
             });
-            ui.horizontal(|ui| { ui.label("New project"); ui.add(egui::TextEdit::singleline(&mut self.target).desired_width(430.0).hint_text("Leave empty for a unique board project in the current folder")); });
+            ui.vertical(|ui| { ui.label("New project"); ui.add(egui::TextEdit::singleline(&mut self.target).desired_width(430.0).hint_text("Leave empty for a unique board project in the current folder")); });
         });
     }
 
     fn show_controls(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| match self.phase {
+        ui.horizontal_wrapped(|ui| match self.phase {
             Phase::Idle => {
                 if ui.button("Start recording").clicked()
                     && let Err(error) = self.start(Instant::now())

@@ -147,7 +147,7 @@ fn modes(tool: &mut VectorShapes, ui: &mut egui::Ui, localizer: Localizer) {
             ShapeTool::Select,
             localizer.text(Message::VectorSelectMode),
         );
-        egui::ComboBox::from_id_salt("vector-shape-kind")
+        crate::appearance::combo(ui, "vector-shape-kind")
             .selected_text(localizer.text(kind_label(tool.draft.kind)))
             .show_ui(ui, |ui| {
                 for kind in [

@@ -175,7 +175,7 @@ fn key_label(key: ShortcutKey) -> String {
 fn binding_controls(ui: &mut egui::Ui, binding: &mut ShortcutBinding, localizer: Localizer) {
     ui.label(action_label(binding.action, localizer));
     ui.horizontal_wrapped(|ui| {
-        egui::ComboBox::from_id_salt("key")
+        crate::appearance::combo(ui, "key")
             .width(65.0)
             .height(180.0)
             .selected_text(key_label(binding.trigger.key))

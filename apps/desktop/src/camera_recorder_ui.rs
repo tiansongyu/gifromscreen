@@ -129,7 +129,7 @@ impl CameraRecorderUi {
                 }
             }
         } else if self.is_active() {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.spinner();
                 ui.label("Opening camera…");
             });
@@ -146,7 +146,7 @@ impl CameraRecorderUi {
         ui.add_enabled_ui(!self.is_active(), |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Camera");
-                egui::ComboBox::from_id_salt("camera-device")
+                crate::appearance::combo(ui, "camera-device")
                     .selected_text(self.devices.get(self.selected).map_or("No camera detected", |device| device.name.as_str()))
                     .show_ui(ui, |ui| {
                         for (index, device) in self.devices.iter().enumerate() {
@@ -165,7 +165,7 @@ impl CameraRecorderUi {
                 ui.add(egui::DragValue::new(&mut self.height).range(1..=4096).prefix("Height "));
                 ui.add(egui::DragValue::new(&mut self.fps).range(1..=60).suffix(" fps"));
             });
-            ui.horizontal(|ui| {
+            ui.vertical(|ui| {
                 ui.label("New project");
                 ui.add(egui::TextEdit::singleline(&mut self.target).desired_width(430.0).hint_text("Leave empty for a new camera recording in this folder"));
             });
@@ -179,7 +179,7 @@ impl CameraRecorderUi {
     fn show_controls(&mut self, ui: &mut egui::Ui) {
         if !self.is_active() {
             ui.add_enabled_ui(!self.devices.is_empty(), |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Preview camera").clicked()
                         && let Err(error) = self.start(false)
                     {
@@ -198,7 +198,7 @@ impl CameraRecorderUi {
             return;
         };
         let phase = control.phase();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let action = match phase {
                 CameraPhase::Preview => ui
                     .button("Start recording")

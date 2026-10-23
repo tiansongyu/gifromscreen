@@ -17,7 +17,7 @@ impl CaptureBindingUi {
     /// The root queues the returned request in the existing annotation worker.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui, workspace: &EditorWorkspace) -> Option<bool> {
         let mut confirm = None;
-        egui::CollapsingHeader::new("Recorded input provenance")
+        crate::appearance::section(ui, "Recorded input provenance")
             .id_salt("recorded-input-provenance")
             .show(ui, |ui| {
                 self.sync_workspace(workspace);

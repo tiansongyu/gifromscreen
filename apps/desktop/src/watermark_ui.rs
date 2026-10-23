@@ -149,7 +149,7 @@ fn show_watermark_fields(ui: &mut egui::Ui, state: &mut WatermarkUiState, locali
             show_watermark_text_fields(ui, state, value_width, localizer);
             show_watermark_numeric_fields(ui, state, localizer);
             ui.label(localizer.text(Message::EditorOverlayBlend));
-            egui::ComboBox::from_id_salt("watermark_blend")
+            crate::appearance::combo(ui, "watermark_blend")
                 .selected_text(blend_label(state.blend_mode, localizer))
                 .show_ui(ui, |ui| {
                     for blend in [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen] {

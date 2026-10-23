@@ -177,7 +177,7 @@ impl TextOverlayTool {
                         .char_limit(MAX_TEXT_BYTES),
                 );
                 self.show_style(ui, localizer);
-                egui::CollapsingHeader::new(localizer.text(Message::TextPlacement))
+                crate::appearance::section(ui, localizer.text(Message::TextPlacement))
                     .id_salt("caption-placement")
                     .show(ui, |ui| {
                         self.show_placement(ui, localizer);
@@ -283,7 +283,7 @@ impl TextOverlayTool {
                 });
                 ui.end_row();
                 ui.label(localizer.text(Message::TextAlignment));
-                egui::ComboBox::from_id_salt("caption_alignment")
+                crate::appearance::combo(ui, "caption_alignment")
                     .selected_text(localizer.text(alignment_label(self.alignment)))
                     .show_ui(ui, |ui| {
                         for alignment in [
@@ -462,7 +462,7 @@ impl TextOverlayTool {
                 |(index, track)| saved_group_label(index, track, localizer),
             );
         ui.horizontal_wrapped(|ui| {
-            egui::ComboBox::from_id_salt("saved-caption")
+            crate::appearance::combo(ui, "saved-caption")
                 .width(ui.available_width().min(340.0))
                 .truncate()
                 .selected_text(selected_label.as_str())
@@ -540,7 +540,7 @@ impl TextOverlayTool {
                 .num_columns(2)
                 .show(ui, |ui| {
                     ui.label(localizer.text(Message::TextTitlePosition));
-                    egui::ComboBox::from_id_salt("caption_title_position")
+                    crate::appearance::combo(ui, "caption_title_position")
                         .selected_text(localizer.text(if self.title_at_start {
                             Message::TextAtStart
                         } else {

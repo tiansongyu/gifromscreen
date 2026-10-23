@@ -81,7 +81,7 @@ pub(crate) fn show_shadow(ui: &mut egui::Ui, style: &mut ImageShadowStyle, local
         );
     });
     ui.weak(localizer.text(Message::ImageShadowAnglesHint));
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(localizer.text(Message::ImageShadowColor));
         let mut color = [style.color.red, style.color.green, style.color.blue];
         if ui.color_edit_button_srgb(&mut color).changed() {
@@ -127,7 +127,7 @@ fn hundredths(ui: &mut egui::Ui, label: &str, suffix: &str, stored: &mut u16, ma
 }
 
 fn color_input(ui: &mut egui::Ui, label: &str, color: &mut Rgba) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(label);
         let mut bytes = [color.red, color.green, color.blue, color.alpha];
         if ui

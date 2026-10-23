@@ -157,28 +157,25 @@ fn show_metrics(
     let (mut width, mut height) = (size.width(), size.height());
     let bounds = geometry.source().size();
     let mut changed = false;
-    ui.add_enabled_ui(
-        stage.allows_resizing() && !geometry.size_is_frozen(),
-        |ui| {
-            ui.spacing_mut().item_spacing.x = 3.0;
-            changed |= ui
-                .add(
-                    egui::DragValue::new(&mut width)
-                        .range(1..=bounds.width())
-                        .speed(1.0),
-                )
-                .changed();
-            ui.label("×");
-            changed |= ui
-                .add(
-                    egui::DragValue::new(&mut height)
-                        .range(1..=bounds.height())
-                        .speed(1.0),
-                )
-                .changed();
-            ui.label("px");
-        },
-    );
+    let resizing = stage.allows_resizing() && !geometry.size_is_frozen();
+    changed |= ui
+        .add_enabled(
+            resizing,
+            egui::DragValue::new(&mut width)
+                .range(1..=bounds.width())
+                .speed(1.0),
+        )
+        .changed();
+    ui.label("×");
+    changed |= ui
+        .add_enabled(
+            resizing,
+            egui::DragValue::new(&mut height)
+                .range(1..=bounds.height())
+                .speed(1.0),
+        )
+        .changed();
+    ui.label("px");
     if changed && let Ok(size) = PhysicalSize::new(width, height) {
         let _ = geometry.resize(size);
     }
@@ -202,10 +199,6 @@ fn primary_controls(
     let mut button = |message, enabled, requested| {
         // Buttons use sequential auto IDs, not their translated captions.
         // Keep them direct children so horizontal wrapping sees each button.
-        if requested == RecorderOverlayAction::Discard && stage != RecorderStage::Finalizing {
-            ui.add_space(16.0);
-            ui.separator();
-        }
         if ui
             .add_enabled(
                 enabled,
@@ -699,6 +692,42 @@ mod tests {
                 RecorderOverlayAction::Discard,
             ),
         ]
+    }
+
+    #[test]
+    fn controller_text_layout_audit() {
+        for (width, scale) in [(640.0, 1.0), (480.0, 1.0), (320.0, 1.5), (240.0, 2.0)] {
+            for tag in ["en", "zh"] {
+                for stage in [
+                    RecorderStage::Ready,
+                    RecorderStage::Recording,
+                    RecorderStage::Paused,
+                ] {
+                    let mut view = View::new(width, 400.0, 1.0, stage);
+                    crate::appearance::configure(&view.context);
+                    crate::preferences::fonts::install(&view.context);
+                    view.context.style_mut(|style| {
+                        for font in style.text_styles.values_mut() {
+                            font.size *= scale;
+                        }
+                    });
+                    view.localizer =
+                        Localizer::new(gif_from_screen_localization::find_language(tag).unwrap());
+                    for expanded in [false, true] {
+                        view.context.data_mut(|data| {
+                            data.insert_temp(egui::Id::new("recorder-options-expanded"), expanded);
+                        });
+                        let output = view.warm();
+                        let issues = crate::editor_shell_layout_tests::text_layout_issues(&output);
+                        assert!(
+                            issues.is_empty(),
+                            "{width}/{scale}/{tag}/{stage:?}/{expanded}: {}",
+                            issues.join("\n")
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

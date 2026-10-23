@@ -1074,12 +1074,33 @@ impl GifFromScreenApp {
         let editor_visible = self.view == AppView::Editor;
         egui::CentralPanel::default().show(context, |ui| match self.view {
             AppView::Landing => self.show_landing(ui),
-            AppView::OpenProject => self.show_open_project(ui),
-            AppView::ImportGif => self.show_import_gif(ui),
-            AppView::ImportImage => self.show_import_image(ui),
-            AppView::ImportImageSequence => self.show_import_sequence(ui),
-            AppView::ImportVideo => self.video_import.show(ui),
-            AppView::NewBlankAnimation => self.show_blank_project(ui),
+            AppView::OpenProject
+            | AppView::ImportGif
+            | AppView::ImportImage
+            | AppView::ImportImageSequence
+            | AppView::ImportVideo
+            | AppView::NewBlankAnimation
+            | AppView::CameraRecorder
+            | AppView::BoardRecorder => {
+                egui::ScrollArea::vertical()
+                    .id_salt(format!("form-page-{:?}", self.view))
+                    .auto_shrink([false, false])
+                    .scroll_source(egui::containers::scroll_area::ScrollSource {
+                        drag: false,
+                        ..Default::default()
+                    })
+                    .show(ui, |ui| match self.view {
+                        AppView::OpenProject => self.show_open_project(ui),
+                        AppView::ImportGif => self.show_import_gif(ui),
+                        AppView::ImportImage => self.show_import_image(ui),
+                        AppView::ImportImageSequence => self.show_import_sequence(ui),
+                        AppView::ImportVideo => self.video_import.show(ui),
+                        AppView::NewBlankAnimation => self.show_blank_project(ui),
+                        AppView::CameraRecorder => self.camera_recorder.show(ui),
+                        AppView::BoardRecorder => self.board_recorder.show(ui),
+                        _ => unreachable!(),
+                    });
+            }
             AppView::ScreenRecorder
                 if self.wayland_prepare_job.is_active()
                     || self.wayland_frozen_preview.is_some() =>
@@ -1093,8 +1114,6 @@ impl GifFromScreenApp {
                         landing_ui::content(ui, |ui| self.show_screen_recorder(ui));
                     });
             }
-            AppView::CameraRecorder => self.camera_recorder.show(ui),
-            AppView::BoardRecorder => self.board_recorder.show(ui),
             AppView::Automation => {
                 if self.auto_tasks.is_running() {
                     self.auto_tasks.show_running(ui);
@@ -1735,22 +1754,15 @@ impl GifFromScreenApp {
         ui.heading("Open editable project");
         ui.label("Choose an existing .gfsproj directory containing manifest.json.");
         ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            ui.label("Project directory");
-            ui.add_enabled(
-                controls_enabled,
-                egui::TextEdit::singleline(&mut self.open_project_path)
-                    .desired_width(420.0)
-                    .hint_text("/path/to/animation.gfsproj"),
-            );
-            ui.add_enabled_ui(controls_enabled, |ui| {
-                if let Some(notice) =
-                    self.open_picker
-                        .show(ui, &mut self.open_project_path, PathKind::Project)
-                {
-                    self.notice = Some(notice.into());
-                }
-            });
+        ui.add_enabled_ui(controls_enabled, |ui| {
+            if let Some(notice) = self.open_picker.show_field(
+                ui,
+                "Project directory",
+                &mut self.open_project_path,
+                PathKind::Project,
+            ) {
+                self.notice = Some(notice.into());
+            }
         });
         ui.add_space(8.0);
         ui.add_enabled_ui(controls_enabled, |ui| {
@@ -1770,7 +1782,7 @@ impl GifFromScreenApp {
             );
         }
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let open_label = if self.open_project_take_over_lock {
                 "Take over lock and open"
             } else {
@@ -1841,25 +1853,16 @@ impl GifFromScreenApp {
             "Safety limits: 10,000 frames, 16K canvas dimensions, and 512 MiB decoded RGBA. This operation cannot currently be cancelled once started.",
         );
         ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            ui.label("GIF file");
-            ui.add_enabled(
-                !running,
-                egui::TextEdit::singleline(&mut self.import_gif_path)
-                    .desired_width(420.0)
-                    .hint_text("/path/to/animation.gif"),
-            );
-            ui.add_enabled_ui(!running, |ui| {
-                if let Some(notice) =
-                    self.gif_picker
-                        .show(ui, &mut self.import_gif_path, PathKind::Gif)
-                {
-                    self.notice = Some(notice.into());
-                }
-            });
+        ui.add_enabled_ui(!running, |ui| {
+            if let Some(notice) =
+                self.gif_picker
+                    .show_field(ui, "GIF file", &mut self.import_gif_path, PathKind::Gif)
+            {
+                self.notice = Some(notice.into());
+            }
         });
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(!running, egui::Button::new("Import"))
                 .clicked()
@@ -1919,25 +1922,18 @@ impl GifFromScreenApp {
             "Safety limits: 16K dimensions and 512 MiB decoded RGBA. The single frame lasts 100 ms. This operation cannot currently be cancelled.",
         );
         ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            ui.label("Image file");
-            ui.add_enabled(
-                !running,
-                egui::TextEdit::singleline(&mut self.import_image_path)
-                    .desired_width(420.0)
-                    .hint_text("/path/to/image.png"),
-            );
-            ui.add_enabled_ui(!running, |ui| {
-                if let Some(notice) =
-                    self.image_picker
-                        .show(ui, &mut self.import_image_path, PathKind::Image)
-                {
-                    self.notice = Some(notice.into());
-                }
-            });
+        ui.add_enabled_ui(!running, |ui| {
+            if let Some(notice) = self.image_picker.show_field(
+                ui,
+                "Image file",
+                &mut self.import_image_path,
+                PathKind::Image,
+            ) {
+                self.notice = Some(notice.into());
+            }
         });
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(!running, egui::Button::new("Import"))
                 .clicked()
@@ -2057,6 +2053,25 @@ impl GifFromScreenApp {
         }
         ui.heading(localizer.text(Message::HomeScreenRecorder));
         ui.add_space(8.0);
+        ui.add_space(12.0);
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    self.job.is_none()
+                        && self.recorder_overlay.is_none()
+                        && !self.output_picker.is_running()
+                        && self.output_picker.is_valid()
+                        && !self.sources.is_empty()
+                        && self.source_catalog_job.state() != CaptureSourceJobState::Loading,
+                    appearance::primary_button(ui, localizer.text(Message::RecorderOpenFrame)),
+                )
+                .clicked()
+                && let Err(error) = self.open_recorder_overlay(ui.ctx())
+            {
+                self.notice = Some(error.into());
+            }
+        });
+
         if let Some(notice) = &self.notice
             && notice.message_id() != Some(Message::RecorderSourcesFound)
         {
@@ -2079,24 +2094,6 @@ impl GifFromScreenApp {
                 return;
             }
         }
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    self.job.is_none()
-                        && self.recorder_overlay.is_none()
-                        && !self.output_picker.is_running()
-                        && self.output_picker.is_valid()
-                        && !self.sources.is_empty()
-                        && self.source_catalog_job.state() != CaptureSourceJobState::Loading,
-                    appearance::primary_button(ui, localizer.text(Message::RecorderOpenFrame)),
-                )
-                .clicked()
-                && let Err(error) = self.open_recorder_overlay(ui.ctx())
-            {
-                self.notice = Some(error.into());
-            }
-        });
         if let Some(summary) = self.shortcut_tool.status_summary(localizer) {
             ui.add(egui::Label::new(&summary).truncate())
                 .on_hover_text(summary);
@@ -2210,7 +2207,7 @@ impl GifFromScreenApp {
         );
         let open_copy = self.project_library.show_save_as(ui, workspace);
         ui.separator();
-        let export_panel = egui::CollapsingHeader::new(localizer.text(Message::ExportTitle))
+        let export_panel = crate::appearance::section(ui, localizer.text(Message::ExportTitle))
             .id_salt("editor-export-options")
             .open(self.export_scroll_target.map(|_| true))
             .show(ui, |ui| {
@@ -2492,97 +2489,87 @@ impl GifFromScreenApp {
     fn show_recording_settings(&mut self, ui: &mut egui::Ui) {
         let localizer = self.language_settings.localizer();
         let previous_source = self.selected_source;
-        egui::Grid::new("recording_settings")
-            .num_columns(2)
-            .spacing([12.0, 6.0])
-            .show(ui, |ui| {
-                ui.label(localizer.text(Message::RecorderCaptureSource));
-                ui.horizontal(|ui| {
-                    let selected_name = self.sources.get(self.selected_source).map_or_else(
-                        || localizer.text(Message::RecorderNoCaptureSource).to_owned(),
-                        |source| {
-                            capture_source_label::display_name(
-                                source,
-                                self.display_server,
-                                localizer,
-                            )
+        crate::appearance::form(ui, "recording_settings", |ui| {
+            ui.label(localizer.text(Message::RecorderCaptureSource));
+            ui.horizontal_wrapped(|ui| {
+                let selected_name = self.sources.get(self.selected_source).map_or_else(
+                    || localizer.text(Message::RecorderNoCaptureSource).to_owned(),
+                    |source| {
+                        capture_source_label::display_name(source, self.display_server, localizer)
                             .into()
-                        },
-                    );
-                    egui::ComboBox::from_id_salt("capture_source")
-                        .selected_text(selected_name)
-                        .show_ui(ui, |ui| {
-                            for (index, source) in self.sources.iter().enumerate() {
-                                ui.selectable_value(
-                                    &mut self.selected_source,
-                                    index,
-                                    capture_source_label::display_name(
-                                        source,
-                                        self.display_server,
-                                        localizer,
-                                    ),
-                                );
-                            }
-                        });
-                    if ui.button(localizer.text(Message::RecentRefresh)).clicked() {
-                        self.refresh_sources();
-                    }
-                    if self.source_catalog_job.state() == CaptureSourceJobState::Loading {
-                        ui.spinner();
-                    }
-                });
-                ui.end_row();
-
-                self.show_recording_output(ui, localizer);
-                show_recording_cadence_settings(
-                    ui,
-                    &mut self.settings,
-                    self.display_server == Some(LinuxDisplayServer::X11),
-                    localizer,
+                    },
                 );
+                crate::appearance::combo(ui, "capture_source")
+                    .selected_text(selected_name)
+                    .show_ui(ui, |ui| {
+                        for (index, source) in self.sources.iter().enumerate() {
+                            ui.selectable_value(
+                                &mut self.selected_source,
+                                index,
+                                capture_source_label::display_name(
+                                    source,
+                                    self.display_server,
+                                    localizer,
+                                ),
+                            );
+                        }
+                    });
+                if ui.button(localizer.text(Message::RecentRefresh)).clicked() {
+                    self.refresh_sources();
+                }
+                if self.source_catalog_job.state() == CaptureSourceJobState::Loading {
+                    ui.spinner();
+                }
             });
+            ui.end_row();
+
+            self.show_recording_output(ui, localizer);
+            show_recording_cadence_settings(
+                ui,
+                &mut self.settings,
+                self.display_server == Some(LinuxDisplayServer::X11),
+                localizer,
+            );
+        });
 
         if self.selected_source != previous_source {
             self.center_selected_recording_region();
         }
-        egui::CollapsingHeader::new(localizer.text(Message::UiAdvancedSettings))
+        crate::appearance::section(ui, localizer.text(Message::UiAdvancedSettings))
             .id_salt("recording-advanced")
             .show(ui, |ui| {
-                egui::Grid::new("recording-advanced-fields")
-                    .num_columns(2)
-                    .spacing([12.0, 8.0])
-                    .show(ui, |ui| {
-                        ui.label(localizer.text(Message::RecorderCountdownSeconds));
-                        ui.add(
-                            egui::DragValue::new(&mut self.settings.countdown_seconds)
-                                .range(0..=MAX_COUNTDOWN_SECONDS),
-                        );
-                        ui.end_row();
-                        ui.label(localizer.text(Message::RecorderMaximumDurationManualStopMs));
-                        ui.add(
-                            egui::DragValue::new(&mut self.settings.duration_ms)
-                                .range(0..=MAX_RECORDING_DURATION_MS),
-                        );
-                        ui.end_row();
-                        show_recording_playback_settings(ui, &mut self.settings, localizer);
-                        show_frame_retention_setting(ui, &mut self.settings, localizer);
-                        show_recording_annotations_setting(
-                            ui,
-                            &mut self.settings,
-                            self.display_server == Some(LinuxDisplayServer::X11),
-                            localizer,
-                        );
-                        ui.label(localizer.text(Message::RecorderCaptureRegion));
-                        ui.checkbox(
-                            &mut self.settings.region_enabled,
-                            localizer.text(Message::RecorderPhysicalRectangle),
-                        );
-                        ui.end_row();
-                    });
+                crate::appearance::form(ui, "recording-advanced-fields", |ui| {
+                    ui.label(localizer.text(Message::RecorderCountdownSeconds));
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.countdown_seconds)
+                            .range(0..=MAX_COUNTDOWN_SECONDS),
+                    );
+                    ui.end_row();
+                    ui.label(localizer.text(Message::RecorderMaximumDurationManualStopMs));
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.duration_ms)
+                            .range(0..=MAX_RECORDING_DURATION_MS),
+                    );
+                    ui.end_row();
+                    show_recording_playback_settings(ui, &mut self.settings, localizer);
+                    show_frame_retention_setting(ui, &mut self.settings, localizer);
+                    show_recording_annotations_setting(
+                        ui,
+                        &mut self.settings,
+                        self.display_server == Some(LinuxDisplayServer::X11),
+                        localizer,
+                    );
+                    ui.label(localizer.text(Message::RecorderCaptureRegion));
+                    ui.checkbox(
+                        &mut self.settings.region_enabled,
+                        localizer.text(Message::RecorderPhysicalRectangle),
+                    );
+                    ui.end_row();
+                });
                 self.show_recording_region_settings(ui, localizer);
                 self.show_recording_source_description(ui, localizer);
                 ui.separator();
-                egui::CollapsingHeader::new(localizer.text(Message::RecorderGlobalShortcuts))
+                crate::appearance::section(ui, localizer.text(Message::RecorderGlobalShortcuts))
                     .id_salt("global-recorder-shortcuts")
                     .show(ui, |ui| {
                         self.shortcut_tool.show(ui, self.display_server, localizer);
@@ -2606,16 +2593,23 @@ impl GifFromScreenApp {
                 self.settings.region_height,
             );
             ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label("X");
-                ui.add(egui::DragValue::new(&mut self.settings.region_x));
-                ui.label("Y");
-                ui.add(egui::DragValue::new(&mut self.settings.region_y));
-                ui.label(localizer.text(Message::RecorderWidth));
-                ui.add(egui::DragValue::new(&mut self.settings.region_width).range(1..=65_535));
-                ui.label(localizer.text(Message::RecorderHeight));
-                ui.add(egui::DragValue::new(&mut self.settings.region_height).range(1..=65_535));
-            });
+            egui::Grid::new("recording-region-coordinates")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("X");
+                    ui.add(egui::DragValue::new(&mut self.settings.region_x));
+                    ui.end_row();
+                    ui.label("Y");
+                    ui.add(egui::DragValue::new(&mut self.settings.region_y));
+                    ui.end_row();
+                    ui.label(localizer.text(Message::RecorderWidth));
+                    ui.add(egui::DragValue::new(&mut self.settings.region_width).range(1..=65_535));
+                    ui.end_row();
+                    ui.label(localizer.text(Message::RecorderHeight));
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.region_height).range(1..=65_535),
+                    );
+                });
             if before
                 != (
                     self.settings.region_x,
@@ -4644,7 +4638,7 @@ fn show_export_panel(
     let asset_issue_count = workspace.asset_issues().len();
     let active = export_job_is_active(job.state());
     ui.add_enabled_ui(!active && !editor_mutation_active, |ui| {
-        egui::CollapsingHeader::new(localizer.text(Message::ExportProjectPreset))
+        crate::appearance::section(ui, localizer.text(Message::ExportProjectPreset))
             .id_salt("export-preset-management")
             .show(ui, |ui| {
                 editor_export_presets::show_export_presets(ui, settings, workspace, localizer);
@@ -4728,190 +4722,185 @@ fn show_export_configuration(
     selected_count: usize,
     localizer: Localizer,
 ) {
-    egui::Grid::new("editor_export_configuration")
-        .num_columns(2)
-        .spacing([16.0, 6.0])
-        .show(ui, |ui| {
-            ui.label(localizer.text(Message::ExportOutputLabel));
-            ui.text_edit_singleline(output);
-            ui.end_row();
+    crate::appearance::form(ui, "editor_export_configuration", |ui| {
+        ui.label(localizer.text(Message::ExportOutputLabel));
+        ui.text_edit_singleline(output);
+        ui.end_row();
 
-            ui.label(localizer.text(Message::EditorFramesTab));
-            ui.horizontal(|ui| {
+        ui.label(localizer.text(Message::EditorFramesTab));
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(
+                &mut settings.frame_scope,
+                ExportFrameScope::All,
+                localizer.text(Message::ExportScopeAll),
+            );
+            ui.selectable_value(
+                &mut settings.frame_scope,
+                ExportFrameScope::Selected,
+                format_message(
+                    localizer,
+                    Message::ExportScopeSelectedCount,
+                    &[("count", &selected_count.to_string())],
+                ),
+            );
+        });
+        ui.end_row();
+
+        ui.label(localizer.text(Message::ExportMaximumColors));
+        ui.add(egui::DragValue::new(&mut settings.max_colors).range(2..=256));
+        ui.end_row();
+
+        ui.label(localizer.text(Message::ExportPalette));
+        crate::appearance::combo(ui, "editor_export_palette")
+            .selected_text(match settings.palette {
+                ExportPaletteChoice::Local => localizer.text(Message::ExportPaletteLocal),
+                ExportPaletteChoice::Global => localizer.text(Message::ExportPaletteGlobal),
+            })
+            .show_ui(ui, |ui| {
                 ui.selectable_value(
-                    &mut settings.frame_scope,
-                    ExportFrameScope::All,
-                    localizer.text(Message::ExportScopeAll),
+                    &mut settings.palette,
+                    ExportPaletteChoice::Local,
+                    localizer.text(Message::ExportPaletteLocal),
                 );
                 ui.selectable_value(
-                    &mut settings.frame_scope,
-                    ExportFrameScope::Selected,
-                    format_message(
-                        localizer,
-                        Message::ExportScopeSelectedCount,
-                        &[("count", &selected_count.to_string())],
-                    ),
+                    &mut settings.palette,
+                    ExportPaletteChoice::Global,
+                    localizer.text(Message::ExportPaletteGlobal),
                 );
             });
-            ui.end_row();
+        ui.end_row();
 
-            ui.label(localizer.text(Message::ExportMaximumColors));
-            ui.add(egui::DragValue::new(&mut settings.max_colors).range(2..=256));
-            ui.end_row();
-
-            ui.label(localizer.text(Message::ExportPalette));
-            egui::ComboBox::from_id_salt("editor_export_palette")
-                .selected_text(match settings.palette {
-                    ExportPaletteChoice::Local => localizer.text(Message::ExportPaletteLocal),
-                    ExportPaletteChoice::Global => localizer.text(Message::ExportPaletteGlobal),
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut settings.palette,
-                        ExportPaletteChoice::Local,
-                        localizer.text(Message::ExportPaletteLocal),
-                    );
-                    ui.selectable_value(
-                        &mut settings.palette,
-                        ExportPaletteChoice::Global,
-                        localizer.text(Message::ExportPaletteGlobal),
-                    );
-                });
-            ui.end_row();
-
-            ui.label(localizer.text(Message::ExportQuantizer));
-            ui.vertical(|ui| {
-                egui::ComboBox::from_id_salt("editor_export_quantizer")
-                    .selected_text(export_quantizer_label(settings.quantizer, localizer))
-                    .show_ui(ui, |ui| {
-                        for choice in [
-                            ExportQuantizerChoice::MedianCut,
-                            ExportQuantizerChoice::Octree,
-                            ExportQuantizerChoice::Wu,
-                            ExportQuantizerChoice::Grayscale,
-                            ExportQuantizerChoice::MostUsed,
-                            ExportQuantizerChoice::NeuQuant,
-                            ExportQuantizerChoice::WebSafe216,
-                            ExportQuantizerChoice::Monochrome,
-                            ExportQuantizerChoice::Windows16,
-                            ExportQuantizerChoice::Custom,
-                        ] {
-                            ui.selectable_value(
-                                &mut settings.quantizer,
-                                choice,
-                                export_quantizer_label(choice, localizer),
-                            );
-                        }
-                    });
-                if let Some(required) = fixed_palette_required_colors(settings.quantizer) {
-                    ui.weak(format_message(
-                        localizer,
-                        Message::ExportFixedPaletteMinimum,
-                        &[("required", &required.to_string())],
-                    ));
-                }
-            });
-            ui.end_row();
-
-            if settings.quantizer == ExportQuantizerChoice::Custom {
-                ui.label(localizer.text(Message::ExportCustomColors));
-                ui.vertical(|ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut settings.custom_palette_text)
-                            .code_editor()
-                            .desired_rows(4)
-                            .desired_width(430.0)
-                            .hint_text("#000000, #FFFFFF"),
-                    );
-                    ui.weak(localizer.text(Message::ExportCustomPaletteHint));
-                });
-                ui.end_row();
-
-                ui.label(localizer.text(Message::ExportCustomTransparency));
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.checkbox(
-                            &mut settings.custom_transparency_enabled,
-                            localizer.text(Message::ExportTransparentIndex),
-                        );
-                        ui.add_enabled(
-                            settings.custom_transparency_enabled,
-                            egui::DragValue::new(&mut settings.custom_transparent_index)
-                                .range(0..=u16::from(u8::MAX)),
-                        );
-                        ui.weak(localizer.text(Message::ExportZeroBased));
-                    });
-                    ui.weak(localizer.text(Message::ExportTransparencyRequired));
-                });
-                ui.end_row();
-            }
-
-            ui.label(localizer.text(Message::ExportDither));
-            egui::ComboBox::from_id_salt("editor_export_dither")
-                .selected_text(export_dither_label(settings.dither, localizer))
+        ui.label(localizer.text(Message::ExportQuantizer));
+        ui.vertical(|ui| {
+            crate::appearance::combo(ui, "editor_export_quantizer")
+                .selected_text(export_quantizer_label(settings.quantizer, localizer))
                 .show_ui(ui, |ui| {
                     for choice in [
-                        ExportDitherChoice::None,
-                        ExportDitherChoice::Bayer,
-                        ExportDitherChoice::Dotted,
-                        ExportDitherChoice::BlueNoise,
-                        ExportDitherChoice::InterleavedNoise,
-                        ExportDitherChoice::FloydSteinberg,
-                        ExportDitherChoice::Atkinson,
-                        ExportDitherChoice::Burkes,
-                        ExportDitherChoice::Sierra,
-                        ExportDitherChoice::SierraLite,
-                        ExportDitherChoice::TwoRowSierra,
-                        ExportDitherChoice::JarvisJudiceNinke,
-                        ExportDitherChoice::Stucki,
-                        ExportDitherChoice::StevensonArce,
+                        ExportQuantizerChoice::MedianCut,
+                        ExportQuantizerChoice::Octree,
+                        ExportQuantizerChoice::Wu,
+                        ExportQuantizerChoice::Grayscale,
+                        ExportQuantizerChoice::MostUsed,
+                        ExportQuantizerChoice::NeuQuant,
+                        ExportQuantizerChoice::WebSafe216,
+                        ExportQuantizerChoice::Monochrome,
+                        ExportQuantizerChoice::Windows16,
+                        ExportQuantizerChoice::Custom,
                     ] {
                         ui.selectable_value(
-                            &mut settings.dither,
+                            &mut settings.quantizer,
                             choice,
-                            export_dither_label(choice, localizer),
+                            export_quantizer_label(choice, localizer),
                         );
                     }
                 });
+            if let Some(required) = fixed_palette_required_colors(settings.quantizer) {
+                ui.weak(format_message(
+                    localizer,
+                    Message::ExportFixedPaletteMinimum,
+                    &[("required", &required.to_string())],
+                ));
+            }
+        });
+        ui.end_row();
+
+        if settings.quantizer == ExportQuantizerChoice::Custom {
+            ui.label(localizer.text(Message::ExportCustomColors));
+            ui.vertical(|ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut settings.custom_palette_text)
+                        .code_editor()
+                        .desired_rows(4)
+                        .desired_width(430.0)
+                        .hint_text("#000000, #FFFFFF"),
+                );
+                ui.weak(localizer.text(Message::ExportCustomPaletteHint));
+            });
             ui.end_row();
 
-            ui.label(localizer.text(Message::ExportAlphaThreshold));
-            ui.add(egui::DragValue::new(&mut settings.alpha_threshold).range(0..=255));
+            ui.label(localizer.text(Message::ExportCustomTransparency));
+            ui.vertical(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(
+                        &mut settings.custom_transparency_enabled,
+                        localizer.text(Message::ExportTransparentIndex),
+                    );
+                    ui.add_enabled(
+                        settings.custom_transparency_enabled,
+                        egui::DragValue::new(&mut settings.custom_transparent_index)
+                            .range(0..=u16::from(u8::MAX)),
+                    );
+                    ui.weak(localizer.text(Message::ExportZeroBased));
+                });
+                ui.weak(localizer.text(Message::ExportTransparencyRequired));
+            });
             ui.end_row();
+        }
 
-            ui.label(localizer.text(Message::ExportLoop));
-            ui.horizontal(|ui| {
-                ui.selectable_value(
-                    &mut settings.loop_choice,
-                    ExportLoopChoice::Infinite,
-                    localizer.text(Message::ExportLoopInfinite),
-                );
-                ui.selectable_value(
-                    &mut settings.loop_choice,
-                    ExportLoopChoice::Finite,
-                    localizer.text(Message::ExportLoopFinite),
-                );
-                if settings.loop_choice == ExportLoopChoice::Finite {
-                    ui.add(
-                        egui::DragValue::new(&mut settings.finite_loop_count).range(1..=u16::MAX),
+        ui.label(localizer.text(Message::ExportDither));
+        crate::appearance::combo(ui, "editor_export_dither")
+            .selected_text(export_dither_label(settings.dither, localizer))
+            .show_ui(ui, |ui| {
+                for choice in [
+                    ExportDitherChoice::None,
+                    ExportDitherChoice::Bayer,
+                    ExportDitherChoice::Dotted,
+                    ExportDitherChoice::BlueNoise,
+                    ExportDitherChoice::InterleavedNoise,
+                    ExportDitherChoice::FloydSteinberg,
+                    ExportDitherChoice::Atkinson,
+                    ExportDitherChoice::Burkes,
+                    ExportDitherChoice::Sierra,
+                    ExportDitherChoice::SierraLite,
+                    ExportDitherChoice::TwoRowSierra,
+                    ExportDitherChoice::JarvisJudiceNinke,
+                    ExportDitherChoice::Stucki,
+                    ExportDitherChoice::StevensonArce,
+                ] {
+                    ui.selectable_value(
+                        &mut settings.dither,
+                        choice,
+                        export_dither_label(choice, localizer),
                     );
                 }
             });
-            ui.end_row();
+        ui.end_row();
 
-            ui.label(localizer.text(Message::ExportOptimization));
-            ui.horizontal(|ui| {
-                ui.checkbox(
-                    &mut settings.delta,
-                    localizer.text(Message::ExportChangedRectangles),
-                );
-                ui.checkbox(
-                    &mut settings.overwrite,
-                    localizer.text(Message::ExportOverwriteOutput),
-                );
-            });
-            ui.end_row();
+        ui.label(localizer.text(Message::ExportAlphaThreshold));
+        ui.add(egui::DragValue::new(&mut settings.alpha_threshold).range(0..=255));
+        ui.end_row();
+
+        ui.label(localizer.text(Message::ExportLoop));
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(
+                &mut settings.loop_choice,
+                ExportLoopChoice::Infinite,
+                localizer.text(Message::ExportLoopInfinite),
+            );
+            ui.selectable_value(
+                &mut settings.loop_choice,
+                ExportLoopChoice::Finite,
+                localizer.text(Message::ExportLoopFinite),
+            );
+            if settings.loop_choice == ExportLoopChoice::Finite {
+                ui.add(egui::DragValue::new(&mut settings.finite_loop_count).range(1..=u16::MAX));
+            }
         });
+        ui.end_row();
+
+        ui.label(localizer.text(Message::ExportOptimization));
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(
+                &mut settings.delta,
+                localizer.text(Message::ExportChangedRectangles),
+            );
+            ui.checkbox(
+                &mut settings.overwrite,
+                localizer.text(Message::ExportOverwriteOutput),
+            );
+        });
+        ui.end_row();
+    });
 }
 
 fn export_phase_label(
@@ -6355,7 +6344,7 @@ fn show_recording_cadence_settings(
 ) {
     ui.label(localizer.text(Message::RecorderCaptureFrequency));
     ui.horizontal_wrapped(|ui| {
-        egui::ComboBox::from_id_salt("recording_cadence")
+        crate::appearance::combo(ui, "recording_cadence")
             .selected_text(recording_cadence_label(settings.cadence, localizer))
             .show_ui(ui, |ui| {
                 for choice in [
@@ -6392,7 +6381,7 @@ fn show_recording_cadence_settings(
             ui.label(localizer.text(Message::RecorderPeriodicInterval));
             ui.horizontal(|ui| {
                 ui.add(egui::DragValue::new(&mut settings.interval_count).range(1..=10_000));
-                egui::ComboBox::from_id_salt("recording_interval_unit")
+                crate::appearance::combo(ui, "recording_interval_unit")
                     .selected_text(recording_interval_unit_label(
                         settings.interval_unit,
                         localizer,
@@ -6431,7 +6420,7 @@ fn show_recording_playback_settings(
     localizer: Localizer,
 ) {
     ui.label(localizer.text(Message::RecorderPlaybackTiming));
-    ui.horizontal_wrapped(|ui| match settings.cadence {
+    ui.vertical(|ui| match settings.cadence {
         RecordingCadenceChoice::FixedFps => {
             ui.checkbox(
                 &mut settings.playback.fixed_frame_rate,
@@ -6511,7 +6500,7 @@ fn show_recording_annotations_setting(
 ) {
     ui.label(localizer.text(Message::RecorderAnnotations));
     ui.vertical(|ui| {
-        egui::ComboBox::from_id_salt("recording-cursor-mode")
+        crate::appearance::combo(ui, "recording-cursor-mode")
             .selected_text(match settings.cursor {
                 RecordingCursor::Embedded => localizer.text(Message::RecorderCursorEmbedded),
                 RecordingCursor::Hidden => localizer.text(Message::RecorderCursorHidden),
@@ -6562,7 +6551,7 @@ fn show_frame_retention_setting(
     localizer: Localizer,
 ) {
     ui.label(localizer.text(Message::RecorderFrameRetention));
-    ui.horizontal_wrapped(|ui| {
+    ui.vertical(|ui| {
         ui.add_enabled_ui(settings.cadence != RecordingCadenceChoice::Manual, |ui| {
             ui.checkbox(
                 &mut settings.changes_only,

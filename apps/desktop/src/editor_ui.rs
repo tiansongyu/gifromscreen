@@ -873,11 +873,14 @@ fn show_clipboard_history(
     localizer: Localizer,
 ) {
     let entry_count = workspace.clipboard_history_len();
-    egui::CollapsingHeader::new(crate::format_message(
-        localizer,
-        Message::EditorClipboardHistory,
-        &[("count", &entry_count.to_string())],
-    ))
+    crate::appearance::section(
+        ui,
+        crate::format_message(
+            localizer,
+            Message::EditorClipboardHistory,
+            &[("count", &entry_count.to_string())],
+        ),
+    )
     .id_salt("editor-clipboard-history")
     .show(ui, |ui| {
         if entry_count == 0 {
@@ -1029,7 +1032,7 @@ fn show_editor_statistics(
     results: &mut Vec<EditorUiResult>,
     localizer: Localizer,
 ) {
-    egui::CollapsingHeader::new(localizer.text(Message::EditorStatistics))
+    crate::appearance::section(ui, localizer.text(Message::EditorStatistics))
         .id_salt("Statistics") // Keep the original English identity across languages.
         .default_open(false)
         .show(ui, |ui| match workspace.statistics() {
@@ -1327,7 +1330,7 @@ fn show_selection_toolbar(
             );
         }
     });
-    egui::CollapsingHeader::new(localizer.text(Message::EditorAdvancedSelection))
+    crate::appearance::section(ui, localizer.text(Message::EditorAdvancedSelection))
         .id_salt("advanced-frame-selection")
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -1716,7 +1719,7 @@ fn show_advanced_timing_toolbar(
             ui.add(
                 egui::TextEdit::singleline(&mut state.reduce_keep_every_input).desired_width(54.0),
             );
-            egui::ComboBox::from_id_salt("reduce_delay_mode")
+            crate::appearance::combo(ui, "reduce_delay_mode")
                 .selected_text(reduce_delay_label(state.reduce_delay_mode, localizer))
                 .show_ui(ui, |ui| {
                     for mode in [
@@ -1757,7 +1760,7 @@ fn show_advanced_timing_toolbar(
 
         ui.horizontal_wrapped(|ui| {
             ui.label(localizer.text(Message::EditorYoyoSource));
-            egui::ComboBox::from_id_salt("yoyo_scope")
+            crate::appearance::combo(ui, "yoyo_scope")
                 .selected_text(yoyo_scope_label(state.yoyo_scope, localizer))
                 .show_ui(ui, |ui| {
                     for scope in [YoyoScope::Selection, YoyoScope::EntireTimeline] {
@@ -1805,7 +1808,7 @@ fn show_duplicate_controls(
             egui::TextEdit::singleline(&mut state.duplicate_threshold_input).desired_width(48.0),
         );
         ui.label("%");
-        egui::ComboBox::from_id_salt("duplicate_retention")
+        crate::appearance::combo(ui, "duplicate_retention")
             .selected_text(duplicate_retention_label(
                 state.duplicate_retention,
                 localizer,
@@ -1822,7 +1825,7 @@ fn show_duplicate_controls(
                     );
                 }
             });
-        egui::ComboBox::from_id_salt("duplicate_delay_mode")
+        crate::appearance::combo(ui, "duplicate_delay_mode")
             .selected_text(duplicate_delay_label(state.duplicate_delay_mode, localizer))
             .show_ui(ui, |ui| {
                 for mode in [
@@ -1923,7 +1926,7 @@ fn show_transition_toolbar(
     results: &mut Vec<EditorUiResult>,
     localizer: Localizer,
 ) {
-    egui::CollapsingHeader::new(localizer.text(Message::EditorTransitions))
+    crate::appearance::section(ui, localizer.text(Message::EditorTransitions))
         .id_salt("editor-transitions")
         .default_open(false)
         .show(ui, |ui| {
@@ -1981,7 +1984,7 @@ fn show_transition_toolbar(
 fn show_transition_inputs(ui: &mut egui::Ui, state: &mut EditorUiState, localizer: Localizer) {
     ui.horizontal_wrapped(|ui| {
         ui.label(localizer.text(Message::EditorTransitionType));
-        egui::ComboBox::from_id_salt("current_frame_transition_kind")
+        crate::appearance::combo(ui, "current_frame_transition_kind")
             .selected_text(transition_choice_label(state.transition_choice, localizer))
             .show_ui(ui, |ui| {
                 for choice in [
@@ -2305,7 +2308,7 @@ fn show_effect_toolbar(
     ui.group(|ui| {
         ui.horizontal_wrapped(|ui| {
             ui.strong(localizer.text(Message::EffectsTitle));
-            egui::ComboBox::from_id_salt("frame_effect_choice")
+            crate::appearance::combo(ui, "frame_effect_choice")
                 .selected_text(effect_choice_label(state.effect_choice, localizer))
                 .show_ui(ui, |ui| {
                     for choice in [
@@ -2737,7 +2740,7 @@ fn show_shape_overlay_inputs(
             );
             ui.end_row();
             ui.label(localizer.text(Message::EditorOverlayKind));
-            egui::ComboBox::from_id_salt("shape_overlay_kind")
+            crate::appearance::combo(ui, "shape_overlay_kind")
                 .selected_text(shape_overlay_choice_label(state.kind, localizer))
                 .show_ui(ui, |ui| {
                     for choice in [
@@ -2761,7 +2764,7 @@ fn show_shape_overlay_inputs(
             ui.add(egui::DragValue::new(&mut state.track_opacity).range(1..=u8::MAX));
             ui.end_row();
             ui.label(localizer.text(Message::EditorOverlayBlend));
-            egui::ComboBox::from_id_salt("shape_overlay_blend")
+            crate::appearance::combo(ui, "shape_overlay_blend")
                 .selected_text(blend_mode_label(state.blend_mode, localizer))
                 .show_ui(ui, |ui| {
                     for blend in [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen] {
@@ -2923,7 +2926,7 @@ fn show_drawing_overlay_inputs(
             ui.add(egui::DragValue::new(&mut draft.track_opacity).range(1..=u8::MAX));
             ui.end_row();
             ui.label(localizer.text(Message::EditorOverlayBlend));
-            egui::ComboBox::from_id_salt("drawing_overlay_blend")
+            crate::appearance::combo(ui, "drawing_overlay_blend")
                 .selected_text(blend_mode_label(draft.blend_mode, localizer))
                 .show_ui(ui, |ui| {
                     for blend in [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen] {

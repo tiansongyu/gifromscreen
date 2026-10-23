@@ -120,3 +120,38 @@ fn application_close_waits_for_a_queued_language_save() {
         LanguagePreference::explicit("zh").unwrap()
     );
 }
+
+#[test]
+fn language_window_text_layout_audit_after_resize_and_font_enlargement() {
+    let context = egui::Context::default();
+    crate::appearance::configure(&context);
+    fonts::install(&context);
+    context.style_mut(|style| {
+        style.animation_time = 0.0;
+        for font in style.text_styles.values_mut() {
+            font.size *= 1.5;
+        }
+    });
+    let mut settings = LanguageSettings {
+        open: true,
+        ..LanguageSettings::default()
+    };
+    for (width, tag) in [(960.0, "en"), (440.0, "zh"), (320.0, "en"), (960.0, "zh")] {
+        settings.select(LanguagePreference::explicit(tag).unwrap());
+        let mut output = None;
+        for _ in 0..8 {
+            output = Some(context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 480.0),
+                    )),
+                    ..Default::default()
+                },
+                |context| settings.show(context),
+            ));
+        }
+        let issues = crate::editor_shell_layout_tests::text_layout_issues(&output.unwrap());
+        assert!(issues.is_empty(), "{width}/{tag}: {}", issues.join("\n"));
+    }
+}

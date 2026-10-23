@@ -687,7 +687,7 @@ impl WindowSnapUi {
         if stage != RecorderStage::Ready || geometry.size_is_frozen() || !self.available {
             return;
         }
-        egui::CollapsingHeader::new(localizer.text(Message::SnapTitle))
+        crate::appearance::section(ui, localizer.text(Message::SnapTitle))
             .id_salt("window-snap")
             .show(ui, |ui| {
                 ui.add_enabled_ui(
@@ -757,7 +757,7 @@ impl WindowSnapUi {
         geometry: RecorderGeometry,
         localizer: Localizer,
     ) {
-        egui::ComboBox::from_id_salt("snap-window-choice")
+        crate::appearance::combo(ui, "snap-window-choice")
             .width(ui.available_width())
             .truncate()
             .selected_text(

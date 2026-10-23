@@ -122,7 +122,7 @@ pub(crate) fn show_export_presets(
     let mut action = None;
     ui.horizontal_wrapped(|ui| {
         ui.label(localizer.text(Message::ExportProjectPreset));
-        egui::ComboBox::from_id_salt("export-preset-list")
+        crate::appearance::combo(ui, "export-preset-list")
             .selected_text(if state.selected.is_empty() {
                 localizer.text(Message::ExportChoosePreset)
             } else {

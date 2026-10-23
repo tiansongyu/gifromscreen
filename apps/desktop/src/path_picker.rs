@@ -21,6 +21,28 @@ pub(crate) struct PathPicker {
 }
 
 impl PathPicker {
+    /// Reserve the browse button before the growing path editor. A nested
+    /// enabled UI at the end of a full wrapping row cannot reflow atomically.
+    pub(crate) fn show_field(
+        &mut self,
+        ui: &mut egui::Ui,
+        label: &str,
+        path: &mut String,
+        kind: PathKind,
+    ) -> Option<String> {
+        ui.label(label);
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                let notice = self.show(ui, path, kind);
+                ui.add(egui::TextEdit::singleline(path).desired_width(ui.available_width()));
+                notice
+            },
+        )
+        .inner
+    }
+
     /// Returns a notice only on failure or when a manually changed field was preserved.
     pub(crate) fn show(
         &mut self,

@@ -101,7 +101,7 @@ impl MotionTools {
     }
 
     pub(crate) fn show(&mut self, ui: &mut egui::Ui, workspace: &EditorWorkspace) {
-        egui::CollapsingHeader::new("Motion tools").id_salt("motion-tools").show(ui, |ui| {
+        crate::appearance::section(ui, "Motion tools").id_salt("motion-tools").show(ui, |ui| {
             self.sync_canvas(workspace);
             ui.add_enabled_ui(!self.is_running(), |ui| {
                 let previous_mode = self.mode;

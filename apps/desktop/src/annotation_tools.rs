@@ -136,7 +136,7 @@ impl AnnotationTools {
     }
 
     pub(crate) fn show(&mut self, ui: &mut egui::Ui, workspace: &EditorWorkspace) {
-        egui::CollapsingHeader::new("Progress & input annotations").id_salt("annotation-tools").show(ui,|ui| {
+        crate::appearance::section(ui, "Progress & input annotations").id_salt("annotation-tools").show(ui,|ui| {
             if self.project_id != Some(workspace.manifest().project_id) {
                 self.project_id = Some(workspace.manifest().project_id);
                 self.replacing = None;
@@ -177,7 +177,7 @@ impl AnnotationTools {
             || "New annotation group".to_owned(),
             |(index, track)| overlay_group_label(index, track),
         );
-        egui::ComboBox::from_id_salt("annotation-existing-group")
+        crate::appearance::combo(ui, "annotation-existing-group")
             .selected_text(label)
             .width(ui.available_width())
             .show_ui(ui, |ui| {
@@ -330,7 +330,7 @@ impl AnnotationTools {
 
 /// Shared with automatic tasks; editing settings never launches work or writes files.
 pub(crate) fn show_annotation_options(ui: &mut egui::Ui, request: &mut AnnotationRequest) {
-    egui::ComboBox::from_id_salt("annotation-mode")
+    crate::appearance::combo(ui, "annotation-mode")
         .selected_text(annotation_name(&request.mode))
         .show_ui(ui, |ui| {
             for mode in [
@@ -369,7 +369,7 @@ pub(crate) fn show_annotation_options(ui: &mut egui::Ui, request: &mut Annotatio
                 ui.checkbox(&mut options.remaining, "Reverse bar / percent");
                 ui.checkbox(&mut options.show_bar, "Show bar");
             });
-            egui::ComboBox::from_id_salt("progress-direction")
+            crate::appearance::combo(ui, "progress-direction")
                 .selected_text(match options.direction {
                     ProgressDirection::LeftToRight => "Left to right",
                     ProgressDirection::RightToLeft => "Right to left",

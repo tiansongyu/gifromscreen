@@ -60,7 +60,7 @@ impl ProjectInsertTool {
     }
 
     pub(crate) fn show(&mut self, ui: &mut egui::Ui, workspace: &EditorWorkspace) {
-        egui::CollapsingHeader::new("Insert recording or imported project").id_salt("insert-project").show(ui, |ui| {
+        crate::appearance::section(ui, "Insert recording or imported project").id_salt("insert-project").show(ui, |ui| {
             ui.label("Choose a .gfsproj with the same canvas size. Frames, overlays, and transitions are inserted together.");
             ui.weak("Import video/images or stop a recording to create its project first. Close that project in other windows before inserting it here.");
             ui.add_enabled_ui(!self.is_running(), |ui| {
@@ -75,7 +75,7 @@ impl ProjectInsertTool {
                 if ui.button("Insert project").clicked() && let Err(error) = self.start(workspace) { self.notice = Some(error); }
             });
             if self.is_running() {
-                ui.horizontal(|ui| { ui.spinner(); ui.label("Verifying and preparing source frames…"); });
+                ui.horizontal_wrapped(|ui| { ui.spinner(); ui.label("Verifying and preparing source frames…"); });
                 if ui.add_enabled(!self.task.is_cancelling(), egui::Button::new("Cancel insertion")).clicked() { self.cancel(); }
                 ui.ctx().request_repaint_after(Duration::from_millis(33));
             }

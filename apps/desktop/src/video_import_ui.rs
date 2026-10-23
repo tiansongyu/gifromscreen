@@ -90,11 +90,7 @@ impl VideoImportTool {
         ui.weak("Uses installed FFmpeg and ffprobe. Audio is not imported. Processing runs in the background with bounded memory.");
         ui.add_space(12.0);
         ui.add_enabled_ui(!self.is_running(), |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Video");
-                ui.add(egui::TextEdit::singleline(&mut self.input).desired_width(410.0));
-                if let Some(notice) = self.picker.show(ui, &mut self.input, PathKind::Video) { self.notice = Some(notice); }
-            });
+            if let Some(notice) = self.picker.show_field(ui, "Video", &mut self.input, PathKind::Video) { self.notice = Some(notice); }
             ui.horizontal_wrapped(|ui| {
                 ui.label("Start");
                 ui.add(egui::DragValue::new(&mut self.start_ms).suffix(" ms"));
@@ -105,12 +101,10 @@ impl VideoImportTool {
             });
             ui.horizontal_wrapped(|ui| {
                 ui.checkbox(&mut self.resize, "Resize video");
-                ui.add_enabled_ui(self.resize, |ui| {
-                    ui.add(egui::DragValue::new(&mut self.width).range(1..=4096).prefix("Width "));
-                    ui.add(egui::DragValue::new(&mut self.height).range(1..=4096).prefix("Height "));
-                });
+                ui.add_enabled(self.resize, egui::DragValue::new(&mut self.width).range(1..=4096).prefix("Width "));
+                ui.add_enabled(self.resize, egui::DragValue::new(&mut self.height).range(1..=4096).prefix("Height "));
             });
-            ui.horizontal_wrapped(|ui| {
+            ui.vertical(|ui| {
                 ui.label("New project");
                 ui.add(egui::TextEdit::singleline(&mut self.target).desired_width(450.0)
                     .hint_text("Leave empty to save beside the video"));
@@ -119,7 +113,7 @@ impl VideoImportTool {
             if ui.button("Import video").clicked() && let Err(error) = self.start() { self.notice = Some(error); }
         });
         if self.is_running() {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.spinner();
                 ui.label(if self.task.is_cancelling() {
                     "Cancelling…"
